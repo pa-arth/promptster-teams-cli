@@ -1,0 +1,8 @@
+/promptster-teams
+/promptster-teams-cli
+/bin/
+/dist/
+npm/binaries/
+node_modules/
+.DS_Store
+.claude/

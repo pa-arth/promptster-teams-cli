@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Audit cleanliness (no anti-cheat / surveillance logic)
+        run: |
+          # The teams CLI must contain ONLY capture + redaction + signing.
+          # Fail the build if hiring's anti-cheat surface ever creeps back in.
+          if grep -rinE 'honeypot|likelyPaste|consentToIntegrity|cadence enrichment' --include='*.go' .; then
+            echo "::error::surveillance/anti-cheat term found in source — teams CLI must stay clean"
+            exit 1
+          fi
+          echo "clean"

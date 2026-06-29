@@ -1,0 +1,37 @@
+{
+  "name": "@promptster/teams-cli",
+  "version": "0.1.0",
+  "description": "On-device, auditable AI-coding capture for internal engineering teams",
+  "keywords": [
+    "promptster",
+    "cli",
+    "teams",
+    "ai",
+    "observability",
+    "developer-productivity"
+  ],
+  "homepage": "https://github.com/pa-arth/promptster-teams-cli",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pa-arth/promptster-teams-cli"
+  },
+  "license": "MIT",
+  "bin": {
+    "promptster-teams": "./bin/promptster-teams.js"
+  },
+  "scripts": {
+    "build": "node scripts/build.js",
+    "prepublishOnly": "node scripts/build.js && node scripts/check-binaries.js"
+  },
+  "files": [
+    "bin/",
+    "binaries/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

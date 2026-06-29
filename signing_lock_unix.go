@@ -1,0 +1,26 @@
+//go:build !windows
+
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"syscall"
+)
+
+func withBufferLock(bufferPath string, fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(bufferPath), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(bufferPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("flock: %w", err)
+	}
+	defer syscall.Flock(int(f.Fd()), syscall.LOCK_UN) //nolint:errcheck
+	return fn()
+}
