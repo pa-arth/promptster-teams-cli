@@ -16,21 +16,40 @@ import (
 //     rules (AWS, GitHub, Anthropic, OpenAI, Slack, PEM, JWT, ...). Engine
 //     init is once per process; if it ever fails the supplemental layer below
 //     still runs, so capture is never blocked and never unscrubbed.
-//  2. Supplemental patterns — Promptster's own credentials and generic shapes
-//     (KEY=value assignments, bearer headers) that a provider-rule scanner
-//     doesn't cover. Doubles as the fallback layer.
+//  2. Supplemental regex patterns — Promptster's own credentials, generic
+//     credential shapes (KEY=value / JSON key:value, bearer headers, URL-
+//     embedded passwords) and PII / business data (email, SSN, phone, private
+//     IPs) that a provider-rule secret scanner doesn't cover.
 //
 // Both layers operate on raw JSON bytes (the hook + codex paths), so every
 // replacement must be JSON-safe: markers contain no quotes or backslashes,
-// and spans are narrowed to the secret token so a match can never consume
-// surrounding JSON structure.
+// spans are narrowed to the secret token, and value matches stop at quotes —
+// so a match can never consume surrounding JSON structure.
+//
+// Deliberately NOT here: a blunt entropy catch-all or a digit-run credit-card
+// pass. Both ran on the raw line before the normalizers parse it — the entropy
+// pass collapsed provider message IDs (msg_/toolu_/call_) to a constant and
+// broke turn dedup, and an unquoted [REDACTED_CC] marker corrupted bare numeric
+// JSON values. Any future org-internal-secret heuristic must run JSON-aware over
+// string values only, skipping structural ID fields.
 var redactPatterns = []struct {
 	re          *regexp.Regexp
 	replacement string
 }{
-	// Value match stops at whitespace OR a quote so redacting raw JSON bytes
-	// never eats a closing quote and corrupts the JSON.
-	{regexp.MustCompile(`(?i)\b(API_KEY|TOKEN|SECRET|PASSWORD|PRIVATE_KEY)\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
+	// --- Credentials & secrets -------------------------------------------
+	// KEY=value assignments. Value match stops at whitespace OR a quote so
+	// redacting raw JSON bytes never eats a closing quote and corrupts the JSON.
+	// PWD is intentionally excluded — it's the working-directory env var far
+	// more often than a password, and clobbering it destroys replay context.
+	{regexp.MustCompile(`(?i)\b(API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY)\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
+	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
+	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
+	// inside the value and mis-bound the JSON. Value is rebuilt quoted.
+	{regexp.MustCompile(`(?i)("(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"`), `${1}"[REDACTED]"`},
+	// Credentials embedded in a connection string / URL (scheme://user:pass@).
+	// Username is optional so userless DSNs (redis://:pass@, amqp://:pass@) are
+	// caught too. Keep scheme + user, drop the password up to the @.
+	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']*):[^\s@/"']+@`), "$1:[REDACTED]@"},
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "[REDACTED_AWS_KEY]"},
 	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
 	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
@@ -51,6 +70,16 @@ var redactPatterns = []struct {
 	// identifies a developer — must never survive into captured content.
 	{regexp.MustCompile(`\bPSE-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b`), "[REDACTED_PROMPTSTER_ENGINEER_KEY]"},
 	{regexp.MustCompile(`\bpsk_live_[A-Za-z0-9_-]{20,}`), "[REDACTED_PROMPTSTER_ORG_KEY]"},
+
+	// --- PII / business data ---------------------------------------------
+	{regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}\b`), "[REDACTED_EMAIL]"},
+	{regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`), "[REDACTED_SSN]"},
+	// Phone numbers that carry separators / parens / a country code. Bare
+	// 10-digit runs are left alone — they're far more often IDs or timestamps.
+	{regexp.MustCompile(`(?:\+?1[ .\-]?)?(?:\(\d{3}\)[ .\-]?|\d{3}[ .\-])\d{3}[ .\-]\d{4}`), "[REDACTED_PHONE]"},
+	{regexp.MustCompile(`\+[1-9]\d{9,14}\b`), "[REDACTED_PHONE]"},
+	// RFC1918 private IPv4 — internal infrastructure addressing.
+	{regexp.MustCompile(`\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b`), "[REDACTED_PRIVATE_IP]"},
 }
 
 var (

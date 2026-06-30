@@ -6,6 +6,77 @@ import (
 	"testing"
 )
 
+// PII / business data must be scrubbed regardless of which layer catches it.
+func TestRedactPII(t *testing.T) {
+	cases := []struct{ name, in, leak string }{
+		{"email", `reach me at jane.doe+ci@example.co.uk please`, "jane.doe+ci@example.co.uk"},
+		{"ssn", `SSN 123-45-6789 on file`, "123-45-6789"},
+		{"phone dashes", `call 555-123-4567 today`, "555-123-4567"},
+		{"phone parens", `call (555) 123-4567 today`, ") 123-4567"},
+		{"phone e164", `wa +15551234567 now`, "+15551234567"},
+		{"private ip 10", `host 10.1.2.3 internal`, "10.1.2.3"},
+		{"private ip 192", `host 192.168.0.42 internal`, "192.168.0.42"},
+		{"db url password", `dsn postgres://app:s3cretpw@db.example.com:5432/x end`, "s3cretpw"},
+		{"userless dsn password", `dsn redis://:s3cretpw@host:6379/0 end`, "s3cretpw"},
+		{"json password", `{"password":"hunter2","keep":"me"}`, "hunter2"},
+		{"json apiKey", `{"apiKey":"abc123def456","other":1}`, "abc123def456"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := redactBytes([]byte(tc.in))
+			if bytes.Contains(out, []byte(tc.leak)) {
+				t.Errorf("PII survived:\n in: %s\nout: %s", tc.in, out)
+			}
+		})
+	}
+}
+
+// PWD is the working-directory env var, not a secret — it must pass through so
+// replay/audit keeps its directory context.
+func TestRedactKeepsPWDEnvVar(t *testing.T) {
+	in := `PWD=/home/alice/project`
+	out := redactBytes([]byte(in))
+	if !bytes.Contains(out, []byte("/home/alice/project")) {
+		t.Errorf("PWD working-directory value was wrongly redacted: %s", out)
+	}
+}
+
+// JSON secret-key redaction must keep siblings and leave parseable JSON.
+func TestRedactJSONSecretKeyKeepsSiblings(t *testing.T) {
+	in := []byte(`{"password":"hunter2","keep":"me"}`)
+	out := redactBytes(in)
+	var v map[string]interface{}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
+	}
+	if v["keep"] != "me" {
+		t.Errorf("sibling field damaged: %s", out)
+	}
+	if v["password"] != "[REDACTED]" {
+		t.Errorf("password not redacted: %s", out)
+	}
+}
+
+// A secret value containing an escaped quote must not mis-bound the JSON match:
+// the whole value goes, the JSON stays valid, and no tail leaks.
+func TestRedactJSONSecretKeyEscapedQuote(t *testing.T) {
+	in := []byte(`{"password":"a\"secrettail","keep":"me"}`)
+	out := redactBytes(in)
+	var v map[string]interface{}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("escaped-quote value broke JSON: %v\n%s", err, out)
+	}
+	if v["password"] != "[REDACTED]" {
+		t.Errorf("password not fully redacted: %s", out)
+	}
+	if bytes.Contains(out, []byte("secrettail")) {
+		t.Errorf("secret tail leaked past the escaped quote: %s", out)
+	}
+	if v["keep"] != "me" {
+		t.Errorf("sibling field damaged: %s", out)
+	}
+}
+
 func TestRedactEnvVarSecret(t *testing.T) {
 	cases := []struct {
 		name  string
