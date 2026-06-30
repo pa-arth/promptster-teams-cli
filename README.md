@@ -82,7 +82,7 @@ promptster-teams status   # show config + locally buffered event count
 | `PROMPTSTER_TEAMS_API_URL` | Ingest base URL (required) |
 | `PROMPTSTER_TEAMS_TOKEN` | Org/device ingest auth token (required) |
 | `PROMPTSTER_TEAMS_WATCH_DIR` | Directory whose transcripts to capture (default: cwd) |
-| `PROMPTSTER_TEAMS_INGEST_PATH` | Override the ingest path (default `/v1/hooks/ingest`) |
+| `PROMPTSTER_TEAMS_INGEST_PATH` | Override the ingest path (default `/v1/teams/ingest`) |
 
 ## Build
 
