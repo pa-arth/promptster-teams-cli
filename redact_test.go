@@ -6,6 +6,85 @@ import (
 	"testing"
 )
 
+// PII / business data must be scrubbed regardless of which layer catches it.
+func TestRedactPII(t *testing.T) {
+	cases := []struct{ name, in, leak string }{
+		{"email", `reach me at jane.doe+ci@example.co.uk please`, "jane.doe+ci@example.co.uk"},
+		{"ssn", `SSN 123-45-6789 on file`, "123-45-6789"},
+		{"phone dashes", `call 555-123-4567 today`, "555-123-4567"},
+		{"phone parens", `call (555) 123-4567 today`, ") 123-4567"},
+		{"phone e164", `wa +15551234567 now`, "+15551234567"},
+		{"credit card spaced", `charge 4242 4242 4242 4242 now`, "4242 4242 4242 4242"},
+		{"credit card solid", `pan 4111111111111111 done`, "4111111111111111"},
+		{"private ip 10", `host 10.1.2.3 internal`, "10.1.2.3"},
+		{"private ip 192", `host 192.168.0.42 internal`, "192.168.0.42"},
+		{"db url password", `dsn postgres://app:s3cretpw@db.example.com:5432/x end`, "s3cretpw"},
+		{"json password", `{"password":"hunter2","keep":"me"}`, "hunter2"},
+		{"json apiKey", `{"apiKey":"abc123def456","other":1}`, "abc123def456"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := redactBytes([]byte(tc.in))
+			if bytes.Contains(out, []byte(tc.leak)) {
+				t.Errorf("PII survived:\n in: %s\nout: %s", tc.in, out)
+			}
+		})
+	}
+}
+
+// A bare numeric ID that fails the Luhn check must NOT be redacted as a card.
+func TestRedactCreditCardLuhnGuard(t *testing.T) {
+	in := `order 1234567890123456 shipped` // 16 digits, Luhn-invalid
+	out := redactBytes([]byte(in))
+	if !bytes.Contains(out, []byte("1234567890123456")) {
+		t.Errorf("Luhn-invalid number wrongly redacted: %s", out)
+	}
+}
+
+// JSON secret-key redaction must keep siblings and leave parseable JSON.
+func TestRedactJSONSecretKeyKeepsSiblings(t *testing.T) {
+	in := []byte(`{"password":"hunter2","keep":"me"}`)
+	out := redactBytes(in)
+	var v map[string]interface{}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
+	}
+	if v["keep"] != "me" {
+		t.Errorf("sibling field damaged: %s", out)
+	}
+	if v["password"] != "[REDACTED]" {
+		t.Errorf("password not redacted: %s", out)
+	}
+}
+
+// The high-entropy catch-all takes org-internal tokens that have no named rule.
+func TestRedactHighEntropyToken(t *testing.T) {
+	token := "K7xQ2mZ9pR4tW1nB6vC3jL8sD5fG0hA" // 31-char random base62, no named rule
+	out := redactBytes([]byte("internal token " + token + " end"))
+	if bytes.Contains(out, []byte(token)) {
+		t.Errorf("high-entropy token survived: %s", out)
+	}
+	if !bytes.Contains(out, []byte("[REDACTED_HIGH_ENTROPY]")) {
+		t.Errorf("expected high-entropy marker: %s", out)
+	}
+}
+
+// The catch-all must NOT eat ordinary high-length-but-structured strings.
+func TestRedactHighEntropyKeepsLegitimateTokens(t *testing.T) {
+	keep := []string{
+		"getUserByEmailAddressFromDatabaseV2",                 // camelCase identifier w/ digit
+		"550e8400-e29b-41d4-a716-446655440000",               // UUID v4
+		"com.example.service.internal.HandlerImplementation2", // dotted path w/ digit
+		"abcdef0123456789abcdef0123456789abcdef01",           // 40-char hex sha
+	}
+	for _, s := range keep {
+		out := redactBytes([]byte("x " + s + " y"))
+		if !bytes.Contains(out, []byte(s)) {
+			t.Errorf("over-redacted legitimate token %q -> %s", s, out)
+		}
+	}
+}
+
 func TestRedactEnvVarSecret(t *testing.T) {
 	cases := []struct {
 		name  string

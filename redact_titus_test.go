@@ -142,6 +142,28 @@ func TestScrubEventCleanUntouched(t *testing.T) {
 	}
 }
 
+// The high-entropy catch-all runs over the whole marshaled event in scrubEvent.
+// Routing IDs are UUIDs (hex, below the entropy floor) and must survive intact —
+// redacting them would silently break threading/dedup on the backend.
+func TestScrubEventPreservesUUIDRoutingIDs(t *testing.T) {
+	id, sess := newUUID(), newUUID()
+	event := Event{
+		ID:        id,
+		SessionID: sess,
+		Kind:      "command",
+		Source:    "terminal",
+		V:         1,
+		Data:      map[string]interface{}{"command": "go build ./..."},
+	}
+	scrubEvent(&event)
+	if event.ID != id {
+		t.Errorf("routing ID was rewritten: %q -> %q", id, event.ID)
+	}
+	if event.SessionID != sess {
+		t.Errorf("session ID was rewritten: %q -> %q", sess, event.SessionID)
+	}
+}
+
 // Multiple distinct secrets in one payload — all must go, ordering intact.
 func TestRedactMultipleSecretsOnePayload(t *testing.T) {
 	in := []byte(`{"output":"ANTHROPIC=sk-ant-` + `api03-jSq6OMjv1syXaEUE0bvOckLe_GtCKy8lvZdko3eOJgV8TH-f2iyzRekyZNSby5d9ScikGYuqQhsrxML3X3N3rQ-XwQaQAAA GITHUB=ghp_` + `wWPw5k4aXcaT4fNP0UcnZwJUVFk6LO0pINUx KEY=PST-A7K2-M9Q4 done"}`)
