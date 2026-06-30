@@ -19,7 +19,7 @@ func newUUID() string {
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
-// Event is the canonical Promptster event shape sent to /v1/hooks/ingest.
+// Event is the canonical Promptster event shape sent to /v1/teams/ingest.
 type Event struct {
 	ID         string      `json:"id"`
 	SessionID  string      `json:"sessionId"`

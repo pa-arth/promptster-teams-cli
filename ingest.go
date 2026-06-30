@@ -30,14 +30,16 @@ func devicePubKeyB64() string {
 }
 
 // ingestEndpoint is the path events are POSTed to. The base URL comes from
-// PROMPTSTER_TEAMS_API_URL (via apiURL); the path is the teams ingest route.
-// The normalized Event envelope is identical to the one the hiring backend
-// accepts, so this stays compatible with a shared ingest contract.
+// PROMPTSTER_TEAMS_API_URL (via apiURL); the path is the dedicated teams
+// ingest route, which authenticates an org API key and persists to the teams
+// database (distinct from the hiring `/v1/hooks/ingest` route, which uses
+// candidate-key auth). Override with PROMPTSTER_TEAMS_INGEST_PATH if your
+// backend mounts it elsewhere.
 func ingestEndpoint() string {
 	if p := os.Getenv("PROMPTSTER_TEAMS_INGEST_PATH"); p != "" {
 		return p
 	}
-	return "/v1/hooks/ingest"
+	return "/v1/teams/ingest"
 }
 
 func ingestEventWithAPIKey(event Event, apiKey string) error {
