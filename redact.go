@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"math"
 	"regexp"
 	"sort"
 	"sync"
@@ -11,26 +10,28 @@ import (
 	"github.com/praetorian-inc/titus/pkg/scanner"
 )
 
-// Secret redaction runs in layers, all behind redactBytes:
+// Secret redaction runs in two layers, both behind redactBytes:
 //
 //  1. Titus (praetorian-inc/titus, Apache-2.0) — ~490 entropy-aware provider
 //     rules (AWS, GitHub, Anthropic, OpenAI, Slack, PEM, JWT, ...). Engine
-//     init is once per process; if it ever fails the supplemental layers
-//     below still run, so capture is never blocked and never unscrubbed.
+//     init is once per process; if it ever fails the supplemental layer below
+//     still runs, so capture is never blocked and never unscrubbed.
 //  2. Supplemental regex patterns — Promptster's own credentials, generic
 //     credential shapes (KEY=value / JSON key:value, bearer headers, URL-
 //     embedded passwords) and PII / business data (email, SSN, phone, private
 //     IPs) that a provider-rule secret scanner doesn't cover.
-//  3. Heuristic passes — Luhn-validated credit-card numbers, and a
-//     high-entropy catch-all for org-internal tokens with no named rule. The
-//     catch-all is deliberately greedy (org secrets matter more than the odd
-//     over-redacted blob); UUIDs, git SHAs and ordinary code identifiers stay
-//     below its entropy floor and pass through.
 //
-// Every layer operates on raw JSON bytes (the hook + codex paths), so every
+// Both layers operate on raw JSON bytes (the hook + codex paths), so every
 // replacement must be JSON-safe: markers contain no quotes or backslashes,
-// and spans are narrowed to the secret token so a match can never consume
-// surrounding JSON structure.
+// spans are narrowed to the secret token, and value matches stop at quotes —
+// so a match can never consume surrounding JSON structure.
+//
+// Deliberately NOT here: a blunt entropy catch-all or a digit-run credit-card
+// pass. Both ran on the raw line before the normalizers parse it — the entropy
+// pass collapsed provider message IDs (msg_/toolu_/call_) to a constant and
+// broke turn dedup, and an unquoted [REDACTED_CC] marker corrupted bare numeric
+// JSON values. Any future org-internal-secret heuristic must run JSON-aware over
+// string values only, skipping structural ID fields.
 var redactPatterns = []struct {
 	re          *regexp.Regexp
 	replacement string
@@ -38,13 +39,17 @@ var redactPatterns = []struct {
 	// --- Credentials & secrets -------------------------------------------
 	// KEY=value assignments. Value match stops at whitespace OR a quote so
 	// redacting raw JSON bytes never eats a closing quote and corrupts the JSON.
-	{regexp.MustCompile(`(?i)\b(API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY)\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
-	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value is
-	// rebuilt quoted so the surrounding JSON stays valid.
-	{regexp.MustCompile(`(?i)("(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|pwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"[^"]*"`), `${1}"[REDACTED]"`},
+	// PWD is intentionally excluded — it's the working-directory env var far
+	// more often than a password, and clobbering it destroys replay context.
+	{regexp.MustCompile(`(?i)\b(API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY)\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
+	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
+	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
+	// inside the value and mis-bound the JSON. Value is rebuilt quoted.
+	{regexp.MustCompile(`(?i)("(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"`), `${1}"[REDACTED]"`},
 	// Credentials embedded in a connection string / URL (scheme://user:pass@).
-	// Keep the scheme + user, drop the password up to the @.
-	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']+):[^\s@/"']+@`), "$1:[REDACTED]@"},
+	// Username is optional so userless DSNs (redis://:pass@, amqp://:pass@) are
+	// caught too. Keep scheme + user, drop the password up to the @.
+	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']*):[^\s@/"']+@`), "$1:[REDACTED]@"},
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "[REDACTED_AWS_KEY]"},
 	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
 	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
@@ -97,16 +102,9 @@ func titusScanner() *scanner.Core {
 
 func redactBytes(input []byte) []byte {
 	out := titusRedact(input)
-	// Credit cards before the phone pattern so a 13-19 digit run isn't half-
-	// eaten as a phone number first.
-	out = redactCreditCards(out)
 	for _, p := range redactPatterns {
 		out = p.re.ReplaceAll(out, []byte(p.replacement))
 	}
-	// High-entropy catch-all runs last: the named patterns above have already
-	// replaced everything they recognise with low-entropy markers, so this only
-	// sees the leftovers (and never re-redacts a marker).
-	out = redactHighEntropy(out)
 	return out
 }
 
@@ -245,121 +243,4 @@ func scrubEvent(event *Event) {
 		return
 	}
 	*event = clean
-}
-
-// ccCandidate matches a 13-19 digit run with optional single space/dash
-// separators (the way card numbers are written). It over-matches on purpose;
-// redactCreditCards confirms each hit with a Luhn check before redacting so
-// ordinary long numeric IDs survive.
-var ccCandidate = regexp.MustCompile(`\b\d[\d -]{11,17}\d\b`)
-
-// redactCreditCards replaces Luhn-valid 13-19 digit card numbers with a marker.
-// The Luhn gate keeps the false-positive rate on arbitrary numeric IDs to ~10%.
-func redactCreditCards(in []byte) []byte {
-	return ccCandidate.ReplaceAllFunc(in, func(m []byte) []byte {
-		digits := make([]byte, 0, len(m))
-		for _, c := range m {
-			if c >= '0' && c <= '9' {
-				digits = append(digits, c)
-			}
-		}
-		if n := len(digits); n < 13 || n > 19 {
-			return m
-		}
-		if !luhnValid(digits) {
-			return m
-		}
-		return []byte("[REDACTED_CC]")
-	})
-}
-
-// luhnValid reports whether the ASCII digit string passes the Luhn checksum.
-func luhnValid(digits []byte) bool {
-	sum, alt := 0, false
-	for i := len(digits) - 1; i >= 0; i-- {
-		d := int(digits[i] - '0')
-		if alt {
-			if d *= 2; d > 9 {
-				d -= 9
-			}
-		}
-		sum += d
-		alt = !alt
-	}
-	return sum%10 == 0
-}
-
-// High-entropy catch-all tuning. A token must clear ALL of these to be cut:
-// long enough to be a credential, mixing letters and digits, and dense enough
-// that it can't be ordinary structured text. The 4.3 bits/char floor sits above
-// hex (≤4.0, so UUIDs and git SHAs survive) and above English-ish camelCase /
-// snake_case identifiers (~4.0-4.2), but below random base62/base64 tokens
-// (~4.4+), which is exactly the org-internal secret shape we want to catch.
-const (
-	highEntropyMinLen = 24
-	highEntropyBits   = 4.3
-)
-
-// redactHighEntropy splices out every high-entropy token. Tokens are maximal
-// runs of secret-material bytes (isSecretMaterial), so a splice never touches
-// JSON structure or whitespace — the same invariant titusRedact relies on.
-func redactHighEntropy(in []byte) []byte {
-	var out bytes.Buffer
-	out.Grow(len(in))
-	i := 0
-	for i < len(in) {
-		if !isSecretMaterial(in[i]) {
-			out.WriteByte(in[i])
-			i++
-			continue
-		}
-		j := i
-		for j < len(in) && isSecretMaterial(in[j]) {
-			j++
-		}
-		if tok := in[i:j]; isHighEntropyToken(tok) {
-			out.WriteString("[REDACTED_HIGH_ENTROPY]")
-		} else {
-			out.Write(tok)
-		}
-		i = j
-	}
-	return out.Bytes()
-}
-
-func isHighEntropyToken(tok []byte) bool {
-	if len(tok) < highEntropyMinLen {
-		return false
-	}
-	var hasDigit, hasLetter bool
-	for _, c := range tok {
-		switch {
-		case c >= '0' && c <= '9':
-			hasDigit = true
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
-			hasLetter = true
-		}
-	}
-	if !hasDigit || !hasLetter {
-		return false
-	}
-	return shannonBits(tok) >= highEntropyBits
-}
-
-// shannonBits returns the Shannon entropy of b in bits per byte.
-func shannonBits(b []byte) float64 {
-	var freq [256]int
-	for _, c := range b {
-		freq[c]++
-	}
-	n := float64(len(b))
-	h := 0.0
-	for _, f := range freq {
-		if f == 0 {
-			continue
-		}
-		p := float64(f) / n
-		h -= p * math.Log2(p)
-	}
-	return h
 }

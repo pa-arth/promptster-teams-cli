@@ -142,9 +142,10 @@ func TestScrubEventCleanUntouched(t *testing.T) {
 	}
 }
 
-// The high-entropy catch-all runs over the whole marshaled event in scrubEvent.
-// Routing IDs are UUIDs (hex, below the entropy floor) and must survive intact —
-// redacting them would silently break threading/dedup on the backend.
+// scrubEvent round-trips the whole marshaled event through redactBytes. Routing
+// IDs (UUIDs) must survive intact — redacting them would silently break
+// threading/dedup on the backend. (Guards against any future content-shaped
+// pattern accidentally matching an ID.)
 func TestScrubEventPreservesUUIDRoutingIDs(t *testing.T) {
 	id, sess := newUUID(), newUUID()
 	event := Event{
