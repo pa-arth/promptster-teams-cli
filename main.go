@@ -15,11 +15,15 @@ func main() {
 	}
 
 	switch os.Args[1] {
+	case "login":
+		// One-time setup: paste the per-engineer key your manager minted (or
+		// pass --key), validate it, and store it locally so `watch` just works.
+		cmdLogin(os.Args[2:])
 	case "watch":
 		// Foreground capture: tails Claude Code + Codex transcript JSONL,
 		// normalizes, redacts on-device, signs, and ships to the configured
 		// teams ingest endpoint.
-		if err := runTeamsWatch(); err != nil {
+		if err := runTeamsWatch(os.Args[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "watch error: %v\n", err)
 			os.Exit(1)
 		}
@@ -54,15 +58,20 @@ func printUsage() {
 Usage: promptster-teams <command>
 
 Commands:
+  login        Save your developer key (PSE-XXXX-XXXX) — paste it or pass --key
   watch        Tail Claude Code + Codex transcripts, redact on-device, ship to your team's backend
   status       Show capture status and event count
-  doctor       Diagnose configuration (ingest URL, token, watched dirs)
+  doctor       Diagnose configuration (key, ingest URL, watched dirs)
   version      Print version
   help         Show this help
 
-Configuration (environment):
-  PROMPTSTER_TEAMS_API_URL   Team ingest base URL (required)
-  PROMPTSTER_TEAMS_TOKEN     Org/device ingest auth token (required)
+Getting started:
+  promptster-teams login            # paste the key your manager gave you
+  promptster-teams watch            # capture from the current repo
+
+Your developer key is resolved from, in order: --key flag,
+PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by
+login). PROMPTSTER_TEAMS_API_URL overrides the ingest URL (default: hosted).
 
 Everything is captured locally and redacted on-device before anything is sent.
 Source: https://github.com/pa-arth/promptster-teams-cli

@@ -66,23 +66,32 @@ npm install -g @promptster/teams-cli   # default
 
 ## Usage
 
-```sh
-export PROMPTSTER_TEAMS_API_URL="https://<your-team-ingest-host>"
-export PROMPTSTER_TEAMS_TOKEN="<your-org/device-token>"
+Your manager mints you a **developer key** (`PSE-XXXX-XXXX`) in the Promptster
+dashboard. Paste it once with `login`, then `watch`:
 
-promptster-teams doctor   # check configuration
+```sh
+promptster-teams login    # paste your PSE-XXXX-XXXX key (or: login --key PSE-…)
 promptster-teams watch    # capture from the current repo (Ctrl-C to stop)
 promptster-teams status   # show config + locally buffered event count
+promptster-teams doctor   # check key, ingest reachability, transcript dir
 ```
+
+The key identifies your sessions to your team and nothing else; it is the only
+identity stamped on captured events. `login` stores it at
+`~/.promptster-teams/credentials` (mode `0600`).
 
 ### Configuration
 
+The developer key is resolved with this precedence: **`--key` flag → `PROMPTSTER_TEAMS_TOKEN` env → stored credentials file** (written by `login`). The ingest URL resolves the same way, defaulting to the hosted backend.
+
 | Variable | Purpose |
 |---|---|
-| `PROMPTSTER_TEAMS_API_URL` | Ingest base URL (required) |
-| `PROMPTSTER_TEAMS_TOKEN` | Org/device ingest auth token (required) |
+| `PROMPTSTER_TEAMS_TOKEN` | Your developer key (`PSE-XXXX-XXXX`). Usually set via `login` instead. |
+| `PROMPTSTER_TEAMS_API_URL` | Ingest base URL (default: hosted). Override for a self-hosted backend. |
 | `PROMPTSTER_TEAMS_WATCH_DIR` | Directory whose transcripts to capture (default: cwd) |
 | `PROMPTSTER_TEAMS_INGEST_PATH` | Override the ingest path (default `/v1/teams/ingest`) |
+
+`watch` and `login` also accept `--key PSE-…` and `--api-url <url>` flags.
 
 ## Build
 

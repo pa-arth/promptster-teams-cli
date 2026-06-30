@@ -38,6 +38,17 @@ func TestRedactAWSKey(t *testing.T) {
 	}
 }
 
+func TestRedactEngineerKey(t *testing.T) {
+	key := "PSE-AB2C-9XYZ"
+	out := redactBytes([]byte(`run with X-API-Key: ` + key + ` to ingest`))
+	if bytes.Contains(out, []byte(key)) {
+		t.Errorf("engineer key not redacted: %q", out)
+	}
+	if !bytes.Contains(out, []byte("[REDACTED_PROMPTSTER_ENGINEER_KEY]")) {
+		t.Errorf("expected [REDACTED_PROMPTSTER_ENGINEER_KEY] marker, got %q", out)
+	}
+}
+
 func TestRedactGitHubToken(t *testing.T) {
 	token := "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
 	out := redactBytes([]byte(`Authorization: token ` + token))

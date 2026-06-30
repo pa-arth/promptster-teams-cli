@@ -2,21 +2,24 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"os"
 	"time"
 )
 
-// loadSession builds the teams capture context from environment configuration.
-// It replaces the hiring CLI's redeem-key session: there is no server round
-// trip, no key, no consent gate — just "where do I send, with what token, and
-// which directory's transcripts do I watch."
+// loadSession builds the teams capture context. The ingest credential is a
+// per-engineer key (PSE-XXXX-XXXX) resolved with flag > env > stored-file
+// precedence (see credentials.go); the API URL resolves the same way, falling
+// back to the hosted default. `runTeamsWatch` exports the resolved values into
+// the environment before spawning the watchers, so this stays signatureless and
+// the watchers (and the `claude-watch`/`codex-watch` subcommands) pick them up.
 func loadSession() (Session, error) {
-	apiURL := os.Getenv("PROMPTSTER_TEAMS_API_URL")
-	token := os.Getenv("PROMPTSTER_TEAMS_TOKEN")
-	if apiURL == "" || token == "" {
-		return Session{}, fmt.Errorf("set PROMPTSTER_TEAMS_API_URL and PROMPTSTER_TEAMS_TOKEN before running `promptster-teams watch`")
+	token, _ := resolveToken("")
+	if token == "" {
+		return Session{}, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
 	}
+	apiURL := resolveAPIURL("")
 
 	root := os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
 	if root == "" {
@@ -51,13 +54,30 @@ func deviceID() string {
 // foreground. Each tails its tool's .jsonl, normalizes, redacts on-device,
 // signs, and ships to the configured ingest endpoint. Returns when either
 // watcher exits (e.g. Ctrl-C).
-func runTeamsWatch() error {
+func runTeamsWatch(args []string) error {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); overrides env/stored")
+	urlFlag := fs.String("api-url", "", "Override ingest base URL")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	// Resolve the credential up front (flag > env > stored) and export the
+	// result so the child watchers — which call loadSession() — and apiURL()
+	// all observe the same values, including a --key passed only to `watch`.
+	token, _ := resolveToken(*keyFlag)
+	if token == "" {
+		return fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+	}
+	apiURL := resolveAPIURL(*urlFlag)
+	os.Setenv("PROMPTSTER_TEAMS_TOKEN", token)
+	os.Setenv("PROMPTSTER_TEAMS_API_URL", apiURL)
+	os.Setenv("PROMPTSTER_API_URL", apiURL)
+
 	cfg, err := loadSession()
 	if err != nil {
 		return err
 	}
-	// Point apiURL() at the team's backend for both watchers.
-	os.Setenv("PROMPTSTER_API_URL", cfg.ApiURL)
 
 	// Ensure a per-device signing keypair exists so every event is signed into
 	// a tamper-evident chain (`prevSig` links each event to the last). This is
@@ -77,52 +97,75 @@ func runTeamsWatch() error {
 	return <-errCh
 }
 
-// cmdTeamsStatus prints the current configuration and local buffer event count.
+// keyDisplay renders the resolved key + where it came from for status/doctor.
+func keyDisplay(token, source string) string {
+	if token == "" {
+		return "(not set)"
+	}
+	return fmt.Sprintf("%s  (%s)", maskKey(token), source)
+}
+
+// cmdTeamsStatus prints the resolved configuration and local buffer count.
 func cmdTeamsStatus() {
-	apiURL := os.Getenv("PROMPTSTER_TEAMS_API_URL")
-	token := os.Getenv("PROMPTSTER_TEAMS_TOKEN")
+	token, source := resolveToken("")
+	apiURL := resolveAPIURL("")
 	root := os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
 	if root == "" {
 		root, _ = os.Getwd()
 	}
 
 	fmt.Println()
-	fmt.Println("  promptster-teams status")
-	fmt.Printf("  ingest URL:  %s\n", orNotSet(apiURL))
-	fmt.Printf("  token:       %s\n", maskToken(token))
-	fmt.Printf("  watch dir:   %s\n", root)
-	fmt.Printf("  device id:   %s\n", deviceID())
-	fmt.Printf("  events buffered locally: %d\n", countBufferedEvents())
+	fmt.Println(brandBar("status"))
+	fmt.Println()
+	fmt.Println(indent(kvPanel("capture",
+		"key", keyDisplay(token, source),
+		"ingest", hostOf(apiURL),
+		"watch", root,
+		"device", deviceID(),
+		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
+	)))
 	fmt.Println()
 }
 
-// cmdTeamsDoctor checks that the minimum configuration is present.
+// cmdTeamsDoctor diagnoses the credential, ingest reachability, and transcript
+// dir. The reachability probe is a plain GET to the API base (not an auth probe
+// against the ingest endpoint), so it never writes anything.
 func cmdTeamsDoctor() {
+	token, source := resolveToken("")
+	apiURL := resolveAPIURL("")
 	ok := true
+
 	fmt.Println()
-	fmt.Println("  promptster-teams doctor")
-	if os.Getenv("PROMPTSTER_TEAMS_API_URL") == "" {
-		fmt.Println("  ✗ PROMPTSTER_TEAMS_API_URL is not set")
+	fmt.Println(brandBar("doctor"))
+	fmt.Println()
+
+	switch {
+	case token == "":
+		printlnIndent(fmt.Sprintf("%s no developer key — run `promptster-teams login`", errGlyph))
 		ok = false
-	} else {
-		fmt.Printf("  ✓ ingest URL: %s\n", os.Getenv("PROMPTSTER_TEAMS_API_URL"))
+	case isEngineerKey(token):
+		printlnIndent(fmt.Sprintf("%s key %s  (%s)", okGlyph, maskKey(token), source))
+	default:
+		printlnIndent(fmt.Sprintf("%s key set but not a PSE- developer key (%s): %s", warnGlyph, source, maskKey(token)))
 	}
-	if os.Getenv("PROMPTSTER_TEAMS_TOKEN") == "" {
-		fmt.Println("  ✗ PROMPTSTER_TEAMS_TOKEN is not set")
-		ok = false
+
+	if pingIngestHost(apiURL) {
+		printlnIndent(fmt.Sprintf("%s ingest reachable: %s", okGlyph, hostOf(apiURL)))
 	} else {
-		fmt.Println("  ✓ ingest token is set")
+		printlnIndent(fmt.Sprintf("%s ingest not reachable: %s", warnGlyph, hostOf(apiURL)))
 	}
+
 	if _, err := os.Stat(claudeProjectsDir()); err == nil {
-		fmt.Printf("  ✓ Claude Code transcript dir found: %s\n", claudeProjectsDir())
+		printlnIndent(fmt.Sprintf("%s Claude Code transcripts: %s", okGlyph, claudeProjectsDir()))
 	} else {
-		fmt.Printf("  • Claude Code transcript dir not found yet: %s\n", claudeProjectsDir())
+		printlnIndent(fmt.Sprintf("%s Claude Code transcript dir not found yet: %s", warnGlyph, claudeProjectsDir()))
 	}
+
 	fmt.Println()
 	if ok {
-		fmt.Println("  Ready. Run `promptster-teams watch` from a repo to begin capturing.")
+		printlnIndent(dimStyle.Render("Ready. Run ") + bodyStyle.Render("promptster-teams watch") + dimStyle.Render(" from a repo."))
 	} else {
-		fmt.Println("  Set the missing variables above, then re-run doctor.")
+		printlnIndent(dimStyle.Render("Run ") + bodyStyle.Render("promptster-teams login") + dimStyle.Render(" to get set up."))
 	}
 	fmt.Println()
 }
@@ -142,21 +185,4 @@ func countBufferedEvents() int {
 		}
 	}
 	return n
-}
-
-func orNotSet(s string) string {
-	if s == "" {
-		return "(not set)"
-	}
-	return s
-}
-
-func maskToken(s string) string {
-	if s == "" {
-		return "(not set)"
-	}
-	if len(s) <= 6 {
-		return "******"
-	}
-	return s[:3] + "…" + s[len(s)-3:]
 }
