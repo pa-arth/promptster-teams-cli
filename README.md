@@ -32,6 +32,23 @@ Read straight from the AI tool's own transcript `.jsonl`:
   sent** (see below)
 - Behavioral signals: no typing-cadence, no paste detection, no authorship
   scoring. Capture is *content*, not surveillance of the developer.
+- Your email or any personal identity. Events are stamped only with an
+  **anonymous per-device hash** and your team key; the CLI never collects or
+  sends your email. Mapping a device to a person is done on the backend, from
+  the key — so nothing in this on-device path needs to know who you are.
+
+## Presence heartbeat
+
+While `watch` is running it emits a small **presence** event on start and every
+few minutes — *even when you are idle and nothing is being captured*. It carries
+only device + environment metadata (the anonymous device hash, the CLI version,
+OS/arch, and which tools are being watched) and **zero transcript content**.
+
+Its only purpose is to let your team tell an *installed-but-idle* seat apart
+from one where the CLI was *never installed* — e.g. for seat-utilization
+reporting. It is not a tracker: it identifies a machine, never a person, and a
+CI test (`presence_test.go`) fails the build if a presence event ever grows a
+field that could carry captured content.
 
 ## Redaction (on-device, before transmission)
 
