@@ -91,6 +91,13 @@ func runTeamsWatch(args []string) error {
 	fmt.Fprintf(os.Stderr, "promptster-teams: capturing transcripts under %s → %s\n", cfg.TaskRoot, apiHost())
 	fmt.Fprintf(os.Stderr, "promptster-teams: everything is redacted on-device before it leaves this machine. Ctrl-C to stop.\n")
 
+	// Announce presence on start and periodically while running, so the backend
+	// can tell "installed but idle" from "never installed" even when no
+	// transcripts are being written. Device + environment metadata only — no
+	// transcript content, no identity (see presence.go).
+	stopPresence := startPresenceHeartbeat(cfg)
+	defer stopPresence()
+
 	errCh := make(chan error, 2)
 	go func() { errCh <- runClaudeWatcher() }()
 	go func() { errCh <- runCodexWatcher() }()
@@ -122,6 +129,8 @@ func cmdTeamsStatus() {
 		"ingest", hostOf(apiURL),
 		"watch", root,
 		"device", deviceID(),
+		"identity", "anonymous — device hash + team key, no email",
+		"presence", fmt.Sprintf("heartbeat every %s during watch", presenceHeartbeatInterval),
 		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
 	)))
 	fmt.Println()
@@ -160,6 +169,8 @@ func cmdTeamsDoctor() {
 	} else {
 		printlnIndent(fmt.Sprintf("%s Claude Code transcript dir not found yet: %s", warnGlyph, claudeProjectsDir()))
 	}
+
+	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, presenceHeartbeatInterval))
 
 	fmt.Println()
 	if ok {
