@@ -232,6 +232,12 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 		}
 
 		data := map[string]interface{}{"text": promptText}
+		// Slash-command invocations arrive as <command-name>/foo</command-name>
+		// envelopes; surface the NAME (no slash, never the expanded body) so
+		// the backend can attribute spend / detect context resets per command.
+		if command := leadingCommandName(promptText); command != "" {
+			data["command"] = command
+		}
 		if len(meta) > 0 {
 			data["meta"] = meta
 		}
@@ -370,9 +376,15 @@ func normalizeClaudeCode(payload map[string]interface{}, sessionID string) (Even
 		} else if v, ok := payload["context_pct"].(float64); ok {
 			contextPct = v
 		}
-		e.Data = map[string]interface{}{
+		data := map[string]interface{}{
 			"contextPct": contextPct,
 		}
+		// Claude Code's PreCompact payload distinguishes hitting the context
+		// wall ("auto") from a typed /compact ("manual").
+		if trigger, _ := payload["trigger"].(string); trigger != "" {
+			data["trigger"] = trigger
+		}
+		e.Data = data
 		e.RawPayload = raw
 		return e, true
 
@@ -740,16 +752,52 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
+	case toolName == "Skill":
+		// Skill invocations carry the skill NAME in the args ({skill, args}).
+		// Surface it as `skill` — name only, never the skill body or args —
+		// so per-skill usage/ROI can be rolled up. `tool` mirrors toolName
+		// under the field name the teams projector persists.
+		e := newEvent("tool_use", sessionID)
+		data := map[string]interface{}{
+			"toolName":     toolName,
+			"tool":         toolName,
+			"inputPreview": jsonPreview(toolInput, 100),
+			"ok":           true,
+		}
+		if skill := skillNameFromInput(toolInput); skill != "" {
+			data["skill"] = skill
+		}
+		e.Data = data
+		e.RawPayload = raw
+		return e, true
+
 	default:
 		e := newEvent("tool_use", sessionID)
 		e.Data = map[string]interface{}{
 			"toolName":     toolName,
+			"tool":         toolName,
 			"inputPreview": jsonPreview(toolInput, 100),
 			"ok":           true,
 		}
 		e.RawPayload = raw
 		return e, true
 	}
+}
+
+// skillNameFromInput extracts the skill NAME from a Skill tool call's input.
+// Current Claude Code sends {skill: "name", args: "..."}; older shapes carried
+// the invocation as {command: "/name args"}. Name only — args are never taken.
+func skillNameFromInput(toolInput map[string]interface{}) string {
+	if s, _ := toolInput["skill"].(string); s != "" {
+		return strings.TrimPrefix(strings.TrimSpace(s), "/")
+	}
+	if c, _ := toolInput["command"].(string); c != "" {
+		name := strings.Fields(strings.TrimSpace(c))
+		if len(name) > 0 {
+			return strings.TrimPrefix(name[0], "/")
+		}
+	}
+	return ""
 }
 
 // normalizeCursor converts a raw Cursor hook payload into a canonical Event.
