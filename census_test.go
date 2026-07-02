@@ -187,6 +187,44 @@ func TestBuildConfigCensusMissingEverything(t *testing.T) {
 	}
 }
 
+// TestCensusPluginsEnabledDisabledFallback pins the nil-vs-empty contract:
+// the installed-plugin fallback only applies when there is no authoritative
+// enabledPlugins list at all — never when the user explicitly disabled
+// every plugin.
+func TestCensusPluginsEnabledDisabledFallback(t *testing.T) {
+	setup := func(t *testing.T, settingsJSON string) string {
+		t.Helper()
+		claudeDir := t.TempDir()
+		pluginDir := filepath.Join(claudeDir, "plugins", "cache", "mkt", "a")
+		registry := `{"version":2,"plugins":{"a@mkt":[{"installPath":` + jsonString(pluginDir) + `}],"b@mkt":[{"installPath":` + jsonString(pluginDir) + `}]}}`
+		if err := os.MkdirAll(filepath.Join(claudeDir, "plugins"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(claudeDir, "plugins", "installed_plugins.json"), []byte(registry), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if settingsJSON != "" {
+			if err := os.WriteFile(filepath.Join(claudeDir, "settings.json"), []byte(settingsJSON), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return claudeDir
+	}
+
+	// (a) Every plugin explicitly disabled → zero plugins, no fallback.
+	if got := censusPlugins(setup(t, `{"enabledPlugins":{"a@mkt":false,"b@mkt":false}}`)); len(got) != 0 {
+		t.Errorf("all-disabled must report zero plugins, got %+v", got)
+	}
+	// (b) settings.json present but no enabledPlugins key → fall back to all installed.
+	if got := censusPlugins(setup(t, `{"model":"opus"}`)); len(got) != 2 {
+		t.Errorf("missing enabledPlugins key must fall back to installed, got %+v", got)
+	}
+	// (c) settings.json missing entirely → fall back to all installed.
+	if got := censusPlugins(setup(t, "")); len(got) != 2 {
+		t.Errorf("missing settings.json must fall back to installed, got %+v", got)
+	}
+}
+
 func TestReadFrontmatter(t *testing.T) {
 	tmp := t.TempDir()
 	p := filepath.Join(tmp, "SKILL.md")

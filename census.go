@@ -193,7 +193,7 @@ func censusPlugins(claudeDir string) []censusPlugin {
 	installPaths := pluginInstallPaths(filepath.Join(claudeDir, "plugins", "installed_plugins.json"))
 
 	names := enabledPluginNames(filepath.Join(claudeDir, "settings.json"))
-	if len(names) == 0 {
+	if names == nil {
 		for name := range installPaths {
 			names = append(names, name)
 		}
@@ -211,7 +211,10 @@ func censusPlugins(claudeDir string) []censusPlugin {
 }
 
 // enabledPluginNames parses settings.json's `enabledPlugins` map, keeping only
-// entries whose value is true.
+// entries whose value is true. Returns nil when settings.json is absent,
+// unparseable, or lacks the enabledPlugins key (no authoritative list);
+// returns a non-nil (possibly empty) slice when the key is present, so
+// callers can distinguish "everything explicitly disabled" from "no list".
 func enabledPluginNames(settingsPath string) []string {
 	raw, err := os.ReadFile(settingsPath)
 	if err != nil {
@@ -221,6 +224,9 @@ func enabledPluginNames(settingsPath string) []string {
 		EnabledPlugins map[string]bool `json:"enabledPlugins"`
 	}
 	if err := json.Unmarshal(raw, &settings); err != nil {
+		return nil
+	}
+	if settings.EnabledPlugins == nil {
 		return nil
 	}
 	names := []string{}

@@ -245,7 +245,8 @@ func (p *claudeTranscriptProcessor) compactBoundaryEvent(rec map[string]interfac
 		}
 	}
 	e.Data = data
-	e.RawPayload = strPreview(fmt.Sprintf("compact boundary trigger=%v", data["trigger"]), 100)
+	trigger, _ := data["trigger"].(string)
+	e.RawPayload = strPreview(fmt.Sprintf("compact boundary trigger=%s", trigger), 100)
 	return e
 }
 
