@@ -393,6 +393,15 @@ func tailCodexRollout(
 				fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
 			}
 			if err := ingestEventWithClient(client, event, session.SessionToken); err != nil {
+				// Schema/kind rejections (4xx) are dropped without retry and
+				// logged quietly — the channel is healthy, the deployed
+				// backend just doesn't accept this event yet (see
+				// ingestClaudeWatchEvent for the rationale).
+				if isIngestRejection(err) {
+					hookDebugf("codex-watcher: event rejected by backend (%s): %v", event.Kind, err)
+					sent++
+					continue
+				}
 				fmt.Fprintf(os.Stderr, "codex-watcher: send error (%s): %v\n", event.Kind, err)
 				continue
 			}

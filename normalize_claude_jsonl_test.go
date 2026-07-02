@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,49 +53,100 @@ func TestClaudeTranscriptPrompt(t *testing.T) {
 	}
 }
 
-func TestClaudeTranscriptSkipsMetaSidechainAndCommandWrappers(t *testing.T) {
+func TestClaudeTranscriptSkipsMetaSidechainAndCommandOutput(t *testing.T) {
 	p := newClaudeTranscriptProcessor("sess-1")
 	events := processAll(t, p,
 		`{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>...</local-command-caveat>"},"timestamp":"2026-06-10T10:00:00Z"}`,
 		`{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"summary of earlier work"},"timestamp":"2026-06-10T10:00:01Z"}`,
 		`{"type":"user","isSidechain":true,"message":{"role":"user","content":"agent-authored subagent prompt"},"timestamp":"2026-06-10T10:00:02Z"}`,
-		`{"type":"user","message":{"role":"user","content":"<command-name>/clear</command-name>"},"timestamp":"2026-06-10T10:00:03Z"}`,
 		`{"type":"user","message":{"role":"user","content":"<local-command-stdout>ok</local-command-stdout>"},"timestamp":"2026-06-10T10:00:04Z"}`,
+		// Malformed envelope (no command-name tag) — not a usable invocation.
+		`{"type":"user","message":{"role":"user","content":"<command-args>orphaned</command-args>"},"timestamp":"2026-06-10T10:00:05Z"}`,
 	)
 	if len(events) != 0 {
 		t.Fatalf("expected 0 events, got %d: %+v", len(events), events)
 	}
 }
 
-func TestClaudeTranscriptSlashCommandBecomesToolIntent(t *testing.T) {
+func TestClaudeTranscriptSlashCommandBecomesPromptWithCommand(t *testing.T) {
 	p := newClaudeTranscriptProcessor("sess-1")
 	events := processAll(t, p,
-		// Custom command with args → tool_intent, human actor.
+		// Custom command with args → prompt event carrying the command NAME.
 		`{"type":"user","message":{"role":"user","content":"<command-name>/deploy-check</command-name>\n<command-message>deploy-check</command-message>\n<command-args>staging --verbose</command-args>"},"timestamp":"2026-06-10T10:00:00Z"}`,
-		// Built-in → still dropped.
+		// Built-ins are emitted too — the backend keys /clear and /compact
+		// reset detection off prompt.command.
 		`{"type":"user","message":{"role":"user","content":"<command-name>/compact</command-name>"},"timestamp":"2026-06-10T10:00:01Z"}`,
-		// Promptster's own explain command → emitted; the WORKER excludes it
-		// by inputPreview, so the preview must carry the name.
-		`{"type":"user","message":{"role":"user","content":"<command-name>/explain</command-name>\n<command-args>chose retries over backoff</command-args>"},"timestamp":"2026-06-10T10:00:02Z"}`,
+		// Plain prompts carry no command field.
+		`{"type":"user","message":{"role":"user","content":"just a normal prompt"},"timestamp":"2026-06-10T10:00:02Z"}`,
 	)
-	if len(events) != 2 {
-		t.Fatalf("expected 2 tool_intent events, got %d: %+v", len(events), events)
+	if len(events) != 3 {
+		t.Fatalf("expected 3 prompt events, got %d: %+v", len(events), events)
 	}
 	e := events[0]
-	if e.Kind != "tool_intent" {
+	if e.Kind != "prompt" {
 		t.Fatalf("kind = %s", e.Kind)
 	}
 	if e.Actor == nil || e.Actor.Type != "human" {
 		t.Errorf("actor = %+v", e.Actor)
 	}
-	if dm(e)["toolName"] != "SlashCommand" {
-		t.Errorf("toolName = %v", dm(e)["toolName"])
+	// Name only — no leading slash, never the args or expanded body.
+	if dm(e)["command"] != "deploy-check" {
+		t.Errorf("command = %v", dm(e)["command"])
 	}
-	if dm(e)["inputPreview"] != "/deploy-check staging --verbose" {
-		t.Errorf("inputPreview = %v", dm(e)["inputPreview"])
+	// text stays as-is (the envelope).
+	text, _ := dm(e)["text"].(string)
+	if !strings.Contains(text, "<command-name>/deploy-check</command-name>") {
+		t.Errorf("text rewritten: %q", text)
 	}
-	if dm(events[1])["inputPreview"] != "/explain chose retries over backoff" {
-		t.Errorf("explain preview = %v", dm(events[1])["inputPreview"])
+	if dm(events[1])["command"] != "compact" {
+		t.Errorf("builtin command = %v", dm(events[1])["command"])
+	}
+	if _, has := dm(events[2])["command"]; has {
+		t.Errorf("plain prompt must not carry command: %v", dm(events[2])["command"])
+	}
+}
+
+func TestLeadingCommandName(t *testing.T) {
+	cases := []struct {
+		text string
+		want string
+	}{
+		{"<command-name>/deploy-check</command-name>\n<command-args>x</command-args>", "deploy-check"},
+		{"<command-name>/compact</command-name>", "compact"},
+		{"  <command-name>hygiene</command-name>", "hygiene"}, // no slash in marker
+		{"<command-name>/ns:cmd</command-name>", "ns:cmd"},
+		{"fix the bug in <command-name>/foo</command-name>", ""}, // not leading
+		{"<command-args>orphan</command-args>", ""},              // no name tag
+		{"<command-name>/unterminated", ""},
+		{"plain prompt", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := leadingCommandName(c.text); got != c.want {
+			t.Errorf("leadingCommandName(%q) = %q, want %q", c.text, got, c.want)
+		}
+	}
+}
+
+func TestClaudeTranscriptCompactBoundary(t *testing.T) {
+	p := newClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","isMeta":false,"timestamp":"2026-06-10T10:09:00Z","compactMetadata":{"trigger":"auto","preTokens":180000}}`,
+		`{"type":"system","subtype":"compact_boundary","content":"Conversation compacted","timestamp":"2026-06-10T10:10:00Z","compactMetadata":{"trigger":"manual","preTokens":42000}}`,
+		// Non-boundary system lines stay silent.
+		`{"type":"system","subtype":"other","timestamp":"2026-06-10T10:11:00Z"}`,
+	)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 context_compact events, got %d: %+v", len(events), events)
+	}
+	if events[0].Kind != "context_compact" || dm(events[0])["trigger"] != "auto" {
+		t.Errorf("first = %s trigger=%v", events[0].Kind, dm(events[0])["trigger"])
+	}
+	if dm(events[1])["trigger"] != "manual" {
+		t.Errorf("second trigger = %v", dm(events[1])["trigger"])
+	}
+	if events[0].Actor == nil || events[0].Actor.Type != "system" {
+		t.Errorf("actor = %+v", events[0].Actor)
 	}
 }
 
@@ -127,11 +179,21 @@ func TestClaudeTranscriptAssistantAccumulation(t *testing.T) {
 	if dm(ar)["model"] != "claude-sonnet-4-6" || dm(ar)["usageScope"] != "request" {
 		t.Errorf("model/usageScope = %v / %v", dm(ar)["model"], dm(ar)["usageScope"])
 	}
-	if dm(ar)["inputTokens"] != int64(100) || dm(ar)["cacheWriteTokens"] != int64(300) {
-		t.Errorf("tokens = %v / %v", dm(ar)["inputTokens"], dm(ar)["cacheWriteTokens"])
+	// The exact camelCase field names are the ingest contract — the teams
+	// projector drops anything else.
+	if dm(ar)["inputTokens"] != int64(100) || dm(ar)["outputTokens"] != int64(50) {
+		t.Errorf("input/output = %v / %v", dm(ar)["inputTokens"], dm(ar)["outputTokens"])
 	}
-	if dm(ar)["cacheWrite1hTokens"] != int64(300) {
-		t.Errorf("cacheWrite1hTokens = %v", dm(ar)["cacheWrite1hTokens"])
+	if dm(ar)["cacheReadTokens"] != int64(2000) || dm(ar)["cacheWriteTokens"] != int64(300) {
+		t.Errorf("cacheRead/cacheWrite = %v / %v", dm(ar)["cacheReadTokens"], dm(ar)["cacheWriteTokens"])
+	}
+	if dm(ar)["cacheWrite5mTokens"] != int64(0) || dm(ar)["cacheWrite1hTokens"] != int64(300) {
+		t.Errorf("cacheWrite5m/1h = %v / %v", dm(ar)["cacheWrite5mTokens"], dm(ar)["cacheWrite1hTokens"])
+	}
+	// Assistant text rides under `text` (the field the teams projector keeps)
+	// as well as the legacy lastAssistantMessage.
+	if dm(ar)["text"] != "Let me look at the config." {
+		t.Errorf("text = %v", dm(ar)["text"])
 	}
 	cmdEv := events[1]
 	if cmdEv.Kind != "command" {
@@ -360,6 +422,89 @@ func TestClaudeTranscriptSidechainUsage(t *testing.T) {
 	}
 	if _, has := dm(e)["lastAssistantMessage"]; has {
 		t.Error("sidechain usage must not carry assistant text")
+	}
+}
+
+func TestClaudeTranscriptSidechainAttribution(t *testing.T) {
+	p := newClaudeTranscriptProcessor("sess-1")
+	p.usageOnly = true
+	// Filename-derived agent id is the floor — rows may repeat it later.
+	p.agentID = "ab276e3606abc0ce2"
+	events := processAll(t, p,
+		// First user line carries agentId + attributionSkill (skill-spawned
+		// sidechain), no usage.
+		`{"type":"user","isSidechain":true,"agentId":"ab276e3606abc0ce2","attributionSkill":"commit-push-pr","message":{"role":"user","content":"agent task"},"timestamp":"2026-06-10T10:05:00Z"}`,
+		// Assistant line carries attributionAgent (agent type) + usage.
+		`{"type":"assistant","isSidechain":true,"agentId":"ab276e3606abc0ce2","attributionAgent":"general-purpose","requestId":"req-a1","message":{"id":"msg-a1","model":"claude-sonnet-4-6","content":[{"type":"text","text":"working"}],"usage":{"input_tokens":11,"output_tokens":22,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}},"timestamp":"2026-06-10T10:05:01Z"}`,
+		// Second request in the same sidechain inherits the pinned attribution.
+		`{"type":"assistant","isSidechain":true,"requestId":"req-a2","message":{"id":"msg-a2","model":"claude-sonnet-4-6","content":[{"type":"text","text":"more"}],"usage":{"input_tokens":5,"output_tokens":6}},"timestamp":"2026-06-10T10:05:02Z"}`,
+	)
+	if len(events) != 2 {
+		t.Fatalf("expected 2 subagent_usage events, got %d: %+v", len(events), events)
+	}
+	for i, e := range events {
+		if e.Kind != "subagent_usage" {
+			t.Fatalf("event %d kind = %s", i, e.Kind)
+		}
+		if dm(e)["agentId"] != "ab276e3606abc0ce2" {
+			t.Errorf("event %d agentId = %v", i, dm(e)["agentId"])
+		}
+		if dm(e)["attributionSkill"] != "commit-push-pr" {
+			t.Errorf("event %d attributionSkill = %v", i, dm(e)["attributionSkill"])
+		}
+		if dm(e)["attributionAgent"] != "general-purpose" {
+			t.Errorf("event %d attributionAgent = %v", i, dm(e)["attributionAgent"])
+		}
+	}
+}
+
+func TestClaudeTranscriptSkillToolCarriesSkillName(t *testing.T) {
+	p := newClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"id":"msg-sk1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_sk1","name":"Skill","input":{"skill":"commit-push-pr","args":"--no-verify"}}],"usage":{"input_tokens":1,"output_tokens":1}},"timestamp":"2026-06-10T10:08:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sk1","content":"ok"}]},"toolUseResult":{"content":"ok"},"timestamp":"2026-06-10T10:08:05Z"}`,
+	)
+	var tu *Event
+	for i := range events {
+		if events[i].Kind == "tool_use" {
+			tu = &events[i]
+		}
+	}
+	if tu == nil {
+		t.Fatalf("no tool_use in %+v", events)
+	}
+	if dm(*tu)["skill"] != "commit-push-pr" {
+		t.Errorf("skill = %v", dm(*tu)["skill"])
+	}
+	if dm(*tu)["tool"] != "Skill" {
+		t.Errorf("tool = %v", dm(*tu)["tool"])
+	}
+}
+
+func TestSkillNameFromInput(t *testing.T) {
+	cases := []struct {
+		input map[string]interface{}
+		want  string
+	}{
+		{map[string]interface{}{"skill": "commit-push-pr", "args": "x"}, "commit-push-pr"},
+		{map[string]interface{}{"skill": "/hygiene"}, "hygiene"},
+		{map[string]interface{}{"command": "/deploy-check staging"}, "deploy-check"},
+		{map[string]interface{}{"args": "no name"}, ""},
+		{map[string]interface{}{}, ""},
+	}
+	for _, c := range cases {
+		if got := skillNameFromInput(c.input); got != c.want {
+			t.Errorf("skillNameFromInput(%v) = %q, want %q", c.input, got, c.want)
+		}
+	}
+}
+
+func TestClaudeAgentIDFromPath(t *testing.T) {
+	if got := claudeAgentIDFromPath("/x/p/sess/subagents/agent-ab276e3606abc0ce2.jsonl"); got != "ab276e3606abc0ce2" {
+		t.Errorf("got %q", got)
+	}
+	if got := claudeAgentIDFromPath("/x/p/sess/subagents/deadbeef.jsonl"); got != "deadbeef" {
+		t.Errorf("got %q", got)
 	}
 }
 

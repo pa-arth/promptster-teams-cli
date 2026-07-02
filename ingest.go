@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -73,7 +74,32 @@ func ingestEventWithClient(client *http.Client, event Event, apiKey string) erro
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("ingest failed: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
+		return &ingestHTTPError{status: resp.StatusCode, body: strings.TrimSpace(string(respBody))}
 	}
 	return nil
+}
+
+// ingestHTTPError is a non-2xx ingest response, kept typed so callers can tell
+// a schema/kind rejection apart from a transport or infrastructure failure.
+type ingestHTTPError struct {
+	status int
+	body   string
+}
+
+func (e *ingestHTTPError) Error() string {
+	return fmt.Sprintf("ingest failed: HTTP %d: %s", e.status, e.body)
+}
+
+// isIngestRejection reports whether err is the backend REJECTING the event's
+// shape or kind (HTTP 400/422) — e.g. a newly-added kind the deployed backend
+// doesn't accept yet. Rejections mean the capture channel itself is healthy:
+// callers must tolerate them (drop the event, no retries) rather than treating
+// the channel as broken. Auth (401/403), rate limiting (429), and 5xx are NOT
+// rejections.
+func isIngestRejection(err error) bool {
+	var httpErr *ingestHTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	return httpErr.status == http.StatusBadRequest || httpErr.status == http.StatusUnprocessableEntity
 }
