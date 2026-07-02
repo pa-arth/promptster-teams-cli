@@ -72,6 +72,15 @@ type claudeTranscriptProcessor struct {
 	// lastPromptTs is the TRANSCRIPT timestamp of the previous human prompt,
 	// retained only as lane state.
 	lastPromptTs time.Time
+	// Sidechain attribution (usageOnly mode). A sidechain file is one subagent
+	// run, so these are constant per file: agentID comes from the filename
+	// (agent-<id>.jsonl) or the rows' agentId field; attributionSkill /
+	// attributionAgent are the NAMES of the skill / agent type that spawned the
+	// sidechain, which Claude Code stamps directly on sidechain rows. Names
+	// only — never skill/agent bodies.
+	agentID          string
+	attributionSkill string
+	attributionAgent string
 	// Lane identity of this transcript: one file IS one Claude Code process
 	// (the filename is the session uuid), so the first record carrying
 	// sessionId/cwd pins both for every event the file produces. Distinct
@@ -173,6 +182,17 @@ func (p *claudeTranscriptProcessor) processLine(line []byte) []Event {
 	if p.laneCwd == "" {
 		p.laneCwd = stringField(rec, "cwd")
 	}
+	// Sidechain attribution hints are constant per file — pin the first value
+	// each of them shows up with.
+	if p.agentID == "" {
+		p.agentID = stringField(rec, "agentId")
+	}
+	if p.attributionSkill == "" {
+		p.attributionSkill = stringField(rec, "attributionSkill")
+	}
+	if p.attributionAgent == "" {
+		p.attributionAgent = stringField(rec, "attributionAgent")
+	}
 	// Sidechain lines are subagent traffic: their "user" prompts are authored
 	// by the AGENT, not the candidate, so they must never become prompt events
 	// or pollute the main-context token series. Their token usage is real
@@ -194,11 +214,39 @@ func (p *claudeTranscriptProcessor) processLine(line []byte) []Event {
 		// is complete before tool results / next prompts get written).
 		events := p.flushAccum()
 		return append(events, p.handleUser(rec, line)...)
+	case "system":
+		// System lines are flush boundaries; the compact_boundary subtype is
+		// also the authoritative compaction marker, carrying whether Claude
+		// Code hit the context wall (trigger=auto) or the user ran /compact
+		// (trigger=manual) — the context-hygiene ground truth.
+		events := p.flushAccum()
+		if stringField(rec, "subtype") == "compact_boundary" {
+			events = append(events, p.compactBoundaryEvent(rec))
+		}
+		return events
 	default:
-		// mode / worktree-state / file-history-snapshot / system / ... carry
-		// no signal of their own but are reliable flush boundaries.
+		// mode / worktree-state / file-history-snapshot / ... carry no signal
+		// of their own but are reliable flush boundaries.
 		return p.flushAccum()
 	}
+}
+
+// compactBoundaryEvent converts a system/compact_boundary transcript line into
+// a context_compact event. compactMetadata.trigger distinguishes auto-compact
+// (context window exhausted) from a typed /compact.
+func (p *claudeTranscriptProcessor) compactBoundaryEvent(rec map[string]interface{}) Event {
+	ts, _ := rec["timestamp"].(string)
+	e := p.newTranscriptEvent("context_compact", ts)
+	e.Actor = systemActor()
+	data := map[string]interface{}{}
+	if cm, ok := rec["compactMetadata"].(map[string]interface{}); ok {
+		if trigger := stringField(cm, "trigger"); trigger != "" {
+			data["trigger"] = trigger
+		}
+	}
+	e.Data = data
+	e.RawPayload = strPreview(fmt.Sprintf("compact boundary trigger=%v", data["trigger"]), 100)
+	return e
 }
 
 // sidechainUsage extracts ONLY token usage from a sidechain (subagent) line:
@@ -244,6 +292,17 @@ func (p *claudeTranscriptProcessor) sidechainUsage(rec map[string]interface{}) [
 	if cc, ok := usage["cache_creation"].(map[string]interface{}); ok {
 		data["cacheWrite5mTokens"] = intField(cc, "ephemeral_5m_input_tokens")
 		data["cacheWrite1hTokens"] = intField(cc, "ephemeral_1h_input_tokens")
+	}
+	// Attribution: which skill/agent spawned this sidechain (names only) and
+	// the sidechain's agent id, so per-skill / per-agent spend can be rolled up.
+	if p.agentID != "" {
+		data["agentId"] = p.agentID
+	}
+	if p.attributionSkill != "" {
+		data["attributionSkill"] = p.attributionSkill
+	}
+	if p.attributionAgent != "" {
+		data["attributionAgent"] = p.attributionAgent
 	}
 	e.Data = data
 	e.RawPayload = strPreview(fmt.Sprintf("subagent usage msg=%s", msgID), 100)
@@ -327,7 +386,10 @@ func (p *claudeTranscriptProcessor) flushAccum() []Event {
 	e.Provenance = transcriptAiProvenance()
 	data := map[string]interface{}{
 		"lastAssistantMessage": a.text.String(),
-		"usageScope":           "request",
+		// The teams projector persists assistant text under `text` (it drops
+		// unknown fields, so lastAssistantMessage alone never lands there).
+		"text":       a.text.String(),
+		"usageScope": "request",
 	}
 	if a.model != "" {
 		data["model"] = a.model
@@ -416,19 +478,30 @@ func (p *claudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	if trimmed == "" {
 		return nil
 	}
-	// Slash-command envelopes are candidate-typed skill/command invocations:
-	// surface them as tool_intent (the ecosystem_leverage signal) instead of
-	// dropping them, so pure-transcript capture matches hook capture. Local
-	// command output stays dropped — it's output, not an invocation.
-	if strings.HasPrefix(trimmed, "<command-") {
-		return p.slashCommandEvent(trimmed, ts, line)
-	}
+	// Local command OUTPUT is not an invocation — drop it.
 	if strings.HasPrefix(trimmed, "<local-command") {
 		return nil
+	}
+	// Slash-command envelopes (<command-name>/foo</command-name>…) are typed
+	// invocations. They stay in the prompt stream with a `command` field — the
+	// slash-command NAME only, never the expanded command body (which lives on
+	// a separate isMeta line and never gets here). The backend keys reset
+	// detection (/clear, /compact) and per-command spend attribution off this
+	// field, so built-ins are emitted too.
+	command := ""
+	if strings.HasPrefix(trimmed, "<command-") {
+		command = leadingCommandName(trimmed)
+		if command == "" {
+			// Malformed/unterminated envelope — not a usable invocation.
+			return nil
+		}
 	}
 
 	e := p.newTranscriptEvent("prompt", ts)
 	data := map[string]interface{}{"text": text}
+	if command != "" {
+		data["command"] = command
+	}
 
 	meta := map[string]interface{}{}
 	if v := stringField(rec, "sessionId"); v != "" {
@@ -462,47 +535,17 @@ func (p *claudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	return []Event{e}
 }
 
-// slashCommandBuiltins are Claude Code built-ins with dedicated semantics
-// (context resets, app chrome, account plumbing). They aren't ecosystem
-// leverage and would otherwise inflate skill-invocation counts.
-var slashCommandBuiltins = map[string]bool{
-	"clear": true, "compact": true, "exit": true, "quit": true,
-	"login": true, "logout": true, "help": true, "doctor": true,
-	"status": true, "cost": true, "config": true, "model": true,
-	"memory": true, "init": true, "resume": true, "context": true,
-	"todos": true, "hooks": true, "permissions": true, "bug": true,
-	"release-notes": true, "terminal-setup": true, "vim": true,
-	"upgrade": true, "mcp": true, "agents": true, "ide": true,
-	"add-dir": true, "export": true, "rewind": true, "usage": true,
-}
-
-// slashCommandEvent converts a typed slash-command envelope
-// (<command-name>/foo</command-name> ... <command-args>bar</command-args>)
-// into a tool_intent event shaped like the PreToolUse hook's SlashCommand
-// intent, so the worker's ecosystem harvest reads both capture paths the
-// same way.
-func (p *claudeTranscriptProcessor) slashCommandEvent(text, ts string, line []byte) []Event {
-	name := extractTagContent(text, "command-name")
-	if name == "" {
-		return nil
+// leadingCommandName returns the slash-command name from a leading
+// slash-command envelope (<command-name>/foo</command-name>…) — name only,
+// without the leading slash, "" when the text doesn't start with an envelope
+// or the name tag is missing/unterminated. It never returns the expanded
+// command body (that lives in a separate isMeta line).
+func leadingCommandName(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "<command-") {
+		return ""
 	}
-	if slashCommandBuiltins[strings.TrimPrefix(name, "/")] {
-		return nil
-	}
-	preview := name
-	if args := extractTagContent(text, "command-args"); args != "" {
-		preview += " " + args
-	}
-
-	e := p.newTranscriptEvent("tool_intent", ts)
-	e.Actor = humanActor()
-	e.Provenance = transcriptHumanProvenance()
-	e.Data = map[string]interface{}{
-		"toolName":     "SlashCommand",
-		"inputPreview": strPreview(preview, 100),
-	}
-	e.RawPayload = strPreview(string(line), 500)
-	return []Event{e}
+	return strings.TrimPrefix(extractTagContent(trimmed, "command-name"), "/")
 }
 
 // extractTagContent returns the trimmed text between <tag> and </tag>, or ""

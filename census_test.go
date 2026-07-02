@@ -1,0 +1,222 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// writeCensusFixture builds a fake Claude config dir + workspace under
+// t.TempDir() and returns the censusEnv pointing at it.
+func writeCensusFixture(t *testing.T) censusEnv {
+	t.Helper()
+	tmp := t.TempDir()
+	claudeDir := filepath.Join(tmp, "claude")
+	ws := filepath.Join(tmp, "ws")
+
+	write := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(tmp, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Global CLAUDE.md: 400 chars → 100 tokens.
+	write("claude/CLAUDE.md", strings.Repeat("g", 400))
+	// Workspace CLAUDE.md: 80 chars → 20 tokens.
+	write("ws/CLAUDE.md", strings.Repeat("w", 80))
+
+	// Skill with single-line description (40 chars → 10 tokens).
+	write("claude/skills/deploy-check/SKILL.md",
+		"---\nname: deploy-check\ndescription: "+strings.Repeat("d", 40)+"\n---\n\n# Deploy Check\n\nSECRET-SKILL-BODY should never leave the machine.\n")
+	// Skill with a wrapped (multiline) description: 20 + 1 (join space) + 19
+	// chars → 40 chars → 10 tokens; name falls back to the slug.
+	write("claude/skills/wrapped/SKILL.md",
+		"---\ndescription: "+strings.Repeat("a", 20)+"\n  "+strings.Repeat("b", 19)+"\n---\nbody\n")
+	// A non-skill file in the skills dir is ignored.
+	write("claude/skills/notes.md", "not a skill")
+
+	// Enabled plugins (one with an enumerable install dir, one without).
+	write("claude/settings.json", `{"enabledPlugins":{"listed@mkt":true,"ghost@mkt":true,"disabled@mkt":false}}`)
+	pluginDir := filepath.Join(claudeDir, "plugins", "cache", "mkt", "listed")
+	registry := `{"version":2,"plugins":{"listed@mkt":[{"installPath":` + jsonString(pluginDir) + `}]}}`
+	write("claude/plugins/installed_plugins.json", registry)
+	// Plugin skill: name "sk" (2 chars) + 38-char description → 40 chars → 10 tokens.
+	write("claude/plugins/cache/mkt/listed/skills/sk/SKILL.md",
+		"---\nname: sk\ndescription: "+strings.Repeat("p", 38)+"\n---\nplugin skill body\n")
+	// Plugin command: name "cmd" (3) + 37-char description → 40 chars → 10 tokens.
+	write("claude/plugins/cache/mkt/listed/commands/cmd.md",
+		"---\ndescription: "+strings.Repeat("c", 37)+"\n---\ncommand body\n")
+
+	// Global MCP registry + workspace .mcp.json (with one duplicate name).
+	write("claude.json", `{"mcpServers":{"posthog":{"type":"http","url":"https://x"},"supabase":{"type":"stdio","command":"npx","env":{"TOKEN":"SECRET-MCP-ENV"}}}}`)
+	write("ws/.mcp.json", `{"mcpServers":{"posthog":{"type":"http"},"local-only":{"type":"stdio"}}}`)
+
+	return censusEnv{
+		claudeDir:      claudeDir,
+		claudeJSONPath: filepath.Join(tmp, "claude.json"),
+		workspaceRoots: []string{ws, ws}, // duplicate root must not double-count
+	}
+}
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func TestBuildConfigCensusFromFixture(t *testing.T) {
+	data := buildConfigCensus(writeCensusFixture(t))
+
+	if data.GlobalClaudeMdTokens != 100 {
+		t.Errorf("globalClaudeMdTokens = %d", data.GlobalClaudeMdTokens)
+	}
+	if data.ProjectClaudeMdTokens != 20 {
+		t.Errorf("projectClaudeMdTokens = %d", data.ProjectClaudeMdTokens)
+	}
+
+	if data.SkillCount != 2 || len(data.Skills) != 2 {
+		t.Fatalf("skills = %+v", data.Skills)
+	}
+	if data.Skills[0].Slug != "deploy-check" || data.Skills[0].Name != "deploy-check" || data.Skills[0].DescTokens != 10 {
+		t.Errorf("skill[0] = %+v", data.Skills[0])
+	}
+	// Frontmatter without name: falls back to slug; wrapped description folds
+	// to 40 chars → 10 tokens.
+	if data.Skills[1].Slug != "wrapped" || data.Skills[1].Name != "wrapped" || data.Skills[1].DescTokens != 10 {
+		t.Errorf("skill[1] = %+v", data.Skills[1])
+	}
+	if data.SkillListingTokens != 20 {
+		t.Errorf("skillListingTokens = %d", data.SkillListingTokens)
+	}
+
+	if data.PluginCount != 2 || len(data.Plugins) != 2 {
+		t.Fatalf("plugins = %+v", data.Plugins)
+	}
+	// Sorted: ghost@mkt (no install dir → 0), listed@mkt (skill 10 + command 10).
+	if data.Plugins[0].Name != "ghost@mkt" || data.Plugins[0].ListingTokens != 0 {
+		t.Errorf("plugin[0] = %+v", data.Plugins[0])
+	}
+	if data.Plugins[1].Name != "listed@mkt" || data.Plugins[1].ListingTokens != 20 {
+		t.Errorf("plugin[1] = %+v", data.Plugins[1])
+	}
+	if data.PluginListingTokens != 20 {
+		t.Errorf("pluginListingTokens = %d", data.PluginListingTokens)
+	}
+
+	if len(data.MCPServers) != 3 {
+		t.Fatalf("mcpServers = %+v", data.MCPServers)
+	}
+	names := []string{data.MCPServers[0].Name, data.MCPServers[1].Name, data.MCPServers[2].Name}
+	if names[0] != "local-only" || names[1] != "posthog" || names[2] != "supabase" {
+		t.Errorf("mcp names = %v", names)
+	}
+	for _, s := range data.MCPServers {
+		if s.Deferred {
+			t.Errorf("deferred must be false (not detectable): %+v", s)
+		}
+	}
+	if data.MCPDeferred {
+		t.Error("mcpDeferred must be false")
+	}
+}
+
+// TestConfigCensusCarriesNoFileContents pins the census privacy rule: the
+// serialized payload may carry names and token counts, never the contents of
+// CLAUDE.md, skill bodies, plugin sources, or MCP server config values.
+func TestConfigCensusCarriesNoFileContents(t *testing.T) {
+	data := buildConfigCensus(writeCensusFixture(t))
+	raw, err := json.Marshal(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := string(raw)
+	for _, leak := range []string{
+		"SECRET-SKILL-BODY",     // skill body
+		"SECRET-MCP-ENV",        // MCP env value
+		strings.Repeat("g", 40), // CLAUDE.md content
+		strings.Repeat("d", 40), // skill description VALUE (only its length may ship)
+		"https://x",             // MCP server URL
+		"npx",                   // MCP server command
+	} {
+		if strings.Contains(payload, leak) {
+			t.Errorf("census payload leaks content %q: %s", leak, payload)
+		}
+	}
+	// The closed field set — nothing beyond counts and names.
+	var round map[string]interface{}
+	if err := json.Unmarshal(raw, &round); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"globalClaudeMdTokens", "projectClaudeMdTokens",
+		"skills", "skillListingTokens", "skillCount",
+		"plugins", "pluginListingTokens", "pluginCount",
+		"mcpServers", "mcpDeferred",
+	}
+	if len(round) != len(want) {
+		t.Errorf("census shape changed: %v", round)
+	}
+	for _, k := range want {
+		if _, ok := round[k]; !ok {
+			t.Errorf("missing field %s", k)
+		}
+	}
+}
+
+func TestBuildConfigCensusMissingEverything(t *testing.T) {
+	tmp := t.TempDir()
+	data := buildConfigCensus(censusEnv{
+		claudeDir:      filepath.Join(tmp, "nope"),
+		claudeJSONPath: filepath.Join(tmp, "nope.json"),
+		workspaceRoots: []string{filepath.Join(tmp, "nows"), ""},
+	})
+	if data.GlobalClaudeMdTokens != 0 || data.ProjectClaudeMdTokens != 0 ||
+		data.SkillCount != 0 || data.PluginCount != 0 || len(data.MCPServers) != 0 {
+		t.Errorf("empty env must produce zeros: %+v", data)
+	}
+	// Arrays must be present (not null) so the payload shape is stable.
+	raw, _ := json.Marshal(data)
+	if strings.Contains(string(raw), "null") {
+		t.Errorf("empty census must not serialize null arrays: %s", raw)
+	}
+}
+
+func TestReadFrontmatter(t *testing.T) {
+	tmp := t.TempDir()
+	p := filepath.Join(tmp, "SKILL.md")
+	content := "---\nname: my-skill\ndescription: >-\n  first part\n  second part\nother: \"quoted\"\n---\n# Body\nnot: frontmatter\n"
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fm := readFrontmatter(p)
+	if fm == nil {
+		t.Fatal("nil frontmatter")
+	}
+	if fm["name"] != "my-skill" {
+		t.Errorf("name = %q", fm["name"])
+	}
+	if fm["description"] != "first part second part" {
+		t.Errorf("description = %q", fm["description"])
+	}
+	if fm["other"] != "quoted" {
+		t.Errorf("other = %q", fm["other"])
+	}
+	if _, has := fm["not"]; has {
+		t.Error("body keys must not parse")
+	}
+	// No frontmatter → nil.
+	p2 := filepath.Join(tmp, "plain.md")
+	_ = os.WriteFile(p2, []byte("# just markdown\n"), 0o644)
+	if readFrontmatter(p2) != nil {
+		t.Error("plain markdown must return nil")
+	}
+	if readFrontmatter(filepath.Join(tmp, "missing.md")) != nil {
+		t.Error("missing file must return nil")
+	}
+}

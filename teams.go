@@ -98,6 +98,12 @@ func runTeamsWatch(args []string) error {
 	stopPresence := startPresenceHeartbeat(cfg)
 	defer stopPresence()
 
+	// Config census: one inventory of the local agent config (token counts +
+	// names ONLY, never file contents — see census.go) on startup, then every
+	// 24h while watching.
+	stopCensus := startConfigCensus(cfg)
+	defer stopCensus()
+
 	errCh := make(chan error, 2)
 	go func() { errCh <- runClaudeWatcher() }()
 	go func() { errCh <- runCodexWatcher() }()

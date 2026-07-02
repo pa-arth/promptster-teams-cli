@@ -46,14 +46,20 @@ func claudeDegradationStep(degraded bool, parsed int, consumed, bytesSinceEvent 
 	return degraded || bytesSinceEvent > claudeDegradedByteThreshold, bytesSinceEvent
 }
 
+// claudeConfigDir returns Claude Code's config root (CLAUDE_CONFIG_DIR or
+// ~/.claude) — transcripts, skills, plugins, and settings all live under it.
+func claudeConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude")
+}
+
 // claudeProjectsDir returns where Claude Code writes per-session transcript
 // JSONL files: <config>/projects/<munged-cwd>/<session-uuid>.jsonl.
 func claudeProjectsDir() string {
-	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
-		return filepath.Join(d, "projects")
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude", "projects")
+	return filepath.Join(claudeConfigDir(), "projects")
 }
 
 // claudeWatcherState tracks the background transcript-tailing process.
@@ -200,12 +206,14 @@ func touchClaudeHookTakeover() {
 // Everything else (prompt, ai_response, command, file_diff, file_read, ...)
 // is owned by the watcher in transcript-capture mode.
 var transcriptKeepKinds = map[string]bool{
-	"session_start":   true,
-	"session_end":     true,
-	"context_compact": true,
-	"tool_intent":     true,
-	"subagent_start":  true,
-	"subagent_stop":   true,
+	"session_start":  true,
+	"session_end":    true,
+	"tool_intent":    true,
+	"subagent_start": true,
+	"subagent_stop":  true,
+	// context_compact moved to watcher ownership: the transcript's
+	// system/compact_boundary line carries the auto-vs-manual trigger the
+	// PreCompact hook path can't always see, so the watcher emits it now.
 }
 
 // suppressForTranscriptCapture decides whether a hook-captured Claude Code
@@ -403,7 +411,13 @@ func pollClaudeTranscripts(
 		proc := processors[path]
 		if proc == nil {
 			proc = newClaudeTranscriptProcessor(session.SessionID)
-			proc.usageOnly = isClaudeSidechainFile(path)
+			if isClaudeSidechainFile(path) {
+				proc.usageOnly = true
+				// The filename is the floor for sidechain attribution: rows
+				// usually repeat it (plus skill/agent names), but agentId must
+				// survive even if they don't.
+				proc.agentID = claudeAgentIDFromPath(path)
+			}
 			processors[path] = proc
 		}
 		n, c := tailClaudeTranscript(path, progress, proc, session, client, dryRun)
@@ -457,6 +471,13 @@ func candidateClaudeTranscripts(startCutoff time.Time) []string {
 func isClaudeSidechainFile(path string) bool {
 	return strings.HasPrefix(filepath.Base(path), "agent-") ||
 		filepath.Base(filepath.Dir(path)) == "subagents"
+}
+
+// claudeAgentIDFromPath derives the sidechain's agent id from its filename
+// (<session>/subagents/agent-<id>.jsonl → <id>).
+func claudeAgentIDFromPath(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+	return strings.TrimPrefix(base, "agent-")
 }
 
 type claudeMatchResult int
@@ -637,6 +658,17 @@ func ingestClaudeWatchEvent(event Event, session Session, client *http.Client) b
 		fmt.Fprintf(os.Stderr, "claude-watcher: buffer error: %v\n", err)
 	}
 	if err := ingestEventWithClient(client, event, session.SessionToken); err != nil {
+		// A 4xx schema/kind rejection (e.g. subagent_usage/config_census before
+		// the backend that accepts them deploys) is NOT a channel failure: the
+		// parser and transport are fine. Count the event as handled — otherwise
+		// a stream of rejected sidechain usage would accumulate bytes-without-
+		// events and trip the degraded state machine, silently stopping ALL
+		// capture. Rejections are dropped without retry (offsets advance
+		// regardless) and logged only under debug to avoid stderr spam.
+		if isIngestRejection(err) {
+			hookDebugf("claude-watcher: event rejected by backend (%s): %v", event.Kind, err)
+			return true
+		}
 		fmt.Fprintf(os.Stderr, "claude-watcher: send error (%s): %v\n", event.Kind, err)
 		return false
 	}
