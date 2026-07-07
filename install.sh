@@ -34,19 +34,47 @@ printf '\033[1m[2/4]\033[0m Downloading CLI...\n'
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 || die "curl or wget is required"
 
 TMP="$(mktemp)"
-trap 'rm -f "${TMP}"' EXIT
+SUMS="$(mktemp)"
+trap 'rm -f "${TMP}" "${SUMS}"' EXIT
 
 if [ "${VERSION}" = "latest" ]; then
-  URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
+  BASE="https://github.com/${REPO}/releases/latest/download"
 else
-  URL="https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}"
+  BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
 fi
 
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL --progress-bar "${URL}" -o "${TMP}"
+# fetch <url> <dest>
+fetch() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --progress-bar "$1" -o "$2"
+  else
+    wget -q --show-progress "$1" -O "$2"
+  fi
+}
+
+fetch "${BASE}/${ASSET}" "${TMP}"
+fetch "${BASE}/SHA256SUMS" "${SUMS}" || die "could not download SHA256SUMS — refusing to install unverified binary"
+
+# Verify the download against the published checksum BEFORE we ever chmod +x
+# and run it. A mismatch means the artifact was tampered with or corrupted.
+EXPECTED="$(grep " ${ASSET}\$" "${SUMS}" | awk '{print $1}')"
+[ -n "${EXPECTED}" ] || die "no checksum for ${ASSET} in SHA256SUMS"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL="$(sha256sum "${TMP}" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  ACTUAL="$(shasum -a 256 "${TMP}" | awk '{print $1}')"
 else
-  wget -q --show-progress "${URL}" -O "${TMP}"
+  die "need sha256sum or shasum to verify the download"
 fi
+
+if [ "${EXPECTED}" != "${ACTUAL}" ]; then
+  die "checksum mismatch for ${ASSET}
+  expected ${EXPECTED}
+  actual   ${ACTUAL}
+Refusing to install a binary that does not match the published checksum."
+fi
+ok "checksum verified"
 
 printf '\033[1m[3/4]\033[0m Installing...\n'
 INSTALL_DIR="${HOME}/.promptster-teams/bin"

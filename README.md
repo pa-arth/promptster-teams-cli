@@ -1,5 +1,10 @@
 # promptster-teams-cli
 
+[![ci](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/ci.yml)
+[![codeql](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/codeql.yml)
+[![npm](https://img.shields.io/npm/v/@promptster/teams-cli.svg)](https://www.npmjs.com/package/@promptster/teams-cli)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 On-device capture of AI-assisted coding for internal engineering teams.
 
 `promptster-teams` tails the transcript files your AI coding tools already write
@@ -14,6 +19,23 @@ machine. There is no hidden telemetry, no keystroke logging, and no "integrity"
 or anti-cheat instrumentation. (Promptster's hiring product is a separate, private
 codebase; none of its assessment, honeypot, or behavioral-analysis logic exists
 here. CI fails the build if any of it is reintroduced.)
+
+## Architecture / data flow
+
+Everything below the dashed line happens **on the developer's machine**. Source
+content is dropped by the field allowlist *before* an event is ever buffered,
+signed, or sent — it never crosses the machine boundary.
+
+```mermaid
+flowchart TD
+  T["AI tool transcript .jsonl<br/>(Claude Code, Codex)"] --> N["normalize<br/>→ canonical Event"]
+  N --> P["project.go<br/>default-deny field allowlist<br/>(strips diffs, file contents,<br/>stdout/stderr, assistant text)"]
+  P --> R["redact.go<br/>Titus secret scan +<br/>supplemental credential patterns"]
+  R --> S["signing.go<br/>Ed25519 sign + chain (prevSig)"]
+  S --> B[("~/.promptster-teams/buffer.jsonl<br/>redacted + signed local audit log")]
+  S --> I["ingest POST<br/>+ X-Promptster-Device-Pubkey"]
+  I -.machine boundary.-> BK["team backend<br/>(re-projects; DB CHECK-rejects<br/>any source-bearing row)"]
+```
 
 ## What it captures
 
@@ -87,13 +109,62 @@ signature (`prevSig`). The **public** verifying key is sent with each ingest
 request (`X-Promptster-Device-Pubkey`) so the backend can confirm the stream
 wasn't altered in transit; the backend pins the first key it sees per device.
 
+## Threat model
+
+What this tool is designed to guarantee, and where its trust boundaries sit.
+
+**Trust boundaries.** The developer's machine is trusted; everything leaving it
+is not. The redaction + allowlist pipeline runs entirely on-device, so the
+guarantee "source never leaves the machine" does not depend on trusting the
+network or the backend.
+
+- **A malicious or compromised backend** can see the metadata this CLI chooses
+  to send (redacted prompts, tool-call metadata, token counts, the anonymous
+  device hash, the team key). It **cannot** obtain source code, diffs, file
+  contents, command output, or assistant response text, because those are
+  dropped locally before transmission — there is nothing on the wire to steal.
+  It cannot deanonymize a device to a person from the CLI's payload alone (the
+  CLI never sends an email or identity).
+- **A network attacker (MITM)** sees only TLS traffic. Tampering is detectable:
+  each event is Ed25519-signed and chained (`prevSig`), and the backend pins the
+  first device pubkey it sees.
+- **Local device compromise is out of scope.** An attacker who already has read
+  access to the user's home directory can read the buffer and the `0600` key
+  seed — the CLI defends the *transmission* boundary, not a fully compromised
+  host.
+
+**Fail behavior — fail-open for availability, fail-closed for content.** The
+field allowlist (`project.go`) is default-deny and always runs, so a
+kept-by-mistake source field is impossible by construction. The secret scanner
+(`redact.go`) layers on top: if the Titus engine fails to initialize, capture
+continues on the supplemental credential-pattern layer rather than blocking the
+developer — availability is preserved, and the source-exclusion guarantee
+(the fail-closed part) is unaffected because it lives in the always-on
+allowlist, not in Titus.
+
+**Verifying claims yourself.** The local buffer at
+`~/.promptster-teams/buffer.jsonl` is the exact, already-redacted, already-signed
+stream — inspect it to see precisely what would leave the machine. To report a
+weakness in any of this, see [SECURITY.md](SECURITY.md).
+
 ## Install
 
 ```sh
 npm install -g @promptster/teams-cli   # default
 ```
 
-(Or `curl -fsSL https://raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh | sh`.)
+The npm package is published with **build provenance** (SLSA attestation) —
+verify it with `npm audit signatures`.
+
+Or install the raw binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh | sh
+```
+
+The installer downloads `SHA256SUMS` from the release and **verifies the binary
+against it before making it executable** — a checksum mismatch aborts the
+install. Every release ships `SHA256SUMS` alongside the binaries.
 
 ## Usage
 
@@ -131,6 +202,12 @@ make build      # -> bin/promptster-teams
 make test
 make release    # cross-compile linux/darwin × amd64/arm64 -> dist/
 ```
+
+CI runs cross-platform build/test, the race detector, `gofmt`/`staticcheck`
+lint, `gosec` (SAST) and `govulncheck` (dependency + stdlib CVEs, published to
+the GitHub Security tab), CodeQL, and a gitleaks self-scan. See
+[CONTRIBUTING.md](CONTRIBUTING.md) to run the same checks locally, and
+[SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## Status
 

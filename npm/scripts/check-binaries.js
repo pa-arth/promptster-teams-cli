@@ -13,7 +13,10 @@ const EXPECTED = [
 ];
 
 const binDir = path.join(__dirname, "..", "binaries");
-const missing = EXPECTED.filter((name) => !fs.existsSync(path.join(binDir, name)));
+// SHA256SUMS is a required release artifact — install.sh verifies against it.
+const missing = [...EXPECTED, "SHA256SUMS"].filter(
+  (name) => !fs.existsSync(path.join(binDir, name)),
+);
 
 if (missing.length > 0) {
   console.error("ERROR: Missing binaries before publish:");
