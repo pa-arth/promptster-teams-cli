@@ -1,0 +1,22 @@
+# Code owners. With branch protection's "require review from Code Owners",
+# changes to the privacy boundary and the supply chain cannot merge without an
+# owner's approval — the property a security reviewer wants enforced, not just
+# documented.
+
+# Default owner for everything.
+*                       @pa-arth
+
+# --- Privacy boundary: what decides whether content leaves the machine ---
+/internal/redact/       @pa-arth
+/internal/event/        @pa-arth
+/internal/sign/         @pa-arth
+/internal/ingest/       @pa-arth
+
+# --- Supply chain: build, release, install, distribution ---
+/.github/               @pa-arth
+/install.sh             @pa-arth
+/Makefile               @pa-arth
+/npm/                   @pa-arth
+
+# --- Security-facing docs ---
+/SECURITY.md            @pa-arth
