@@ -55,8 +55,12 @@ func hookBufferPath() string {
 // The local buffer + signature chain is a trust feature, not surveillance: it
 // lets a team independently verify the event stream wasn't tampered with.
 func appendEventToLocalBuffer(event *Event) error {
-	// Defense-in-depth scrub at the choke point every capture path funnels
-	// through, before the event is signed or persisted anywhere.
+	// Source exclusion + secret scrub at the choke point every capture path
+	// funnels through, before the event is signed or persisted anywhere.
+	// projectEvent strips source-bearing fields (diffs, stdout, file contents,
+	// assistant text, RawPayload) so they never reach the buffer, the signature,
+	// or the wire; scrubEvent then redacts secrets from what remains.
+	projectEvent(event)
 	scrubEvent(event)
 	p := hookBufferPath()
 	return withBufferLock(p, func() error {
