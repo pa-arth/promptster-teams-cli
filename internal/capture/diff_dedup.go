@@ -80,23 +80,6 @@ func recordAiTouchedPath(sessionID, relPath string) {
 	})
 }
 
-// wasAiTouchedPath reports whether an AI channel edited relPath earlier in
-// this session.
-func wasAiTouchedPath(sessionID, relPath string) bool {
-	if sessionID == "" || relPath == "" {
-		return false
-	}
-	data, err := os.ReadFile(aiPathsLedgerPath())
-	if err != nil {
-		return false
-	}
-	var ledger aiPathsLedger
-	if json.Unmarshal(data, &ledger) != nil || ledger.SessionID != sessionID {
-		return false
-	}
-	return ledger.Paths[relPath]
-}
-
 // fileContentSHA returns a hex sha256 of the file's current contents.
 func fileContentSHA(absPath string) (string, bool) {
 	data, err := os.ReadFile(absPath)

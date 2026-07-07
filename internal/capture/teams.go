@@ -52,29 +52,50 @@ func DeviceID() string {
 	return "dev-" + ingest.Sha256Hex(fp.HostnameHash + fp.UsernameHash)[:16]
 }
 
+// resolveWatchEnv parses the shared `watch`/`start` flags (--key, --api-url),
+// resolves the credential (flag > env > stored) and ingest URL, and reports the
+// directory to watch (PROMPTSTER_TEAMS_WATCH_DIR env, else cwd). It does NOT
+// mutate the environment — callers decide whether to export into their own env
+// (foreground `watch`) or hand the values to a detached child (`start`), so the
+// two entry points can't drift on how a credential is resolved.
+func resolveWatchEnv(args []string) (token, apiURL, watchDir string, err error) {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); overrides env/stored")
+	urlFlag := fs.String("api-url", "", "Override ingest base URL")
+	if err := fs.Parse(args); err != nil {
+		return "", "", "", err
+	}
+
+	token, _ = ingest.ResolveToken(*keyFlag)
+	if token == "" {
+		return "", "", "", fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+	}
+	apiURL = ingest.ResolveAPIURL(*urlFlag)
+
+	watchDir = os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
+	if watchDir == "" {
+		if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+			watchDir = cwd
+		}
+	}
+	return token, apiURL, watchDir, nil
+}
+
 // runTeamsWatch runs the Claude + Codex transcript watchers concurrently in the
 // foreground. Each tails its tool's .jsonl, normalizes, redacts on-device,
 // signs, and ships to the configured ingest endpoint. Returns when either
 // watcher exits (e.g. Ctrl-C).
 func RunTeamsWatch(args []string) error {
-	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); overrides env/stored")
-	urlFlag := fs.String("api-url", "", "Override ingest base URL")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-
 	// Resolve the credential up front (flag > env > stored) and export the
 	// result so the child watchers — which call loadSession() — and apiURL()
 	// all observe the same values, including a --key passed only to `watch`.
-	token, _ := ingest.ResolveToken(*keyFlag)
-	if token == "" {
-		return fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+	token, apiURL, _, err := resolveWatchEnv(args)
+	if err != nil {
+		return err
 	}
-	apiURL := ingest.ResolveAPIURL(*urlFlag)
-	os.Setenv("PROMPTSTER_TEAMS_TOKEN", token)
-	os.Setenv("PROMPTSTER_TEAMS_API_URL", apiURL)
-	os.Setenv("PROMPTSTER_API_URL", apiURL)
+	_ = os.Setenv("PROMPTSTER_TEAMS_TOKEN", token)
+	_ = os.Setenv("PROMPTSTER_TEAMS_API_URL", apiURL)
+	_ = os.Setenv("PROMPTSTER_API_URL", apiURL)
 
 	cfg, err := loadSession()
 	if err != nil {
