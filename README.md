@@ -19,13 +19,22 @@ here. CI fails the build if any of it is reintroduced.)
 
 Read straight from the AI tool's own transcript `.jsonl`:
 
-- Prompts you send and the assistant's responses
-- Tool calls (file edits, commands) and their results
+- Prompts you send
+- Tool-call *metadata*: file paths + line counts for edits, command invocations
+  (with inline code bodies masked) + exit codes — never diffs, file contents, or
+  command output
 - Per-request token usage and the exact model, for cost estimation
 - Timestamps, so the timeline reflects when work happened
 
 ## What it does NOT capture
 
+- **Source code — it never leaves your machine.** Before an event is buffered,
+  signed, or sent, a default-deny field allowlist (`project.go`) strips diffs,
+  file contents, command stdout/stderr, and assistant response text on-device.
+  The backend applies the same projection again at its write boundary and its
+  database rejects source-bearing rows outright (CHECK constraints) — but with
+  this CLI the source content is never even transmitted.
+- Assistant response *text* (only its token usage + model are kept)
 - Keystrokes, clipboard, screen, webcam/microphone
 - Any file you didn't open through the AI tool
 - Secrets and credentials — these are **redacted on-device before anything is
@@ -52,12 +61,17 @@ field that could carry captured content.
 
 ## Redaction (on-device, before transmission)
 
-Every captured line passes through two redaction layers locally, before it is
+Every captured line passes through three layers locally, before it is
 buffered, signed, or sent:
 
-1. **Titus** (Praetorian's entropy-aware scanner, ~490 provider rules: AWS,
-   GitHub, Anthropic/OpenAI, Slack, JWT, PEM private keys, …)
-2. **Supplemental patterns** for `KEY=value` assignments, bearer headers, and
+1. **Source exclusion** (`project.go`) — a default-deny, per-kind field
+   allowlist that strips diffs, file contents, command output, and assistant
+   text, and masks inline code bodies in kept command strings
+   (`python -c '…'` → `python -c '<inline-code-redacted>'`).
+2. **Titus** (Praetorian's entropy-aware scanner, ~490 provider rules: AWS,
+   GitHub, Anthropic/OpenAI, Slack, JWT, PEM private keys, …). Why Titus and
+   not gitleaks: see [docs/redaction-titus-vs-gitleaks.md](docs/redaction-titus-vs-gitleaks.md).
+3. **Supplemental patterns** for `KEY=value` assignments, bearer headers, and
    other generic credential shapes.
 
 If you need to verify exactly what would leave a machine, the local buffer at
