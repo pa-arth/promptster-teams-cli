@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -130,7 +131,8 @@ func TestBuildConfigCensusFromFixture(t *testing.T) {
 // serialized payload may carry names and token counts, never the contents of
 // CLAUDE.md, skill bodies, plugin sources, or MCP server config values.
 func TestConfigCensusCarriesNoFileContents(t *testing.T) {
-	data := buildConfigCensus(writeCensusFixture(t))
+	env := writeCensusFixture(t)
+	data := buildConfigCensus(env)
 	raw, err := json.Marshal(data)
 	if err != nil {
 		t.Fatal(err)
@@ -148,12 +150,18 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 			t.Errorf("census payload leaks content %q: %s", leak, payload)
 		}
 	}
+	// The workspace key must never carry the workspace filesystem path (the
+	// non-git fixture falls back to a hash, which must be opaque).
+	if abs, err := filepath.Abs(env.workspaceRoots[0]); err == nil && strings.Contains(payload, abs) {
+		t.Errorf("census payload leaks workspace path %q: %s", abs, payload)
+	}
 	// The closed field set — nothing beyond counts and names.
 	var round map[string]interface{}
 	if err := json.Unmarshal(raw, &round); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
+		"workspaceKey",
 		"globalClaudeMdTokens", "projectClaudeMdTokens",
 		"skills", "skillListingTokens", "skillCount",
 		"plugins", "pluginListingTokens", "pluginCount",
@@ -165,6 +173,75 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 	for _, k := range want {
 		if _, ok := round[k]; !ok {
 			t.Errorf("missing field %s", k)
+		}
+	}
+}
+
+// TestConfigCensusWorkspaceKey pins the non-git fallback: an opaque, stable,
+// path-free hash that is populated, repeatable, and distinct per workspace.
+func TestConfigCensusWorkspaceKey(t *testing.T) {
+	env := writeCensusFixture(t) // fixture ws is not a git repo → hash fallback
+
+	a := buildConfigCensus(env).WorkspaceKey
+	if a == "" {
+		t.Fatal("workspaceKey must be populated")
+	}
+	if b := buildConfigCensus(env).WorkspaceKey; a != b {
+		t.Errorf("workspaceKey must be stable across builds: %q != %q", a, b)
+	}
+	if len(a) != 16 {
+		t.Errorf("hashed workspaceKey must be 16 hex chars, got %q (len %d)", a, len(a))
+	}
+	if strings.Contains(a, string(filepath.Separator)) || strings.Contains(a, env.workspaceRoots[0]) {
+		t.Errorf("workspaceKey must not leak a path: %q", a)
+	}
+
+	// A different workspace must produce a different key.
+	if other := buildConfigCensus(writeCensusFixture(t)).WorkspaceKey; other == a {
+		t.Errorf("distinct workspaces must yield distinct keys, both %q", a)
+	}
+}
+
+// TestWorkspaceKeyPrefersGitRemoteSlug pins the preferred path: a git repo with
+// an origin remote reports its owner/name slug (matching outcome_events.repo),
+// not a hash.
+func TestWorkspaceKeyPrefersGitRemoteSlug(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	ws := t.TempDir()
+	git := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", ws}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	git("init")
+	git("remote", "add", "origin", "git@github.com:promptster/teams-cli.git")
+
+	if got := workspaceKey(ws); got != "promptster/teams-cli" {
+		t.Errorf("workspaceKey = %q, want git slug promptster/teams-cli", got)
+	}
+}
+
+// TestNormalizeRemoteSlug covers the git URL forms the slug normalizer must
+// reduce to owner/name, and the cases it must reject.
+func TestNormalizeRemoteSlug(t *testing.T) {
+	cases := map[string]string{
+		"git@github.com:owner/name.git":         "owner/name",
+		"git@github.com:owner/name":             "owner/name",
+		"https://github.com/owner/name.git":     "owner/name",
+		"https://github.com/owner/name":         "owner/name",
+		"ssh://git@github.com/owner/name.git":   "owner/name",
+		"https://gitlab.com/group/sub/name.git": "sub/name", // nested → last two
+		"  git@github.com:owner/name.git\n":     "owner/name",
+		"":                                      "",
+		"not-a-url":                             "",
+	}
+	for in, want := range cases {
+		if got := normalizeRemoteSlug(in); got != want {
+			t.Errorf("normalizeRemoteSlug(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
