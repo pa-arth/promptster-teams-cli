@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -76,25 +75,6 @@ func loadCodexWatchProgress() codexWatchProgress {
 	return p
 }
 
-// codexRolloutActiveSince reports whether any rollout file matched to this
-// workspace was modified after t — i.e. a codex turn was producing output
-// during the window. The git watcher uses this to attribute working-tree
-// changes that have no per-edit rollout record (shell writes, mid-turn
-// snapshots) to the agent instead of the candidate. Reads the progress
-// file's match cache, so it's accurate from the first processed rollout on.
-func codexRolloutActiveSince(t time.Time) bool {
-	progress := loadCodexWatchProgress()
-	for path, match := range progress.Match {
-		if match != "yes" {
-			continue
-		}
-		if info, err := os.Stat(path); err == nil && info.ModTime().After(t) {
-			return true
-		}
-	}
-	return false
-}
-
 func saveCodexWatchProgress(p codexWatchProgress) {
 	data, err := json.Marshal(p)
 	if err != nil {
@@ -150,50 +130,6 @@ func isCodexWatcherRunning() (codexWatcherState, bool) {
 	}
 	clearCodexWatcherState()
 	return codexWatcherState{}, false
-}
-
-// ensureCodexWatcher launches the codex rollout watcher if not already running.
-func ensureCodexWatcher() {
-	if _, ok := isCodexWatcherRunning(); ok {
-		return
-	}
-	killStalePromptsterDaemons("promptster codex-watch")
-	if err := startCodexWatcherProcess(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not start codex watcher: %v\n", err)
-	}
-}
-
-// stopCodexWatcher signals the tracked watcher and sweeps orphaned daemons.
-func stopCodexWatcher() {
-	st, err := loadCodexWatcherState()
-	if err == nil && st.PID > 0 {
-		signalAndWaitForExit(st.PID)
-	}
-	killStalePromptsterDaemons("promptster codex-watch")
-	clearCodexWatcherState()
-}
-
-func startCodexWatcherProcess() error {
-	logPath := codexWatcherLogPath()
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return err
-	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer devNull.Close()
-
-	cmd := exec.Command(state.PromptsterBin(), "codex-watch")
-	cmd.Stdin = devNull
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	return cmd.Start()
 }
 
 // runCodexWatcher is the main loop for the `promptster codex-watch` subcommand.

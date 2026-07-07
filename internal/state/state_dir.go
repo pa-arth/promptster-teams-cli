@@ -20,27 +20,16 @@ func activeWorkspacePath() string {
 	return filepath.Join(GlobalPromptsterDir(), "active-workspace")
 }
 
-// writeActiveWorkspace saves the workspace path so hooks can find state files.
-func writeActiveWorkspace(workspacePath string) error {
-	dir := GlobalPromptsterDir()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	return os.WriteFile(activeWorkspacePath(), []byte(workspacePath), 0o600)
-}
-
-// readActiveWorkspace reads the pointer to the current workspace.
+// readActiveWorkspace reads the pointer to the current workspace, if one was
+// set. Today nothing writes it (capture keeps state in the global dir), so this
+// consistently returns "" and StateDir falls through to the global fallback;
+// the branch stays so a future per-workspace mode can light it up.
 func readActiveWorkspace() string {
 	data, err := os.ReadFile(activeWorkspacePath())
 	if err != nil {
 		return ""
 	}
 	return strings.TrimSpace(string(data))
-}
-
-// clearActiveWorkspace removes the pointer file on session cleanup.
-func clearActiveWorkspace() {
-	_ = os.Remove(activeWorkspacePath())
 }
 
 // stateDir returns the directory for per-session state files.

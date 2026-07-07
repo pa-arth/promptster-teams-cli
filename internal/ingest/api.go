@@ -21,12 +21,6 @@ func apiURL() string {
 	return DefaultAPIURL
 }
 
-// usingDefaultAPI reports whether the CLI is pointed at the hosted Promptster
-// API (vs a self-hosted backend). Used to soften hosted-only hints in doctor.
-func usingDefaultAPI() bool {
-	return apiURL() == DefaultAPIURL
-}
-
 // apiHost returns the host portion of the configured API URL for display in
 // diagnostics, falling back to the raw URL if it doesn't parse.
 func APIHost() string {

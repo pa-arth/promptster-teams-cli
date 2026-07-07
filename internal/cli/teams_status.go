@@ -34,6 +34,11 @@ func cmdTeamsStatus() {
 		root, _ = os.Getwd()
 	}
 
+	daemon := "not running — start with `promptster-teams start`"
+	if pid, running := capture.DaemonStatus(); running {
+		daemon = fmt.Sprintf("running (pid %d)", pid)
+	}
+
 	fmt.Println()
 	fmt.Println(brandBar("status"))
 	fmt.Println()
@@ -41,6 +46,7 @@ func cmdTeamsStatus() {
 		"key", keyDisplay(token, source),
 		"ingest", hostOf(apiURL),
 		"watch", root,
+		"daemon", daemon,
 		"device", capture.DeviceID(),
 		"identity", "anonymous — device hash + team key, no email",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", capture.PresenceHeartbeatInterval),

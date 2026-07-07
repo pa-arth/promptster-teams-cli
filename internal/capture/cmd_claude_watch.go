@@ -245,50 +245,6 @@ func suppressForTranscriptCapture(session Session, e *event.Event) bool {
 	return false
 }
 
-// ensureClaudeWatcher launches the transcript watcher if not already running.
-func ensureClaudeWatcher() {
-	if _, ok := isClaudeWatcherRunning(); ok {
-		return
-	}
-	killStalePromptsterDaemons("promptster claude-watch")
-	if err := startClaudeWatcherProcess(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not start claude transcript watcher: %v\n", err)
-	}
-}
-
-func stopClaudeWatcher() {
-	st, err := loadClaudeWatcherState()
-	if err == nil && st.PID > 0 {
-		signalAndWaitForExit(st.PID)
-	}
-	killStalePromptsterDaemons("promptster claude-watch")
-	clearClaudeWatcherState()
-	_ = os.Remove(claudeHookTakeoverPath())
-}
-
-func startClaudeWatcherProcess() error {
-	logPath := claudeWatcherLogPath()
-	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
-		return err
-	}
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	defer logFile.Close()
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
-	if err != nil {
-		return err
-	}
-	defer devNull.Close()
-
-	cmd := exec.Command(state.PromptsterBin(), "claude-watch")
-	cmd.Stdin = devNull
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	return cmd.Start()
-}
-
 // runClaudeWatcher is the main loop for the `promptster claude-watch`
 // subcommand. It tails Claude Code transcript JSONL files whose recorded cwd
 // is inside the workspace, normalizes each new line, and ingests the events.

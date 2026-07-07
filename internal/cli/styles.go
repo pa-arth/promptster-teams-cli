@@ -17,8 +17,6 @@ var (
 	cMuted = lipgloss.AdaptiveColor{Light: "#52525b", Dark: "#a3a3a3"}
 	// cDim: lowest-emphasis dim text (was #888888 / #888).
 	cDim = lipgloss.AdaptiveColor{Light: "#71717a", Dark: "#888888"}
-	// cWarnText: warning body text (was #fcd34d, invisible on white).
-	cWarnText = lipgloss.AdaptiveColor{Light: "#b45309", Dark: "#fcd34d"}
 	// cGold: gold warning emphasis used as text (was #eab308).
 	cGold = lipgloss.AdaptiveColor{Light: "#a16207", Dark: "#eab308"}
 )

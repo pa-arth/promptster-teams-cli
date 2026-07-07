@@ -25,9 +25,21 @@ func Main(argv []string) int {
 	case "watch":
 		// Foreground capture: tails Claude Code + Codex transcript JSONL,
 		// normalizes, redacts on-device, signs, and ships to the configured
-		// teams ingest endpoint.
+		// teams ingest endpoint. Holds the terminal until Ctrl-C.
 		if err := capture.RunTeamsWatch(argv[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "watch error: %v\n", err)
+			return 1
+		}
+	case "start":
+		// Background capture: spawn a detached `watch` supervisor and return
+		// the shell. `stop` tears it down; `status` shows whether it's alive.
+		if err := capture.StartTeamsDaemon(argv[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "start error: %v\n", err)
+			return 1
+		}
+	case "stop":
+		if err := capture.StopTeamsDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "stop error: %v\n", err)
 			return 1
 		}
 	case "claude-watch":
@@ -63,15 +75,18 @@ Usage: promptster-teams <command>
 
 Commands:
   login        Save your developer key (PSE-XXXX-XXXX) — paste it or pass --key
-  watch        Tail Claude Code + Codex transcripts, redact on-device, ship to your team's backend
-  status       Show capture status and event count
+  start        Capture in the background (detaches and returns your shell)
+  stop         Stop background capture
+  watch        Foreground capture — tail transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
+  status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
   version      Print version
   help         Show this help
 
 Getting started:
   promptster-teams login            # paste the key your manager gave you
-  promptster-teams watch            # capture from the current repo
+  promptster-teams start            # capture from the current repo in the background
+  promptster-teams stop             # stop when you're done
 
 Your developer key is resolved from, in order: --key flag,
 PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by
