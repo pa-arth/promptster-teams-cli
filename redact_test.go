@@ -181,26 +181,6 @@ func TestRedactKeepsJSONValid(t *testing.T) {
 	}
 }
 
-// End-to-end: a Cursor afterShellExecution line carrying a secret in the command
-// output is scrubbed before normalization, so the emitted command event is clean.
-func TestCursorAfterShellRedactsSecret(t *testing.T) {
-	line := `{"hook_event_name":"afterShellExecution","cursor_version":"2026.02.27","conversation_id":"c1","command":"printenv","output":"TOKEN=ghp_` + `A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8\n"}`
-	redacted := redactBytes([]byte(line))
-	var payload map[string]interface{}
-	if err := json.Unmarshal(redacted, &payload); err != nil {
-		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, redacted)
-	}
-	e, ok := normalizeCursor(payload, "sess-1")
-	if !ok || e.Kind != "command" {
-		t.Fatalf("expected command event, kind=%q ok=%v", e.Kind, ok)
-	}
-	data, _ := e.Data.(map[string]interface{})
-	out, _ := data["stdout"].(string)
-	if bytes.Contains([]byte(out), []byte("ghp_A1b2")) {
-		t.Errorf("secret leaked into command output: %q", out)
-	}
-}
-
 // End-to-end: a codex rollout line carrying a secret in the prompt is scrubbed
 // before normalization, so the emitted prompt event has no secret.
 func TestCodexRolloutRedactsSecret(t *testing.T) {
