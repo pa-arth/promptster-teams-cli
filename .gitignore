@@ -6,3 +6,7 @@ npm/binaries/
 node_modules/
 .DS_Store
 .claude/
+
+# Scratch / working notes — never committed. Durable, reviewer-facing docs
+# live directly under docs/.
+docs/internal/
