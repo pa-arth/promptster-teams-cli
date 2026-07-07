@@ -41,8 +41,9 @@ var projectUsageFields = []string{
 var projectFieldAllowlist = map[string][]string{
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
-	"prompt":     {"text", "command"},
-	"model_turn": {"text"},
+	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
+	// absent: unknown kinds project to nothing.)
+	"prompt": {"text", "command"},
 	// ai_response deliberately carries NO text: assistant messages routinely
 	// embed source (patches, file bodies). Usage/model metadata only.
 	"ai_response":    projectUsageFields,
@@ -129,11 +130,13 @@ var shellCommandKinds = map[string]bool{
 const inlineCodeMarker = "<inline-code-redacted>"
 
 // Quoted inline-exec bodies: flag (-c/-e/--eval) + optional space/`=` +
-// optional ANSI-C `$` + quote … matching quote. Go's RE2 has no backreferences,
-// so single- and double-quoted bodies are separate patterns.
+// optional ANSI-C `$` + quoted body. Separate patterns per quote character:
+// double-quoted bodies honor backslash escapes (`-c "print(\"hi\")"` masks
+// fully); single-quoted bodies can't contain escaped quotes in shell, so they
+// end at the next `'`.
 var (
 	inlineExecSingle = regexp.MustCompile(`(\s(?:-(?:c|e)|--eval)[= ]?\s*\$?)'[^']*'`)
-	inlineExecDouble = regexp.MustCompile(`(\s(?:-(?:c|e)|--eval)[= ]?\s*\$?)"[^"]*"`)
+	inlineExecDouble = regexp.MustCompile(`(\s(?:-(?:c|e)|--eval)[= ]?\s*\$?)"(?:\\.|[^"\\])*"`)
 	// Heredoc marker: `<<TAG`, `<<-TAG`, `<<'TAG'`, `<<"TAG"`. Here-strings
 	// (`<<<`) are excluded by a preceding-char check in scrubHeredocBodies
 	// (RE2 has no lookbehind).
@@ -201,20 +204,40 @@ func scrubHeredocBodies(cmd string) string {
 			break
 		}
 		bodyStart := markerEnd + nl + 1
-		// Terminator: the tag alone on its own line (leading tabs allowed for
-		// `<<-`). Tag is [A-Za-z0-9_]+ so embedding it in a pattern is safe.
-		termRe := regexp.MustCompile(`(?m)^[ \t]*` + tag + `[ \t]*$`)
-		tloc := termRe.FindStringIndex(rest[bodyStart:])
-		if tloc == nil {
+		termStart := findHeredocTerminator(rest[bodyStart:], tag)
+		if termStart < 0 {
 			// Unterminated heredoc — leave as-is (parity with the backend scrub).
 			out.WriteString(rest)
 			break
 		}
 		out.WriteString(rest[:bodyStart])
 		out.WriteString(inlineCodeMarker + "\n")
-		rest = rest[bodyStart+tloc[0]:]
+		rest = rest[bodyStart+termStart:]
 	}
 	return out.String()
+}
+
+// findHeredocTerminator returns the offset of the line that terminates a
+// heredoc body — the tag alone on its own line (leading tabs/spaces allowed
+// for `<<-`) — or -1 if the body is unterminated. A plain line scan; no
+// per-heredoc regex compilation on the event hot path.
+func findHeredocTerminator(body, tag string) int {
+	offset := 0
+	for offset <= len(body) {
+		lineEnd := strings.Index(body[offset:], "\n")
+		line := body[offset:]
+		next := len(body) + 1
+		if lineEnd >= 0 {
+			line = body[offset : offset+lineEnd]
+			next = offset + lineEnd + 1
+		}
+		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), " \t")
+		if trimmed == tag {
+			return offset
+		}
+		offset = next
+	}
+	return -1
 }
 
 // projectEvent strips a fully-built Event down to its source-free shape,

@@ -208,6 +208,11 @@ func TestScrubInlineCommand(t *testing.T) {
 			want: `node --eval "<inline-code-redacted>"`,
 		},
 		{
+			name: "escaped double quotes inside body mask fully, not partially",
+			in:   `python -c "print(\"secret-body\")" && echo ok`,
+			want: `python -c "<inline-code-redacted>" && echo ok`,
+		},
+		{
 			name: "bash -c ANSI-C quoting",
 			in:   `bash -c $'echo hi'`,
 			want: `bash -c $'<inline-code-redacted>'`,
