@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -158,7 +159,12 @@ func workspaceKey(root string) string {
 // "" when the dir is not a git repo, has no origin remote, or the URL can't be
 // reduced to owner/name. Only the slug leaves the machine — never the URL.
 func gitRemoteSlug(root string) string {
-	out, err := exec.Command("git", "-C", root, "config", "--get", "remote.origin.url").Output()
+	// A local `git config` read is normally milliseconds, but on a
+	// network-mounted workspace or a corrupt .git it can hang indefinitely —
+	// bound it so census never stalls the watch process.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
 		return ""
 	}
@@ -178,16 +184,33 @@ func normalizeRemoteSlug(raw string) string {
 	}
 	raw = strings.TrimSuffix(raw, ".git")
 	if i := strings.Index(raw, "://"); i >= 0 {
-		// scheme://[user@]host/owner/name — drop scheme + host.
-		rest := raw[i+3:]
-		if j := strings.Index(rest, "/"); j >= 0 {
-			raw = rest[j+1:]
-		} else {
+		// scheme://[user@]host/owner/name — drop scheme + host. A non-empty host
+		// must sit between the "://" and the first "/"; an empty host (as in
+		// file:///home/alice/repo) means a local path, not a hosted remote —
+		// reject so no filesystem segment can survive into the identity.
+		if strings.EqualFold(raw[:i], "file") {
 			return ""
 		}
+		rest := raw[i+3:]
+		j := strings.Index(rest, "/")
+		if j <= 0 {
+			return ""
+		}
+		raw = rest[j+1:]
 	} else if i := strings.LastIndex(raw, ":"); i >= 0 {
-		// scp-style git@host:owner/name — everything after the colon.
-		raw = raw[i+1:]
+		// scp-style [user@]host:owner/name — everything after the colon. Reject
+		// forms that are actually filesystem paths: a host with a slash, or a
+		// path after the colon (C:/Users/alice/repo, git@host:/abs/path).
+		host, rest := raw[:i], raw[i+1:]
+		if host == "" || strings.ContainsAny(host, "/\\") || strings.HasPrefix(rest, "/") {
+			return ""
+		}
+		raw = rest
+	} else {
+		// No scheme and no colon → a bare local path (/home/alice/repo, ./repo)
+		// or junk, never a hosted remote. Reject so the WorkspaceKey never
+		// encodes a filesystem path (it falls back to the hashed root instead).
+		return ""
 	}
 	parts := strings.Split(strings.Trim(raw, "/"), "/")
 	if len(parts) < 2 {

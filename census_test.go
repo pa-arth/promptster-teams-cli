@@ -236,8 +236,16 @@ func TestNormalizeRemoteSlug(t *testing.T) {
 		"ssh://git@github.com/owner/name.git":   "owner/name",
 		"https://gitlab.com/group/sub/name.git": "sub/name", // nested → last two
 		"  git@github.com:owner/name.git\n":     "owner/name",
+		"git@internal-host:owner/name":          "owner/name", // bare host, no dot
 		"":                                      "",
 		"not-a-url":                             "",
+		// Local-path remotes must NEVER leak filesystem segments into the slug —
+		// each of these reduces to owner/name today only because it splits a path.
+		"/home/alice/repos/myproject":  "",
+		"/home/alice/myproject":        "",
+		"./myproject":                  "",
+		"file:///home/alice/myproject": "",
+		"C:/Users/alice/repo":          "",
 	}
 	for in, want := range cases {
 		if got := normalizeRemoteSlug(in); got != want {
