@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -65,6 +67,14 @@ type censusMCPServer struct {
 // configCensusData is the CLOSED payload of a config_census event. Counts and
 // names only — adding any field that carries file contents is forbidden.
 type configCensusData struct {
+	// WorkspaceKey is a stable, privacy-safe identity for the active workspace
+	// so the backend can de-dupe workspaces across sessions (e.g. "share of my
+	// repos with a healthy CLAUDE.md"). It is the git remote slug (owner/name)
+	// when the workspace is a git repo with an `origin` remote — matching the
+	// outcome_events.repo convention so coverage can correlate with PR outcomes
+	// — else an opaque sha256(abspath) hash. It NEVER carries a filesystem path
+	// or file contents. Empty only when there is no workspace.
+	WorkspaceKey          string            `json:"workspaceKey"`
 	GlobalClaudeMdTokens  int               `json:"globalClaudeMdTokens"`
 	ProjectClaudeMdTokens int               `json:"projectClaudeMdTokens"`
 	Skills                []censusSkill     `json:"skills"`
@@ -113,10 +123,111 @@ func fileTokens(path string) int {
 	return approxTokens(int(info.Size()))
 }
 
+// primaryWorkspaceRoot returns the first non-empty workspace root — the
+// engineer's active workspace. Worktrees of the same repo share an origin
+// remote, so any of them yields the same WorkspaceKey; the first is canonical.
+func primaryWorkspaceRoot(roots []string) string {
+	for _, r := range roots {
+		if r != "" {
+			return r
+		}
+	}
+	return ""
+}
+
+// workspaceKey derives a stable, privacy-safe identity for a workspace. It
+// PREFERS the git remote slug (owner/name) so backend rollups can correlate
+// CLAUDE.md coverage with PR outcomes (outcome_events.repo uses the same
+// convention); when the workspace is not a git repo with an origin remote it
+// falls back to an opaque sha256(abspath) hash truncated to 16 hex chars. The
+// result never carries a filesystem path or file contents. Empty root → "".
+func workspaceKey(root string) string {
+	if root == "" {
+		return ""
+	}
+	if slug := gitRemoteSlug(root); slug != "" {
+		return slug
+	}
+	abs := root
+	if a, err := filepath.Abs(root); err == nil {
+		abs = a
+	}
+	return sha256Hex(abs)[:16]
+}
+
+// gitRemoteSlug returns the workspace's origin remote as an owner/name slug, or
+// "" when the dir is not a git repo, has no origin remote, or the URL can't be
+// reduced to owner/name. Only the slug leaves the machine — never the URL.
+func gitRemoteSlug(root string) string {
+	// A local `git config` read is normally milliseconds, but on a
+	// network-mounted workspace or a corrupt .git it can hang indefinitely —
+	// bound it so census never stalls the watch process.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return ""
+	}
+	return normalizeRemoteSlug(string(out))
+}
+
+// normalizeRemoteSlug reduces a git remote URL to its trailing owner/name,
+// stripping scheme, host, userinfo, and a trailing ".git". Handles the common
+// forms: https://host/owner/name(.git), ssh://git@host/owner/name(.git), and
+// the scp-style git@host:owner/name(.git). Returns "" when it can't isolate an
+// owner and name. Taking only the last two path segments guarantees no full
+// filesystem path can survive into the identity.
+func normalizeRemoteSlug(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	raw = strings.TrimSuffix(raw, ".git")
+	if i := strings.Index(raw, "://"); i >= 0 {
+		// scheme://[user@]host/owner/name — drop scheme + host. A non-empty host
+		// must sit between the "://" and the first "/"; an empty host (as in
+		// file:///home/alice/repo) means a local path, not a hosted remote —
+		// reject so no filesystem segment can survive into the identity.
+		if strings.EqualFold(raw[:i], "file") {
+			return ""
+		}
+		rest := raw[i+3:]
+		j := strings.Index(rest, "/")
+		if j <= 0 {
+			return ""
+		}
+		raw = rest[j+1:]
+	} else if i := strings.LastIndex(raw, ":"); i >= 0 {
+		// scp-style [user@]host:owner/name — everything after the colon. Reject
+		// forms that are actually filesystem paths: a host with a slash, or a
+		// path after the colon (C:/Users/alice/repo, git@host:/abs/path).
+		host, rest := raw[:i], raw[i+1:]
+		if host == "" || strings.ContainsAny(host, "/\\") || strings.HasPrefix(rest, "/") {
+			return ""
+		}
+		raw = rest
+	} else {
+		// No scheme and no colon → a bare local path (/home/alice/repo, ./repo)
+		// or junk, never a hosted remote. Reject so the WorkspaceKey never
+		// encodes a filesystem path (it falls back to the hashed root instead).
+		return ""
+	}
+	parts := strings.Split(strings.Trim(raw, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	owner, name := parts[len(parts)-2], parts[len(parts)-1]
+	if owner == "" || name == "" {
+		return ""
+	}
+	return owner + "/" + name
+}
+
 // buildConfigCensus inventories the config surfaces under env. Every branch is
 // best-effort: a missing file/dir contributes zeros, never an error.
 func buildConfigCensus(env censusEnv) configCensusData {
 	data := configCensusData{
+		WorkspaceKey:         workspaceKey(primaryWorkspaceRoot(env.workspaceRoots)),
 		GlobalClaudeMdTokens: fileTokens(filepath.Join(env.claudeDir, "CLAUDE.md")),
 		Skills:               []censusSkill{},
 		Plugins:              []censusPlugin{},
