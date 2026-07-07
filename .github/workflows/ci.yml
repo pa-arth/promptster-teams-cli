@@ -5,24 +5,138 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; jobs opt into more where needed.
+permissions:
+  contents: read
+
 jobs:
-  build-test:
-    runs-on: ubuntu-latest
+  # Cross-platform build + tests. The CLI ships darwin + windows binaries and
+  # has platform-split files (signing_lock_unix.go / signing_lock_windows.go),
+  # so we compile and test all three OSes — not just Linux.
+  test:
+    name: build & test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test ./...
-      - name: Audit cleanliness (no anti-cheat / surveillance logic)
+          check-latest: true
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test ./...
+
+  # Race detector + coverage. Requires cgo (a C toolchain), which the hosted
+  # ubuntu runner has; kept separate from the matrix so Windows (no default
+  # C compiler) isn't asked to run -race.
+  race:
+    name: race & coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
+      - run: go tool cover -func=coverage.out | tail -1
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: coverage
+          path: coverage.out
+
+  lint:
+    name: lint (gofmt, vet, staticcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: gofmt
         run: |
-          # The teams CLI must contain ONLY capture + redaction + signing.
-          # Fail the build if hiring's anti-cheat surface ever creeps back in.
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::these files are not gofmt-clean:"; echo "$unformatted"
+            exit 1
+          fi
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+
+  # Static application security testing. All findings (any severity) are
+  # published to the GitHub Security tab as SARIF so reviewers can see them;
+  # the gate itself fails only on HIGH-severity/HIGH-confidence findings.
+  gosec:
+    name: gosec (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: gosec (report all → SARIF)
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out gosec.sarif ./...
+      - name: upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        continue-on-error: true
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+      - name: gate on HIGH findings
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -severity high -confidence high ./...
+
+  # Dependency + stdlib CVE scan on the latest Go. Non-blocking: stdlib
+  # findings track the Go release cycle (fixed by a toolchain bump when a
+  # patch lands), so they must not gate merges — but they ARE surfaced in the
+  # Security tab. Dependency findings here are actionable: bump the module.
+  govulncheck:
+    name: govulncheck (deps + stdlib CVEs)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: stable # scan against the newest patched stdlib
+      - name: scan (SARIF)
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest -format sarif ./... > govulncheck.sarif
+      - name: upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        continue-on-error: true
+        with:
+          sarif_file: govulncheck.sarif
+          category: govulncheck
+      - name: human-readable report
+        continue-on-error: true
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # Guardrail: the teams CLI must contain ONLY capture + redaction + signing.
+  # Fail the build if the sibling hiring product's anti-cheat / surveillance
+  # surface ever creeps back into this source.
+  audit-cleanliness:
+    name: audit (no surveillance/anti-cheat logic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: scan for forbidden terms
+        run: |
           if grep -rinE 'honeypot|likelyPaste|consentToIntegrity|cadence enrichment' --include='*.go' .; then
             echo "::error::surveillance/anti-cheat term found in source — teams CLI must stay clean"
             exit 1
