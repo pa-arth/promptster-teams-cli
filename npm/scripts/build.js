@@ -7,6 +7,7 @@
  */
 
 const { execSync } = require("child_process");
+const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
 
@@ -50,5 +51,15 @@ for (const { goos, goarch, out } of TARGETS) {
   }
 }
 
+// Emit SHA256SUMS covering every built artifact. Uploaded to the GitHub
+// Release and used by install.sh to verify a download before executing it.
+const sumsLines = TARGETS.map(({ out }) => {
+  const buf = fs.readFileSync(path.join(binariesDir, out));
+  const hex = crypto.createHash("sha256").update(buf).digest("hex");
+  return `${hex}  ${out}`;
+});
+fs.writeFileSync(path.join(binariesDir, "SHA256SUMS"), sumsLines.join("\n") + "\n");
+
 console.log("\n✓ All binaries built successfully");
+console.log("✓ Wrote binaries/SHA256SUMS");
 console.log(`  Output: ${binariesDir}`);
