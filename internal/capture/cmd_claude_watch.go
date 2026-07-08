@@ -123,7 +123,7 @@ func saveClaudeWatchProgress(p claudeWatchProgress) {
 		return
 	}
 	tmp := claudeWatchProgressPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, claudeWatchProgressPath())
@@ -143,7 +143,7 @@ func loadClaudeWatcherState() (claudeWatcherState, error) {
 
 func saveClaudeWatcherState(s claudeWatcherState) error {
 	path := claudeWatcherStatePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(s)
@@ -151,7 +151,7 @@ func saveClaudeWatcherState(s claudeWatcherState) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -205,7 +205,7 @@ func claudeHookTakeoverPath() string { return filepath.Join(state.StateDir(), "c
 func touchClaudeHookTakeover() {
 	p := claudeHookTakeoverPath()
 	_ = os.MkdirAll(filepath.Dir(p), 0o700)
-	_ = os.WriteFile(p, []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
+	_ = os.WriteFile(p, []byte(time.Now().UTC().Format(time.RFC3339)), 0o600)
 }
 
 // transcriptKeepKinds are hook-emitted kinds the transcript JSONL does NOT
@@ -269,7 +269,7 @@ func RunClaudeWatcher() error {
 	defer clearClaudeWatcherState()
 
 	if os.Getenv("PROMPTSTER_API_URL") == "" && session.ApiURL != "" {
-		os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
+		_ = os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
 	}
 
 	workspace := resolvePath(session.TaskRoot)
@@ -459,6 +459,7 @@ const (
 // picked up before their transcripts get classified.
 func workspaceMatchRoots(workspace string) []string {
 	roots := []string{workspace}
+	// #nosec G204 -- constant argv; workspace is the capture session's own root dir, not user input. Reads only the local worktree list.
 	out, err := exec.Command("git", "-C", workspace, "worktree", "list", "--porcelain").Output()
 	if err != nil {
 		return roots
@@ -481,6 +482,7 @@ func workspaceMatchRoots(workspace string) []string {
 // (mode, permission-mode, ...) often lack cwd, so a file with no cwd yet stays
 // undecided rather than being cached as a mismatch.
 func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time) claudeMatchResult {
+	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
 		return claudeMatchUndecided
@@ -559,6 +561,7 @@ func tailClaudeTranscript(
 	client *http.Client,
 	dryRun bool,
 ) (int, int64) {
+	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0

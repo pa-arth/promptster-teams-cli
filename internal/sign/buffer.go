@@ -51,7 +51,8 @@ func AppendEventToLocalBuffer(ev *event.Event) error {
 		if err != nil {
 			return err
 		}
-		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		// #nosec G304 -- p is state.HookBufferPath(), derived from state.StateDir(), not user input.
+		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}

@@ -204,6 +204,7 @@ func signEvent(e event.Event, prevSigHex string, priv ed25519.PrivateKey) (sigHe
 // buffer, hex-encoded. Used to chain a new event to the previous one. Returns
 // "" if the buffer is empty or missing.
 func readLastChainSig(bufferPath string) (string, error) {
+	// #nosec G304 -- bufferPath is state.HookBufferPath(), derived from state.StateDir(), not user input.
 	f, err := os.Open(bufferPath)
 	if err != nil {
 		if os.IsNotExist(err) {

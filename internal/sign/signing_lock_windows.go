@@ -11,10 +11,11 @@ import (
 )
 
 func WithBufferLock(bufferPath string, fn func() error) error {
-	if err := os.MkdirAll(filepath.Dir(bufferPath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(bufferPath), 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(bufferPath, os.O_CREATE|os.O_RDWR, 0o644)
+	// #nosec G304 -- bufferPath is always state.StateDir()-derived across all callers (HookBufferPath + dedup ledger locks), not user input.
+	f, err := os.OpenFile(bufferPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}

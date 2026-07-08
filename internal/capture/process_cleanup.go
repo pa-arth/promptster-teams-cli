@@ -58,6 +58,7 @@ func findPromptsterDaemonPIDs(pattern string) []int {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
+	// #nosec G204 -- constant argv; pattern is one of three hardcoded daemon command strings (see killStalePromptsterDaemons callers), not user input.
 	out, err := exec.Command("pgrep", "-f", pattern).Output()
 	if err != nil {
 		return nil
