@@ -100,7 +100,7 @@ jobs:
       - name: gosec (report all → SARIF)
         run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out gosec.sarif ./...
       - name: upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         continue-on-error: true
         with:
           sarif_file: gosec.sarif
@@ -127,7 +127,7 @@ jobs:
         continue-on-error: true
         run: go run golang.org/x/vuln/cmd/govulncheck@latest -format sarif ./... > govulncheck.sarif
       - name: upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@411c4c9a36b3fca4d674f06b6396b2c6d23522c6 # v3
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         continue-on-error: true
         with:
           sarif_file: govulncheck.sarif
