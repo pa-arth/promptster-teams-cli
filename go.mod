@@ -1,11 +1,11 @@
 module github.com/pa-arth/promptster-teams-cli
 
-go 1.25.7
+go 1.25.8
 
 require (
 	github.com/charmbracelet/lipgloss v1.1.0
-	github.com/praetorian-inc/titus v1.2.2
-	golang.org/x/sys v0.43.0
+	github.com/praetorian-inc/titus v1.2.6
+	golang.org/x/sys v0.45.0
 )
 
 require (
@@ -33,7 +33,7 @@ require (
 	github.com/rogpeppe/go-internal v1.12.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
-	golang.org/x/tools v0.39.0 // indirect
+	golang.org/x/tools v0.44.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.67.6 // indirect
