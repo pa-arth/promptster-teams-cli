@@ -360,7 +360,7 @@ var codexExitCodeRe = regexp.MustCompile(`(?i)(?:exited with code|exit code:?)\s
 func parseCodexExecOutput(output string) (int, string) {
 	exitCode := 0
 	if m := codexExitCodeRe.FindStringSubmatch(output); m != nil {
-		fmt.Sscanf(m[1], "%d", &exitCode)
+		_, _ = fmt.Sscanf(m[1], "%d", &exitCode) // regex guarantees digits; exitCode stays 0 otherwise.
 	}
 	stdout := output
 	if idx := strings.Index(output, "Output:\n"); idx >= 0 {

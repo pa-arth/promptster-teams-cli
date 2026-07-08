@@ -24,13 +24,14 @@ func lastPromptStatePath() string {
 // saveLastPromptTs writes the current Unix-millisecond timestamp to the state file.
 func saveLastPromptTs() {
 	p := lastPromptStatePath()
-	_ = os.MkdirAll(filepath.Dir(p), 0o755)
-	_ = os.WriteFile(p, []byte(fmt.Sprintf("%d", time.Now().UnixMilli())), 0o644)
+	_ = os.MkdirAll(filepath.Dir(p), 0o700)
+	_ = os.WriteFile(p, []byte(fmt.Sprintf("%d", time.Now().UnixMilli())), 0o600)
 }
 
 // loadLastPromptTs reads the persisted prompt timestamp, returning zero if unavailable.
 func loadLastPromptTs() time.Time {
 	p := lastPromptStatePath()
+	// #nosec G304 -- p is lastPromptStatePath(), derived from state.StateDir(), not user input.
 	data, err := os.ReadFile(p)
 	if err != nil {
 		return time.Time{}

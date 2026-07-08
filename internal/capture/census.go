@@ -169,6 +169,7 @@ func gitRemoteSlug(root string) string {
 	// bound it so census never stalls the watch process.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
+	// #nosec G204 -- constant argv; root is a discovered workspace dir, not user input. Reads only the local origin URL, timeout-bounded.
 	out, err := exec.CommandContext(ctx, "git", "-C", root, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
 		return ""
@@ -332,6 +333,7 @@ func censusPlugins(claudeDir string) []censusPlugin {
 // returns a non-nil (possibly empty) slice when the key is present, so
 // callers can distinguish "everything explicitly disabled" from "no list".
 func enabledPluginNames(settingsPath string) []string {
+	// #nosec G304 -- settingsPath is the Claude settings.json under the config dir, not user input; only enabledPlugins keys are read.
 	raw, err := os.ReadFile(settingsPath)
 	if err != nil {
 		return nil
@@ -359,6 +361,7 @@ func enabledPluginNames(settingsPath string) []string {
 // name -> install path. Defensive: any parse miss yields an empty map.
 func pluginInstallPaths(registryPath string) map[string]string {
 	paths := map[string]string{}
+	// #nosec G304 -- registryPath is the Claude installed_plugins.json under the config dir, not user input; only names + install paths are read.
 	raw, err := os.ReadFile(registryPath)
 	if err != nil {
 		return paths
@@ -432,6 +435,7 @@ func censusMCPServers(claudeJSONPath string, workspaceRoots []string) []censusMC
 	seen := map[string]bool{}
 	servers := []censusMCPServer{}
 	add := func(path string) {
+		// #nosec G304 -- path is the global ~/.claude.json or a workspace .mcp.json, not user input; only mcpServers keys are read.
 		raw, err := os.ReadFile(path)
 		if err != nil {
 			return
@@ -467,6 +471,7 @@ func censusMCPServers(claudeJSONPath string, workspaceRoots []string) []censusMC
 // block scalars (`>`, `|`) folded into the previous key's value. Returns nil
 // when the file is missing or has no frontmatter.
 func readFrontmatter(path string) map[string]string {
+	// #nosec G304 -- path is a SKILL.md/command/agent markdown file under a discovered plugin install dir, not user input; only frontmatter is parsed.
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil

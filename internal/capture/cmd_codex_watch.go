@@ -81,7 +81,7 @@ func saveCodexWatchProgress(p codexWatchProgress) {
 		return
 	}
 	tmp := codexWatchProgressPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
 	_ = os.Rename(tmp, codexWatchProgressPath())
@@ -101,7 +101,7 @@ func loadCodexWatcherState() (codexWatcherState, error) {
 
 func saveCodexWatcherState(s codexWatcherState) error {
 	path := codexWatcherStatePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(s)
@@ -109,7 +109,7 @@ func saveCodexWatcherState(s codexWatcherState) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)
@@ -156,7 +156,7 @@ func RunCodexWatcher() error {
 	defer clearCodexWatcherState()
 
 	if os.Getenv("PROMPTSTER_API_URL") == "" && session.ApiURL != "" {
-		os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
+		_ = os.Setenv("PROMPTSTER_API_URL", session.ApiURL)
 	}
 
 	// Resolve the workspace path through symlinks once (macOS /tmp -> /private/tmp)
@@ -256,6 +256,7 @@ func pollCodexRollouts(
 // reports whether its cwd is inside the workspace and its timestamp is recent
 // enough to belong to this capture session.
 func codexRolloutMatchesWorkspace(path, workspace string, startCutoff time.Time) bool {
+	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
 		return false
@@ -295,6 +296,7 @@ func tailCodexRollout(
 	session Session,
 	client *http.Client,
 ) int {
+	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
 		return 0

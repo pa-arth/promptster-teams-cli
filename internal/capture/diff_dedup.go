@@ -73,7 +73,7 @@ func recordAiTouchedPath(sessionID, relPath string) {
 			return err
 		}
 		tmp := aiPathsLedgerPath() + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
 			return err
 		}
 		return os.Rename(tmp, aiPathsLedgerPath())
@@ -82,6 +82,7 @@ func recordAiTouchedPath(sessionID, relPath string) {
 
 // fileContentSHA returns a hex sha256 of the file's current contents.
 func fileContentSHA(absPath string) (string, bool) {
+	// #nosec G304 -- absPath is a workspace file the capture session already touched (from a tool diff), hashed for dedup; not user input.
 	data, err := os.ReadFile(absPath)
 	if err != nil {
 		return "", false
@@ -129,7 +130,7 @@ func claimFileDiff(relPath, hash string) bool {
 			return err
 		}
 		tmp := diffDedupLedgerPath() + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
 			return err
 		}
 		return os.Rename(tmp, diffDedupLedgerPath())
