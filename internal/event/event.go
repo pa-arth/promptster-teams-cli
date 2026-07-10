@@ -2,6 +2,7 @@ package event
 
 import (
 	"crypto/rand"
+	"crypto/sha1" // #nosec G505 -- used only for RFC 4122 v5 UUID construction, not as a security primitive.
 	"fmt"
 	"time"
 )
@@ -11,6 +12,36 @@ func NewUUID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// promptsterEventNamespace is a fixed, arbitrary namespace UUID for deriving
+// deterministic (v5) event ids. It never changes — the whole point is that the
+// same logical source produces the same id forever, so the backend can dedupe.
+var promptsterEventNamespace = [16]byte{
+	0x8f, 0x2a, 0x6c, 0x1d, 0x4b, 0x77, 0x45, 0x9e,
+	0xa3, 0x51, 0xd0, 0x9c, 0x2e, 0x7f, 0x88, 0x14,
+}
+
+// DeterministicUUID derives a stable RFC 4122 v5 UUID from name. Given the same
+// name it always returns the same UUID, so an event whose id is derived from a
+// STABLE source key (a transcript line's own `uuid`, an assistant message.id, a
+// tool_use_id) gets the SAME id no matter how many times that source is
+// re-read, re-tailed from a resumed/forked transcript, or resent after a
+// transport error — letting the backend collapse the duplicates on ingest.
+// This is the idempotency primitive that fixes CLI-side double-emission at the
+// source of identity rather than relying on any single emit path being
+// exactly-once.
+func DeterministicUUID(name string) string {
+	// #nosec G401 -- SHA-1 is mandated by RFC 4122 for v5 UUIDs; not a security use.
+	h := sha1.New()
+	_, _ = h.Write(promptsterEventNamespace[:])
+	_, _ = h.Write([]byte(name))
+	sum := h.Sum(nil)
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x50 // version 5
 	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
