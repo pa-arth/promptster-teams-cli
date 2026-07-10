@@ -2,6 +2,7 @@ package capture
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -295,12 +296,15 @@ func RunClaudeWatcher() error {
 	degraded := false
 
 	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
-	// successful fetch says otherwise. Resolved once at start and re-fetched on
-	// the policy cadence; the resolved bool is threaded into every projected
-	// event via ingestClaudeWatchEvent -> AppendEventToLocalBuffer.
+	// successful fetch says otherwise. Refreshed in the background (immediate +
+	// every RefreshInterval) so the poll loop never blocks on the 15s-timeout
+	// policy fetch; each iteration just reads the lock-guarded cached bool and
+	// threads it into every projected event via ingestClaudeWatchEvent ->
+	// AppendEventToLocalBuffer.
 	policyResolver := policy.NewResolver(session.SessionToken)
-	policyResolver.Refresh()
-	lastPolicyRefresh := time.Now()
+	policyCtx, cancelPolicy := context.WithCancel(context.Background())
+	defer cancelPolicy()
+	policyResolver.StartBackground(policyCtx)
 
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "claude-watcher: started, polling %s every %s (workspace=%s)\n",
@@ -308,10 +312,6 @@ func RunClaudeWatcher() error {
 	}
 
 	for {
-		if time.Since(lastPolicyRefresh) >= policy.RefreshInterval {
-			policyResolver.Refresh()
-			lastPolicyRefresh = time.Now()
-		}
 		captureProse := policyResolver.CaptureAssistantProse()
 		// While degraded, hooks own emission — the watcher keeps PARSING (to
 		// detect recovery and advance offsets) but discards events: hooks were

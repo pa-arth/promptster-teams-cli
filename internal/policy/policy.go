@@ -10,6 +10,7 @@
 package policy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -105,6 +106,29 @@ func (r *Resolver) CaptureAssistantProse() bool {
 		return true
 	}
 	return false
+}
+
+// StartBackground runs policy refreshes OFF the caller's hot path: it fires an
+// immediate refresh, then one every RefreshInterval, in a goroutine that exits
+// when ctx is cancelled. The capture loop only ever reads CaptureAssistantProse
+// (lock-guarded, no network), so it never blocks on the 15s-timeout policy
+// fetch — the reason this replaced the inline Refresh in the watch loops.
+// Fail-closed is unchanged: prose stays off until the first successful fetch
+// completes.
+func (r *Resolver) StartBackground(ctx context.Context) {
+	go func() {
+		r.Refresh()
+		ticker := time.NewTicker(RefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				r.Refresh()
+			}
+		}
+	}()
 }
 
 // Refresh performs one network fetch and, on success, updates the cached value

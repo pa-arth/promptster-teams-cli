@@ -2,6 +2,7 @@ package capture
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -177,12 +178,15 @@ func RunCodexWatcher() error {
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 	eventsSent := 0
 
-	// Org capture policy (opt-in assistant prose), fail-closed. Resolved at
-	// start and re-fetched on the policy cadence; threaded into every projected
-	// event via tailCodexRollout -> AppendEventToLocalBuffer.
+	// Org capture policy (opt-in assistant prose), fail-closed. Refreshed in the
+	// background (immediate + every RefreshInterval) so the poll loop never
+	// blocks on the 15s-timeout policy fetch; each iteration reads the
+	// lock-guarded cached bool and threads it into every projected event via
+	// tailCodexRollout -> AppendEventToLocalBuffer.
 	policyResolver := policy.NewResolver(session.SessionToken)
-	policyResolver.Refresh()
-	lastPolicyRefresh := time.Now()
+	policyCtx, cancelPolicy := context.WithCancel(context.Background())
+	defer cancelPolicy()
+	policyResolver.StartBackground(policyCtx)
 
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "codex-watcher: started, polling %s every %s (workspace=%s)\n",
@@ -190,10 +194,6 @@ func RunCodexWatcher() error {
 	}
 
 	for {
-		if time.Since(lastPolicyRefresh) >= policy.RefreshInterval {
-			policyResolver.Refresh()
-			lastPolicyRefresh = time.Now()
-		}
 		captureProse := policyResolver.CaptureAssistantProse()
 		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client, captureProse)
 		eventsSent += sent
