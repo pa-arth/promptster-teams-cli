@@ -187,9 +187,26 @@ func writeDiskCache(c diskCache) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	tmp := cacheFilePath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Per-process temp file in the SAME dir, then atomic rename onto the final
+	// path. A shared literal ".tmp" path races when claude-watch + codex-watch
+	// write concurrently (and os.Rename fails on Windows when the dest exists),
+	// silently dropping the update; a unique temp per write avoids the collision.
+	tmp, err := os.CreateTemp(dir, "teams-policy-*.json.tmp")
+	if err != nil {
 		return
 	}
-	_ = os.Rename(tmp, cacheFilePath())
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return
+	}
+	// os.CreateTemp already made the file 0600, so no chmod is needed.
+	if err := os.Rename(tmpName, cacheFilePath()); err != nil {
+		_ = os.Remove(tmpName)
+	}
 }
