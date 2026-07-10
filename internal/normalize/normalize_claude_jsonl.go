@@ -142,6 +142,9 @@ func (p *ClaudeTranscriptProcessor) stableEventID(sourceKey, kind string) string
 // tool_use_id); pass "" only when no stable key exists.
 func (p *ClaudeTranscriptProcessor) newTranscriptEvent(kind, ts, sourceKey string) event.Event {
 	e := event.NewEvent(kind, p.sessionID)
+	// Overwrite NewEvent's random id with the stable, source-derived one (the
+	// discarded random read is negligible next to this event's Ed25519 signing
+	// + POST; keeping NewEvent as the single source of Ts/Source/V defaults).
 	e.ID = p.stableEventID(sourceKey, kind)
 	e.Source = "claude-code"
 	switch kind {

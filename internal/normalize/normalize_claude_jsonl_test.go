@@ -449,6 +449,9 @@ func TestClaudeTranscriptDeterministicEventIDs(t *testing.T) {
 		if len(ids) != 1 {
 			t.Fatalf("expected exactly one %s event, got %d (%v)", k, len(ids), ids)
 		}
+		if len(second[k]) != 1 {
+			t.Fatalf("expected exactly one %s event in second run, got %d (%v)", k, len(second[k]), second[k])
+		}
 		if second[k][0] != ids[0] {
 			t.Errorf("%s id not idempotent across re-observation: %q (first) vs %q (second)",
 				k, ids[0], second[k][0])
