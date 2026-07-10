@@ -96,7 +96,9 @@ func buildPresenceEvent(session Session) event.Event {
 // that fails to send is logged only under debug and never interrupts capture.
 func emitPresenceEvent(session Session) {
 	ev := buildPresenceEvent(session)
-	if err := sign.AppendEventToLocalBuffer(&ev); err != nil {
+	// captureAssistantProse=false: a presence event carries no ai_response text,
+	// so the prose gate is irrelevant — pass the fail-closed default.
+	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("presence buffer error: %v", err)
 	}
 	if err := ingest.IngestEventWithAPIKey(ev, session.SessionToken); err != nil {

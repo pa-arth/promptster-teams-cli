@@ -561,7 +561,9 @@ func buildConfigCensusEvent(session Session) event.Event {
 // advances so a rejecting backend is probed at most once per interval.
 func emitConfigCensus(session Session) {
 	ev := buildConfigCensusEvent(session)
-	if err := sign.AppendEventToLocalBuffer(&ev); err != nil {
+	// captureAssistantProse=false: a config_census event carries no ai_response
+	// text, so the prose gate is irrelevant — pass the fail-closed default.
+	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("config census buffer error: %v", err)
 	}
 	if err := ingest.IngestEventWithAPIKey(ev, session.SessionToken); err != nil {

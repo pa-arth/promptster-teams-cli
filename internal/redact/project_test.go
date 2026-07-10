@@ -119,7 +119,7 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := eventWithData(tc.kind, tc.data)
-			ProjectEvent(&e)
+			ProjectEvent(&e, false)
 
 			if e.RawPayload != "" {
 				t.Errorf("RawPayload not cleared: %q", e.RawPayload)
@@ -160,7 +160,7 @@ func TestProjectEventConfigCensusArrayElements(t *testing.T) {
 			map[string]interface{}{"name": "github", "deferred": true, "config": leakCanary},
 		},
 	})
-	ProjectEvent(&e)
+	ProjectEvent(&e, false)
 	b, _ := json.Marshal(e)
 	if strings.Contains(string(b), leakCanary) {
 		t.Fatalf("canary survived array-element projection: %s", b)
@@ -178,7 +178,7 @@ func TestProjectEventConfigCensusArrayElements(t *testing.T) {
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary
-	ProjectEvent(&e)
+	ProjectEvent(&e, false)
 	data, ok := e.Data.(map[string]interface{})
 	if !ok || len(data) != 0 {
 		t.Fatalf("non-map Data must project to empty map, got %#v", e.Data)
@@ -245,3 +245,156 @@ func TestScrubInlineCommand(t *testing.T) {
 		})
 	}
 }
+
+// proseCanary / proseMarker mirror the constants in the backend's
+// scrubAssistantProse.test.ts LOCKSTEP table. proseCanary is a fake leak-detection
+// sentinel, not a credential — the trailing directive keeps gitleaks from flagging it.
+const (
+	proseCanary = "PROMPTSTER_LEAK_CANARY_prose_4c1" //gitleaks:allow
+	proseMarker = "<code-redacted>"
+)
+
+// TestScrubAssistantProse pins the on-device scrubber to the SAME input->output
+// table the backend runs (packages/shared/src/eventFieldProjection.ts). These
+// two tables must stay byte-for-byte identical — a divergence means the
+// on-device scrub and the backend's re-scrub disagree.
+func TestScrubAssistantProse(t *testing.T) {
+	j := func(lines ...string) string { return strings.Join(lines, "\n") }
+
+	cases := []struct {
+		name, in, want string
+	}{
+		{
+			name: "plain prose untouched",
+			in:   "I'll use the frontend-design skill, then clear context before continuing.",
+			want: "I'll use the frontend-design skill, then clear context before continuing.",
+		},
+		{
+			name: "fenced block collapses to marker",
+			in:   j("I'll edit `auth.ts` then run:", "```ts", `const x = "`+proseCanary+`"`, "```", "Done."),
+			want: j("I'll edit `auth.ts` then run:", "```ts", proseMarker, "```", "Done."),
+		},
+		{
+			name: "tilde fence collapses",
+			in:   j("~~~python", `print("`+proseCanary+`")`, "~~~"),
+			want: j("~~~python", proseMarker, "~~~"),
+		},
+		{
+			name: "unterminated fence collapses",
+			in:   j("text", "```js", `evil("`+proseCanary+`")`),
+			want: j("text", "```js", proseMarker),
+		},
+		{
+			name: "short inline refs kept",
+			in:   "Use `useState` and edit `src/hooks/useAuth.ts` now.",
+			want: "Use `useState` and edit `src/hooks/useAuth.ts` now.",
+		},
+		{
+			name: "over-long inline span redacted",
+			in:   "Set `const apiKey = process.env." + proseCanary + "_LONG_ENV_NAME` in config.",
+			want: "Set `" + proseMarker + "` in config.",
+		},
+		{
+			name: "unfenced diff run collapses",
+			in: j("Here's the patch:", "diff --git a/x.ts b/x.ts", "@@ -1,2 +1,2 @@",
+				"-const a = 1", `+const a = "`+proseCanary+`"`, "Looks good."),
+			want: j("Here's the patch:", proseMarker, "Looks good."),
+		},
+		{
+			name: "markdown bullets survive (no anchor)",
+			in:   j("Steps:", "- first", "- second", "+ bonus", "Done."),
+			want: j("Steps:", "- first", "- second", "+ bonus", "Done."),
+		},
+		{
+			name: "empty string",
+			in:   "",
+			want: "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scrubAssistantProse(tc.in)
+			if got != tc.want {
+				t.Errorf("scrubAssistantProse(%q)\n  got  %q\n  want %q", tc.in, got, tc.want)
+			}
+			if strings.Contains(got, proseCanary) {
+				t.Errorf("secret survived scrub: %q", got)
+			}
+		})
+	}
+}
+
+// TestProjectEventAssistantProseGate pins the org-policy gate on ai_response
+// text: dropped when off (default), kept-but-code-scrubbed when on.
+func TestProjectEventAssistantProseGate(t *testing.T) {
+	proseText := j2(
+		"I'll edit `auth.ts` then run:",
+		"```ts",
+		`const k = "`+proseCanary+`"`,
+		"```",
+		"Done.",
+	)
+
+	newAIResponse := func() event.Event {
+		return eventWithData("ai_response", map[string]interface{}{
+			"text":                 proseText,
+			"lastAssistantMessage": proseText,
+			"model":                "claude-sonnet-5",
+			"inputTokens":          1200,
+			"outputTokens":         340,
+		})
+	}
+
+	t.Run("policy off drops text, keeps usage", func(t *testing.T) {
+		e := newAIResponse()
+		ProjectEvent(&e, false)
+		data := e.Data.(map[string]interface{})
+		if _, present := data["text"]; present {
+			t.Errorf("text survived with policy off")
+		}
+		if _, present := data["lastAssistantMessage"]; present {
+			t.Errorf("lastAssistantMessage survived with policy off")
+		}
+		if data["model"] != "claude-sonnet-5" {
+			t.Errorf("usage model lost: %v", data["model"])
+		}
+		b, _ := json.Marshal(e)
+		if strings.Contains(string(b), proseCanary) {
+			t.Errorf("secret survived with policy off: %s", b)
+		}
+	})
+
+	t.Run("policy on keeps scrubbed text", func(t *testing.T) {
+		e := newAIResponse()
+		ProjectEvent(&e, true)
+		data := e.Data.(map[string]interface{})
+		text, ok := data["text"].(string)
+		if !ok {
+			t.Fatalf("text dropped with policy on")
+		}
+		if strings.Contains(text, proseCanary) {
+			t.Errorf("secret survived the on-device scrub: %q", text)
+		}
+		if !strings.Contains(text, "auth.ts") {
+			t.Errorf("short inline ref was lost: %q", text)
+		}
+		if !strings.Contains(text, proseMarker) {
+			t.Errorf("code block was not replaced with marker: %q", text)
+		}
+		// lastAssistantMessage stays dropped even when prose is kept.
+		if _, present := data["lastAssistantMessage"]; present {
+			t.Errorf("lastAssistantMessage survived (should stay dropped)")
+		}
+		if data["model"] != "claude-sonnet-5" {
+			t.Errorf("usage model lost: %v", data["model"])
+		}
+		b, _ := json.Marshal(e)
+		if strings.Contains(string(b), proseCanary) {
+			t.Errorf("secret survived somewhere in the event: %s", b)
+		}
+	})
+}
+
+// j2 joins lines with '\n' (helper local to the prose-gate test).
+func j2(lines ...string) string { return strings.Join(lines, "\n") }

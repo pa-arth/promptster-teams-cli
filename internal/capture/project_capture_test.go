@@ -34,7 +34,7 @@ func TestProjectedEventSignsAndVerifies(t *testing.T) {
 	e := eventWithData("file_diff", map[string]interface{}{
 		"path": "a.ts", "diff": leakCanary, "linesAdded": 1,
 	})
-	if err := sign.AppendEventToLocalBuffer(&e); err != nil {
+	if err := sign.AppendEventToLocalBuffer(&e, false); err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
@@ -76,7 +76,7 @@ func TestWireBodyCarriesNoSource(t *testing.T) {
 		"stdout":   "output " + leakCanary,
 		"stderr":   "error " + leakCanary,
 	})
-	if !ingestClaudeWatchEvent(e, session, srv.Client()) {
+	if !ingestClaudeWatchEvent(e, session, srv.Client(), false) {
 		t.Fatal("event was not sent")
 	}
 	if len(received) == 0 {

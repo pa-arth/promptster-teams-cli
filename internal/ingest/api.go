@@ -21,6 +21,21 @@ func apiURL() string {
 	return DefaultAPIURL
 }
 
+// APIURL is the exported form of apiURL so sibling packages (e.g. policy)
+// resolve the SAME teams base URL the ingest path uses, instead of duplicating
+// the PROMPTSTER_API_URL resolution.
+func APIURL() string {
+	return apiURL()
+}
+
+// HTTPClient returns the shared outbound client (15s timeout, injects
+// X-Promptster-CLI-Version via versionTransport). Exported so sibling packages
+// reuse the same transport — every request the CLI makes carries the version
+// header — rather than rebuilding it.
+func HTTPClient() *http.Client {
+	return httpClient
+}
+
 // apiHost returns the host portion of the configured API URL for display in
 // diagnostics, falling back to the raw URL if it doesn't parse.
 func APIHost() string {

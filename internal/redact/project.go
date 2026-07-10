@@ -242,12 +242,195 @@ func findHeredocTerminator(body, tag string) int {
 	return -1
 }
 
+// --- assistant-prose scrubber -------------------------------------------------
+//
+// Opt-in assistant-prose capture (org-gated, default off). When an org turns on
+// GET /v1/teams/policy { captureAssistantProse: true }, ProjectEvent KEEPS the
+// ai_response `text` field — but only after scrubbing every code-bearing span
+// out of it ON-DEVICE, so narration ("I'll use the frontend-design skill, then
+// clear context") survives while patches, fenced blocks, and long inline code
+// are replaced with a marker before the text is signed, buffered, or sent. This
+// preserves the never-store-source guarantee even with prose capture enabled.
+//
+// LOCKSTEP: this scrubber must produce BYTE-FOR-BYTE identical output to
+// scrubAssistantProse in the backend's packages/shared/src/eventFieldProjection.ts.
+// The two are a documented pinned contract (mirrored input→output test tables on
+// both sides). Any change to the redaction rules must land in the same release
+// on both, or the on-device scrub and the backend's defense-in-depth re-scrub
+// diverge. See scrubInlineCommand above for the sibling command-body scrubber.
+
+const proseRedactionMarker = "<code-redacted>"
+
+// inlineSpanMax is the max length (in runes) of an inline `backtick` span that
+// is kept verbatim; longer spans are code, not a symbol reference, and get
+// redacted. Rune count matches the JS UTF-16 length for the ASCII-ish spans
+// that occur here; non-BMP input could differ, but that is out of scope.
+const inlineSpanMax = 40
+
+var (
+	// fenceInfoRe matches an opening/closing code-fence line: up to 3 leading
+	// spaces, then a run of 3+ backticks or tildes, then an info string.
+	fenceInfoRe = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
+	// inlineSpanRe matches a single-line inline code span (no backticks or
+	// newlines inside).
+	inlineSpanRe = regexp.MustCompile("`([^`\n]*)`")
+)
+
+type proseFence struct {
+	char   string // "`" or "~"
+	length int    // run length of the fence
+	info   string // trimmed info string after the fence
+}
+
+// fenceInfo parses a line as a code fence, returning ok=false when it is not a
+// fence line. Mirrors fenceInfo() in the backend.
+func fenceInfo(line string) (proseFence, bool) {
+	m := fenceInfoRe.FindStringSubmatch(line)
+	if m == nil {
+		return proseFence{}, false
+	}
+	run := m[1]
+	return proseFence{
+		char:   string(run[0]),
+		length: len(run),
+		info:   strings.TrimSpace(m[2]),
+	}, true
+}
+
+// diffLineKind reports whether a line looks like part of a diff/patch and, if
+// so, whether it is a structural anchor (diff --git / @@ / --- / +++ / index).
+// Mirrors diffLineKind() in the backend.
+func diffLineKind(line string) (isDiff bool, isAnchor bool) {
+	isAnchor = strings.HasPrefix(line, "diff --git ") ||
+		strings.HasPrefix(line, "@@ ") ||
+		strings.HasPrefix(line, "--- ") ||
+		strings.HasPrefix(line, "+++ ") ||
+		strings.HasPrefix(line, "index ")
+	isMarker := strings.HasPrefix(line, "+") || strings.HasPrefix(line, "-")
+	return isAnchor || isMarker, isAnchor
+}
+
+// scrubInlineSpans redacts inline code spans longer than inlineSpanMax while
+// keeping short symbol references (`useState`, `src/x.ts`). Mirrors
+// scrubInlineSpans() in the backend.
+func scrubInlineSpans(line string) string {
+	return inlineSpanRe.ReplaceAllStringFunc(line, func(full string) string {
+		// full includes the surrounding backticks; the class excludes them so
+		// stripping the first/last byte yields the body.
+		body := full[1 : len(full)-1]
+		if len([]rune(body)) <= inlineSpanMax {
+			return full
+		}
+		return "`" + proseRedactionMarker + "`"
+	})
+}
+
+// scrubAssistantProse strips code out of assistant narration, keeping the prose.
+// Three passes, mirroring the backend byte-for-byte: (1) fenced code blocks
+// collapse to a single marker, (2) unfenced diff/patch runs anchored by a
+// diff header collapse to one marker, (3) over-long inline backtick spans are
+// redacted on the remaining prose lines.
+func scrubAssistantProse(text string) string {
+	if text == "" {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+
+	// Pass 1 — fenced code blocks.
+	var out []string
+	var locked []bool
+	for i := 0; i < len(lines); {
+		fi, ok := fenceInfo(lines[i])
+		if ok && !(fi.char == "`" && strings.Contains(fi.info, "`")) {
+			out = append(out, lines[i])
+			locked = append(locked, true)
+			i++
+			body := 0
+			closed := false
+			for i < len(lines) {
+				ci, cok := fenceInfo(lines[i])
+				if cok && ci.char == fi.char && ci.length >= fi.length && ci.info == "" {
+					if body > 0 {
+						out = append(out, proseRedactionMarker)
+						locked = append(locked, true)
+					}
+					out = append(out, lines[i])
+					locked = append(locked, true)
+					i++
+					closed = true
+					break
+				}
+				body++
+				i++
+			}
+			if !closed && body > 0 {
+				out = append(out, proseRedactionMarker)
+				locked = append(locked, true)
+			}
+			continue
+		}
+		out = append(out, lines[i])
+		locked = append(locked, false)
+		i++
+	}
+
+	// Pass 2 — unfenced diff/patch runs collapse to one marker when a run has an anchor.
+	var diffed []string
+	var diffLocked []bool
+	for i := 0; i < len(out); {
+		if isDiff, _ := diffLineKind(out[i]); locked[i] || !isDiff {
+			diffed = append(diffed, out[i])
+			diffLocked = append(diffLocked, locked[i])
+			i++
+			continue
+		}
+		j := i
+		hasAnchor := false
+		for j < len(out) {
+			isDiff, _ := diffLineKind(out[j])
+			if locked[j] || !isDiff {
+				break
+			}
+			if _, anchor := diffLineKind(out[j]); anchor {
+				hasAnchor = true
+			}
+			j++
+		}
+		if hasAnchor {
+			diffed = append(diffed, proseRedactionMarker)
+			diffLocked = append(diffLocked, true)
+		} else {
+			for k := i; k < j; k++ {
+				diffed = append(diffed, out[k])
+				diffLocked = append(diffLocked, false)
+			}
+		}
+		i = j
+	}
+
+	// Pass 3 — inline backtick spans on remaining prose lines.
+	for i := 0; i < len(diffed); i++ {
+		if !diffLocked[i] {
+			diffed[i] = scrubInlineSpans(diffed[i])
+		}
+	}
+
+	return strings.Join(diffed, "\n")
+}
+
 // projectEvent strips a fully-built Event down to its source-free shape,
 // in place. Default-deny: an unknown kind (or a non-map Data) keeps nothing.
 // Envelope fields (id, sessionId, ts, kind, source, actor, provenance) are
 // untouched; RawPayload — a raw-line preview that can carry source and is not
 // covered by the signature — is always cleared.
-func ProjectEvent(e *event.Event) {
+//
+// captureAssistantProse is the org policy (GET /v1/teams/policy), resolved and
+// threaded down from the watch loop. When true, an ai_response's `text` is
+// KEPT — scrubbed of code by scrubAssistantProse — instead of dropped; when
+// false (the default) assistant text is dropped exactly as before. This is a
+// conditional special-case, NOT an allowlist entry, so the default projection
+// stays source-free even if the flag plumbing regresses.
+func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 	if e == nil {
 		return
 	}
@@ -274,6 +457,13 @@ func ProjectEvent(e *event.Event) {
 	if shellCommandKinds[e.Kind] {
 		if cmd, isString := projected["command"].(string); isString {
 			projected["command"] = scrubInlineCommand(cmd)
+		}
+	}
+	// Opt-in assistant prose: keep ai_response.text (code-scrubbed) only when the
+	// org policy is on. lastAssistantMessage stays dropped (redundant with text).
+	if captureAssistantProse && e.Kind == "ai_response" {
+		if text, isString := data["text"].(string); isString {
+			projected["text"] = scrubAssistantProse(text)
 		}
 	}
 	e.Data = projected
