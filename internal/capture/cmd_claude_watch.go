@@ -293,8 +293,10 @@ func RunClaudeWatcher() error {
 	var bytesConsumed, bytesSinceEvent int64
 	degraded := false
 
-	fmt.Fprintf(os.Stderr, "claude-watcher: started, polling %s every %s (workspace=%s)\n",
-		ClaudeProjectsDir(), claudeWatchInterval, workspace)
+	if verboseWatch() {
+		fmt.Fprintf(os.Stderr, "claude-watcher: started, polling %s every %s (workspace=%s)\n",
+			ClaudeProjectsDir(), claudeWatchInterval, workspace)
+	}
 
 	for {
 		// While degraded, hooks own emission — the watcher keeps PARSING (to
@@ -603,7 +605,7 @@ func tailClaudeTranscript(
 
 	if consumed > 0 {
 		progress.Offsets[path] = offset + consumed
-		if sent > 0 {
+		if sent > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "claude-watcher: sent %d event(s) from %s\n", sent, filepath.Base(path))
 		}
 	}

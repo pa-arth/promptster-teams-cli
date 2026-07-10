@@ -71,35 +71,39 @@ func DaemonStatus() (pid int, running bool) {
 	return 0, false
 }
 
-// StartTeamsDaemon spawns the transcript capture as a detached background
-// process and returns immediately, freeing the shell. It re-runs this same
-// binary as `watch` (which already owns credential export, signing-keypair
-// bootstrap, presence, census, and both watchers) so the background path and
-// the foreground `watch` share one code path. `stop` tears it down.
-func StartTeamsDaemon(args []string) error {
-	if pid, running := DaemonStatus(); running {
-		fmt.Fprintf(os.Stderr, "promptster-teams: background capture already running (pid %d) — stop it with `promptster-teams stop`\n", pid)
-		return nil
+// StartDaemon spawns the transcript capture as a detached background process and
+// returns immediately, freeing the shell. It re-runs this same binary as `watch`
+// (which already owns credential export, signing-keypair bootstrap, presence,
+// census, and both watchers) so the background path and the foreground `watch`
+// share one code path.
+//
+// It does NOT print — callers render their own UX (the `start` command prints a
+// plain banner; `login` prints a styled line). It is idempotent: if a supervisor
+// is already alive it spawns nothing and returns that pid with alreadyRunning=true.
+// `stop` tears it down.
+func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, err error) {
+	if p, running := DaemonStatus(); running {
+		return p, "", true, nil
 	}
 
 	token, apiURL, watchDir, err := resolveWatchEnv(args)
 	if err != nil {
-		return err
+		return 0, "", false, err
 	}
 
 	logPath := daemonLogPath()
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return err
+		return 0, "", false, err
 	}
 	// #nosec G304 -- logPath is daemonLogPath() derived from StateDir(), not user input.
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		return err
+		return 0, "", false, err
 	}
 	defer logFile.Close()
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDONLY, 0)
 	if err != nil {
-		return err
+		return 0, "", false, err
 	}
 	defer devNull.Close()
 
@@ -121,45 +125,80 @@ func StartTeamsDaemon(args []string) error {
 	cmd.SysProcAttr = detachSysProcAttr()
 
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("could not start background capture: %w", err)
+		return 0, "", false, fmt.Errorf("could not start background capture: %w", err)
 	}
 	// Capture the PID before Release() — releasing the Process handle resets its
 	// Pid to -1, and we still need it for the state file and the banner.
-	pid := cmd.Process.Pid
+	pid = cmd.Process.Pid
 	// The parent writes the state file synchronously so an immediately-following
 	// `stop` always finds the PID (the child writes its own watcher state later).
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveDaemonState(daemonState{
 		PID: pid, StartedAt: now, WatchDir: watchDir, LogPath: logPath,
 	}); err != nil {
-		return err
+		return 0, "", false, err
 	}
 	_ = cmd.Process.Release()
 
+	return pid, watchDir, false, nil
+}
+
+// StartTeamsDaemon is the `start` command: it spawns the detached supervisor via
+// StartDaemon and prints the CLI banner. `stop` tears it down.
+func StartTeamsDaemon(args []string) error {
+	pid, watchDir, already, err := StartDaemon(args)
+	if err != nil {
+		return err
+	}
+	if already {
+		fmt.Fprintf(os.Stderr, "promptster-teams: background capture already running (pid %d) — stop it with `promptster-teams stop`\n", pid)
+		return nil
+	}
 	fmt.Fprintf(os.Stderr, "promptster-teams: capturing in background (pid %d) under %s → %s\n", pid, watchDir, ingest.APIHost())
-	fmt.Fprintf(os.Stderr, "promptster-teams: logs at %s · stop with `promptster-teams stop`\n", logPath)
+	fmt.Fprintf(os.Stderr, "promptster-teams: logs at %s · stop with `promptster-teams stop`\n", daemonLogPath())
 	return nil
 }
 
-// StopTeamsDaemon terminates the background supervisor (graceful SIGINT, then
-// SIGKILL) and sweeps any orphaned capture processes whose state file was lost.
-// Safe to run when nothing is running.
+// StopTeamsDaemon terminates the background capture recorded in THIS state dir's
+// pidfiles (graceful SIGINT, then SIGKILL). The supervisor and both watcher
+// pidfiles all live under StateDir(), so reading them to find PIDs is inherently
+// scoped to this install — `stop` never reaches into another workspace's daemon.
+// It deliberately does NOT fall back to a global cmdline sweep: a pgrep over all
+// `promptster-teams … watch` processes is not tied to this state dir, so it could
+// terminate another workspace's daemon. Safe to run when nothing is running.
 func StopTeamsDaemon() error {
-	stopped := false
-	if st, err := loadDaemonState(); err == nil && st.PID > 0 && processExists(st.PID) {
-		signalAndWaitForExit(st.PID)
-		stopped = true
+	// Collect candidate PIDs from every pidfile this install writes. The watchers
+	// run as in-process goroutines under one `watch` PID, so the supervisor and
+	// both watcher pidfiles usually point at the same process — the dedup set
+	// handles that. Crucially, a daemon launched as a bare `watch` (e.g. the npm
+	// binary, or an old `start`) writes only the watcher pidfiles and no
+	// supervisor.json, so reading all three is the only reliable way to find it —
+	// reading only supervisor.json silently misses it and `stop` becomes a no-op.
+	seen := map[int]bool{}
+	addPID := func(pid int) {
+		if pid > 0 && pid != os.Getpid() {
+			seen[pid] = true
+		}
+	}
+	if st, err := loadDaemonState(); err == nil {
+		addPID(st.PID)
+	}
+	if st, err := loadClaudeWatcherState(); err == nil {
+		addPID(st.PID)
+	}
+	if st, err := loadCodexWatcherState(); err == nil {
+		addPID(st.PID)
 	}
 
-	// Belt-and-suspenders: catch a supervisor (or a manually-launched watcher
-	// subcommand) whose state file was overwritten or never written. The real
-	// process cmdline is `<bin>/promptster-teams watch`, so the pattern must
-	// include `-teams` to match (a bare `promptster watch` never would).
-	swept := killStalePromptsterDaemons("promptster-teams watch")
-	swept += killStalePromptsterDaemons("promptster-teams claude-watch")
-	swept += killStalePromptsterDaemons("promptster-teams codex-watch")
-	if swept > 0 {
-		stopped = true
+	stopped := false
+	for pid := range seen {
+		// pidLooksLikeOurs guards against a stale pidfile whose PID the OS has
+		// reused for an unrelated process — processExists only proves the number
+		// is live, so without this a reused PID would get signaled by mistake.
+		if processExists(pid) && pidLooksLikeOurs(pid) {
+			signalAndWaitForExit(pid)
+			stopped = true
+		}
 	}
 
 	// SIGINT/SIGKILL pre-empt the watchers' deferred state cleanup, so clear the
@@ -173,7 +212,7 @@ func StopTeamsDaemon() error {
 	if stopped {
 		fmt.Fprintln(os.Stderr, "promptster-teams: background capture stopped")
 	} else {
-		fmt.Fprintln(os.Stderr, "promptster-teams: no background capture was running")
+		fmt.Fprintln(os.Stderr, "promptster-teams: no tracked background capture was running — if one is running without a pidfile, find it with `pgrep -fl promptster-teams` and stop it manually")
 	}
 	return nil
 }

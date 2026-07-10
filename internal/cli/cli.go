@@ -84,9 +84,12 @@ Commands:
   help         Show this help
 
 Getting started:
-  promptster-teams login            # paste the key your manager gave you
-  promptster-teams start            # capture from the current repo in the background
+  promptster-teams login            # paste your key — capture starts in the background automatically
+  promptster-teams status           # confirm capture is running
   promptster-teams stop             # stop when you're done
+
+Capture runs detached and silent. Set PROMPTSTER_DEBUG=1 before watch/start
+to see per-event watcher logging.
 
 Your developer key is resolved from, in order: --key flag,
 PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by
