@@ -11,6 +11,7 @@ package policy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -20,6 +21,11 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
+
+// maxPolicyBodyBytes caps how much of the policy response we read. The payload
+// is a single boolean object (tens of bytes); 64 KB is generous slack while
+// bounding memory against a malformed or hostile response.
+const maxPolicyBodyBytes = 64 << 10
 
 const (
 	// RefreshInterval is how often a running watcher re-fetches the policy from
@@ -140,7 +146,7 @@ func fetchPolicy(apiKey string) (bool, error) {
 		return false, &httpError{status: resp.StatusCode}
 	}
 	var parsed apiResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPolicyBodyBytes)).Decode(&parsed); err != nil {
 		return false, err
 	}
 	return parsed.CaptureAssistantProse, nil
