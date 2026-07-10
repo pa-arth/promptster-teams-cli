@@ -1,0 +1,10 @@
+# gitleaks fingerprints to ignore (format: <commit>:<file>:<rule>:<line>).
+#
+# The prose-capture test defines a FAKE leak-detection canary const,
+# `PROMPTSTER_LEAK_CANARY_prose_4c1`, used to assert scrubAssistantProse strips
+# embedded source. It is not a credential. HEAD already renames the const off the
+# "secret" keyword and carries a //gitleaks:allow directive, but the original
+# commit (8c89ed4) added it as `proseSecret = "…"`, which gitleaks' history scan
+# (fetch-depth 0) still flags via generic-api-key. This fingerprint suppresses
+# that one historical finding.
+8c89ed4f60b777a5f2ecef0a1b960f2c802573f3:internal/redact/project_test.go:generic-api-key:252
