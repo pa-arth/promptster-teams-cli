@@ -163,16 +163,10 @@ func StartTeamsDaemon(args []string) error {
 // pidfiles (graceful SIGINT, then SIGKILL). The supervisor and both watcher
 // pidfiles all live under StateDir(), so reading them to find PIDs is inherently
 // scoped to this install — `stop` never reaches into another workspace's daemon.
-// With `--force` it additionally runs an unscoped cmdline sweep for true orphans
-// whose pidfiles were lost. Safe to run when nothing is running.
-func StopTeamsDaemon(args []string) error {
-	force := false
-	for _, a := range args {
-		if a == "--force" || a == "-f" {
-			force = true
-		}
-	}
-
+// It deliberately does NOT fall back to a global cmdline sweep: a pgrep over all
+// `promptster-teams … watch` processes is not tied to this state dir, so it could
+// terminate another workspace's daemon. Safe to run when nothing is running.
+func StopTeamsDaemon() error {
 	// Collect candidate PIDs from every pidfile this install writes. The watchers
 	// run as in-process goroutines under one `watch` PID, so the supervisor and
 	// both watcher pidfiles usually point at the same process — the dedup set
@@ -207,23 +201,6 @@ func StopTeamsDaemon(args []string) error {
 		}
 	}
 
-	// Fallback for true orphans (every pidfile lost). This cmdline sweep is NOT
-	// state-dir-scoped: with a different PROMPTSTER_STATE_DIR at stop time it
-	// could match another workspace's daemon, so it is opt-in behind `--force`
-	// and runs only when the scoped pidfile path found nothing live. The pattern
-	// must match the real per-platform binary: the npm build is
-	// `promptster-teams-darwin-arm64`, not `promptster-teams`, so the old exact
-	// `promptster-teams watch` never matched it (pgrep -f takes a regex; `[^ ]*`
-	// absorbs the `-darwin-arm64` suffix).
-	if !stopped && force {
-		swept := killStalePromptsterDaemons(`promptster-teams[^ ]* watch`)
-		swept += killStalePromptsterDaemons(`promptster-teams[^ ]* claude-watch`)
-		swept += killStalePromptsterDaemons(`promptster-teams[^ ]* codex-watch`)
-		if swept > 0 {
-			stopped = true
-		}
-	}
-
 	// SIGINT/SIGKILL pre-empt the watchers' deferred state cleanup, so clear the
 	// state files here — otherwise `status` would read stale until the next
 	// liveness check self-heals them.
@@ -234,10 +211,8 @@ func StopTeamsDaemon(args []string) error {
 
 	if stopped {
 		fmt.Fprintln(os.Stderr, "promptster-teams: background capture stopped")
-	} else if !force {
-		fmt.Fprintln(os.Stderr, "promptster-teams: no tracked background capture was running — if one is running without a pidfile, retry with `promptster-teams stop --force`")
 	} else {
-		fmt.Fprintln(os.Stderr, "promptster-teams: no background capture was running")
+		fmt.Fprintln(os.Stderr, "promptster-teams: no tracked background capture was running — if one is running without a pidfile, find it with `pgrep -fl promptster-teams` and stop it manually")
 	}
 	return nil
 }

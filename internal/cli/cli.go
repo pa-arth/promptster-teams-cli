@@ -38,7 +38,7 @@ func Main(argv []string) int {
 			return 1
 		}
 	case "stop":
-		if err := capture.StopTeamsDaemon(argv[2:]); err != nil {
+		if err := capture.StopTeamsDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "stop error: %v\n", err)
 			return 1
 		}
