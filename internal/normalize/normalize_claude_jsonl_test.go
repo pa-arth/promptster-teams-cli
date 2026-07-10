@@ -401,6 +401,97 @@ func TestClaudeTranscriptUsageOnlyMode(t *testing.T) {
 	}
 }
 
+// idempotencyLines is a self-contained turn that exercises every watcher-owned
+// kind that was observed duplicated in the wild (prompt, ai_response, command)
+// plus context_compact. Each line carries the stable identity Claude Code
+// writes (line `uuid`, message.id, tool_use_id) that the fix keys event ids off.
+var idempotencyLines = []string{
+	`{"type":"user","message":{"role":"user","content":"add retry to the ingest client"},"timestamp":"2026-06-10T09:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-9","uuid":"line-prompt-1"}`,
+	`{"type":"assistant","requestId":"req-9","message":{"id":"msg-9","model":"claude-sonnet-4-6","content":[{"type":"text","text":"On it."},{"type":"tool_use","id":"toolu_9","name":"Bash","input":{"command":"go build ./..."}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T09:00:05.000Z","uuid":"line-asst-1"}`,
+	`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_9","content":"ok"}]},"toolUseResult":{"stdout":"ok\n","stderr":"","interrupted":false},"timestamp":"2026-06-10T09:00:09.000Z","uuid":"line-toolres-1"}`,
+	`{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto"},"timestamp":"2026-06-10T09:00:12.000Z","uuid":"line-compact-1"}`,
+}
+
+// idsByKind processes the canonical turn through a FRESH processor (a fresh
+// processor is exactly what a resumed/forked transcript, a re-tail after a
+// watcher restart, or re-reading a mis-advanced offset produces) and returns
+// kind -> [event ids]. FlushStale drains the final accumulated message.
+func idsByKind(t *testing.T, sessionID string) map[string][]string {
+	t.Helper()
+	p := NewClaudeTranscriptProcessor(sessionID)
+	events := processAll(t, p, idempotencyLines...)
+	events = append(events, p.FlushStale(0)...)
+	out := map[string][]string{}
+	for _, e := range events {
+		if e.ID == "" {
+			t.Fatalf("event %s has empty id", e.Kind)
+		}
+		out[e.Kind] = append(out[e.Kind], e.ID)
+	}
+	return out
+}
+
+// TestClaudeTranscriptDeterministicEventIDs is the regression guard for the
+// timeline double-emit bug: the SAME source line/message must never yield two
+// distinct event ids, no matter how the transcript is re-observed. Two
+// independent processors over identical input model all three duplicate
+// mechanisms at once — a forked/resumed transcript that copied prior history
+// (two files, two processors), a re-tail after a watcher restart, and a re-read
+// from an offset wobble. If ids matched only within one processor the backend
+// could not dedupe; they must be byte-identical across processors.
+func TestClaudeTranscriptDeterministicEventIDs(t *testing.T) {
+	first := idsByKind(t, "sess-idem")
+	second := idsByKind(t, "sess-idem")
+
+	wantKinds := []string{"prompt", "ai_response", "command", "context_compact"}
+	for _, k := range wantKinds {
+		ids := first[k]
+		if len(ids) != 1 {
+			t.Fatalf("expected exactly one %s event, got %d (%v)", k, len(ids), ids)
+		}
+		if len(second[k]) != 1 {
+			t.Fatalf("expected exactly one %s event in second run, got %d (%v)", k, len(second[k]), second[k])
+		}
+		if second[k][0] != ids[0] {
+			t.Errorf("%s id not idempotent across re-observation: %q (first) vs %q (second)",
+				k, ids[0], second[k][0])
+		}
+	}
+
+	// Every emitted id must be distinct across kinds — determinism must not
+	// collapse different logical events onto the same id.
+	seen := map[string]string{}
+	for kind, ids := range first {
+		for _, id := range ids {
+			if prev, dup := seen[id]; dup {
+				t.Errorf("id %q reused across kinds %s and %s", id, prev, kind)
+			}
+			seen[id] = kind
+		}
+	}
+
+	// A different session must NOT collide with this one — ids are session-scoped.
+	other := idsByKind(t, "sess-other")
+	if other["prompt"][0] == first["prompt"][0] {
+		t.Errorf("prompt id collided across sessions: %q", other["prompt"][0])
+	}
+}
+
+// TestDeterministicUUIDStableAndVersioned pins the primitive the fix relies on:
+// same input -> same valid v5 UUID, different input -> different id.
+func TestDeterministicUUIDStableAndVersioned(t *testing.T) {
+	a := event.DeterministicUUID("sess-1\x1fprompt\x1fline-1")
+	if a != event.DeterministicUUID("sess-1\x1fprompt\x1fline-1") {
+		t.Fatalf("DeterministicUUID not stable for identical input")
+	}
+	if a == event.DeterministicUUID("sess-1\x1fprompt\x1fline-2") {
+		t.Fatalf("DeterministicUUID collided for distinct input")
+	}
+	if len(a) != 36 || a[14] != '5' {
+		t.Fatalf("not a v5 UUID: %q", a)
+	}
+}
+
 func TestParseClaudeExitCodeFromErrorText(t *testing.T) {
 	p := NewClaudeTranscriptProcessor("sess-1")
 	events := processAll(t, p,
