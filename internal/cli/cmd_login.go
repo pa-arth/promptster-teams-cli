@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 )
 
@@ -78,7 +79,22 @@ func cmdLogin(args []string) {
 		"stored", prettyHome(ingest.CredentialsPath()),
 	)))
 	fmt.Println()
-	printlnIndent(dimStyle.Render("Run ") + bodyStyle.Render("promptster-teams watch") + dimStyle.Render(" from a repo to start capturing."))
+
+	// Auto-start background capture so login is the only command a new engineer
+	// has to run — capture "just works" afterward instead of waiting for a manual
+	// `start`. StartDaemon is idempotent (no-ops if a supervisor is already alive)
+	// and detaches, so it never holds the terminal.
+	pid, _, already, startErr := capture.StartDaemon(nil)
+	switch {
+	case startErr != nil:
+		printlnIndent(fmt.Sprintf("%s key saved, but couldn't auto-start capture: %v", warnGlyph, startErr))
+		printlnIndent(dimStyle.Render("Start it yourself with ") + bodyStyle.Render("promptster-teams start") + dimStyle.Render("."))
+	case already:
+		printlnIndent(fmt.Sprintf("%s capture already running in the background (pid %d)", okGlyph, pid))
+	default:
+		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, pid))
+		printlnIndent(dimStyle.Render("Stop anytime with ") + bodyStyle.Render("promptster-teams stop") + dimStyle.Render("."))
+	}
 	fmt.Println()
 }
 

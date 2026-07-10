@@ -40,6 +40,17 @@ func loadSession() (Session, error) {
 	}, nil
 }
 
+// verboseWatch reports whether the watchers should emit chatty per-flush and
+// per-startup progress lines ("sent N event(s) from X", "started, polling …").
+// Off by default: those lines fire on every 3s poll and bury the useful
+// startup/shutdown/error lines — and in detached mode they flood daemon.log.
+// Set PROMPTSTER_DEBUG=1 to turn them back on. `status` surfaces the running
+// event count instead. Errors, degraded/handoff, and shutdown lines are never
+// gated (they're rare and actionable).
+func verboseWatch() bool {
+	return os.Getenv("PROMPTSTER_DEBUG") == "1"
+}
+
 // deviceID returns a stable, anonymous per-device identifier (a hash of the
 // machine id, falling back to hostname+user). It is the only identity stamped
 // on events in this phase; org -> team -> developer enrollment lands with the

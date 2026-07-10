@@ -176,8 +176,10 @@ func RunCodexWatcher() error {
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 	eventsSent := 0
 
-	fmt.Fprintf(os.Stderr, "codex-watcher: started, polling %s every %s (workspace=%s)\n",
-		codexSessionsDir(), codexWatchInterval, workspace)
+	if verboseWatch() {
+		fmt.Fprintf(os.Stderr, "codex-watcher: started, polling %s every %s (workspace=%s)\n",
+			codexSessionsDir(), codexWatchInterval, workspace)
+	}
 
 	for {
 		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client)
@@ -357,7 +359,7 @@ func tailCodexRollout(
 
 	if consumed > 0 {
 		progress.Offsets[path] = offset + consumed
-		if sent > 0 {
+		if sent > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "codex-watcher: sent %d event(s) from %s\n", sent, filepath.Base(path))
 		}
 	}
