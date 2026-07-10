@@ -72,3 +72,27 @@ func TestResolverDefaultFalse(t *testing.T) {
 		t.Fatal("expected false before any successful fetch")
 	}
 }
+
+// TestResolverAdoptsDiskCache proves a fresh process (a second Resolver over the
+// same state dir) picks up a within-TTL cached policy WITHOUT a network fetch:
+// resolver #1 does a successful opted-in Refresh (writing the disk cache), then
+// resolver #2 reports true straight from NewResolver, never calling Refresh.
+func TestResolverAdoptsDiskCache(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"captureAssistantProse":true}`))
+	})
+
+	// Resolver #1 fetches and persists the cache.
+	r1 := NewResolver("PSE-TEST")
+	r1.Refresh()
+	if !r1.CaptureAssistantProse() {
+		t.Fatal("resolver #1: expected true after a successful fetch")
+	}
+
+	// Resolver #2 shares the state dir (set by setup) and must adopt the cache
+	// on construction — no Refresh call.
+	r2 := NewResolver("PSE-TEST")
+	if !r2.CaptureAssistantProse() {
+		t.Fatal("resolver #2: expected true adopted from the disk cache without Refresh")
+	}
+}
