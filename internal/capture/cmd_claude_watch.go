@@ -15,6 +15,7 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -293,12 +294,25 @@ func RunClaudeWatcher() error {
 	var bytesConsumed, bytesSinceEvent int64
 	degraded := false
 
+	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
+	// successful fetch says otherwise. Resolved once at start and re-fetched on
+	// the policy cadence; the resolved bool is threaded into every projected
+	// event via ingestClaudeWatchEvent -> AppendEventToLocalBuffer.
+	policyResolver := policy.NewResolver(session.SessionToken)
+	policyResolver.Refresh()
+	lastPolicyRefresh := time.Now()
+
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "claude-watcher: started, polling %s every %s (workspace=%s)\n",
 			ClaudeProjectsDir(), claudeWatchInterval, workspace)
 	}
 
 	for {
+		if time.Since(lastPolicyRefresh) >= policy.RefreshInterval {
+			policyResolver.Refresh()
+			lastPolicyRefresh = time.Now()
+		}
+		captureProse := policyResolver.CaptureAssistantProse()
 		// While degraded, hooks own emission — the watcher keeps PARSING (to
 		// detect recovery and advance offsets) but discards events: hooks were
 		// live for that window and already emitted them. The first poll that
@@ -306,7 +320,7 @@ func RunClaudeWatcher() error {
 		// owns emission and hooks suppress again. This handoff means neither a
 		// real mid-session format break nor a false-positive degradation can
 		// double-emit or lose events.
-		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, client, degraded)
+		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, client, degraded, captureProse)
 		bytesConsumed += consumed
 		wasDegraded := degraded
 		degraded, bytesSinceEvent = claudeDegradationStep(degraded, parsed, consumed, bytesSinceEvent)
@@ -349,6 +363,7 @@ func pollClaudeTranscripts(
 	processors map[string]*normalize.ClaudeTranscriptProcessor,
 	client *http.Client,
 	dryRun bool,
+	captureProse bool,
 ) (int, int64) {
 	progress := loadClaudeWatchProgress()
 	sent := 0
@@ -385,7 +400,7 @@ func pollClaudeTranscripts(
 			}
 			processors[path] = proc
 		}
-		n, c := tailClaudeTranscript(path, progress, proc, session, client, dryRun)
+		n, c := tailClaudeTranscript(path, progress, proc, session, client, dryRun, captureProse)
 		sent += n
 		consumed += c
 	}
@@ -398,7 +413,7 @@ func pollClaudeTranscripts(
 				sent++
 				continue
 			}
-			if ingestClaudeWatchEvent(ev, session, client) {
+			if ingestClaudeWatchEvent(ev, session, client, captureProse) {
 				sent++
 			}
 		}
@@ -562,6 +577,7 @@ func tailClaudeTranscript(
 	session Session,
 	client *http.Client,
 	dryRun bool,
+	captureProse bool,
 ) (int, int64) {
 	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -597,7 +613,7 @@ func tailClaudeTranscript(
 				continue
 			}
 			ev := ev
-			if ingestClaudeWatchEvent(ev, session, client) {
+			if ingestClaudeWatchEvent(ev, session, client, captureProse) {
 				sent++
 			}
 		}
@@ -615,14 +631,14 @@ func tailClaudeTranscript(
 // ingestClaudeWatchEvent runs the shared per-event funnel (path relativize,
 // cross-channel file_diff dedup, local signed buffer, ingest POST). Returns
 // true when the event was sent.
-func ingestClaudeWatchEvent(ev event.Event, session Session, client *http.Client) bool {
+func ingestClaudeWatchEvent(ev event.Event, session Session, client *http.Client, captureProse bool) bool {
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.
 	if !dedupeFileDiff(session.TaskRoot, &ev) {
 		return false
 	}
-	if err := sign.AppendEventToLocalBuffer(&ev); err != nil {
+	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: buffer error: %v\n", err)
 	}
 	if err := ingest.IngestEventWithClient(client, ev, session.SessionToken); err != nil {

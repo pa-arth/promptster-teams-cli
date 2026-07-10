@@ -13,6 +13,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -176,13 +177,25 @@ func RunCodexWatcher() error {
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 	eventsSent := 0
 
+	// Org capture policy (opt-in assistant prose), fail-closed. Resolved at
+	// start and re-fetched on the policy cadence; threaded into every projected
+	// event via tailCodexRollout -> AppendEventToLocalBuffer.
+	policyResolver := policy.NewResolver(session.SessionToken)
+	policyResolver.Refresh()
+	lastPolicyRefresh := time.Now()
+
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "codex-watcher: started, polling %s every %s (workspace=%s)\n",
 			codexSessionsDir(), codexWatchInterval, workspace)
 	}
 
 	for {
-		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client)
+		if time.Since(lastPolicyRefresh) >= policy.RefreshInterval {
+			policyResolver.Refresh()
+			lastPolicyRefresh = time.Now()
+		}
+		captureProse := policyResolver.CaptureAssistantProse()
+		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client, captureProse)
 		eventsSent += sent
 
 		_ = saveCodexWatcherState(codexWatcherState{
@@ -207,6 +220,7 @@ func pollCodexRollouts(
 	startCutoff time.Time,
 	processors map[string]*normalize.CodexRolloutProcessor,
 	client *http.Client,
+	captureProse bool,
 ) int {
 	dir := codexSessionsDir()
 	progress := loadCodexWatchProgress()
@@ -245,7 +259,7 @@ func pollCodexRollouts(
 			proc = normalize.NewCodexRolloutProcessor(session.SessionID)
 			processors[path] = proc
 		}
-		n := tailCodexRollout(path, progress, proc, session, client)
+		n := tailCodexRollout(path, progress, proc, session, client, captureProse)
 		sent += n
 		return nil
 	})
@@ -297,6 +311,7 @@ func tailCodexRollout(
 	proc *normalize.CodexRolloutProcessor,
 	session Session,
 	client *http.Client,
+	captureProse bool,
 ) int {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -337,7 +352,7 @@ func tailCodexRollout(
 			if !dedupeFileDiff(session.TaskRoot, &ev) {
 				continue
 			}
-			if err := sign.AppendEventToLocalBuffer(&ev); err != nil {
+			if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 				fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
 			}
 			if err := ingest.IngestEventWithClient(client, ev, session.SessionToken); err != nil {

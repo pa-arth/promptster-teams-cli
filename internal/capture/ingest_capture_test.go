@@ -27,7 +27,7 @@ func TestIngestClaudeWatchEventToleratesRejection(t *testing.T) {
 	}))
 	defer rejecting.Close()
 	t.Setenv("PROMPTSTER_API_URL", rejecting.URL)
-	if !ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, rejecting.Client()) {
+	if !ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, rejecting.Client(), false) {
 		t.Error("4xx rejection must count as handled (no degradation, no retry)")
 	}
 
@@ -36,7 +36,7 @@ func TestIngestClaudeWatchEventToleratesRejection(t *testing.T) {
 	}))
 	defer failing.Close()
 	t.Setenv("PROMPTSTER_API_URL", failing.URL)
-	if ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, failing.Client()) {
+	if ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, failing.Client(), false) {
 		t.Error("5xx must still count as a send failure")
 	}
 }

@@ -20,6 +20,24 @@ follows [Semantic Versioning](https://semver.org/).
 - Internal `docs/teams-cli-e2e-findings.md` engineering work-log (no longer part
   of the published repository).
 
+## [0.5.0] — 2026-07-09
+
+### Added
+- **Opt-in assistant-prose capture (org-gated, default off)** — when an org
+  turns it on, the CLI keeps assistant response narration instead of dropping it
+  entirely. The policy is fetched from `GET /v1/teams/policy`
+  (`{ captureAssistantProse }`), refreshed at watch start and every 10 minutes,
+  cached to the state dir, and **fail-closed**: any error (network, non-200,
+  unparseable, teams-not-configured 503, or no cache) resolves to false, so prose
+  is only ever captured when the backend affirmatively opts the org in.
+- **`scrubAssistantProse` on-device scrubber** — before any kept assistant text
+  is signed, buffered, or sent, code is stripped out on-device: fenced code
+  blocks and anchored diff/patch runs collapse to a `<code-redacted>` marker, and
+  over-long inline backtick spans are redacted, while narration and short symbol
+  references (`useState`, `src/x.ts`) survive. Byte-for-byte lockstep with the
+  backend scrubber, so the never-store-source guarantee holds even with prose
+  capture enabled.
+
 ## [0.4.0] — 2026-07-07
 
 ### Added
@@ -53,7 +71,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.1.1...v0.2.0

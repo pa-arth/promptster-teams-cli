@@ -1,0 +1,189 @@
+// Package policy resolves and caches the org-level teams capture policy that
+// gates opt-in behaviors on-device. Today it carries a single flag —
+// captureAssistantProse — fetched from GET /v1/teams/policy and threaded into
+// the projection choke point (redact.ProjectEvent) by the watch loops.
+//
+// The design is FAIL-CLOSED by construction: the resolved value is false unless
+// a SUCCESSFUL, recent fetch affirmatively set it true. Every failure path
+// (network error, non-200, unparseable body, teams-not-configured 503, missing
+// cache) resolves to false, so assistant prose is never captured on doubt.
+package policy
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
+)
+
+const (
+	// RefreshInterval is how often a running watcher re-fetches the policy from
+	// the backend. The watch loop calls Refresh once at start and then on this
+	// cadence.
+	RefreshInterval = 10 * time.Minute
+
+	// cacheTTL is how long a successfully-fetched value stays trusted without a
+	// fresh confirmation. It is longer than RefreshInterval so a single failed
+	// refresh doesn't flip capture off mid-window; a sustained outage (two-plus
+	// consecutive failures) ages the value out and CaptureAssistantProse fails
+	// closed to false.
+	cacheTTL = 15 * time.Minute
+
+	// cacheFileName is the on-disk cache under the state dir. It lets a fresh
+	// process reuse a recent successful fetch (within cacheTTL) instead of
+	// starting from false until its first refresh completes.
+	cacheFileName = "teams-policy.json"
+
+	// defaultPolicyPath is the backend route. Override with
+	// PROMPTSTER_TEAMS_POLICY_PATH (parity with PROMPTSTER_TEAMS_INGEST_PATH).
+	defaultPolicyPath = "/v1/teams/policy"
+)
+
+// policyPath returns the policy route, honoring the env override.
+func policyPath() string {
+	if p := os.Getenv("PROMPTSTER_TEAMS_POLICY_PATH"); p != "" {
+		return p
+	}
+	return defaultPolicyPath
+}
+
+// apiResponse mirrors GET /v1/teams/policy.
+type apiResponse struct {
+	CaptureAssistantProse bool `json:"captureAssistantProse"`
+}
+
+// diskCache is the on-disk shape: the resolved flag plus when it was fetched.
+type diskCache struct {
+	CaptureAssistantProse bool      `json:"captureAssistantProse"`
+	FetchedAt             time.Time `json:"fetchedAt"`
+}
+
+// Resolver caches the org's capture policy for one CLI process. Safe for
+// concurrent use (the watch loops read it from their poll goroutines while a
+// refresh may be in flight).
+type Resolver struct {
+	apiKey string
+
+	mu        sync.Mutex
+	value     bool
+	fetchedAt time.Time // time of the last SUCCESSFUL fetch (zero = never)
+}
+
+// NewResolver builds a Resolver for the given PSE engineer key. If a recent
+// (within cacheTTL) successful fetch was persisted by an earlier run, it is
+// adopted so the process starts from the last known-good policy rather than
+// false — the "stale cache within the refresh window may be used" allowance.
+func NewResolver(apiKey string) *Resolver {
+	r := &Resolver{apiKey: apiKey}
+	if c, ok := readDiskCache(); ok && time.Since(c.FetchedAt) < cacheTTL {
+		r.value = c.CaptureAssistantProse
+		r.fetchedAt = c.FetchedAt
+	}
+	return r
+}
+
+// CaptureAssistantProse returns the current policy WITHOUT any network call:
+// the cached value from the last successful fetch, but only while it is still
+// within cacheTTL. It is false until a successful Refresh (or an adopted disk
+// cache) sets it true, and it decays back to false once the last good fetch
+// ages out — so a watcher whose refreshes all fail fails closed on its own.
+func (r *Resolver) CaptureAssistantProse() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.value && !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL {
+		return true
+	}
+	return false
+}
+
+// Refresh performs one network fetch and, on success, updates the cached value
+// (memory + disk) and its freshness timestamp. On ANY error it is a no-op: the
+// prior value is retained and left to age out via cacheTTL, so a transient blip
+// doesn't immediately drop capture but a real outage still fails closed. Safe
+// to call at watch start and on a ticker.
+func (r *Resolver) Refresh() {
+	val, err := fetchPolicy(r.apiKey)
+	if err != nil {
+		// Fail-closed: keep the last good value (if any); CaptureAssistantProse
+		// enforces cacheTTL so a stale value can't be trusted indefinitely.
+		return
+	}
+	now := time.Now()
+	r.mu.Lock()
+	r.value = val
+	r.fetchedAt = now
+	r.mu.Unlock()
+	writeDiskCache(diskCache{CaptureAssistantProse: val, FetchedAt: now})
+}
+
+// fetchPolicy does the GET and parses the response. Returns an error on any
+// non-200, transport failure, or unparseable body so the caller fails closed.
+func fetchPolicy(apiKey string) (bool, error) {
+	req, err := http.NewRequest(http.MethodGet, ingest.APIURL()+policyPath(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("X-API-Key", apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := ingest.HTTPClient().Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, &httpError{status: resp.StatusCode}
+	}
+	var parsed apiResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return false, err
+	}
+	return parsed.CaptureAssistantProse, nil
+}
+
+// httpError is a non-200 policy response.
+type httpError struct{ status int }
+
+func (e *httpError) Error() string {
+	return "policy fetch: unexpected HTTP status " + http.StatusText(e.status)
+}
+
+func cacheFilePath() string {
+	return filepath.Join(state.StateDir(), cacheFileName)
+}
+
+func readDiskCache() (diskCache, bool) {
+	data, err := os.ReadFile(cacheFilePath())
+	if err != nil {
+		return diskCache{}, false
+	}
+	var c diskCache
+	if err := json.Unmarshal(data, &c); err != nil {
+		return diskCache{}, false
+	}
+	if c.FetchedAt.IsZero() {
+		return diskCache{}, false
+	}
+	return c, true
+}
+
+func writeDiskCache(c diskCache) {
+	data, err := json.Marshal(c)
+	if err != nil {
+		return
+	}
+	dir := state.StateDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	tmp := cacheFilePath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, cacheFilePath())
+}

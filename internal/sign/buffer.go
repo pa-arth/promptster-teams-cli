@@ -15,15 +15,21 @@ import (
 // and appends it under an exclusive lock. It mutates the event with Sig/PrevSig
 // so the caller POSTs the signed version unchanged.
 //
+// captureAssistantProse is the org policy resolved and threaded from the watch
+// loop (default false / fail-closed). It only affects ai_response.text; all
+// other kinds project identically regardless. Emitters with no assistant text
+// (presence, config_census) pass false.
+//
 // The local buffer + signature chain is a trust feature, not surveillance: it
 // lets a team independently verify the event stream wasn't tampered with.
-func AppendEventToLocalBuffer(ev *event.Event) error {
+func AppendEventToLocalBuffer(ev *event.Event, captureAssistantProse bool) error {
 	// Source exclusion + secret scrub at the choke point every capture path
 	// funnels through, before the event is signed or persisted anywhere.
 	// projectEvent strips source-bearing fields (diffs, stdout, file contents,
 	// assistant text, RawPayload) so they never reach the buffer, the signature,
-	// or the wire; scrubEvent then redacts secrets from what remains.
-	redact.ProjectEvent(ev)
+	// or the wire; scrubEvent then redacts secrets from what remains. With the
+	// org policy on, ai_response prose survives — code-scrubbed on-device.
+	redact.ProjectEvent(ev, captureAssistantProse)
 	redact.ScrubEvent(ev)
 	p := state.HookBufferPath()
 	return WithBufferLock(p, func() error {
