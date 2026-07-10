@@ -246,10 +246,11 @@ func TestScrubInlineCommand(t *testing.T) {
 	}
 }
 
-// proseSecret / proseMarker mirror the constants in the backend's
-// scrubAssistantProse.test.ts LOCKSTEP table.
+// proseCanary / proseMarker mirror the constants in the backend's
+// scrubAssistantProse.test.ts LOCKSTEP table. proseCanary is a fake leak-detection
+// sentinel, not a credential — the trailing directive keeps gitleaks from flagging it.
 const (
-	proseSecret = "PROMPTSTER_LEAK_CANARY_prose_4c1"
+	proseCanary = "PROMPTSTER_LEAK_CANARY_prose_4c1" //gitleaks:allow
 	proseMarker = "<code-redacted>"
 )
 
@@ -270,17 +271,17 @@ func TestScrubAssistantProse(t *testing.T) {
 		},
 		{
 			name: "fenced block collapses to marker",
-			in:   j("I'll edit `auth.ts` then run:", "```ts", `const x = "`+proseSecret+`"`, "```", "Done."),
+			in:   j("I'll edit `auth.ts` then run:", "```ts", `const x = "`+proseCanary+`"`, "```", "Done."),
 			want: j("I'll edit `auth.ts` then run:", "```ts", proseMarker, "```", "Done."),
 		},
 		{
 			name: "tilde fence collapses",
-			in:   j("~~~python", `print("`+proseSecret+`")`, "~~~"),
+			in:   j("~~~python", `print("`+proseCanary+`")`, "~~~"),
 			want: j("~~~python", proseMarker, "~~~"),
 		},
 		{
 			name: "unterminated fence collapses",
-			in:   j("text", "```js", `evil("`+proseSecret+`")`),
+			in:   j("text", "```js", `evil("`+proseCanary+`")`),
 			want: j("text", "```js", proseMarker),
 		},
 		{
@@ -290,13 +291,13 @@ func TestScrubAssistantProse(t *testing.T) {
 		},
 		{
 			name: "over-long inline span redacted",
-			in:   "Set `const apiKey = process.env." + proseSecret + "_LONG_ENV_NAME` in config.",
+			in:   "Set `const apiKey = process.env." + proseCanary + "_LONG_ENV_NAME` in config.",
 			want: "Set `" + proseMarker + "` in config.",
 		},
 		{
 			name: "unfenced diff run collapses",
 			in: j("Here's the patch:", "diff --git a/x.ts b/x.ts", "@@ -1,2 +1,2 @@",
-				"-const a = 1", `+const a = "`+proseSecret+`"`, "Looks good."),
+				"-const a = 1", `+const a = "`+proseCanary+`"`, "Looks good."),
 			want: j("Here's the patch:", proseMarker, "Looks good."),
 		},
 		{
@@ -317,7 +318,7 @@ func TestScrubAssistantProse(t *testing.T) {
 			if got != tc.want {
 				t.Errorf("scrubAssistantProse(%q)\n  got  %q\n  want %q", tc.in, got, tc.want)
 			}
-			if strings.Contains(got, proseSecret) {
+			if strings.Contains(got, proseCanary) {
 				t.Errorf("secret survived scrub: %q", got)
 			}
 		})
@@ -330,7 +331,7 @@ func TestProjectEventAssistantProseGate(t *testing.T) {
 	proseText := j2(
 		"I'll edit `auth.ts` then run:",
 		"```ts",
-		`const k = "`+proseSecret+`"`,
+		`const k = "`+proseCanary+`"`,
 		"```",
 		"Done.",
 	)
@@ -359,7 +360,7 @@ func TestProjectEventAssistantProseGate(t *testing.T) {
 			t.Errorf("usage model lost: %v", data["model"])
 		}
 		b, _ := json.Marshal(e)
-		if strings.Contains(string(b), proseSecret) {
+		if strings.Contains(string(b), proseCanary) {
 			t.Errorf("secret survived with policy off: %s", b)
 		}
 	})
@@ -372,7 +373,7 @@ func TestProjectEventAssistantProseGate(t *testing.T) {
 		if !ok {
 			t.Fatalf("text dropped with policy on")
 		}
-		if strings.Contains(text, proseSecret) {
+		if strings.Contains(text, proseCanary) {
 			t.Errorf("secret survived the on-device scrub: %q", text)
 		}
 		if !strings.Contains(text, "auth.ts") {
@@ -389,7 +390,7 @@ func TestProjectEventAssistantProseGate(t *testing.T) {
 			t.Errorf("usage model lost: %v", data["model"])
 		}
 		b, _ := json.Marshal(e)
-		if strings.Contains(string(b), proseSecret) {
+		if strings.Contains(string(b), proseCanary) {
 			t.Errorf("secret survived somewhere in the event: %s", b)
 		}
 	})
