@@ -121,8 +121,28 @@ func transcriptAiProvenance() *event.Provenance {
 	}
 }
 
-func (p *ClaudeTranscriptProcessor) newTranscriptEvent(kind, ts string) event.Event {
+// stableEventID derives a deterministic event id from a STABLE per-source key
+// (a transcript line's own `uuid`, an assistant message.id, or a tool_use_id)
+// scoped by session and kind. The same logical source therefore always yields
+// the same id — so a line re-read after an offset wobble, re-tailed from a
+// resumed/forked transcript that copied prior history, or an event resent after
+// a transport error all collapse to ONE row on the backend instead of landing
+// as byte-identical duplicates with fresh random ids. When sourceKey is empty
+// (a malformed line missing its uuid) it falls back to a random id — never
+// worse than the previous always-random behavior.
+func (p *ClaudeTranscriptProcessor) stableEventID(sourceKey, kind string) string {
+	if sourceKey == "" {
+		return event.NewUUID()
+	}
+	return event.DeterministicUUID(p.sessionID + "\x1f" + kind + "\x1f" + sourceKey)
+}
+
+// newTranscriptEvent builds a canonical event for a transcript-derived kind.
+// sourceKey is the stable identity of the source (line uuid / message.id /
+// tool_use_id); pass "" only when no stable key exists.
+func (p *ClaudeTranscriptProcessor) newTranscriptEvent(kind, ts, sourceKey string) event.Event {
 	e := event.NewEvent(kind, p.sessionID)
+	e.ID = p.stableEventID(sourceKey, kind)
 	e.Source = "claude-code"
 	switch kind {
 	case "prompt":
@@ -238,7 +258,7 @@ func (p *ClaudeTranscriptProcessor) processLine(line []byte) []event.Event {
 // (context window exhausted) from a typed /compact.
 func (p *ClaudeTranscriptProcessor) compactBoundaryEvent(rec map[string]interface{}) event.Event {
 	ts, _ := rec["timestamp"].(string)
-	e := p.newTranscriptEvent("context_compact", ts)
+	e := p.newTranscriptEvent("context_compact", ts, stringField(rec, "uuid"))
 	e.Actor = event.SystemActor()
 	data := map[string]interface{}{}
 	if cm, ok := rec["compactMetadata"].(map[string]interface{}); ok {
@@ -276,7 +296,8 @@ func (p *ClaudeTranscriptProcessor) sidechainUsage(rec map[string]interface{}) [
 	p.emittedMsgIDs[msgID] = true
 
 	ts, _ := rec["timestamp"].(string)
-	e := p.newTranscriptEvent("subagent_usage", ts)
+	// message.id is stable per subagent API response across re-reads/forks.
+	e := p.newTranscriptEvent("subagent_usage", ts, msgID)
 	e.Provenance = transcriptAiProvenance()
 	data := map[string]interface{}{
 		"usageScope":       "request",
@@ -385,7 +406,10 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 	}
 	p.emittedMsgIDs[a.msgID] = true
 
-	e := p.newTranscriptEvent("ai_response", a.ts)
+	// message.id keys the whole accumulated response; it is stable across a
+	// re-read of the transcript or a resumed/forked copy of these lines, so the
+	// ai_response id is deterministic even though it spans multiple lines.
+	e := p.newTranscriptEvent("ai_response", a.ts, a.msgID)
 	e.Provenance = transcriptAiProvenance()
 	data := map[string]interface{}{
 		"lastAssistantMessage": a.text.String(),
@@ -500,7 +524,7 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 		}
 	}
 
-	e := p.newTranscriptEvent("prompt", ts)
+	e := p.newTranscriptEvent("prompt", ts, stringField(rec, "uuid"))
 	data := map[string]interface{}{"text": text}
 	if command != "" {
 		data["command"] = command
@@ -611,6 +635,10 @@ func (p *ClaudeTranscriptProcessor) resolveToolResult(rec map[string]interface{}
 		return event.Event{}, false
 	}
 	ev.Source = "claude-code"
+	// tool_use_id is unique per tool call and stable across re-reads / forked
+	// transcripts, so derive a deterministic id from it (the normalizer minted a
+	// random one). One tool_use resolves to exactly one event.
+	ev.ID = p.stableEventID(id, ev.Kind)
 	if t := parseCodexTs(ts); t != "" {
 		ev.Ts = t
 	}
