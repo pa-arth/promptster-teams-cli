@@ -16,6 +16,7 @@
 package service
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -40,14 +41,22 @@ type Manager interface {
 	Status() (installed bool, detail string, err error)
 }
 
-// binPath is the binary the service invokes — the canonical install path,
-// already .exe-aware on Windows (internal/state/hooks.go).
-func binPath() string { return state.PromptsterBin() }
-
-// logPath is where launchd/Task Scheduler tee the watcher's stdout/stderr. It
-// sits alongside the manual daemon's log under ~/.promptster-teams. (systemd
-// logs to journald instead — see renderUnit.)
-func logPath() string { return filepath.Join(state.GlobalPromptsterDir(), "daemon.log") }
+// binPath is the binary the service should invoke at login. It prefers the
+// actual running executable (os.Executable) so the registered path is guaranteed
+// to exist: npm installs run the binary from node_modules, NOT the canonical
+// ~/.promptster-teams/bin that state.PromptsterBin() assumes — registering that
+// hardcoded path would leave launchd/systemd/Task Scheduler pointing at a file
+// that can't exec. Symlinks are resolved (npm global bin is a symlink). Falls
+// back to the canonical path only if the executable can't be resolved.
+func binPath() string {
+	if exe, err := os.Executable(); err == nil {
+		if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+			return resolved
+		}
+		return exe
+	}
+	return state.PromptsterBin()
+}
 
 // xmlEscape escapes the five XML special chars for safe interpolation into the
 // plist (a home/bin path could in principle contain & or <).
@@ -100,9 +109,13 @@ func renderPlist(bin, log, home string) string {
 }
 
 // renderUnit builds the systemd --user unit for Linux. WantedBy=default.target
-// starts it at graphical/user login; Restart=always revives it on crash. Logs
-// go to journald (journalctl --user -u promptster-teams). The binary is quoted
-// so a home dir with spaces still parses.
+// starts it at graphical/user login. Restart=on-failure (NOT always) is the
+// systemd analog of the mac plist's KeepAlive{SuccessfulExit:false}: it revives
+// a crashed watcher but does NOT restart a clean exit(0) — critical because the
+// single-instance guard exits 0 when the lock is already held, and Restart=always
+// would busy-loop that bow-out every RestartSec forever. Logs go to journald
+// (journalctl --user -u promptster-teams). The binary is quoted so a home dir
+// with spaces still parses.
 func renderUnit(bin string) string {
 	return `[Unit]
 Description=Promptster Teams — on-device AI coding capture
@@ -111,7 +124,7 @@ After=default.target
 [Service]
 Type=simple
 ExecStart="` + bin + `" watch
-Restart=always
+Restart=on-failure
 RestartSec=10
 
 [Install]

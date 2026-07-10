@@ -2,6 +2,7 @@ package capture
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -31,5 +32,22 @@ func TestWatchLockIsSingleInstance(t *testing.T) {
 	if ok2 {
 		rel2()
 		t.Fatal("second acquire succeeded while the first was held — single-instance guard is broken")
+	}
+}
+
+// TestWatchRunningIgnoresStaleReusedPID guards the PID-reuse trap: a stale
+// watch.lock left after a crash/reboot, whose old PID has been recycled by an
+// unrelated live process, must NOT read as running. Liveness comes from the
+// lock (nobody holds it here), not the stored PID.
+func TestWatchRunningIgnoresStaleReusedPID(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	// PID 1 (init/launchd) always exists — a PID-based check would call this
+	// "running"; a lock-based check must not, since no one holds the lock.
+	if err := os.WriteFile(filepath.Join(dir, "watch.lock"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if pid, running := watchRunning(); running {
+		t.Fatalf("watchRunning reported running (pid %d) from a stale lock with a reused PID — must derive liveness from the lock", pid)
 	}
 }

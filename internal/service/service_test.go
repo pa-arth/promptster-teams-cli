@@ -1,10 +1,21 @@
 package service
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
 )
+
+// TestBinPathExists guards the npm-path trap: the binary the service registers
+// must actually exist. os.Executable() (the running binary) always does; a
+// hardcoded ~/.promptster-teams/bin path does not for npm installs.
+func TestBinPathExists(t *testing.T) {
+	p := binPath()
+	if _, err := os.Stat(p); err != nil {
+		t.Fatalf("binPath()=%q must point at an existing executable: %v", p, err)
+	}
+}
 
 func TestRenderPlist(t *testing.T) {
 	out := renderPlist("/opt/pt/promptster-teams", "/home/u/.promptster-teams/daemon.log", "/home/u")
@@ -45,7 +56,7 @@ func TestRenderUnit(t *testing.T) {
 
 	wants := []string{
 		`ExecStart="/opt/pt/promptster-teams" watch`, // quoted bin, `watch` subcommand
-		"Restart=always",
+		"Restart=on-failure",                         // NOT always — a clean lock bow-out must not loop
 		"RestartSec=10",
 		"WantedBy=default.target",
 	}
@@ -53,6 +64,9 @@ func TestRenderUnit(t *testing.T) {
 		if !strings.Contains(out, w) {
 			t.Errorf("unit missing %q\n---\n%s", w, out)
 		}
+	}
+	if strings.Contains(out, "Restart=always") {
+		t.Error("Restart=always busy-loops the single-instance clean exit(0); want Restart=on-failure")
 	}
 	if strings.Contains(out, "start\n") || strings.Contains(out, "\" start") {
 		t.Error("unit must run `watch`, not `start`")

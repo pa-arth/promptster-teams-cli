@@ -7,12 +7,19 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 type darwinManager struct{}
 
 // New returns the launchd-backed autostart manager for macOS.
 func New() Manager { return darwinManager{} }
+
+// logPath is where the launchd job tees the watcher's stdout/stderr (macOS
+// only; systemd logs to journald and Task Scheduler inherits). It sits alongside
+// the manual daemon's log under ~/.promptster-teams.
+func logPath() string { return filepath.Join(state.GlobalPromptsterDir(), "daemon.log") }
 
 // plistPath is ~/Library/LaunchAgents/ai.promptster.teams.plist.
 func plistPath() (string, error) {

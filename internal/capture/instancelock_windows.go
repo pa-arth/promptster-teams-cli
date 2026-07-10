@@ -53,3 +53,24 @@ func acquireWatchLock() (release func(), ok bool, err error) {
 	}
 	return release, true, nil
 }
+
+// watchLockHeld reports whether a live watcher currently holds the lock, by
+// probing the same high-offset byte range acquireWatchLock locks with a
+// fail-immediately exclusive lock. Liveness comes from the lock (Windows
+// releases it when the holder dies), so this is immune to PID reuse. A missing
+// lock file means nobody has ever locked → not running.
+func watchLockHeld() bool {
+	// #nosec G304 -- path is watchLockPath() derived from StateDir(), not user input.
+	f, err := os.OpenFile(watchLockPath(), os.O_RDWR, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	handle := windows.Handle(f.Fd())
+	ol := &windows.Overlapped{OffsetHigh: 1}
+	if err := windows.LockFileEx(handle, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, ol); err != nil {
+		return err == windows.ERROR_LOCK_VIOLATION // still held by a live watcher
+	}
+	_ = windows.UnlockFileEx(handle, 0, 1, 0, ol)
+	return false
+}

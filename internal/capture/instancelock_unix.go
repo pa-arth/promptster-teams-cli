@@ -49,3 +49,23 @@ func acquireWatchLock() (release func(), ok bool, err error) {
 	}
 	return release, true, nil
 }
+
+// watchLockHeld reports whether a live watcher currently holds the lock, by
+// probing it non-destructively: open a fresh fd and try a non-blocking exclusive
+// flock. flock is per-open-file-description, so this contends even with a lock
+// held by another fd in the same process. Liveness comes from the lock (a dead
+// holder's flock is auto-released by the kernel), making it immune to PID reuse.
+// A missing lock file means nobody has ever locked → not running.
+func watchLockHeld() bool {
+	// #nosec G304 -- path is watchLockPath() derived from StateDir(), not user input.
+	f, err := os.OpenFile(watchLockPath(), os.O_RDONLY, 0)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return err == syscall.EWOULDBLOCK // still held by a live watcher
+	}
+	_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	return false
+}

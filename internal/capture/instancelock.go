@@ -14,28 +14,23 @@ import (
 // sweep and this lock share one directory.
 func watchLockPath() string { return filepath.Join(state.StateDir(), "watch.lock") }
 
-// watchRunning reports whether a `watch` supervisor is alive, by any launch path
-// — manual `start`, a foreground `watch`, or the autostart service (which never
-// writes supervisor.json). It reads the PID the lock holder stamped into
-// watch.lock and confirms the process is live, self-healing a stale file the way
-// DaemonStatus does. The PID is written at offset 0, outside the byte range the
-// Windows lock covers, so this read never contends with the holder's lock.
-// WatchRunning is the exported view of watchRunning for status/doctor, so they
-// report capture started by any path — manual `start`, foreground `watch`, or
-// the autostart service (which never writes supervisor.json).
-func WatchRunning() (pid int, running bool) { return watchRunning() }
-
+// watchRunning reports whether a `watch` supervisor is alive. Liveness is
+// derived from the lock itself (watchLockHeld, a non-destructive try-lock), NOT
+// from the stored PID: a dead holder's lock is auto-released by the OS, so this
+// is immune to PID reuse. A stale watch.lock left after a crash/reboot whose old
+// PID has since been recycled by an unrelated process would otherwise read as
+// "running" and silently suppress capture (start/status bail). The stamped PID
+// is read only for display, once we know a live holder exists.
 func watchRunning() (pid int, running bool) {
-	data, err := os.ReadFile(watchLockPath())
-	if err != nil {
+	if !watchLockHeld() {
 		return 0, false
 	}
-	pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return 0, false
+	// A live watcher holds the lock — read the PID it stamped (offset 0, outside
+	// the Windows lock range) for display. Best-effort.
+	if data, err := os.ReadFile(watchLockPath()); err == nil {
+		if p, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && p > 0 {
+			pid = p
+		}
 	}
-	if processExists(pid) {
-		return pid, true
-	}
-	return 0, false
+	return pid, true
 }
