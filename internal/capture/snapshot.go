@@ -39,6 +39,20 @@ type CaptureSnapshot struct {
 // the ~3s poll cadence so a couple of missed polls don't flap the display.
 const watcherStaleGrace = 2 * time.Minute
 
+// watcherLive reports whether a watcher pidfile represents live capture. The PID
+// must exist AND the heartbeat must be present and recent. Both watchers write a
+// heartbeat at startup and refresh it every poll, so a missing/unparsable (zero)
+// heartbeat means a stale or malformed pidfile — not a fresh watcher — and a
+// future heartbeat (negative age) is likewise untrusted; either way we must not
+// report a reused PID as active.
+func watcherLive(pid int, heartbeat, now time.Time) bool {
+	if !processExists(pid) || heartbeat.IsZero() {
+		return false
+	}
+	age := now.Sub(heartbeat)
+	return age >= 0 && age <= watcherStaleGrace
+}
+
 func parseWatchTime(s string) time.Time {
 	if s == "" {
 		return time.Time{}
@@ -48,20 +62,6 @@ func parseWatchTime(s string) time.Time {
 		return time.Time{}
 	}
 	return t
-}
-
-// watcherLive reports whether a watcher pidfile represents live capture: its PID
-// must exist AND, if it has recorded a heartbeat, that heartbeat must be recent.
-// An empty heartbeat (just started, no poll yet) is trusted so a fresh daemon
-// isn't hidden.
-func watcherLive(pid int, heartbeat, now time.Time) bool {
-	if !processExists(pid) {
-		return false
-	}
-	if heartbeat.IsZero() {
-		return true
-	}
-	return now.Sub(heartbeat) <= watcherStaleGrace
 }
 
 func claudeWatcherStat(now time.Time) WatcherStat {
