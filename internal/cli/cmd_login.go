@@ -89,10 +89,13 @@ func cmdLogin(args []string) {
 	// login's incidental cwd. The watchers only capture transcripts whose recorded
 	// cwd is inside the watch dir, so binding to wherever `login` happened to run
 	// (an installer shell, /tmp, or a single repo) would silently miss their other
-	// repos. Home spans them all. (An explicit `promptster-teams start` from a repo
-	// still scopes to that repo for anyone who wants a narrow capture.)
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		_ = os.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", home)
+	// repos. Home spans them all. Only default when unset — an explicit
+	// `PROMPTSTER_TEAMS_WATCH_DIR=/repo promptster-teams login` is respected, and
+	// an explicit `promptster-teams start` from a repo still scopes narrowly.
+	if os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR") == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			_ = os.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", home)
+		}
 	}
 	pid, watchDir, already, startErr := capture.StartDaemon(nil)
 	switch {
