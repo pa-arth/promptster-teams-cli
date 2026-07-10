@@ -52,6 +52,10 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "codex watcher error: %v\n", err)
 			return 1
 		}
+	case "autostart":
+		// Register/remove the per-user OS service that relaunches capture at
+		// login so it survives reboots (launchd / systemd --user / Task Scheduler).
+		return cmdAutostart(argv[2:])
 	case "status":
 		cmdTeamsStatus(argv[2:])
 	case "doctor":
@@ -77,6 +81,7 @@ Commands:
   login        Save your developer key (PSE-XXXX-XXXX) — paste it or pass --key
   start        Capture in the background (detaches and returns your shell)
   stop         Stop background capture
+  autostart    Keep capture alive across reboots (enable|disable|status) — starts at login
   watch        Foreground capture — tail transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
@@ -85,6 +90,7 @@ Commands:
 
 Getting started:
   promptster-teams login            # paste your key — capture starts in the background automatically
+  promptster-teams autostart enable # keep capturing across reboots (starts at login)
   promptster-teams status           # confirm capture is running
   promptster-teams stop             # stop when you're done
 

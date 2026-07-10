@@ -85,6 +85,14 @@ func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, 
 	if p, running := DaemonStatus(); running {
 		return p, "", true, nil
 	}
+	// A watcher launched some other way (foreground `watch` or the autostart
+	// service) holds the single-instance lock but never wrote supervisor.json —
+	// treat it as already running so we don't spawn a child that would just hit
+	// the lock and exit. Idempotent, like the DaemonStatus check above; callers
+	// render their own UX.
+	if p, running := watchRunning(); running {
+		return p, "", true, nil
+	}
 
 	token, apiURL, watchDir, err := resolveWatchEnv(args)
 	if err != nil {

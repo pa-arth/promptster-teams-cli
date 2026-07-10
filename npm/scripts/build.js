@@ -20,6 +20,7 @@ const TARGETS = [
   { goos: "darwin", goarch: "amd64", out: "promptster-teams-darwin-x64" },
   { goos: "darwin", goarch: "arm64", out: "promptster-teams-darwin-arm64" },
   { goos: "windows", goarch: "amd64", out: "promptster-teams-win32-x64.exe" },
+  { goos: "windows", goarch: "arm64", out: "promptster-teams-win32-arm64.exe" },
 ];
 
 const goSrcDir = path.resolve(__dirname, "../..");

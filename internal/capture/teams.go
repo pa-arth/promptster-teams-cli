@@ -97,6 +97,25 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, err error) 
 // signs, and ships to the configured ingest endpoint. Returns when either
 // watcher exits (e.g. Ctrl-C).
 func RunTeamsWatch(args []string) error {
+	// Single-instance guard: only one supervisor may capture at a time, whatever
+	// launched it (manual `start`, this foreground `watch`, or the autostart
+	// service). A second watcher would double-count presence + events and corrupt
+	// the seat-utilization metric, so bow out cleanly (exit 0 — launchd's
+	// KeepAlive{SuccessfulExit:false} then won't respawn a duplicate).
+	release, ok, err := acquireWatchLock()
+	if err != nil {
+		return fmt.Errorf("could not take capture lock: %w", err)
+	}
+	if !ok {
+		if pid, running := watchRunning(); running {
+			fmt.Fprintf(os.Stderr, "promptster-teams: capture already running (pid %d) — not starting a second watcher\n", pid)
+		} else {
+			fmt.Fprintln(os.Stderr, "promptster-teams: capture already running — not starting a second watcher")
+		}
+		return nil
+	}
+	defer release()
+
 	// Resolve the credential up front (flag > env > stored) and export the
 	// result so the child watchers — which call loadSession() — and apiURL()
 	// all observe the same values, including a --key passed only to `watch`.
