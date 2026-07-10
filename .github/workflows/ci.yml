@@ -44,6 +44,70 @@ jobs:
       - if: matrix.os == 'ubuntu-latest'
         run: GOOS=windows go build ./...
 
+  # Exercise the per-user autostart service managers end-to-end on the two
+  # platforms a dev Mac can't drive: register -> status -> deregister. This is
+  # the only coverage that runs the real `schtasks` (Windows) and
+  # `systemctl --user` (Linux) round-trips — the rest of CI only compiles them.
+  # The schtasks /TR quoting round-trip in particular can't be verified any
+  # other way. Credentials point at a dead localhost so a watcher the service
+  # starts has zero external egress.
+  autostart-smoke:
+    name: autostart smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Linux: systemd --user needs a running user manager; enable-linger starts
+      # one for the runner account, and XDG_RUNTIME_DIR points systemctl at it.
+      - name: linux — systemd --user round-trip
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          go build -o /tmp/pt ./cmd/promptster-teams
+          sudo loginctl enable-linger "$USER"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for i in $(seq 1 15); do systemctl --user show-environment >/dev/null 2>&1 && break; sleep 1; done
+          mkdir -p ~/.promptster-teams
+          printf '{"token":"PSE-TEST-TEST","apiUrl":"http://127.0.0.1:9"}\n' > ~/.promptster-teams/credentials
+          /tmp/pt autostart enable
+          /tmp/pt autostart status | tee /tmp/s1
+          grep -q "systemd --user" /tmp/s1                       # enabled
+          test -f ~/.config/systemd/user/promptster-teams.service
+          grep -q "Restart=on-failure" ~/.config/systemd/user/promptster-teams.service
+          /tmp/pt autostart disable
+          /tmp/pt autostart status | tee /tmp/s2
+          grep -qi "not enabled" /tmp/s2                          # deregistered
+          test ! -f ~/.config/systemd/user/promptster-teams.service
+
+      # Windows: Task Scheduler round-trip — the real test of the schtasks /TR
+      # quoting (the binary path is double-quoted and re-parsed by schtasks).
+      - name: windows — Task Scheduler round-trip
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        env:
+          PROMPTSTER_TEAMS_TOKEN: PSE-TEST-TEST
+        run: |
+          set -euxo pipefail
+          go build -o /tmp/pt.exe ./cmd/promptster-teams
+          mkdir -p "$USERPROFILE/.promptster-teams"
+          printf '{"token":"PSE-TEST-TEST","apiUrl":"http://127.0.0.1:9"}\n' > "$USERPROFILE/.promptster-teams/credentials"
+          /tmp/pt.exe autostart enable
+          /tmp/pt.exe autostart status | tee /tmp/s1
+          grep -q "Task Scheduler" /tmp/s1                        # enabled
+          schtasks //Query //TN "Promptster Teams"                # task really registered
+          /tmp/pt.exe autostart disable
+          /tmp/pt.exe autostart status | tee /tmp/s2
+          grep -qi "not enabled" /tmp/s2                          # deregistered
+
   # Race detector + coverage. Requires cgo (a C toolchain), which the hosted
   # ubuntu runner has; kept separate from the matrix so Windows (no default
   # C compiler) isn't asked to run -race.
