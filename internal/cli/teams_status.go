@@ -25,8 +25,29 @@ func keyDisplay(token, source string) string {
 	return fmt.Sprintf("%s  (%s)", ingest.MaskKey(token), source)
 }
 
-// cmdTeamsStatus prints the resolved configuration and local buffer count.
-func cmdTeamsStatus() {
+// cmdTeamsStatus shows capture status. By default it opens the live dashboard
+// (a full-screen view that refreshes every second); with `--once`/`--plain`, or
+// when stdout is not a TTY (pipe/CI), it prints a single static snapshot and
+// exits so scripts and redirects stay clean.
+func cmdTeamsStatus(args []string) {
+	once := false
+	for _, a := range args {
+		if a == "--once" || a == "--plain" || a == "-1" {
+			once = true
+		}
+	}
+	if !once && stdoutIsTTY() {
+		if err := runStatusTUI(); err == nil {
+			return
+		}
+		// Fall through to the static print if the TUI couldn't start.
+	}
+	printStatusStatic()
+}
+
+// printStatusStatic prints the resolved configuration and local buffer count as
+// a single snapshot.
+func printStatusStatic() {
 	token, source := ingest.ResolveToken("")
 	apiURL := ingest.ResolveAPIURL("")
 	root := os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
@@ -35,8 +56,8 @@ func cmdTeamsStatus() {
 	}
 
 	daemon := "not running — start with `promptster-teams start`"
-	if pid, running := capture.DaemonStatus(); running {
-		daemon = fmt.Sprintf("running (pid %d)", pid)
+	if snap := capture.Snapshot(); snap.Live {
+		daemon = fmt.Sprintf("running (pid %d)", snap.DaemonPID)
 	}
 
 	fmt.Println()
