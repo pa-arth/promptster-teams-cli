@@ -7,6 +7,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -55,9 +56,14 @@ func printStatusStatic() {
 		root, _ = os.Getwd()
 	}
 
-	daemon := "not running — start with `promptster-teams start`"
+	daemon := "not running — `promptster-teams login` starts it, or `autostart enable` for reboots"
 	if snap := capture.Snapshot(); snap.Live {
 		daemon = fmt.Sprintf("running (pid %d)", snap.DaemonPID)
+	}
+
+	autostart := "not enabled — `promptster-teams autostart enable`"
+	if _, detail, err := service.New().Status(); err == nil && detail != "" {
+		autostart = detail
 	}
 
 	fmt.Println()
@@ -68,6 +74,7 @@ func printStatusStatic() {
 		"ingest", hostOf(apiURL),
 		"watch", root,
 		"daemon", daemon,
+		"autostart", autostart,
 		"device", capture.DeviceID(),
 		"identity", "anonymous — device hash + team key, no email",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", capture.PresenceHeartbeatInterval),
@@ -111,6 +118,12 @@ func cmdTeamsDoctor() {
 	}
 
 	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, capture.PresenceHeartbeatInterval))
+
+	if installed, detail, serr := service.New().Status(); serr == nil && installed {
+		printlnIndent(fmt.Sprintf("%s autostart %s", okGlyph, detail))
+	} else {
+		printlnIndent(fmt.Sprintf("%s autostart not enabled — run `promptster-teams autostart enable` so capture survives reboots", warnGlyph))
+	}
 
 	fmt.Println()
 	if ok {

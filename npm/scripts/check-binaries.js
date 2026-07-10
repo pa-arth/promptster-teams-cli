@@ -10,6 +10,7 @@ const EXPECTED = [
   "promptster-teams-darwin-x64",
   "promptster-teams-darwin-arm64",
   "promptster-teams-win32-x64.exe",
+  "promptster-teams-win32-arm64.exe",
 ];
 
 const binDir = path.join(__dirname, "..", "binaries");

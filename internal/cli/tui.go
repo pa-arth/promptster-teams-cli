@@ -34,7 +34,7 @@ var (
 			BorderForeground(cDim).
 			Padding(0, 2)
 
-	panelLabel = lipgloss.NewStyle().Foreground(cMuted).Width(9)
+	panelLabel = lipgloss.NewStyle().Foreground(cMuted).Width(10)
 	panelValue = lipgloss.NewStyle().Foreground(cBody)
 )
 

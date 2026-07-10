@@ -12,6 +12,7 @@ const MAP = {
   "linux-x64": "promptster-teams-linux-x64",
   "linux-arm64": "promptster-teams-linux-arm64",
   "win32-x64": "promptster-teams-win32-x64.exe",
+  "win32-arm64": "promptster-teams-win32-arm64.exe",
 };
 
 const key = `${process.platform}-${process.arch}`;
