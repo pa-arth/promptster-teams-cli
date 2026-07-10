@@ -84,7 +84,17 @@ func cmdLogin(args []string) {
 	// has to run — capture "just works" afterward instead of waiting for a manual
 	// `start`. StartDaemon is idempotent (no-ops if a supervisor is already alive)
 	// and detaches, so it never holds the terminal.
-	pid, _, already, startErr := capture.StartDaemon(nil)
+	//
+	// Scope the auto-started capture to the engineer's home directory rather than
+	// login's incidental cwd. The watchers only capture transcripts whose recorded
+	// cwd is inside the watch dir, so binding to wherever `login` happened to run
+	// (an installer shell, /tmp, or a single repo) would silently miss their other
+	// repos. Home spans them all. (An explicit `promptster-teams start` from a repo
+	// still scopes to that repo for anyone who wants a narrow capture.)
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		_ = os.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", home)
+	}
+	pid, watchDir, already, startErr := capture.StartDaemon(nil)
 	switch {
 	case startErr != nil:
 		printlnIndent(fmt.Sprintf("%s key saved, but couldn't auto-start capture: %v", warnGlyph, startErr))
@@ -93,7 +103,7 @@ func cmdLogin(args []string) {
 		printlnIndent(fmt.Sprintf("%s capture already running in the background (pid %d)", okGlyph, pid))
 	default:
 		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, pid))
-		printlnIndent(dimStyle.Render("Stop anytime with ") + bodyStyle.Render("promptster-teams stop") + dimStyle.Render("."))
+		printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(watchDir)) + dimStyle.Render(" · stop with ") + bodyStyle.Render("promptster-teams stop"))
 	}
 	fmt.Println()
 }
