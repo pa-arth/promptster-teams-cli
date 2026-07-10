@@ -20,7 +20,7 @@ follows [Semantic Versioning](https://semver.org/).
 - Internal `docs/teams-cli-e2e-findings.md` engineering work-log (no longer part
   of the published repository).
 
-## [0.5.0] — 2026-07-09
+## [0.5.1] — 2026-07-10
 
 ### Added
 - **Opt-in assistant-prose capture (org-gated, default off)** — when an org
@@ -37,6 +37,13 @@ follows [Semantic Versioning](https://semver.org/).
   references (`useState`, `src/x.ts`) survive. Byte-for-byte lockstep with the
   backend scrubber, so the never-store-source guarantee holds even with prose
   capture enabled.
+
+### Changed
+- Policy refresh runs on a background goroutine (`Resolver.StartBackground`)
+  instead of inline in the capture loops, so a slow policy fetch never stalls
+  transcript capture. Response body is size-capped (64 KB) before decode, and the
+  disk cache is written via a per-process temp file for safe concurrent writes
+  across `claude-watch`/`codex-watch` (Windows-safe atomic rename).
 
 ## [0.4.0] — 2026-07-07
 
@@ -71,8 +78,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.4.0...v0.5.0
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...v0.5.1
 [0.4.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.1.1...v0.2.0
