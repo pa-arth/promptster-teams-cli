@@ -53,7 +53,7 @@ func Main(argv []string) int {
 			return 1
 		}
 	case "status":
-		cmdTeamsStatus()
+		cmdTeamsStatus(argv[2:])
 	case "doctor":
 		cmdTeamsDoctor()
 	case "version", "--version", "-v":
