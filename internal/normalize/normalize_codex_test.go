@@ -82,6 +82,76 @@ func TestCodexRolloutNormalization(t *testing.T) {
 	}
 }
 
+// idsByKindCodex processes the canonical rollout through a FRESH processor (a
+// fresh processor is exactly what a resumed/forked rollout that copied prior
+// history, a re-tail after a watcher restart, or a re-read from a mis-advanced
+// offset produces) and returns kind -> [event ids].
+func idsByKindCodex(t *testing.T, sessionID string) map[string][]string {
+	t.Helper()
+	p := NewCodexRolloutProcessor(sessionID)
+	var events []event.Event
+	for _, l := range codexRolloutLines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	out := map[string][]string{}
+	for _, e := range events {
+		if e.ID == "" {
+			t.Fatalf("event %s has empty id", e.Kind)
+		}
+		out[e.Kind] = append(out[e.Kind], e.ID)
+	}
+	return out
+}
+
+// TestCodexTranscriptDeterministicEventIDs is the regression guard for the
+// rollout double-emit bug (the Codex analogue of the Claude fix in
+// pa-arth/promptster-teams-cli#28): the SAME rollout record must never yield two
+// distinct event ids, no matter how the rollout is re-observed. Codex
+// resume/fork writes a NEW rollout file that copies prior history verbatim, and
+// the watcher runs one processor (its own dedup state) per file — so two
+// independent processors over identical input model that fork, plus a re-tail
+// after a watcher restart and a re-read from an offset wobble. If ids matched
+// only within one processor the backend could not dedupe; they must be
+// byte-identical across processors. Reverting stableEventID to event.NewUUID()
+// (the pre-fix random id) makes this fail — verified locally.
+func TestCodexTranscriptDeterministicEventIDs(t *testing.T) {
+	first := idsByKindCodex(t, "sess-idem")
+	second := idsByKindCodex(t, "sess-idem")
+
+	wantKinds := []string{"session_start", "prompt", "file_diff", "command", "ai_response"}
+	for _, k := range wantKinds {
+		ids := first[k]
+		if len(ids) != 1 {
+			t.Fatalf("expected exactly one %s event, got %d (%v)", k, len(ids), ids)
+		}
+		if len(second[k]) != 1 {
+			t.Fatalf("expected exactly one %s event in second run, got %d (%v)", k, len(second[k]), second[k])
+		}
+		if second[k][0] != ids[0] {
+			t.Errorf("%s id not idempotent across re-observation: %q (first) vs %q (second)",
+				k, ids[0], second[k][0])
+		}
+	}
+
+	// Every emitted id must be distinct across kinds — determinism must not
+	// collapse different logical events onto the same id.
+	seen := map[string]string{}
+	for kind, ids := range first {
+		for _, id := range ids {
+			if prev, dup := seen[id]; dup {
+				t.Errorf("id %q reused across kinds %s and %s", id, prev, kind)
+			}
+			seen[id] = kind
+		}
+	}
+
+	// A different session must NOT collide with this one — ids are session-scoped.
+	other := idsByKindCodex(t, "sess-other")
+	if other["prompt"][0] == first["prompt"][0] {
+		t.Errorf("prompt id collided across sessions: %q", other["prompt"][0])
+	}
+}
+
 func TestParseCodexExecOutput(t *testing.T) {
 	code, stdout := parseCodexExecOutput("Chunk ID: a1\nProcess exited with code 3\nOutput:\nhello\nworld\n")
 	if code != 3 {
