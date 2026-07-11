@@ -49,13 +49,38 @@ func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
 	}
 }
 
+// stableEventID derives a deterministic event id from a STABLE per-source key
+// scoped by session and kind, so the same rollout record always yields the same
+// id no matter how often it is re-observed. Codex resume/fork writes a NEW
+// rollout file that copies prior history verbatim, and the watcher runs one
+// processor (its own dedup state) per file — so without this a copied line
+// re-emits as a byte-identical duplicate carrying a fresh random id the backend
+// can't collapse. The stable key is the record's own identity: the session id
+// for session_start, the tool call_id for command/tool/mcp/plan/file_diff, and
+// the rollout line timestamp for the event_msg-derived prompt/ai_response (Codex
+// event_msg lines carry no per-item id — the line timestamp is copied verbatim
+// on fork, so it is the record's stable identity). When sourceKey is empty it
+// falls back to a random id — never worse than the previous always-random
+// behavior. Mirrors ClaudeTranscriptProcessor.stableEventID.
+func (p *CodexRolloutProcessor) stableEventID(sourceKey, kind string) string {
+	if sourceKey == "" {
+		return event.NewUUID()
+	}
+	return event.DeterministicUUID(p.sessionID + "\x1f" + kind + "\x1f" + sourceKey)
+}
+
 // newCodexEvent builds a canonical Event stamped with the rollout line's own
 // timestamp (so the replay timeline reflects when things actually happened, not
 // when the watcher observed them) and source="codex". Actor is derived from
 // kind: prompts are the candidate, session lifecycle is the system, and every
-// tool/output event is the agent acting.
-func (p *CodexRolloutProcessor) newCodexEvent(kind, ts string) event.Event {
+// tool/output event is the agent acting. sourceKey is the stable identity of the
+// source record (session id / tool call_id / rollout line ts); pass "" only when
+// no stable key exists.
+func (p *CodexRolloutProcessor) newCodexEvent(kind, ts, sourceKey string) event.Event {
 	e := event.NewEvent(kind, p.sessionID)
+	// Overwrite NewEvent's random id with the stable, source-derived one (keeping
+	// NewEvent as the single source of Ts/Source/V defaults).
+	e.ID = p.stableEventID(sourceKey, kind)
 	e.Source = "codex"
 	switch kind {
 	case "prompt":
@@ -99,7 +124,8 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 }
 
 func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, raw string) []event.Event {
-	e := p.newCodexEvent("session_start", ts)
+	// The session id is stable per rollout (and identical in a forked copy).
+	e := p.newCodexEvent("session_start", ts, stringField(payload, "id"))
 	data := map[string]interface{}{
 		"ideSessionId": stringField(payload, "id"),
 		"cwd":          stringField(payload, "cwd"),
@@ -116,7 +142,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	switch stringField(payload, "type") {
 	case "user_message":
 		text := stringField(payload, "message")
-		e := p.newCodexEvent("prompt", ts)
+		// event_msg lines carry no per-item id; the rollout line ts is the
+		// record's stable identity (copied verbatim on resume/fork).
+		e := p.newCodexEvent("prompt", ts, ts)
 		e.Provenance = event.HumanProvenance()
 		data := map[string]interface{}{"text": text}
 		e.Data = data
@@ -131,7 +159,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		if stringField(payload, "phase") != "final_answer" {
 			return nil
 		}
-		e := p.newCodexEvent("ai_response", ts)
+		// Same as the prompt: no per-item id on the event_msg line, so key off
+		// the (fork-stable) rollout line ts.
+		e := p.newCodexEvent("ai_response", ts, ts)
 		data := map[string]interface{}{
 			"lastAssistantMessage": stringField(payload, "message"),
 		}
@@ -168,6 +198,9 @@ func (p *CodexRolloutProcessor) patchApplyEnd(payload map[string]interface{}, ts
 	if !ok || len(changes) == 0 {
 		return nil
 	}
+	// call_id is the apply_patch call's stable identity; one patch_apply_end
+	// emits one file_diff per path, so scope the key by path too.
+	callID := stringField(payload, "call_id")
 	var events []event.Event
 	for path, rawChange := range changes {
 		change, _ := rawChange.(map[string]interface{})
@@ -176,7 +209,7 @@ func (p *CodexRolloutProcessor) patchApplyEnd(payload map[string]interface{}, ts
 		}
 		diff := stringField(change, "unified_diff")
 		added, removed := countDiffLines(diff)
-		e := p.newCodexEvent("file_diff", ts)
+		e := p.newCodexEvent("file_diff", ts, callID+"\x1f"+path)
 		e.Provenance = event.AIProvenance()
 		data := map[string]interface{}{
 			"path":         path,
@@ -220,7 +253,7 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 		}
 		delete(p.pending, callID)
 		output := stringField(payload, "output")
-		return p.emitToolEvent(call, output, ts, raw)
+		return p.emitToolEvent(call, callID, output, ts, raw)
 
 	default:
 		// message / reasoning context items duplicate event_msg signal — skip.
@@ -229,13 +262,16 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 }
 
 // emitToolEvent converts a completed tool call (call + output) into the right
-// canonical event, branching on the codex tool name.
-func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts, raw string) []event.Event {
+// canonical event, branching on the codex tool name. callID is the tool call's
+// stable identity (the OpenAI call_id, copied verbatim on resume/fork), used to
+// derive a deterministic event id — mirrors how the Claude path keys off
+// tool_use_id.
+func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, output, ts, raw string) []event.Event {
 	switch {
 	case isCodexShellTool(call.name):
 		cmd := codexCommandString(call.args)
 		exitCode, stdout := parseCodexExecOutput(output)
-		e := p.newCodexEvent("command", ts)
+		e := p.newCodexEvent("command", ts, callID)
 		e.Provenance = event.AIProvenance()
 		e.Data = map[string]interface{}{
 			"command":  cmd,
@@ -246,7 +282,7 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts,
 		return []event.Event{e}
 
 	case call.name == "update_plan":
-		e := p.newCodexEvent("planning", ts)
+		e := p.newCodexEvent("planning", ts, callID)
 		data := map[string]interface{}{}
 		// Codex carries the plan steps under "plan" (array of {step,status}).
 		if plan, ok := call.args["plan"]; ok {
@@ -259,7 +295,7 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts,
 		return []event.Event{e}
 
 	case isCodexMCPTool(call.name):
-		e := p.newCodexEvent("mcp_call", ts)
+		e := p.newCodexEvent("mcp_call", ts, callID)
 		e.Data = map[string]interface{}{
 			"tool":        call.name,
 			"argsPreview": jsonPreview(call.args, 100),
@@ -268,7 +304,7 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, output, ts,
 		return []event.Event{e}
 
 	default:
-		e := p.newCodexEvent("tool_use", ts)
+		e := p.newCodexEvent("tool_use", ts, callID)
 		e.Data = map[string]interface{}{
 			"toolName":     call.name,
 			"inputPreview": jsonPreview(call.args, 100),
