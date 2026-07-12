@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-07-11
+
+### Fixed
+- **Deterministic transcript event IDs (Claude + Codex)** — a session
+  resume/fork/compact writes a new transcript/rollout file that copies prior
+  history verbatim; because the watcher runs one processor per file, those
+  re-observed lines were re-emitted with fresh random event IDs, so the backend
+  stored each event twice (visible as doubled rows in session replay). Event IDs
+  are now derived deterministically (UUIDv5) from each source line's stable
+  identity — the transcript line `uuid` / `message.id` / tool `call_id` (Claude),
+  and the rollout session `id` / `call_id` / line timestamp (Codex) — so a
+  re-observed line yields the same ID and collapses instead of duplicating.
+
 ### Changed
 - Repository reorganized for external security review: dead hook/Cursor
   normalization code removed, source moved into `cmd/` + `internal/` packages.
@@ -78,7 +91,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...v0.5.1
 [0.4.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.2.0...v0.3.0
