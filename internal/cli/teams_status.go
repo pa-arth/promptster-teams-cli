@@ -64,8 +64,8 @@ func printStatusStatic() {
 		daemon = fmt.Sprintf("running (pid %d)", snap.DaemonPID)
 	}
 
-	autostart := "not enabled — `promptster-teams autostart enable`"
-	if _, detail, err := service.New().Status(); err == nil && detail != "" {
+	autostart := "not enabled — `promptster-teams autostart enable` (so capture survives reboots)"
+	if installed, detail, err := service.New().Status(); err == nil && installed && detail != "" {
 		autostart = detail
 	}
 

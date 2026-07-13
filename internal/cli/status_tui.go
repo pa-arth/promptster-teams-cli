@@ -11,6 +11,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 )
 
 // Live-status dashboard. A small bubbletea program that re-reads the capture
@@ -112,8 +113,15 @@ func (m statusModel) capturePanel() string {
 	} else {
 		state = dotIdle.Render("○") + dimStyle.Render(" idle — run ") + bodyStyle.Render("promptster-teams start")
 	}
+	// autostart tells an installed-but-idle seat apart from one that will simply
+	// die on the next reboot — surface it live so the gap is visible, not silent.
+	autostart := dotWarn.Render("○") + dimStyle.Render(" off — ") + bodyStyle.Render("promptster-teams autostart enable")
+	if installed, detail, err := service.New().Status(); err == nil && installed && detail != "" {
+		autostart = dotOK.Render("●") + " " + detail
+	}
 	return kvPanel("capture",
 		"state", state,
+		"autostart", autostart,
 		"ingest", hostOf(m.apiURL),
 		"key", keyDisplay(m.token, m.source),
 		"device", m.device,
