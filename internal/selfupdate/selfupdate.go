@@ -218,11 +218,11 @@ func (u *updater) downloadAndVerify(tag, asset, dir string) (string, error) {
 
 	sums, code, err := u.httpGet(base+"/SHA256SUMS", maxSumsBytes)
 	if err != nil || code != http.StatusOK {
-		return "", fmt.Errorf("download SHA256SUMS (status %d): %w", code, err)
+		return "", httpErr("SHA256SUMS", code, err)
 	}
 	sig, code, err := u.httpGet(base+"/SHA256SUMS.minisig", maxSigBytes)
 	if err != nil || code != http.StatusOK {
-		return "", fmt.Errorf("download SHA256SUMS.minisig (status %d): %w", code, err)
+		return "", httpErr("SHA256SUMS.minisig", code, err)
 	}
 
 	// (a) minisign signature over SHA256SUMS — the trust gate. Reject if unsigned.
@@ -240,7 +240,7 @@ func (u *updater) downloadAndVerify(tag, asset, dir string) (string, error) {
 	}
 	bin, code, err := u.httpGet(base+"/"+asset, maxBinaryBytes)
 	if err != nil || code != http.StatusOK {
-		return "", fmt.Errorf("download %s (status %d): %w", asset, code, err)
+		return "", httpErr(asset, code, err)
 	}
 
 	staged, err := os.CreateTemp(dir, ".promptster-teams-update-*")
@@ -262,6 +262,15 @@ func (u *updater) downloadAndVerify(tag, asset, dir string) (string, error) {
 		return "", err
 	}
 	return stagedName, nil
+}
+
+// httpErr formats a download failure without misusing %w on a nil error (a
+// non-200 with err==nil would otherwise print "%!w(<nil>)").
+func httpErr(what string, code int, err error) error {
+	if err != nil {
+		return fmt.Errorf("download %s: %w", what, err)
+	}
+	return fmt.Errorf("download %s: status %d", what, code)
 }
 
 // fetchLatestTag reads the latest release's tag_name from the GitHub API.
@@ -295,7 +304,11 @@ func httpGetLimited(url string, limit int64) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("Accept", "application/octet-stream")
+	// `*/*` is the only Accept that works for BOTH endpoints this helper hits:
+	// the GitHub JSON API (`/repos/.../releases/latest`) 415s on
+	// `application/octet-stream`, while the raw release-download URLs
+	// (`/releases/download/...`) serve the file for any Accept. Don't narrow this.
+	req.Header.Set("Accept", "*/*")
 	resp, err := ingest.HTTPClient().Do(req)
 	if err != nil {
 		return nil, 0, err
