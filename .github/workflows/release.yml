@@ -48,6 +48,31 @@ jobs:
       - name: Check binaries
         run: node npm/scripts/check-binaries.js
 
+      - name: Sign SHA256SUMS (minisign)
+        env:
+          # Unencrypted minisign secret key (full file contents, incl. the
+          # "untrusted comment:" line). The matching PUBLIC key is embedded in
+          # the CLI (internal/selfupdate/verify.go) and committed as minisign.pub.
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          if [ -z "${MINISIGN_SECRET_KEY}" ]; then
+            echo "::error::MINISIGN_SECRET_KEY secret is not set — auto-update clients will REJECT this release"
+            exit 1
+          fi
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          KEYFILE="$(mktemp)"
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${KEYFILE}"
+          chmod 600 "${KEYFILE}"
+          # Key is unencrypted, so no password prompt; stdin from /dev/null keeps
+          # it non-interactive. Signs in place → npm/binaries/SHA256SUMS.minisig,
+          # which the `npm/binaries/*` glob then uploads to the release.
+          minisign -S -s "${KEYFILE}" -m npm/binaries/SHA256SUMS < /dev/null
+          rm -f "${KEYFILE}"
+          test -f npm/binaries/SHA256SUMS.minisig
+          echo "Signed SHA256SUMS:"
+          cat npm/binaries/SHA256SUMS.minisig
+
       - name: Publish to npm (idempotent)
         working-directory: npm
         env:

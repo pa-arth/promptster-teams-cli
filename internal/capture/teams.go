@@ -1,12 +1,15 @@
 package capture
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/policy"
+	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 )
 
@@ -69,17 +72,18 @@ func DeviceID() string {
 // mutate the environment — callers decide whether to export into their own env
 // (foreground `watch`) or hand the values to a detached child (`start`), so the
 // two entry points can't drift on how a credential is resolved.
-func resolveWatchEnv(args []string) (token, apiURL, watchDir string, err error) {
+func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdate bool, err error) {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); overrides env/stored")
 	urlFlag := fs.String("api-url", "", "Override ingest base URL")
+	noUpdateFlag := fs.Bool("no-auto-update", false, "Disable silent self-update of the CLI while watching")
 	if err := fs.Parse(args); err != nil {
-		return "", "", "", err
+		return "", "", "", false, err
 	}
 
 	token, _ = ingest.ResolveToken(*keyFlag)
 	if token == "" {
-		return "", "", "", fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+		return "", "", "", false, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
 	}
 	apiURL = ingest.ResolveAPIURL(*urlFlag)
 
@@ -89,7 +93,7 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, err error) 
 			watchDir = cwd
 		}
 	}
-	return token, apiURL, watchDir, nil
+	return token, apiURL, watchDir, *noUpdateFlag, nil
 }
 
 // runTeamsWatch runs the Claude + Codex transcript watchers concurrently in the
@@ -119,7 +123,7 @@ func RunTeamsWatch(args []string) error {
 	// Resolve the credential up front (flag > env > stored) and export the
 	// result so the child watchers — which call loadSession() — and apiURL()
 	// all observe the same values, including a --key passed only to `watch`.
-	token, apiURL, _, err := resolveWatchEnv(args)
+	token, apiURL, _, noAutoUpdate, err := resolveWatchEnv(args)
 	if err != nil {
 		return err
 	}
@@ -156,6 +160,19 @@ func RunTeamsWatch(args []string) error {
 	// 24h while watching.
 	stopCensus := StartConfigCensus(cfg)
 	defer stopCensus()
+
+	// Silent self-update: on startup and every 24h, check GitHub Releases for a
+	// newer signed CLI and swap in place (re-exec keeps capture running). Opt out
+	// per-machine with --no-auto-update / PROMPTSTER_TEAMS_NO_AUTO_UPDATE, or
+	// org-wide via the capture policy. A dedicated resolver refreshes the org
+	// switch/pin off the hot path; fail-OPEN so a policy blip never strands the
+	// fleet on an old binary (see selfupdate + policy.AutoUpdateEnabled).
+	updatePolicy := policy.NewResolver(cfg.SessionToken)
+	policyCtx, cancelPolicy := context.WithCancel(context.Background())
+	defer cancelPolicy()
+	updatePolicy.StartBackground(policyCtx)
+	stopUpdate := selfupdate.StartAutoUpdate(noAutoUpdate, updatePolicy)
+	defer stopUpdate()
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- RunClaudeWatcher() }()

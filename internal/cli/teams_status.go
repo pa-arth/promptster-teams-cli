@@ -4,11 +4,14 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/pa-arth/promptster-teams-cli/internal/version"
 )
 
 // loadSession builds the teams capture context. The ingest credential is a
@@ -95,6 +98,9 @@ func cmdTeamsDoctor() {
 	fmt.Println(brandBar("doctor"))
 	fmt.Println()
 
+	printlnIndent(fmt.Sprintf("%s version %s", okGlyph, version.Version))
+	printAutoUpdateStatus()
+
 	switch {
 	case token == "":
 		printlnIndent(fmt.Sprintf("%s no developer key — run `promptster-teams login`", errGlyph))
@@ -132,6 +138,31 @@ func cmdTeamsDoctor() {
 		printlnIndent(dimStyle.Render("Run ") + bodyStyle.Render("promptster-teams login") + dimStyle.Render(" to get set up."))
 	}
 	fmt.Println()
+}
+
+// printAutoUpdateStatus renders the self-updater's read-only state for doctor:
+// whether it is on, disabled by the per-machine env opt-out, or (best-effort)
+// whether a newer release exists. Org-policy disable/pin is resolved only while
+// watching (it needs an authenticated fetch), so doctor reports the machine-
+// local switch and a short-timeout latest-version probe that degrades silently.
+func printAutoUpdateStatus() {
+	if v := os.Getenv("PROMPTSTER_TEAMS_NO_AUTO_UPDATE"); v == "1" || v == "true" || v == "yes" || v == "on" {
+		printlnIndent(fmt.Sprintf("%s auto-update disabled (PROMPTSTER_TEAMS_NO_AUTO_UPDATE set)", warnGlyph))
+		return
+	}
+	if version.Version == "dev" || version.Version == "" {
+		printlnIndent(fmt.Sprintf("%s auto-update inactive for dev build", warnGlyph))
+		return
+	}
+	if latest, ok := selfupdate.LatestVersionBestEffort(3 * time.Second); ok {
+		if latest != version.Version {
+			printlnIndent(fmt.Sprintf("%s auto-update on — newer release available (%s); it installs on the next 24h check while watching", okGlyph, latest))
+		} else {
+			printlnIndent(fmt.Sprintf("%s auto-update on — up to date (%s)", okGlyph, latest))
+		}
+		return
+	}
+	printlnIndent(fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph))
 }
 
 func countBufferedEvents() int {

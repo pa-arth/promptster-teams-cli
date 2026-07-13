@@ -73,6 +73,60 @@ func TestResolverDefaultFalse(t *testing.T) {
 	}
 }
 
+// TestAutoUpdateDefaultsOpen pins the FAIL-OPEN posture: a resolver that never
+// fetched leaves auto-update ON and unpinned, so a network blip can't strand the
+// fleet on an old binary.
+func TestAutoUpdateDefaultsOpen(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	r := NewResolver("PSE-TEST")
+	if !r.AutoUpdateEnabled() {
+		t.Fatal("auto-update must default ON before any fetch")
+	}
+	if r.PinnedCliVersion() != "" {
+		t.Fatal("pin must default empty")
+	}
+}
+
+// TestAutoUpdateFailsOpenOnError proves a failing refresh does NOT flip
+// auto-update off — the opposite of the prose fail-closed rule.
+func TestAutoUpdateFailsOpenOnError(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusInternalServerError) })
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if !r.AutoUpdateEnabled() {
+		t.Fatal("auto-update must stay ON when the policy fetch fails")
+	}
+}
+
+// TestAutoUpdateExplicitDisableAndPin proves an explicit backend response flips
+// the switch off and carries the pin.
+func TestAutoUpdateExplicitDisableAndPin(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"autoUpdate":false,"pinnedCliVersion":"0.6.0"}`))
+	})
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if r.AutoUpdateEnabled() {
+		t.Fatal("explicit autoUpdate:false must disable")
+	}
+	if r.PinnedCliVersion() != "0.6.0" {
+		t.Fatalf("pin = %q, want 0.6.0", r.PinnedCliVersion())
+	}
+}
+
+// TestAutoUpdateAbsentFieldStaysOpen proves that a policy body WITHOUT the
+// autoUpdate key (unknown, not false) leaves auto-update ON.
+func TestAutoUpdateAbsentFieldStaysOpen(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"captureAssistantProse":true}`))
+	})
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if !r.AutoUpdateEnabled() {
+		t.Fatal("absent autoUpdate field must be treated as ON, not false")
+	}
+}
+
 // TestResolverAdoptsDiskCache proves a fresh process (a second Resolver over the
 // same state dir) picks up a within-TTL cached policy WITHOUT a network fetch:
 // resolver #1 does a successful opted-in Refresh (writing the disk cache), then
