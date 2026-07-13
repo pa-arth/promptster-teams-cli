@@ -94,7 +94,7 @@ func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, 
 		return p, "", true, nil
 	}
 
-	token, apiURL, watchDir, err := resolveWatchEnv(args)
+	token, apiURL, watchDir, noAutoUpdate, err := resolveWatchEnv(args)
 	if err != nil {
 		return 0, "", false, err
 	}
@@ -122,6 +122,13 @@ func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, 
 	_ = os.Setenv("PROMPTSTER_TEAMS_API_URL", apiURL)
 	_ = os.Setenv("PROMPTSTER_API_URL", apiURL)
 	_ = os.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", watchDir)
+	// The detached child re-runs a bare `watch` (no argv), so a --no-auto-update
+	// passed to `start` would be lost — propagate it via the env opt-out the
+	// updater also honors, which the inherited environment (and any later
+	// in-place re-exec) carries forward.
+	if noAutoUpdate {
+		_ = os.Setenv("PROMPTSTER_TEAMS_NO_AUTO_UPDATE", "1")
+	}
 
 	// #nosec G204 -- re-execs our own resolved install binary (state.PromptsterBin()); the subcommand is a constant.
 	cmd := exec.Command(state.PromptsterBin(), "watch")

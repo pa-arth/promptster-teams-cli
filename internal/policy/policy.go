@@ -60,13 +60,25 @@ func policyPath() string {
 }
 
 // apiResponse mirrors GET /v1/teams/policy.
+//
+// AutoUpdate/PinnedCliVersion gate the CLI self-updater (internal/selfupdate).
+// AutoUpdate is a POINTER so an absent field ("unknown") is distinguishable
+// from an explicit false — unknown must fail OPEN (auto-update stays on), the
+// deliberate OPPOSITE of the fail-closed CaptureAssistantProse rule, because a
+// network/parse blip must never STRAND the fleet on an old binary.
 type apiResponse struct {
-	CaptureAssistantProse bool `json:"captureAssistantProse"`
+	CaptureAssistantProse bool   `json:"captureAssistantProse"`
+	AutoUpdate            *bool  `json:"autoUpdate"`
+	PinnedCliVersion      string `json:"pinnedCliVersion"`
 }
 
-// diskCache is the on-disk shape: the resolved flag plus when it was fetched.
+// diskCache is the on-disk shape: the resolved flags plus when they were
+// fetched. AutoUpdate is a pointer for the same unknown-vs-false reason as
+// apiResponse.
 type diskCache struct {
 	CaptureAssistantProse bool      `json:"captureAssistantProse"`
+	AutoUpdate            *bool     `json:"autoUpdate"`
+	PinnedCliVersion      string    `json:"pinnedCliVersion"`
 	FetchedAt             time.Time `json:"fetchedAt"`
 }
 
@@ -79,17 +91,33 @@ type Resolver struct {
 	mu        sync.Mutex
 	value     bool
 	fetchedAt time.Time // time of the last SUCCESSFUL fetch (zero = never)
+
+	// autoUpdate is the org's self-update switch. It defaults to true and is
+	// only flipped off by an explicit `autoUpdate:false` from the backend, so an
+	// unknown/never-fetched policy leaves auto-update ON (fail-OPEN).
+	autoUpdate bool
+	// pinnedCliVersion, when non-empty, pins the fleet to an exact CLI tag.
+	pinnedCliVersion string
 }
 
 // NewResolver builds a Resolver for the given PSE engineer key. If a recent
-// (within cacheTTL) successful fetch was persisted by an earlier run, it is
-// adopted so the process starts from the last known-good policy rather than
-// false — the "stale cache within the refresh window may be used" allowance.
+// (within cacheTTL) successful fetch was persisted by an earlier run, the prose
+// flag is adopted so the process starts from the last known-good policy rather
+// than false — the "stale cache within the refresh window may be used"
+// allowance. The auto-update fields are adopted whenever a cache exists (no TTL
+// gate): unlike prose, self-update tolerates a stale value, so the last known
+// pin/switch is preferred over resetting to the default.
 func NewResolver(apiKey string) *Resolver {
-	r := &Resolver{apiKey: apiKey}
-	if c, ok := readDiskCache(); ok && time.Since(c.FetchedAt) < cacheTTL {
-		r.value = c.CaptureAssistantProse
-		r.fetchedAt = c.FetchedAt
+	r := &Resolver{apiKey: apiKey, autoUpdate: true}
+	if c, ok := readDiskCache(); ok {
+		if time.Since(c.FetchedAt) < cacheTTL {
+			r.value = c.CaptureAssistantProse
+			r.fetchedAt = c.FetchedAt
+		}
+		if c.AutoUpdate != nil {
+			r.autoUpdate = *c.AutoUpdate
+		}
+		r.pinnedCliVersion = c.PinnedCliVersion
 	}
 	return r
 }
@@ -106,6 +134,27 @@ func (r *Resolver) CaptureAssistantProse() bool {
 		return true
 	}
 	return false
+}
+
+// AutoUpdateEnabled reports whether the org allows CLI self-update. It is
+// fail-OPEN: true unless a successful fetch (or adopted disk cache) explicitly
+// set autoUpdate:false. A never-fetched or failing resolver therefore leaves
+// auto-update ON — the deliberate opposite of CaptureAssistantProse, so a
+// network blip cannot strand the fleet on an old binary. No TTL decay: a stale
+// value keeps being used until the next successful refresh replaces it.
+func (r *Resolver) AutoUpdateEnabled() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.autoUpdate
+}
+
+// PinnedCliVersion returns the exact CLI tag the org pins the fleet to, or ""
+// when unpinned. Like AutoUpdateEnabled it uses the last known value with no TTL
+// decay.
+func (r *Resolver) PinnedCliVersion() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.pinnedCliVersion
 }
 
 // StartBackground runs policy refreshes OFF the caller's hot path: it fires an
@@ -137,43 +186,59 @@ func (r *Resolver) StartBackground(ctx context.Context) {
 // doesn't immediately drop capture but a real outage still fails closed. Safe
 // to call at watch start and on a ticker.
 func (r *Resolver) Refresh() {
-	val, err := fetchPolicy(r.apiKey)
+	parsed, err := fetchPolicy(r.apiKey)
 	if err != nil {
-		// Fail-closed: keep the last good value (if any); CaptureAssistantProse
-		// enforces cacheTTL so a stale value can't be trusted indefinitely.
+		// Fail-closed for prose: keep the last good value (if any);
+		// CaptureAssistantProse enforces cacheTTL so a stale value can't be
+		// trusted indefinitely. Fail-OPEN for auto-update: the existing
+		// autoUpdate/pin fields are left untouched, so a failed refresh never
+		// flips self-update off.
 		return
 	}
 	now := time.Now()
+	// Auto-update defaults ON when the field is absent (unknown != disabled).
+	autoUpdate := true
+	if parsed.AutoUpdate != nil {
+		autoUpdate = *parsed.AutoUpdate
+	}
 	r.mu.Lock()
-	r.value = val
+	r.value = parsed.CaptureAssistantProse
 	r.fetchedAt = now
+	r.autoUpdate = autoUpdate
+	r.pinnedCliVersion = parsed.PinnedCliVersion
 	r.mu.Unlock()
-	writeDiskCache(diskCache{CaptureAssistantProse: val, FetchedAt: now})
+	writeDiskCache(diskCache{
+		CaptureAssistantProse: parsed.CaptureAssistantProse,
+		AutoUpdate:            parsed.AutoUpdate,
+		PinnedCliVersion:      parsed.PinnedCliVersion,
+		FetchedAt:             now,
+	})
 }
 
 // fetchPolicy does the GET and parses the response. Returns an error on any
-// non-200, transport failure, or unparseable body so the caller fails closed.
-func fetchPolicy(apiKey string) (bool, error) {
+// non-200, transport failure, or unparseable body so the caller fails closed
+// (prose) / retains its prior value (auto-update).
+func fetchPolicy(apiKey string) (apiResponse, error) {
 	req, err := http.NewRequest(http.MethodGet, ingest.APIURL()+policyPath(), nil)
 	if err != nil {
-		return false, err
+		return apiResponse{}, err
 	}
 	req.Header.Set("X-API-Key", apiKey)
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := ingest.HTTPClient().Do(req)
 	if err != nil {
-		return false, err
+		return apiResponse{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, &httpError{status: resp.StatusCode}
+		return apiResponse{}, &httpError{status: resp.StatusCode}
 	}
 	var parsed apiResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPolicyBodyBytes)).Decode(&parsed); err != nil {
-		return false, err
+		return apiResponse{}, err
 	}
-	return parsed.CaptureAssistantProse, nil
+	return parsed, nil
 }
 
 // httpError is a non-200 policy response.
