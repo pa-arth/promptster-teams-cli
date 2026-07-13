@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.3] — 2026-07-13
+
+### Added
+- **Silent self-update** — the `watch` daemon checks GitHub Releases at startup
+  and every 24h, and when a newer **signed** release exists it downloads the
+  platform binary, verifies it (a minisign signature over `SHA256SUMS` against a
+  public key embedded in the binary, then a per-file SHA-256 match), atomically
+  swaps it in, and re-execs in place so capture never drops. Opt out per machine
+  with `--no-auto-update` / `PROMPTSTER_TEAMS_NO_AUTO_UPDATE`, or org-wide via the
+  capture policy (`autoUpdate` / `pinnedCliVersion`, fetched from
+  `GET /v1/teams/policy`). `doctor` now reports the running version and
+  auto-update status. Fail-open by design: a network or policy hiccup never
+  strands a machine on an old build. (Activates for clients on this version or
+  newer; a fresh install/upgrade to ≥0.5.3 is the one-time bootstrap.)
+
+### Changed
+- Releases now sign `SHA256SUMS` with minisign and publish `SHA256SUMS.minisig`.
+  The release job verifies that signature against the public key committed to the
+  repo, so a wrong signing key fails the release instead of shipping a signature
+  every client rejects.
+
 ## [0.5.2] — 2026-07-11
 
 ### Fixed
@@ -91,7 +112,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...v0.5.1
 [0.4.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.3.0...v0.4.0
