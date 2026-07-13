@@ -114,6 +114,19 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			},
 			wantDropped: []string{"transcript"},
 		},
+		{
+			// Source-exclusion defense-in-depth: even if a future/buggy emitter put
+			// a cutToolInput (a command body / file path) on an interrupt, the
+			// default-deny projector must strip it. Safe metadata survives.
+			name: "interrupt keeps subtype/cutTool/variant, drops any cutToolInput",
+			kind: "interrupt",
+			data: map[string]interface{}{
+				"subtype": "action", "cutTool": "Bash", "variant": "generation",
+				"cutToolInput": leakCanary,
+			},
+			wantKept:    map[string]interface{}{"subtype": "action", "cutTool": "Bash", "variant": "generation"},
+			wantDropped: []string{"cutToolInput"},
+		},
 	}
 
 	for _, tc := range cases {

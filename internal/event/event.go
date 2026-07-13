@@ -58,6 +58,12 @@ type Event struct {
 	Actor      *Actor      `json:"actor,omitempty"`
 	Provenance *Provenance `json:"provenance,omitempty"`
 	RawPayload string      `json:"rawPayload,omitempty"`
+	// RelatedEventIDs back-links this event to earlier events in the same
+	// session (e.g. a redirect prompt to the interrupt that preceded it). The
+	// backend envelope field is `relatedEventIds`. Not covered by the signing
+	// message (BuildSigningMessage hashes only Data + header fields), so it is
+	// pure linkage metadata — no source, no signature exposure.
+	RelatedEventIDs []string `json:"relatedEventIds,omitempty"`
 	// Ed25519 signature over the canonical signing message (hex). Added by
 	// signAndAppendEvent during buffer append; empty on legacy unsigned events.
 	Sig string `json:"sig,omitempty"`

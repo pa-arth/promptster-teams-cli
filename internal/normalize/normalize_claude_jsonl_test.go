@@ -511,3 +511,318 @@ func TestParseClaudeExitCodeFromErrorText(t *testing.T) {
 		t.Errorf("exitCode = %v, want the parsed 2 (not the is_error fallback 1)", dm(*cmd)["exitCode"])
 	}
 }
+
+func TestClaudeTranscriptInterruptActionNotPrompt(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// Assistant fires a Bash tool_use, then the developer hits ESC — Claude Code
+	// writes a plain-string user line. It must become ONE interrupt event
+	// (subtype=action, cutTool from the preceding record), NOT a prompt.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-i1","message":{"id":"msg-i1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_i1","name":"Bash","input":{"command":"rm -rf /tmp/scratch"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:10:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:10:03Z","uuid":"line-int-1"}`,
+	)
+	var interrupt *event.Event
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			t.Fatalf("interrupt sentinel must NOT become a prompt: %+v", events[i])
+		}
+		if events[i].Kind == "interrupt" {
+			interrupt = &events[i]
+		}
+	}
+	if interrupt == nil {
+		t.Fatalf("expected an interrupt event, got %+v", events)
+	}
+	if interrupt.Source != "claude-code" {
+		t.Errorf("source = %s", interrupt.Source)
+	}
+	if interrupt.Actor == nil || interrupt.Actor.Type != "human" {
+		t.Errorf("actor = %+v", interrupt.Actor)
+	}
+	if interrupt.Provenance == nil || interrupt.Provenance.Methods[0] != "transcript-jsonl" {
+		t.Errorf("provenance = %+v", interrupt.Provenance)
+	}
+	d := dm(*interrupt)
+	if d["subtype"] != "action" {
+		t.Errorf("subtype = %v, want action", d["subtype"])
+	}
+	if d["cutTool"] != "Bash" {
+		t.Errorf("cutTool = %v", d["cutTool"])
+	}
+	if d["variant"] != "generation" {
+		t.Errorf("variant = %v, want generation (the plain sentinel)", d["variant"])
+	}
+	// SOURCE-EXCLUSION REGRESSION GUARD: the teams CLI must NEVER emit a
+	// cutToolInput (a Bash command body / file path is source-adjacent). The
+	// hiring CLI carries it; teams deliberately omits it.
+	if _, has := d["cutToolInput"]; has {
+		t.Errorf("teams interrupt must NOT carry cutToolInput (source exclusion): %v", d["cutToolInput"])
+	}
+}
+
+func TestClaudeTranscriptInterruptGenerationSubtype(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// Assistant emits only text (no tool_use), then interrupted → subtype
+	// generation, no cutTool.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-g1","message":{"id":"msg-g1","model":"claude-sonnet-4-6","content":[{"type":"text","text":"Here is a long explanation that got cut off"}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:11:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:11:02Z","uuid":"line-int-g1"}`,
+	)
+	var interrupt, aiResp *event.Event
+	for i := range events {
+		switch events[i].Kind {
+		case "interrupt":
+			interrupt = &events[i]
+		case "ai_response":
+			aiResp = &events[i]
+		}
+	}
+	if aiResp == nil {
+		t.Errorf("the interrupted assistant text should still flush as ai_response")
+	}
+	if interrupt == nil {
+		t.Fatalf("expected interrupt, got %+v", events)
+	}
+	d := dm(*interrupt)
+	if d["subtype"] != "generation" {
+		t.Errorf("subtype = %v, want generation", d["subtype"])
+	}
+	if _, has := d["cutTool"]; has {
+		t.Errorf("generation interrupt must not carry cutTool: %v", d["cutTool"])
+	}
+	if _, has := d["cutToolInput"]; has {
+		t.Errorf("teams interrupt must NOT carry cutToolInput (source exclusion)")
+	}
+}
+
+func TestClaudeTranscriptInterruptForToolUseVariant(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// The "...for tool use" sentinel arriving inside a content array.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-t1","message":{"id":"msg-t1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_t1","name":"Edit","input":{"file_path":"/tmp/ws/app.go","old_string":"a","new_string":"b"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:12:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"timestamp":"2026-06-10T10:12:01Z","uuid":"line-int-t1"}`,
+	)
+	var interrupt *event.Event
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			t.Fatalf("array-form sentinel must NOT become a prompt: %+v", events[i])
+		}
+		if events[i].Kind == "interrupt" {
+			interrupt = &events[i]
+		}
+	}
+	if interrupt == nil {
+		t.Fatalf("expected interrupt, got %+v", events)
+	}
+	d := dm(*interrupt)
+	if d["variant"] != "tool_use" {
+		t.Errorf("variant = %v, want tool_use", d["variant"])
+	}
+	if d["subtype"] != "action" || d["cutTool"] != "Edit" {
+		t.Errorf("subtype/cutTool = %v / %v", d["subtype"], d["cutTool"])
+	}
+	// The cut tool's file_path must NOT leak as cutToolInput (source exclusion).
+	if _, has := d["cutToolInput"]; has {
+		t.Errorf("teams interrupt must NOT carry cutToolInput (would leak the file_path)")
+	}
+}
+
+func TestClaudeTranscriptInterruptRedirectLinkage(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-r1","message":{"id":"msg-r1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_r1","name":"Bash","input":{"command":"sleep 999"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:13:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:13:02Z","uuid":"line-int-r1"}`,
+		`{"type":"user","message":{"role":"user","content":"actually run the tests instead"},"timestamp":"2026-06-10T10:13:05Z","uuid":"line-redir-r1"}`,
+	)
+	var interrupt, prompt *event.Event
+	for i := range events {
+		switch events[i].Kind {
+		case "interrupt":
+			interrupt = &events[i]
+		case "prompt":
+			prompt = &events[i]
+		}
+	}
+	if interrupt == nil || prompt == nil {
+		t.Fatalf("expected an interrupt AND a redirect prompt, got %+v", events)
+	}
+	if dm(*prompt)["followsInterrupt"] != true {
+		t.Errorf("redirect prompt missing followsInterrupt: %v", dm(*prompt))
+	}
+	if len(prompt.RelatedEventIDs) != 1 || prompt.RelatedEventIDs[0] != interrupt.ID {
+		t.Errorf("relatedEventIds = %v, want [%s]", prompt.RelatedEventIDs, interrupt.ID)
+	}
+}
+
+func TestClaudeTranscriptConsecutiveInterruptsCollapse(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// ESC ESC in a burst → exactly one interrupt event; the redirect still
+	// links to that single interrupt.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-c1","message":{"id":"msg-c1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_c1","name":"Bash","input":{"command":"top"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:14:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:14:01Z","uuid":"line-int-c1"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:14:01Z","uuid":"line-int-c2"}`,
+		`{"type":"user","message":{"role":"user","content":"stop and summarize"},"timestamp":"2026-06-10T10:14:03Z","uuid":"line-redir-c1"}`,
+	)
+	interrupts := 0
+	var interrupt, prompt *event.Event
+	for i := range events {
+		switch events[i].Kind {
+		case "interrupt":
+			interrupts++
+			interrupt = &events[i]
+		case "prompt":
+			prompt = &events[i]
+		}
+	}
+	if interrupts != 1 {
+		t.Fatalf("ESC ESC burst must collapse to 1 interrupt, got %d", interrupts)
+	}
+	if prompt == nil || interrupt == nil {
+		t.Fatalf("expected interrupt + prompt, got %+v", events)
+	}
+	if len(prompt.RelatedEventIDs) != 1 || prompt.RelatedEventIDs[0] != interrupt.ID {
+		t.Errorf("redirect must link the single interrupt: %v", prompt.RelatedEventIDs)
+	}
+}
+
+func TestClaudeTranscriptInterruptAbortNoRedirect(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// Interrupt followed by a NEW assistant record (no redirect prompt) → the
+	// pending link is cleared; a later prompt does NOT back-link.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-a1","message":{"id":"msg-a1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_a1","name":"Bash","input":{"command":"make"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:15:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:15:01Z","uuid":"line-int-a1"}`,
+		`{"type":"assistant","requestId":"req-a2","message":{"id":"msg-a2","model":"claude-sonnet-4-6","content":[{"type":"text","text":"resuming on my own"}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:15:02Z"}`,
+		`{"type":"user","message":{"role":"user","content":"unrelated follow-up"},"timestamp":"2026-06-10T10:15:06Z","uuid":"line-prompt-a1"}`,
+	)
+	var prompt *event.Event
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			prompt = &events[i]
+		}
+	}
+	if prompt == nil {
+		t.Fatalf("expected a prompt, got %+v", events)
+	}
+	if _, has := dm(*prompt)["followsInterrupt"]; has {
+		t.Errorf("prompt after an intervening assistant must NOT follow the interrupt")
+	}
+	if len(prompt.RelatedEventIDs) != 0 {
+		t.Errorf("relatedEventIds = %v, want empty", prompt.RelatedEventIDs)
+	}
+}
+
+func TestClaudeTranscriptChunkedToolThenTextInterruptIsGeneration(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// One API message chunked across two records sharing message.id: a tool_use
+	// record THEN a text-only record. The trailing text record is the most recent
+	// content, so an interrupt after it must classify as "generation" with NO
+	// stale cutTool — not "action" carried over from the earlier tool_use record.
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-ch1","message":{"id":"msg-ch1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_ch1","name":"Bash","input":{"command":"npm run build"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:20:00Z"}`,
+		`{"type":"assistant","requestId":"req-ch1","message":{"id":"msg-ch1","model":"claude-sonnet-4-6","content":[{"type":"text","text":"now let me explain the plan before running anything"}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:20:01Z"}`,
+		`{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"},"timestamp":"2026-06-10T10:20:03Z","uuid":"line-int-ch1"}`,
+	)
+	var interrupt *event.Event
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			t.Fatalf("interrupt sentinel must NOT become a prompt: %+v", events[i])
+		}
+		if events[i].Kind == "interrupt" {
+			interrupt = &events[i]
+		}
+	}
+	if interrupt == nil {
+		t.Fatalf("expected an interrupt event, got %+v", events)
+	}
+	d := dm(*interrupt)
+	if d["subtype"] != "generation" {
+		t.Errorf("subtype = %v, want generation (text record cleared the tool state)", d["subtype"])
+	}
+	if _, has := d["cutTool"]; has {
+		t.Errorf("stale cutTool leaked from the earlier tool_use record: %v", d["cutTool"])
+	}
+}
+
+func TestClaudeTranscriptSentinelToolResultEmitsOnlyInterrupt(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	// A cut tool call: the synthetic user record's content array carries the
+	// sentinel in a tool_result block AND a sibling text block. Exactly ONE
+	// interrupt must be emitted, and NO prompt (the sibling text is not a real
+	// prompt, and must not be back-linked as a redirect either).
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-sr1","message":{"id":"msg-sr1","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_sr1","name":"Bash","input":{"command":"sleep 999"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:21:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_sr1","content":"[Request interrupted by user for tool use]"},{"type":"text","text":"stray sibling text"}]},"timestamp":"2026-06-10T10:21:01Z","uuid":"line-int-sr1"}`,
+	)
+	interrupts := 0
+	var interrupt *event.Event
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			t.Fatalf("sentinel tool_result must NOT also emit a prompt: %+v", events[i])
+		}
+		if events[i].Kind == "interrupt" {
+			interrupts++
+			interrupt = &events[i]
+		}
+	}
+	if interrupts != 1 {
+		t.Fatalf("expected exactly 1 interrupt, got %d: %+v", interrupts, events)
+	}
+	d := dm(*interrupt)
+	if d["variant"] != "tool_use" {
+		t.Errorf("variant = %v, want tool_use", d["variant"])
+	}
+	if d["subtype"] != "action" || d["cutTool"] != "Bash" {
+		t.Errorf("subtype/cutTool = %v / %v", d["subtype"], d["cutTool"])
+	}
+}
+
+func TestToolResultTextArrayContent(t *testing.T) {
+	// Array-shaped tool_result.content carrying the sentinel must be detected.
+	block := map[string]interface{}{
+		"type":        "tool_result",
+		"tool_use_id": "toolu_arr1",
+		"content": []interface{}{
+			map[string]interface{}{"type": "text", "text": "[Request interrupted by user for tool use]"},
+		},
+	}
+	got := toolResultText(block)
+	variant, ok := interruptVariant(got)
+	if !ok {
+		t.Fatalf("array-shaped tool_result content not detected: %q", got)
+	}
+	if variant != "tool_use" {
+		t.Errorf("variant = %v, want tool_use", variant)
+	}
+	// Multiple text blocks concatenate with newlines; non-text blocks are ignored.
+	multi := map[string]interface{}{
+		"content": []interface{}{
+			map[string]interface{}{"type": "text", "text": "line one"},
+			map[string]interface{}{"type": "image", "source": "..."},
+			map[string]interface{}{"type": "text", "text": "line two"},
+		},
+	}
+	if got := toolResultText(multi); got != "line one\nline two" {
+		t.Errorf("concatenation = %q", got)
+	}
+	// End-to-end through handleUser: array tool_result sentinel yields one
+	// interrupt and no prompt.
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-arr","message":{"id":"msg-arr","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_arr2","name":"Edit","input":{"file_path":"/tmp/ws/x.go"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:22:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_arr2","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]}]},"timestamp":"2026-06-10T10:22:01Z","uuid":"line-int-arr1"}`,
+	)
+	interrupts := 0
+	for i := range events {
+		if events[i].Kind == "prompt" {
+			t.Fatalf("array sentinel must NOT become a prompt: %+v", events[i])
+		}
+		if events[i].Kind == "interrupt" {
+			interrupts++
+		}
+	}
+	if interrupts != 1 {
+		t.Fatalf("expected 1 interrupt from array-shaped sentinel, got %d: %+v", interrupts, events)
+	}
+}

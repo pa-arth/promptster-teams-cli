@@ -90,6 +90,26 @@ type ClaudeTranscriptProcessor struct {
 	// meta.ideSessionId / meta.cwd.
 	ideSessionID string
 	laneCwd      string
+	// Interrupt tracking. Claude Code writes a synthetic user line
+	// ([Request interrupted by user] / ...for tool use) when the developer hits
+	// ESC/Ctrl+C mid-response. We classify what was cut POSITIONALLY from the
+	// most-recent assistant RECORD — interruptedMessageId is null ~1/3 of the
+	// time, so it can't be relied on. lastAssistantHadTool/lastCutToolName are
+	// re-derived from each assistant record's own content (NOT sticky across
+	// records sharing a message.id), so a text-only record following a tool_use
+	// record for the same message clears the cut-tool state.
+	//
+	// SOURCE EXCLUSION: only the tool NAME is tracked here (same class as a
+	// slash-command name), never the tool INPUT. A Bash command body or file
+	// path is source-adjacent, so — unlike the hiring CLI — no cutToolInput is
+	// derived, kept, or emitted. If in doubt it stays out.
+	lastAssistantHadTool bool
+	lastCutToolName      string
+	// pendingInterruptID is the ID of an emitted interrupt awaiting the redirect
+	// prompt that follows it. The next prompt (with no assistant record between)
+	// back-links to it; an intervening assistant record or a second interrupt
+	// clears it.
+	pendingInterruptID string
 }
 
 func NewClaudeTranscriptProcessor(sessionID string) *ClaudeTranscriptProcessor {
@@ -344,6 +364,11 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 	msgID := stringField(msg, "id")
 	ts, _ := rec["timestamp"].(string)
 
+	// Any assistant activity clears a pending interrupt back-link: an assistant
+	// record standing between an interrupt and the next prompt means the
+	// interrupt was an abort with no redirect prompt following it.
+	p.pendingInterruptID = ""
+
 	var events []event.Event
 	if p.accum != nil && p.accum.msgID != msgID {
 		events = p.flushAccum()
@@ -363,6 +388,15 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 	if p.accum != nil && p.accum.msgID == msgID {
 		p.accum.updatedAt = time.Now()
 	}
+
+	// Re-derive the positional interrupt context from THIS record's own content.
+	// One API message is chunked across multiple records that share message.id;
+	// a tool_use record followed by a text-only record for the same id must leave
+	// the cut-tool state CLEARED, so an interrupt after the text record is
+	// classified "generation", not a stale "action". So track the most-recent
+	// RECORD's content, not sticky state keyed on message.id.
+	recordHadTool := false
+	var recordToolName string
 
 	content, _ := msg["content"].([]interface{})
 	for _, rawBlock := range content {
@@ -389,9 +423,20 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 			if id != "" {
 				p.pendingTools[id] = claudePendingTool{name: stringField(block, "name"), input: input}
 			}
+			// This record contains a tool call, so an interrupt arriving next cut
+			// an ACTION. Record the tool NAME (never its input) so the interrupt
+			// event can name what was killed without carrying source.
+			recordHadTool = true
+			recordToolName = stringField(block, "name")
 		}
 		// thinking / other block types carry no event of their own.
 	}
+
+	// Reflect the most-recent assistant record: a tool_use record sets the
+	// cut-tool state; a text-only (or thinking-only) record clears it.
+	p.lastAssistantHadTool = recordHadTool
+	p.lastCutToolName = recordToolName
+
 	return events
 }
 
@@ -470,13 +515,21 @@ func (p *ClaudeTranscriptProcessor) handleUser(rec map[string]interface{}, line 
 	}
 	ts, _ := rec["timestamp"].(string)
 
+	uuid := stringField(rec, "uuid")
+
 	switch content := msg["content"].(type) {
 	case string:
+		// An ESC/Ctrl+C interrupt arrives here as a plain-string user message —
+		// intercept it before it becomes a spurious prompt.
+		if variant, ok := interruptVariant(content); ok {
+			return p.interruptEvent(variant, ts, uuid, line)
+		}
 		return p.promptEvent(content, rec, ts, line)
 	case []interface{}:
 		var events []event.Event
 		var textParts []string
 		hasToolResult := false
+		interruptVar := ""
 		for _, rawBlock := range content {
 			block, _ := rawBlock.(map[string]interface{})
 			if block == nil {
@@ -484,13 +537,29 @@ func (p *ClaudeTranscriptProcessor) handleUser(rec map[string]interface{}, line 
 			}
 			switch stringField(block, "type") {
 			case "tool_result":
+				// A tool_result marks this as a synthetic (non-prompt) record —
+				// set the flag FIRST so the "...for tool use" sentinel path below
+				// can't fall through and also emit a stray prompt from a sibling
+				// text block. The sentinel can land inside a tool_result block when
+				// a tool call was cut — catch it before pairing.
 				hasToolResult = true
+				if variant, ok := interruptVariant(toolResultText(block)); ok {
+					interruptVar = variant
+					continue
+				}
 				if ev, ok := p.resolveToolResult(rec, block, ts, line); ok {
 					events = append(events, ev)
 				}
 			case "text":
+				if variant, ok := interruptVariant(stringField(block, "text")); ok {
+					interruptVar = variant
+					continue
+				}
 				textParts = append(textParts, stringField(block, "text"))
 			}
+		}
+		if interruptVar != "" {
+			events = append(events, p.interruptEvent(interruptVar, ts, uuid, line)...)
 		}
 		// A content array with text blocks and no tool_result is a human
 		// prompt (e.g. prompt with attachments).
@@ -501,6 +570,84 @@ func (p *ClaudeTranscriptProcessor) handleUser(rec map[string]interface{}, line 
 	default:
 		return nil
 	}
+}
+
+// interruptSentinels maps the exact synthetic user text Claude Code writes on an
+// ESC/Ctrl+C interrupt to the variant recorded on the interrupt event. Match is
+// on the trimmed, whole string only.
+var interruptSentinels = map[string]string{
+	"[Request interrupted by user]":              "generation",
+	"[Request interrupted by user for tool use]": "tool_use",
+}
+
+// interruptVariant reports whether text is an interrupt sentinel and, if so, the
+// variant ("generation" | "tool_use") to stamp on the event.
+func interruptVariant(text string) (string, bool) {
+	v, ok := interruptSentinels[strings.TrimSpace(text)]
+	return v, ok
+}
+
+// toolResultText returns the textual content of a tool_result block. Content is
+// either a plain string or an array of blocks (Claude Code writes the interrupt
+// sentinel in both shapes); for the array form the text of every type=="text"
+// block is concatenated. Returns "" for any other shape.
+func toolResultText(block map[string]interface{}) string {
+	switch content := block["content"].(type) {
+	case string:
+		return content
+	case []interface{}:
+		var parts []string
+		for _, rawInner := range content {
+			inner, _ := rawInner.(map[string]interface{})
+			if inner == nil {
+				continue
+			}
+			if stringField(inner, "type") == "text" {
+				parts = append(parts, stringField(inner, "text"))
+			}
+		}
+		return strings.Join(parts, "\n")
+	}
+	return ""
+}
+
+// interruptEvent emits an `interrupt` event describing what the developer cut
+// mid-response. subtype is classified positionally from the most-recent
+// assistant record: "action" if it contained a tool_use block (naming the cut
+// tool), else "generation". variant records which sentinel matched.
+//
+// SOURCE EXCLUSION: unlike the hiring CLI this carries NO cutToolInput — a Bash
+// command body or file path is source-adjacent and would violate the teams
+// "never store your code" guarantee. Only the tool NAME (safe, same class as a
+// slash-command name), subtype, and variant are emitted; the redact projector's
+// interrupt allowlist enforces the same restriction as defense-in-depth.
+//
+// Consecutive interrupts (ESC ESC) collapse: a second interrupt while one is
+// still pending is skipped so a burst counts once. sourceKey is the synthetic
+// user line's own uuid, so the emitted interrupt gets a deterministic id.
+func (p *ClaudeTranscriptProcessor) interruptEvent(variant, ts, sourceKey string, line []byte) []event.Event {
+	if p.pendingInterruptID != "" {
+		return nil
+	}
+	subtype := "generation"
+	data := map[string]interface{}{
+		"variant": variant,
+	}
+	if p.lastAssistantHadTool {
+		subtype = "action"
+		if p.lastCutToolName != "" {
+			data["cutTool"] = p.lastCutToolName
+		}
+	}
+	data["subtype"] = subtype
+
+	e := p.newTranscriptEvent("interrupt", ts, sourceKey)
+	e.Actor = event.HumanActor()
+	e.Provenance = transcriptHumanProvenance()
+	e.Data = data
+	e.RawPayload = strPreview(string(line), 500)
+	p.pendingInterruptID = e.ID
+	return []event.Event{e}
 }
 
 func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]interface{}, ts string, line []byte) []event.Event {
@@ -558,6 +705,14 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// behavioral analysis of the developer.
 	if lineTime, err := time.Parse(time.RFC3339, ts); err == nil {
 		p.lastPromptTs = lineTime
+	}
+
+	// This is the redirect prompt following an interrupt (no assistant record
+	// intervened, or it would have cleared pendingInterruptID) — back-link it.
+	if p.pendingInterruptID != "" {
+		e.RelatedEventIDs = append(e.RelatedEventIDs, p.pendingInterruptID)
+		data["followsInterrupt"] = true
+		p.pendingInterruptID = ""
 	}
 
 	e.Data = data
