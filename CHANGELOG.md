@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.4] — 2026-07-13
+
+### Changed
+- Onboarding now points at the canonical `login` → `autostart enable` →
+  `status` flow across `install.sh`, the README, and the npm README, so capture
+  is set up to survive reboots from the first run.
+- The live `status` dashboard shows an **autostart** row, so an
+  installed-but-not-armed seat is visible instead of silently dying on the next
+  reboot.
+
+### Fixed
+- The live status dashboard no longer probes the OS service manager on every
+  render tick/keypress — a slow `launchctl` / `systemctl` / `schtasks` could
+  stutter or block the dashboard. It now probes once and on manual refresh, and
+  an installed-but-inactive autostart service shows a warning instead of a
+  healthy green indicator.
+
 ## [0.5.3] — 2026-07-13
 
 ### Added
@@ -113,6 +130,7 @@ follows [Semantic Versioning](https://semver.org/).
   tamper-evident chain, and streams to a team backend.
 
 [Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...HEAD
+[0.5.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.0...v0.5.1
