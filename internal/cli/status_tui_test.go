@@ -11,7 +11,7 @@ import (
 // fakeDevKey is a syntactically-valid but entirely fake developer key for tests
 // — not a secret. The trailing comment tells gitleaks to skip it (its
 // generic-api-key rule otherwise flags any literal next to *_TOKEN).
-const fakeDevKey = "PSE-ABCD-2345" // gitleaks:allow
+const fakeDevKey = "PSE-ABCD-2345-6789-JKLM-NPQR-STUV" // gitleaks:allow
 
 // writeWatcherPidfile drops a watcher pidfile pointing at the current process
 // (which is guaranteed alive) into the state dir, so Snapshot() reports it live.

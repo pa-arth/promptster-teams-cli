@@ -78,7 +78,7 @@ func printUsage() {
 Usage: promptster-teams <command>
 
 Commands:
-  login        Save your developer key (PSE-XXXX-XXXX) — paste it or pass --key
+  login        Save your developer key (PSE-XXXX-…) — paste it or pass --key
   start        Capture in the background (detaches and returns your shell)
   stop         Stop background capture
   autostart    Keep capture alive across reboots (enable|disable|status) — starts at login

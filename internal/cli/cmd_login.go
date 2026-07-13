@@ -15,12 +15,13 @@ import (
 )
 
 // cmdLogin onboards an individual contributor: it takes the per-engineer key
-// (PSE-XXXX-XXXX) their manager minted — pasted interactively or via --key —
+// (PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX) their manager minted — pasted interactively
+// or via --key —
 // validates it, checks the ingest host is reachable, and persists it to
 // ~/.promptster-teams/credentials (0600) so `watch` just works afterward.
 func cmdLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
-	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); paste interactively if omitted")
+	keyFlag := fs.String("key", "", "Developer key ("+ingest.KeyFormatHint+"); paste interactively if omitted")
 	urlFlag := fs.String("api-url", "", "Override ingest base URL (default: hosted)")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
@@ -37,7 +38,7 @@ func cmdLogin(args []string) {
 	if key == "" {
 		// Interactive paste — only when stdin is a terminal.
 		if !stdinIsTTY() {
-			fmt.Fprintf(os.Stderr, "  %s no key provided. Pass --key PSE-XXXX-XXXX, or run `login` in a terminal.\n\n", errGlyph)
+			fmt.Fprintf(os.Stderr, "  %s no key provided. Pass --key %s, or run `login` in a terminal.\n\n", errGlyph, ingest.KeyFormatHint)
 			os.Exit(1)
 		}
 		fmt.Printf("  %s Paste your developer key: ", promptGlyph())
@@ -49,7 +50,7 @@ func cmdLogin(args []string) {
 	}
 
 	if !ingest.IsEngineerKey(key) {
-		fmt.Printf("  %s that doesn't look like a developer key (expected PSE-XXXX-XXXX).\n\n", errGlyph)
+		fmt.Printf("  %s that doesn't look like a developer key (expected %s).\n\n", errGlyph, ingest.KeyFormatHint)
 		os.Exit(1)
 	}
 

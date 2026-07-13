@@ -110,7 +110,7 @@ func TestRedactAWSKey(t *testing.T) {
 }
 
 func TestRedactEngineerKey(t *testing.T) {
-	key := "PSE-AB2C-9XYZ"
+	key := "PSE-VJA3-3W49-6RX8-D2QC-S7CN-CE8N" // gitleaks:allow — fake six-group key
 	out := RedactBytes([]byte(`run with X-API-Key: ` + key + ` to ingest`))
 	if bytes.Contains(out, []byte(key)) {
 		t.Errorf("engineer key not redacted: %q", out)

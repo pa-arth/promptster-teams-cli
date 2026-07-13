@@ -14,7 +14,7 @@ import (
 )
 
 // loadSession builds the teams capture context. The ingest credential is a
-// per-engineer key (PSE-XXXX-XXXX) resolved with flag > env > stored-file
+// per-engineer key (PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX) resolved with flag > env > stored-file
 // precedence (see credentials.go); the API URL resolves the same way, falling
 // back to the hosted default. `runTeamsWatch` exports the resolved values into
 // the environment before spawning the watchers, so this stays signatureless and
@@ -22,7 +22,7 @@ import (
 func loadSession() (Session, error) {
 	token, _ := ingest.ResolveToken("")
 	if token == "" {
-		return Session{}, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+		return Session{}, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key " + ingest.KeyFormatHint)
 	}
 	apiURL := ingest.ResolveAPIURL("")
 
@@ -74,7 +74,7 @@ func DeviceID() string {
 // two entry points can't drift on how a credential is resolved.
 func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdate bool, err error) {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
-	keyFlag := fs.String("key", "", "Developer key (PSE-XXXX-XXXX); overrides env/stored")
+	keyFlag := fs.String("key", "", "Developer key ("+ingest.KeyFormatHint+"); overrides env/stored")
 	urlFlag := fs.String("api-url", "", "Override ingest base URL")
 	noUpdateFlag := fs.Bool("no-auto-update", false, "Disable silent self-update of the CLI while watching")
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +83,7 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdat
 
 	token, _ = ingest.ResolveToken(*keyFlag)
 	if token == "" {
-		return "", "", "", false, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key PSE-XXXX-XXXX")
+		return "", "", "", false, fmt.Errorf("no developer key configured — run `promptster-teams login`, set PROMPTSTER_TEAMS_TOKEN, or pass --key " + ingest.KeyFormatHint)
 	}
 	apiURL = ingest.ResolveAPIURL(*urlFlag)
 
