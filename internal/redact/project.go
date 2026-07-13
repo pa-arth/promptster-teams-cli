@@ -43,9 +43,17 @@ var projectUsageFields = []string{
 var projectFieldAllowlist = map[string][]string{
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
+	// followsInterrupt is a boolean flag marking a redirect prompt (the one
+	// typed right after an ESC/Ctrl+C interrupt); its relatedEventIds linkage
+	// lives on the envelope, outside Data.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command"},
+	"prompt": {"text", "command", "followsInterrupt"},
+	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
+	// the tool NAME (same class as a slash-command name); subtype/variant are
+	// enums. NO cutToolInput — a command body / file path is source-adjacent, so
+	// it is neither emitted by the CLI nor allowlisted here (double protection).
+	"interrupt": {"subtype", "cutTool", "variant"},
 	// ai_response deliberately carries NO text: assistant messages routinely
 	// embed source (patches, file bodies). Usage/model metadata only.
 	"ai_response":    projectUsageFields,
