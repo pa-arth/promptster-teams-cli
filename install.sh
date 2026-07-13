@@ -115,6 +115,6 @@ esac
 
 printf '\n\033[1mpromptster-teams installed!\033[0m\n'
 printf 'Get started:\n'
-printf '  export PROMPTSTER_TEAMS_API_URL=...\n'
-printf '  export PROMPTSTER_TEAMS_TOKEN=...\n'
-printf '  promptster-teams doctor\n\n'
+printf '  promptster-teams login             # paste your PSE-XXXX-XXXX key — capture starts automatically\n'
+printf '  promptster-teams autostart enable  # keep capturing across reboots (starts at login)\n'
+printf '  promptster-teams status            # confirm it'\''s running\n\n'

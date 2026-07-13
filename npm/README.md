@@ -5,12 +5,14 @@ On-device, auditable AI-coding capture for internal engineering teams.
 ```sh
 npm install -g @promptster/teams-cli
 
-export PROMPTSTER_TEAMS_API_URL="https://<your-team-ingest-host>"
-export PROMPTSTER_TEAMS_TOKEN="<your-org/device-token>"
-
-promptster-teams doctor
-promptster-teams watch
+promptster-teams login             # paste your PSE-XXXX-XXXX key — capture starts automatically
+promptster-teams autostart enable  # keep capturing across reboots (starts at login)
+promptster-teams status            # confirm it's running
 ```
+
+Background capture from `login` doesn't survive a reboot on its own —
+`autostart enable` installs a per-OS login service (launchd / systemd / Task
+Scheduler) so it comes back after every restart.
 
 Tails Claude Code + Codex transcripts, redacts secrets on-device, signs each
 event into a tamper-evident chain, and streams to your team's backend. Capture

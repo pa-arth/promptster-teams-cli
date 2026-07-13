@@ -169,18 +169,28 @@ install. Every release ships `SHA256SUMS` alongside the binaries.
 ## Usage
 
 Your manager mints you a **developer key** (`PSE-XXXX-XXXX`) in the Promptster
-dashboard. Paste it once with `login`, then `watch`:
+dashboard. Paste it once with `login` — capture starts in the background
+automatically — then arm `autostart` so it survives reboots:
 
 ```sh
-promptster-teams login    # paste your PSE-XXXX-XXXX key (or: login --key PSE-…)
-promptster-teams watch    # capture from the current repo (Ctrl-C to stop)
-promptster-teams status   # show config + locally buffered event count
-promptster-teams doctor   # check key, ingest reachability, transcript dir
+promptster-teams login             # paste your PSE-XXXX-XXXX key — capture starts automatically
+promptster-teams autostart enable  # keep capturing across reboots (starts at login)
+promptster-teams status            # confirm it's running
 ```
 
 The key identifies your sessions to your team and nothing else; it is the only
 identity stamped on captured events. `login` stores it at
 `~/.promptster-teams/credentials` (mode `0600`).
+
+`login` and `start` run capture as a detached background process — but a plain
+background process **does not survive a reboot**. `autostart enable` installs a
+per-OS login service (launchd on macOS, `systemd --user` on Linux, Task
+Scheduler on Windows) that brings capture back after every restart; `autostart
+disable` removes it and `autostart status` shows whether it's armed.
+
+Other commands: `watch` runs capture in the foreground (Ctrl-C to stop) for
+debugging, `stop` halts background capture, and `doctor` checks your key, ingest
+reachability, and transcript dirs.
 
 ### Configuration
 

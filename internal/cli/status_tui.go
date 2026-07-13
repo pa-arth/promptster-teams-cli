@@ -11,6 +11,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 )
 
 // Live-status dashboard. A small bubbletea program that re-reads the capture
@@ -33,15 +34,16 @@ func statusTick() tea.Cmd {
 }
 
 type statusModel struct {
-	snap     capture.CaptureSnapshot
-	buffered int
-	token    string
-	source   string
-	apiURL   string
-	device   string
-	now      time.Time
-	tick     int
-	quitting bool
+	snap      capture.CaptureSnapshot
+	buffered  int
+	token     string
+	source    string
+	apiURL    string
+	device    string
+	autostart string
+	now       time.Time
+	tick      int
+	quitting  bool
 }
 
 func newStatusModel() statusModel {
@@ -55,7 +57,29 @@ func newStatusModel() statusModel {
 	}
 	m.snap = capture.Snapshot()
 	m.buffered = countBufferedEvents()
+	m.autostart = autostartLine()
 	return m
+}
+
+// autostartLine probes the OS service manager (launchctl/systemctl/schtasks) and
+// renders a colored status line. It is deliberately NOT called from the render
+// path: the probe spawns a subprocess, so it runs once at start and only on an
+// explicit refresh, never on every tick or keypress. Green is reserved for a
+// service that is actually active — an installed-but-inactive service (e.g.
+// "enabled (systemd --user, inactive)" or macOS "installed but not loaded")
+// gets a warn dot so a broken autostart never reads as healthy.
+func autostartLine() string {
+	installed, detail, err := service.New().Status()
+	if err != nil || !installed || detail == "" {
+		return dotWarn.Render("○") + dimStyle.Render(" off — ") + bodyStyle.Render("promptster-teams autostart enable")
+	}
+	healthy := strings.HasPrefix(detail, "enabled") &&
+		!strings.Contains(detail, "inactive") &&
+		!strings.Contains(detail, "failed")
+	if healthy {
+		return dotOK.Render("●") + " " + detail
+	}
+	return dotWarn.Render("●") + " " + detail + dimStyle.Render(" — re-run ") + bodyStyle.Render("autostart enable")
 }
 
 func (m statusModel) Init() tea.Cmd { return statusTick() }
@@ -70,6 +94,7 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.snap = capture.Snapshot()
 			m.buffered = countBufferedEvents()
+			m.autostart = autostartLine()
 			return m, nil
 		}
 	case statusTickMsg:
@@ -112,8 +137,11 @@ func (m statusModel) capturePanel() string {
 	} else {
 		state = dotIdle.Render("○") + dimStyle.Render(" idle — run ") + bodyStyle.Render("promptster-teams start")
 	}
+	// autostart is probed off the render path (see autostartLine) and cached on
+	// the model — surface it live so an installed-but-idle seat is visible.
 	return kvPanel("capture",
 		"state", state,
+		"autostart", m.autostart,
 		"ingest", hostOf(m.apiURL),
 		"key", keyDisplay(m.token, m.source),
 		"device", m.device,
