@@ -68,9 +68,11 @@ var redactPatterns = []struct {
 	// session completes, and the results page is key-authenticated — they must
 	// not survive into terminal-command events or replay payloads.
 	{regexp.MustCompile(`\bPST-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b`), "[REDACTED_PROMPTSTER_KEY]"},
-	// Teams per-engineer ingest credential (PSE-XXXX-XXXX). Long-lived auth that
-	// identifies a developer — must never survive into captured content.
-	{regexp.MustCompile(`\bPSE-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}\b`), "[REDACTED_PROMPTSTER_ENGINEER_KEY]"},
+	// Teams per-engineer ingest credential (PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX).
+	// Long-lived auth that identifies a developer — must never survive into
+	// captured content. One-or-more segments so any key length the backend mints
+	// is redacted (it currently mints six; older keys had two).
+	{regexp.MustCompile(`\bPSE-(?:[A-HJ-NP-Z2-9]{4}-)+[A-HJ-NP-Z2-9]{4}\b`), "[REDACTED_PROMPTSTER_ENGINEER_KEY]"},
 	{regexp.MustCompile(`\bpsk_live_[A-Za-z0-9_-]{20,}`), "[REDACTED_PROMPTSTER_ORG_KEY]"},
 
 	// --- PII / business data ---------------------------------------------

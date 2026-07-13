@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.5] — 2026-07-13
+
+### Fixed
+- **`login` now accepts current developer keys.** The backend mints six-group
+  (120-bit) engineer keys (`PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX`), but the CLI still
+  required the retired two-group format and rejected every real key with "that
+  doesn't look like a developer key". Key validation now accepts any number of
+  groups, so it won't break again when the backend tunes key entropy.
+- **Security: six-group keys are now redacted from captured content.** The
+  redaction pass shared the same two-group pattern, so a current engineer key
+  pasted into a transcript survived unredacted. It now matches any key length.
+
 ## [0.5.4] — 2026-07-13
 
 ### Changed
@@ -129,7 +141,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...HEAD
+[0.5.5]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.1...v0.5.2

@@ -15,7 +15,7 @@ import (
 )
 
 // loadSession builds the teams capture context. The ingest credential is a
-// per-engineer key (PSE-XXXX-XXXX) resolved with flag > env > stored-file
+// per-engineer key (PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX) resolved with flag > env > stored-file
 // precedence (see credentials.go); the API URL resolves the same way, falling
 // back to the hosted default. `runTeamsWatch` exports the resolved values into
 // the environment before spawning the watchers, so this stays signatureless and

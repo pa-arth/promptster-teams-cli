@@ -12,7 +12,8 @@ import (
 )
 
 // Credential resolution for the teams CLI. A developer's ingest credential is a
-// per-engineer key (PSE-XXXX-XXXX) their manager minted. It is resolved, in
+// per-engineer key (PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX) their manager minted. It
+// is resolved, in
 // order of precedence:
 //
 //	--key flag  >  PROMPTSTER_TEAMS_TOKEN env  >  stored credentials file
@@ -23,11 +24,18 @@ import (
 // default (see api.go).
 
 // engineerKeyRe matches the PSE- key format minted by the backend
-// (POST /v1/team/engineers): two 4-char base32 segments, charset
-// ABCDEFGHJKLMNPQRSTUVWXYZ23456789 (no I/O/0/1).
-var engineerKeyRe = regexp.MustCompile(`^PSE-[A-HJ-NP-Z2-9]{4}-[A-HJ-NP-Z2-9]{4}$`)
+// (POST /v1/team/engineers): one or more 4-char base32 segments, charset
+// ABCDEFGHJKLMNPQRSTUVWXYZ23456789 (no I/O/0/1). The backend mints six segments
+// (120-bit); older keys had two. The segment count is intentionally not pinned —
+// this is only a typo guard, the backend hash lookup is the real gate, and a
+// pinned count is exactly what silently broke login when the backend upgraded.
+var engineerKeyRe = regexp.MustCompile(`^PSE-(?:[A-HJ-NP-Z2-9]{4}-)+[A-HJ-NP-Z2-9]{4}$`)
 
 func IsEngineerKey(s string) bool { return engineerKeyRe.MatchString(strings.TrimSpace(s)) }
+
+// KeyFormatHint is the canonical developer-key shape shown in help text and
+// errors: PSE- plus six 4-char base32 groups, as the backend mints today.
+const KeyFormatHint = "PSE-XXXX-XXXX-XXXX-XXXX-XXXX-XXXX"
 
 // storedCredentials is the on-disk shape of the login credential file.
 type StoredCredentials struct {
