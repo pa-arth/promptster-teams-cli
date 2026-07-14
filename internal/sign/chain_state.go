@@ -93,17 +93,31 @@ func readChainState(path string) (chainState, bool) {
 // fork. There is deliberately no ledger size cap: a rebuild only happens when
 // the index is missing or corrupt, so paying one slow scan is strictly better
 // than silently restarting every session's chain.
-func rebuildChainStateFromBuffer(bufferPath string) (cs chainState, complete bool) {
+func rebuildChainStateFromBuffer() (cs chainState, complete bool) {
 	cs = chainState{V: chainStateVersion, Sessions: map[string]chainEntry{}}
+	complete = true
+	// Oldest segment first, so a session's newer tip overwrites its older one.
+	// Skipping rotated segments here would silently fork any session whose tip
+	// happens to sit just the far side of a rotation.
+	for _, seg := range ledgerSegmentsOldestFirst() {
+		if !scanLedgerSegment(seg, &cs) {
+			complete = false
+		}
+	}
+	return cs, complete
+}
 
-	// #nosec G304 -- bufferPath is state.HookBufferPath(), derived from state.StateDir(), not user input.
-	f, err := os.Open(bufferPath)
+// scanLedgerSegment folds one segment's tips into cs, returning false if it
+// could not read the segment in full.
+func scanLedgerSegment(path string, cs *chainState) (complete bool) {
+	// #nosec G304 -- path is derived from state.HookBufferPath(), not user input.
+	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return cs, true // no ledger yet == empty chain, and that IS the whole truth
+			return true // a segment that was never written is not a gap
 		}
-		chainWarnf("cannot read ledger to rebuild index (%v) — events will start new chain segments", err)
-		return cs, false
+		chainWarnf("cannot read ledger segment %s (%v) — events may start new chain segments", path, err)
+		return false
 	}
 	defer f.Close()
 
@@ -140,10 +154,10 @@ func rebuildChainStateFromBuffer(bufferPath string) (cs chainState, complete boo
 		// whose events live past that point are absent from cs. Say so loudly and
 		// report the result as incomplete rather than letting a partial index be
 		// mistaken for the whole ledger.
-		chainWarnf("index rebuild stopped early (%v) — result is partial and will not be persisted", err)
-		return cs, false
+		chainWarnf("index rebuild stopped early in %s (%v) — result is partial and will not be persisted", path, err)
+		return false
 	}
-	return cs, true
+	return true
 }
 
 // chainEntryTsMs prefers the event's own timestamp so a rebuilt index prunes by
@@ -163,11 +177,11 @@ func chainEntryTsMs(ts string, fallbackMs int64) int64 {
 // loadOrRebuildChainState is the single entry point for the append path.
 // persistable=false means the tips are a lower bound (an incomplete rebuild) and
 // the caller must not write the index back.
-func loadOrRebuildChainState(bufferPath, statePath string) (cs chainState, persistable bool) {
+func loadOrRebuildChainState(statePath string) (cs chainState, persistable bool) {
 	if cs, ok := readChainState(statePath); ok {
 		return cs, true
 	}
-	return rebuildChainStateFromBuffer(bufferPath)
+	return rebuildChainStateFromBuffer()
 }
 
 // prevSigFor returns the tip of sessionID's chain, or "" to start a new

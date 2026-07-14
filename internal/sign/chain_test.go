@@ -371,7 +371,7 @@ func TestIncompleteRebuildIsNotPersisted(t *testing.T) {
 		t.Fatalf("write oversized buffer: %v", err)
 	}
 
-	cs, complete := rebuildChainStateFromBuffer(state.HookBufferPath())
+	cs, complete := rebuildChainStateFromBuffer()
 	if complete {
 		t.Error("rebuild reported complete despite aborting mid-scan")
 	}
