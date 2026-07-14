@@ -16,11 +16,7 @@
 package service
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
-
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // label is the launchd/service identifier; taskName is the Windows Task
@@ -47,23 +43,6 @@ type Manager interface {
 	Disable() error
 	// Status reports whether autostart is installed plus a human-readable detail.
 	Status() (installed bool, detail string, err error)
-}
-
-// binPath is the binary the service should invoke at login. It prefers the
-// actual running executable (os.Executable) so the registered path is guaranteed
-// to exist: npm installs run the binary from node_modules, NOT the canonical
-// ~/.promptster-teams/bin that state.PromptsterBin() assumes — registering that
-// hardcoded path would leave launchd/systemd/Task Scheduler pointing at a file
-// that can't exec. Symlinks are resolved (npm global bin is a symlink). Falls
-// back to the canonical path only if the executable can't be resolved.
-func binPath() string {
-	if exe, err := os.Executable(); err == nil {
-		if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
-			return resolved
-		}
-		return exe
-	}
-	return state.PromptsterBin()
 }
 
 // xmlEscape escapes the five XML special chars for safe interpolation into the

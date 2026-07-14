@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 const unitName = "promptster-teams.service"
@@ -34,7 +36,7 @@ func (linuxManager) Enable() error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(p, []byte(renderUnit(binPath())), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(renderUnit(state.SelfBin())), 0o600); err != nil {
 		return err
 	}
 	// #nosec G204 -- constant subcommands, no user input.
