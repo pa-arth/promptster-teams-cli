@@ -656,13 +656,31 @@ func failCursorAfter(t *testing.T, n int32) *int32 {
 // bucket: quieter than "line rate", still ruinous, still forever.
 //
 // So the discriminator is the GAP, not the count. Old is deterministically capped
-// at drainIdleInterval; backed-off retries climb past it (measured 2.7-4.0s here,
-// heading for backoffCap). A gap above ~1s proves a real backoff is in the loop.
+// at drainIdleInterval; backed-off retries climb past it, heading for backoffCap.
+// A gap above ~1s proves a real backoff is in the loop.
+//
+// The count cannot be the discriminator: correct backoff reaches 11 POSTs in its
+// tail and the bug produces ~14, so the two overlap. The gap separates them
+// cleanly — but only once the jitter is pinned, below.
 func TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond(t *testing.T) {
 	newOutboxTest(t)
 	warnings := captureWarnings(t)
 	// Real base: the fix's value is that the ramp escapes drainIdleInterval.
 	backoffBase = 500 * time.Millisecond
+	// Pin the jitter to the ceiling, making the schedule the exact ramp
+	// (0.5s, 1s, 2s, 4s...) instead of a uniform draw under it.
+	//
+	// Without this the assertion below is a coin toss on the RNG: backoffFor
+	// returns uniform(0, d], so a run whose draws all land low has every gap
+	// under the threshold while the code is behaving perfectly. That is not
+	// hypothetical — it failed ~2.7% of runs (~1 in 37) and twice on real CI,
+	// both times with the exact signature the model predicts: 7 POSTs, maxGap
+	// under 1.5s. Pinning kills the false alarm without weakening the check;
+	// the bug still yields a 1.0s cap and still fails. TestBackoffForFullJitter
+	// covers the real jitter that this stubs out.
+	prevJitter := backoffJitter
+	backoffJitter = func(d time.Duration) time.Duration { return d }
+	t.Cleanup(func() { backoffJitter = prevJitter })
 
 	var mu sync.Mutex
 	var stamps []time.Time
@@ -708,6 +726,47 @@ func TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond(t *testing.T)
 	}
 	if w := warnings.String(); !strings.Contains(w, "cannot record delivery progress") {
 		t.Errorf("a cursor-write failure is a local disk fault the user can act on and must be surfaced loudly; warnings = %q", w)
+	}
+}
+
+// TestBackoffForFullJitter covers the real jitter that the test above pins away,
+// so pinning trades a false alarm for a stub rather than for lost coverage.
+//
+// Full jitter is a deliberate property, not an implementation detail: every
+// watcher on every machine in an org backs off against the SAME endpoint, so a
+// deterministic schedule re-synchronizes them into the retry storm the backoff
+// exists to break up. That is a distribution claim, so assert the distribution
+// rather than any single draw — the mistake that made the other test flaky.
+func TestBackoffForFullJitter(t *testing.T) {
+	prevBase := backoffBase
+	backoffBase = 500 * time.Millisecond
+	t.Cleanup(func() { backoffBase = prevBase })
+
+	const draws = 200
+	for _, attempt := range []int{0, 1, 3} {
+		ceiling := backoffBase << attempt
+		seen := make(map[time.Duration]bool, draws)
+		for range draws {
+			d := backoffFor(attempt)
+			if d <= 0 || d > ceiling {
+				t.Fatalf("backoffFor(%d) = %v, want a draw within (0, %v] — a delay above the ceiling "+
+					"stalls delivery, and a zero delay busy-loops", attempt, d, ceiling)
+			}
+			seen[d] = true
+		}
+		// Jitter gone (a fixed schedule) collapses this to 1 distinct value.
+		if len(seen) < 2 {
+			t.Errorf("backoffFor(%d) returned %d distinct value(s) over %d draws — the fleet would "+
+				"re-synchronize onto one retry schedule", attempt, len(seen), draws)
+		}
+	}
+
+	// A large attempt must saturate at backoffCap, not overflow the shift into a
+	// nonsense (or negative) delay.
+	for range draws {
+		if d := backoffFor(60); d <= 0 || d > backoffCap {
+			t.Fatalf("backoffFor(60) = %v, want a draw within (0, %v] — the ramp must saturate at the cap", d, backoffCap)
+		}
 	}
 }
 
