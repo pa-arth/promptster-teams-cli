@@ -54,13 +54,18 @@ func cmdTeamsStatus(args []string) {
 func printStatusStatic() {
 	token, source := ingest.ResolveToken("")
 	apiURL := ingest.ResolveAPIURL("")
+	// One snapshot for every row it feeds. Sampling per row let capture start or
+	// exit between reads, printing a `watch` scope and a `daemon` liveness that
+	// never held at the same instant.
+	snap := capture.Snapshot()
+
 	// Report what the LIVE daemon is watching, not what a daemon started from
 	// here would watch. The watch dir gates which transcripts are captured, and
 	// `login` scopes the daemon to $HOME — so recomputing from this process's cwd
 	// showed `status` run inside a repo that repo's path, implying a scope the
 	// running capture never had. Fall back to the env/cwd derivation only when no
-	// supervisor is live, where it correctly previews the next `start`.
-	root := capture.Snapshot().WatchDir
+	// capture is live, where it correctly previews the next `start`.
+	root := snap.WatchDir
 	if root == "" {
 		root = os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
 	}
@@ -69,7 +74,7 @@ func printStatusStatic() {
 	}
 
 	daemon := "not running — `promptster-teams login` starts it, or `autostart enable` for reboots"
-	if snap := capture.Snapshot(); snap.Live {
+	if snap.Live {
 		daemon = fmt.Sprintf("running (pid %d)", snap.DaemonPID)
 	}
 

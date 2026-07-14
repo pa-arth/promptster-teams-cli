@@ -29,13 +29,13 @@ type CaptureSnapshot struct {
 	// DaemonPID is the supervisor pid, or the live watcher pid when no supervisor
 	// pidfile exists (they are the same process — the watchers are goroutines).
 	DaemonPID int
-	// WatchDir is the directory live capture is actually scoped to, as recorded
-	// at spawn by the supervisor or, failing that, by a running watcher. Callers
-	// must prefer this over recomputing from cwd: the watch dir is the gate that
-	// decides which transcripts get captured at all, and capture's is routinely
-	// not the caller's — `login` scopes it to $HOME and autostart to the home dir
-	// in the plist, while `status` gets run from inside some repo. Empty only when
-	// nothing is running, which is the caller's cue to fall back.
+	// WatchDir is the directory live capture is actually scoped to, as recorded at
+	// spawn by a running watcher. Callers must prefer this over recomputing from
+	// cwd: the watch dir is the gate that decides which transcripts get captured
+	// at all, and capture's is routinely not the caller's — `login` scopes it to
+	// $HOME and autostart to the home dir in the plist, while `status` gets run
+	// from inside some repo. Empty when no watcher is live, which is the caller's
+	// cue to fall back.
 	WatchDir string
 	Claude   WatcherStat
 	Codex    WatcherStat
@@ -117,24 +117,25 @@ func Snapshot() CaptureSnapshot {
 	codex := codexWatcherStat(now)
 	pid, running := DaemonStatus()
 
-	// Resolve the live scope from the supervisor pidfile, else from whichever
-	// watcher is actually up. The fallback is what covers autostart: the service
-	// runs a bare `watch`, which writes no supervisor.json at all, so the
-	// supervisor lookup alone would come back empty for the deployment we expect
-	// most engineers to be on.
+	// Resolve the live scope from a running watcher, and ONLY from a running
+	// watcher. supervisor.json records a WatchDir too, but reading it is a trap:
+	// the supervisor owns both watchers as goroutines in its own process, so
+	// whenever it is genuinely up they are up and answer first — meaning the
+	// supervisor branch is only ever *reached* when no watcher is live, which is
+	// exactly the state where it cannot be trusted. DaemonStatus() proves only
+	// that the recorded PID exists, so a crashed supervisor whose PID the OS
+	// recycled would hand back a stale dir and point debugging at a directory
+	// nothing is watching. watcherLive() demands a recent heartbeat and can't be
+	// fooled that way.
+	//
+	// Reading watchers also covers autostart, which runs a bare `watch` and writes
+	// no supervisor.json at all — the deployment most engineers are on.
 	var watchDir string
-	if running {
-		if st, err := loadDaemonState(); err == nil {
-			watchDir = st.WatchDir
-		}
-	}
-	if watchDir == "" {
-		switch {
-		case claude.Running && claude.WatchDir != "":
-			watchDir = claude.WatchDir
-		case codex.Running && codex.WatchDir != "":
-			watchDir = codex.WatchDir
-		}
+	switch {
+	case claude.Running && claude.WatchDir != "":
+		watchDir = claude.WatchDir
+	case codex.Running && codex.WatchDir != "":
+		watchDir = codex.WatchDir
 	}
 
 	effPID := pid
