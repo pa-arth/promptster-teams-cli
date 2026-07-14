@@ -44,3 +44,96 @@ desktop app opened on a different folder — no matter which surface produced it
 When triaging "why didn't X get captured", check cwd before suspecting the
 surface. Transcripts carry no surface marker at all, so capture could not
 distinguish CLI from IDE even if it wanted to.
+
+## Self-update (`internal/selfupdate`)
+
+Facts below are verified against the code and by driving the real binary end-to-end.
+Several are counterintuitive and were gotten wrong by reading summaries instead of the
+dispatch — trust this section over inference.
+
+### What triggers a check
+
+Only **two** call sites outside the package:
+
+- `internal/capture/teams.go` → `selfupdate.StartAutoUpdate(...)`, inside `RunTeamsWatch`.
+- `internal/cli/teams_status.go` → `selfupdate.LatestVersionBestEffort(3s)`, read-only
+  display for `doctor`. Never applies anything.
+
+**`start` DOES check.** It is not a separate capture path — `StartTeamsDaemon` →
+`StartDaemon` → `exec.Command(state.PromptsterBin(), "watch")` (`internal/capture/daemon.go`),
+so the detached child runs the normal watch startup check within a second. Same for
+`autostart`: launchd/systemd run `watch`, and `RunAtLoad` means a check every login.
+
+Anything that never reaches `watch` never checks.
+
+### Timing
+
+- `updateCheckInterval = 24 * time.Hour`, `updateCheckPoll = time.Hour` (`selfupdate.go`).
+- `runAutoUpdate` checks **once at startup unconditionally** — it ignores the persisted
+  cursor. So a restart always forces a check.
+- Steady state: an hourly ticker compares now against the cursor and acts once 24h have
+  elapsed. Worst case release→update is therefore **~24–25h**, not 24h.
+- Cursor: `state.GlobalPromptsterDir()/last-update-check`, RFC3339, mode 0600. Unreadable
+  or unparseable → zero time → treated as stale → checks on the next tick.
+- **No backoff.** The cursor advances after every check including failures, so a broken
+  release is retried at most once per 24h rather than hot-looping.
+
+### npm installs DO auto-update
+
+The npm package is a wrapper: `npm/bin/promptster-teams.js` `spawnSync`s the real Go
+binary from `<pkg>/binaries/promptster-teams-<platform>`. Self-update is a property of
+the **running binary, not the install channel** — `os.Executable()` resolves to that
+path inside `node_modules`, and the rename-over-self + `syscall.Exec` swap happens right
+there. The node wrapper is waiting on a PID and does not care that the image changed
+underneath it.
+
+What is genuinely absent: there is **no `postinstall`**, so `npm install` itself never
+triggers a check. That is the only npm gap.
+
+**Known drift:** `npm/package.json` stays pinned at its published version while the
+binary underneath self-updates, so `npm ls` / `npm outdated` will lie, and a reinstall
+writes the older binary back. It self-heals within 24h because `isNewer` only moves
+forward — cosmetic, but it will confuse fleet debugging.
+
+### The not-writable nudge must update THE COPY THAT PRINTED IT
+
+When the install dir fails the `dirWritable` probe, `checkAndApply` prints `nudgeFor(self)`.
+
+The invariant: any hint that installs somewhere other than `self` drops a second binary in
+a different PATH entry, leaves a coin flip over which one runs, and leaves the stale copy
+stale — the exact failure the hint exists to fix. Two ways to violate it, and both are easy
+to walk back into:
+
+- Telling an npm-installed engineer to run the curl installer.
+- Telling a **project-local** or pnpm install to `npm i -g` — that updates the global
+  prefix and leaves the local copy untouched. Global-vs-local matters more than
+  npm-vs-pnpm.
+
+So only the documented **global** layouts (`<prefix>/lib/node_modules`,
+`<AppData>\npm\node_modules`, pnpm's `global`) get a copyable command. Anything else under
+`node_modules` names the package and the project dir and stops there: the path cannot tell
+npm from yarn, and guessing is the same second-install bug again.
+
+Path checks match a `node_modules` **path segment** (not a substring) and split on both
+`/` and `\` — deliberately NOT `filepath.ToSlash`, which only rewrites `\` when
+GOOS=windows and would make the checks host-dependent and untestable from a unix CI runner.
+
+### Gotchas when testing self-update locally
+
+- **Local builds never update.** The gate skips when version is `"dev"` or `""`. To
+  exercise the real path you must build with
+  `-ldflags "-X github.com/pa-arth/promptster-teams-cli/internal/version.Version=0.0.1"`.
+- **Isolate state or the single-instance lock refuses**: a real daemon on the dev machine
+  makes `watch` print `capture already running (pid N) — not starting a second watcher`.
+  Set `HOME` and `PROMPTSTER_STATE_DIR` to throwaway dirs. Never kill the developer's
+  real capture process to free the lock.
+- **macOS has no `timeout(1)`.** Background the process and `kill` it, or a
+  `timeout ... | grep` pipeline fails and silently looks like "the feature didn't fire".
+
+### Open edge
+
+`runAutoUpdate`'s startup check ignores the cursor, so a crash-looping watch under launchd
+(`ThrottleInterval` 10s, `internal/service/service.go`) hits
+`api.github.com/repos/.../releases/latest` on every respawn and can burn the 60/hr
+unauthenticated rate limit. `KeepAlive{SuccessfulExit: false}` limits this to genuine
+crashes. Fix would be to honor the cursor at startup unless it is older than ~1h.
