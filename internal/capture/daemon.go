@@ -33,6 +33,12 @@ var newServiceManager = service.New
 func daemonStatePath() string { return filepath.Join(state.StateDir(), "supervisor.json") }
 func daemonLogPath() string   { return filepath.Join(state.StateDir(), "daemon.log") }
 
+// DaemonLogPath exposes the supervisor's log path so diagnostics elsewhere can
+// name it. The outbox writes its delivery failures to stderr, which lands here
+// in detached mode — so this is the file to send an engineer to when the send
+// queue is stuck.
+func DaemonLogPath() string { return daemonLogPath() }
+
 func loadDaemonState() (daemonState, error) {
 	data, err := os.ReadFile(daemonStatePath())
 	if err != nil {

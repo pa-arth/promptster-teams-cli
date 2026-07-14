@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **`doctor` now reports delivery-queue health, so a stuck send queue is visible
+  where engineers actually look.** The durable send queue drains in the
+  background and shouts about failures on stderr — which lands in `daemon.log`,
+  which nobody tails. A revoked key could therefore 401 every upload for days
+  while `doctor` cheerfully reported "Ready". It now checks the queue, and is
+  careful about when it complains: a raw pending count is not a health signal,
+  because a machine that captured events and then stopped watching legitimately
+  holds a backlog forever. Doctor warns only when the queue is *not draining
+  while something is supposed to be draining it* — using the cursor's mtime as
+  the progress probe, and falling back to the watcher's start time when no cursor
+  exists at all (delivery that has never once succeeded, i.e. exactly what a
+  revoked key looks like). A backlog with no watcher running is reported as the
+  normal idle state, not a problem, and liveness is judged by a watcher's
+  heartbeat rather than by a supervisor pidfile whose PID the OS may have
+  recycled. It also warns at 75% of the queue's 64 MB cap and reports an error at
+  the cap, where events are being dropped outright. The check is a diagnostic: it
+  stats files and never advances the cursor, compacts the queue, touches the
+  ledger, or sends anything.
+
 ### Fixed
 - **The same transcript was captured twice, and the duplicates blew the ingest
   rate limit.** Watcher progress was keyed by absolute path, but one Claude Code
