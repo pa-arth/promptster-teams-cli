@@ -13,7 +13,7 @@ import (
 // and never any captured transcript content. If someone widens presenceData
 // with a transcript-bearing field, this fails.
 func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
-	sess := Session{SessionID: "dev-0123456789abcdef", SessionToken: "PSE-ABCD-2345"}
+	sess := Session{DeviceID: "dev-0123456789abcdef", SessionToken: fakeTeamKey}
 	e := buildPresenceEvent(sess)
 
 	if e.Kind != "presence" {
@@ -25,8 +25,8 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	if e.RawPayload != "" {
 		t.Errorf("presence event carries rawPayload %q — must be empty", e.RawPayload)
 	}
-	if e.SessionID != sess.SessionID {
-		t.Errorf("sessionID = %q, want %q", e.SessionID, sess.SessionID)
+	if e.SessionID != sess.DeviceID {
+		t.Errorf("sessionID = %q, want %q", e.SessionID, sess.DeviceID)
 	}
 
 	// The Data payload must contain EXACTLY the closed allow-list of keys.
@@ -79,7 +79,7 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 // TestPresenceEventIsSignable confirms a presence event round-trips through the
 // signing path (canonicalization must not choke on the struct payload).
 func TestPresenceEventIsSignable(t *testing.T) {
-	e := buildPresenceEvent(Session{SessionID: "dev-abc", SessionToken: "PSE-ABCD-2345"})
+	e := buildPresenceEvent(Session{DeviceID: "dev-abc", SessionToken: fakeTeamKey})
 	if _, err := sign.BuildSigningMessage(e, ""); err != nil {
 		t.Fatalf("presence event not signable: %v", err)
 	}

@@ -69,7 +69,7 @@ func TestWireBodyCarriesNoSource(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("PROMPTSTER_API_URL", srv.URL)
 
-	session := Session{SessionID: "sess-wire-test", SessionToken: "PSE-TEST", TaskRoot: tmp}
+	session := Session{DeviceID: "sess-wire-test", SessionToken: "PSE-TEST", TaskRoot: tmp}
 	e := eventWithData("command", map[string]interface{}{
 		"command":  `python -c 'print("` + leakCanary + `")'`,
 		"exitCode": 1,

@@ -67,9 +67,24 @@ type Event struct {
 	// Ed25519 signature over the canonical signing message (hex). Added by
 	// signAndAppendEvent during buffer append; empty on legacy unsigned events.
 	Sig string `json:"sig,omitempty"`
-	// Hex of the previous event's `sig` in the session chain; empty for the
-	// first event in the chain or for legacy unsigned sessions.
+	// Hex of the previous event's `sig` in this event's SESSION chain; empty to
+	// start a new segment — the session's first event in the local ledger, or
+	// the first after the chain index aged out. A verifier must therefore group
+	// by SessionID and walk segments, treating "" as a boundary, not as tamper.
 	PrevSig string `json:"prevSig,omitempty"`
+	// DeviceID is the anonymous per-device identity (capture.DeviceID()).
+	//
+	// SessionID identifies the AI-tool session; this identifies the machine it
+	// ran on. They were the same value historically, which is exactly the bug
+	// that collapsed every session into one — do not re-conflate them.
+	//
+	// UNSIGNED, deliberately: BuildSigningMessage is mirrored byte-for-byte in
+	// the backend's TS implementation, and adding a field to one side breaks
+	// verification everywhere with no error surfaced. Binding this into the
+	// signature needs a versioned PST-EVT-V2 message rolled out on both sides.
+	// Until then the backend cross-checks it against the pinned device pubkey
+	// rather than trusting it.
+	DeviceID string `json:"deviceId,omitempty"`
 }
 
 // Provenance captures who authored a change and how confident we are.

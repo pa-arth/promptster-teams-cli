@@ -550,9 +550,13 @@ func saveLastCensusAt(t time.Time) {
 // The census goes through eventDataMap rather than being assigned directly:
 // Data must hold a map[string]interface{} or the redaction projector
 // default-denies it and the whole census ships as {}. See eventDataMap.
+// Like presence, the census is DEVICE-scoped — it describes the machine's tool
+// configuration, not any one AI-tool session — so its envelope sessionId stays
+// the device id and the backend skips minting a session row for this kind.
 func buildConfigCensusEvent(session Session) event.Event {
-	e := event.NewEvent("config_census", session.SessionID)
+	e := event.NewEvent("config_census", session.DeviceID)
 	e.Source = presenceSource
+	e.DeviceID = session.DeviceID
 	e.Actor = event.SystemActor()
 	e.Data = eventDataMap(buildConfigCensus(defaultCensusEnv(session.TaskRoot)))
 	return e

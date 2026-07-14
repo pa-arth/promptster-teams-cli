@@ -108,7 +108,7 @@ func TestConfigCensusEventSurvivesEmitPath(t *testing.T) {
 	writeEmitFixture(t, filepath.Join(tmp, ".claude.json"),
 		`{"mcpServers":{"posthog":{"type":"http","url":"https://x"}}}`)
 
-	ev := buildConfigCensusEvent(Session{SessionID: "dev-census-emit", TaskRoot: ws})
+	ev := buildConfigCensusEvent(Session{DeviceID: "dev-census-emit", TaskRoot: ws})
 
 	// The REAL funnel: mutates ev in place (project → scrub → sign), and
 	// emitConfigCensus ships this same ev afterwards.
@@ -175,7 +175,7 @@ func TestConfigCensusEventSurvivesEmitPath(t *testing.T) {
 func TestPresenceEventSurvivesEmitPath(t *testing.T) {
 	sandboxEmitEnv(t)
 
-	ev := buildPresenceEvent(Session{SessionID: "dev-presence-emit", SessionToken: fakeTeamKey})
+	ev := buildPresenceEvent(Session{DeviceID: "dev-presence-emit", SessionToken: fakeTeamKey})
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		t.Fatalf("append presence to buffer: %v", err)
 	}

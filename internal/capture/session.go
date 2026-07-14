@@ -9,8 +9,14 @@ import "time"
 // trap markers, no behavioral-timing state, no time limit — by design, so a
 // customer security review sees only capture plumbing.
 type Session struct {
-	// SessionID is a stable per-device capture identity (hash of machine id).
-	SessionID string
+	// DeviceID is a stable per-device capture identity (hash of machine id).
+	//
+	// It is NOT a session id, and was named SessionID until it turned out that
+	// every caller handing it to a normalizer stamped it on events as one —
+	// collapsing every concurrent AI-tool session on a machine into a single
+	// reported session, permanently. Real session ids come from the transcript
+	// each watcher tails, never from here.
+	DeviceID string
 	// SessionToken is the ingest auth token (PROMPTSTER_TEAMS_TOKEN).
 	SessionToken string
 	// TaskRoot is the directory whose AI-tool transcripts are captured.

@@ -390,7 +390,7 @@ func pollClaudeTranscripts(
 
 		proc := processors[path]
 		if proc == nil {
-			proc = normalize.NewClaudeTranscriptProcessor(session.SessionID)
+			proc = normalize.NewClaudeTranscriptProcessor(claudeSessionIDFromPath(path))
 			if isClaudeSidechainFile(path) {
 				proc.UsageOnly = true
 				// The filename is the floor for sidechain attribution: rows
@@ -458,6 +458,33 @@ func isClaudeSidechainFile(path string) bool {
 func claudeAgentIDFromPath(path string) string {
 	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	return strings.TrimPrefix(base, "agent-")
+}
+
+// claudeSessionIDFromPath derives the OWNING session uuid from a transcript
+// path, so a processor knows its session before it has read a single line (an
+// event stamped before then would land in a shared "unknown" chain).
+//
+// The two shapes differ in where the uuid lives:
+//
+//	<slug>/<session-uuid>.jsonl                        → the filename
+//	<slug>/<session-uuid>/subagents/agent-<id>.jsonl   → the GRANDPARENT dir
+//
+// A subagent's own filename is its agent id, not a session — taking the
+// grandparent is what rolls subagent work up to the session that spawned it,
+// rather than fragmenting each subagent into a phantom session of its own.
+// Every subagent row also carries the parent's sessionId in content, which the
+// normalizer uses as a fallback; the two agree.
+func claudeSessionIDFromPath(path string) string {
+	if filepath.Base(filepath.Dir(path)) == "subagents" {
+		return filepath.Base(filepath.Dir(filepath.Dir(path)))
+	}
+	if isClaudeSidechainFile(path) {
+		// agent-*.jsonl outside a subagents/ dir: shape we don't recognise, so
+		// let the normalizer fall back to the transcript's own sessionId rather
+		// than guess a parent from the path.
+		return ""
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
 }
 
 type claudeMatchResult int
@@ -632,6 +659,12 @@ func tailClaudeTranscript(
 // cross-channel file_diff dedup, local signed buffer, ingest POST). Returns
 // true when the event was sent.
 func ingestClaudeWatchEvent(ev event.Event, session Session, client *http.Client, captureProse bool) bool {
+	// Device identity is stamped here, at the funnel, rather than inside the
+	// normalizer: the normalizer's job is to read a transcript, and it has no
+	// business knowing what machine it runs on. SessionID comes from the
+	// transcript; DeviceID comes from the environment. Keeping the two sourced
+	// separately is what stops them collapsing back into one value.
+	ev.DeviceID = session.DeviceID
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.

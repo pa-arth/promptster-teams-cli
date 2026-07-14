@@ -83,13 +83,6 @@ type ClaudeTranscriptProcessor struct {
 	AgentID          string
 	attributionSkill string
 	attributionAgent string
-	// Lane identity of this transcript: one file IS one Claude Code process
-	// (the filename is the session uuid), so the first record carrying
-	// sessionId/cwd pins both for every event the file produces. Distinct
-	// lanes = parallel sessions; the worker's parallelism signals key on
-	// meta.ideSessionId / meta.cwd.
-	ideSessionID string
-	laneCwd      string
 	// Interrupt tracking. Claude Code writes a synthetic user line
 	// ([Request interrupted by user] / ...for tool use) when the developer hits
 	// ESC/Ctrl+C mid-response. We classify what was cut POSITIONALLY from the
@@ -180,40 +173,15 @@ func (p *ClaudeTranscriptProcessor) newTranscriptEvent(kind, ts, sourceKey strin
 	return e
 }
 
-// process parses one transcript line and returns zero or more canonical events.
-// attachLane stamps the transcript's lane identity (meta.ideSessionId /
-// meta.cwd) onto every outgoing event whose data is a map, never overwriting
-// keys a normalizer already set.
-func (p *ClaudeTranscriptProcessor) attachLane(events []event.Event) []event.Event {
-	if p.ideSessionID == "" && p.laneCwd == "" {
-		return events
-	}
-	for i := range events {
-		data, ok := events[i].Data.(map[string]interface{})
-		if !ok || data == nil {
-			continue
-		}
-		meta, _ := data["meta"].(map[string]interface{})
-		if meta == nil {
-			meta = map[string]interface{}{}
-		}
-		if p.ideSessionID != "" {
-			if _, exists := meta["ideSessionId"]; !exists {
-				meta["ideSessionId"] = p.ideSessionID
-			}
-		}
-		if p.laneCwd != "" {
-			if _, exists := meta["cwd"]; !exists {
-				meta["cwd"] = p.laneCwd
-			}
-		}
-		data["meta"] = meta
-	}
-	return events
-}
-
+// Process parses one transcript line and returns zero or more canonical events.
+//
+// Lane identity used to be stamped here onto data.meta (ideSessionId / cwd).
+// That was dead code: the redaction projector allowlists no `meta` key for any
+// kind, so it was stripped before the buffer, the signature, and the wire —
+// nothing ever received it. The session id it was trying to carry now lives on
+// the envelope, where the projector cannot reach it.
 func (p *ClaudeTranscriptProcessor) Process(line []byte) []event.Event {
-	return p.attachLane(p.processLine(line))
+	return p.processLine(line)
 }
 
 func (p *ClaudeTranscriptProcessor) processLine(line []byte) []event.Event {
@@ -221,11 +189,12 @@ func (p *ClaudeTranscriptProcessor) processLine(line []byte) []event.Event {
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return nil
 	}
-	if p.ideSessionID == "" {
-		p.ideSessionID = stringField(rec, "sessionId")
-	}
-	if p.laneCwd == "" {
-		p.laneCwd = stringField(rec, "cwd")
+	// The transcript path is the primary source of session identity (the file IS
+	// the session), but fall back to the transcript's own sessionId if the path
+	// could not be parsed. On a subagent transcript this field is the PARENT
+	// session — which is what rolls that work up rather than fragmenting it.
+	if p.sessionID == "" {
+		p.sessionID = stringField(rec, "sessionId")
 	}
 	// Sidechain attribution hints are constant per file — pin the first value
 	// each of them shows up with.
@@ -497,7 +466,7 @@ func (p *ClaudeTranscriptProcessor) FlushStale(maxAge time.Duration) []event.Eve
 	if p.accum == nil || time.Since(p.accum.updatedAt) < maxAge {
 		return nil
 	}
-	return p.attachLane(p.flushAccum())
+	return p.flushAccum()
 }
 
 func (p *ClaudeTranscriptProcessor) handleUser(rec map[string]interface{}, line []byte) []event.Event {

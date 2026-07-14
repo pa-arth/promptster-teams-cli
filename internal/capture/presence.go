@@ -84,11 +84,22 @@ func dirExists(path string) bool {
 // default-denies it and the heartbeat ships with no cliVersion/device at all —
 // which is exactly the fleet-health signal this event exists to carry. See
 // eventDataMap.
+// Presence is DEVICE-scoped, not session-scoped: it answers "is this seat
+// alive", which is a property of the machine, not of any one AI-tool session.
+// So its envelope sessionId stays the device id (the backend skips minting a
+// session row for this kind), and data.device is read from session.DeviceID
+// EXPLICITLY rather than inherited from the envelope.
+//
+// That independence is load-bearing. data.device backs seat utilization and
+// "last seen" per device; if it ever tracked a per-session envelope id, every
+// watch restart would look like a brand-new device and seat counts would
+// inflate without bound.
 func buildPresenceEvent(session Session) event.Event {
-	e := event.NewEvent("presence", session.SessionID)
+	e := event.NewEvent("presence", session.DeviceID)
 	e.Source = presenceSource
+	e.DeviceID = session.DeviceID
 	e.Data = eventDataMap(presenceData{
-		Device:     session.SessionID,
+		Device:     session.DeviceID,
 		CLIVersion: version.Version,
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,

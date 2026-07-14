@@ -43,10 +43,32 @@ func diffDedupLedgerPath() string { return filepath.Join(state.StateDir(), "diff
 // previous session's AI paths.
 func aiPathsLedgerPath() string { return filepath.Join(state.StateDir(), "ai-paths.json") }
 
+// aiPathsLedger is keyed BY session rather than holding one session at a time.
+//
+// It used to store a single sessionId and wipe itself whenever a different one
+// showed up. That was survivable only because every event carried the same
+// device-wide id, so the key never changed. Now that ids are per-session,
+// concurrent Claude and Codex sessions would take turns invalidating each
+// other's paths on every write — last writer wins, both lose.
 type aiPathsLedger struct {
-	SessionID string          `json:"sessionId"`
-	Paths     map[string]bool `json:"paths"`
+	V        int                     `json:"v"`
+	Sessions map[string]aiPathsEntry `json:"sessions"`
 }
+
+type aiPathsEntry struct {
+	Paths map[string]bool `json:"paths"`
+	TsMs  int64           `json:"tsMs"`
+}
+
+const (
+	aiPathsLedgerVersion = 2
+	// aiPathsTTL bounds the ledger to recently-active sessions. It has no TTL
+	// per-entry semantics beyond eviction: the git watcher reads it long after
+	// the 5-minute dedup window, so this must outlive a working session by a lot.
+	aiPathsTTL = 7 * 24 * time.Hour
+	// aiPathsMaxSessions is a backstop for a device that opens sessions in a loop.
+	aiPathsMaxSessions = 64
+)
 
 type diffDedupEntry struct {
 	Hash string `json:"hash"`
@@ -60,14 +82,28 @@ func recordAiTouchedPath(sessionID, relPath string) {
 		return
 	}
 	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
-		ledger := aiPathsLedger{SessionID: sessionID, Paths: map[string]bool{}}
+		ledger := aiPathsLedger{V: aiPathsLedgerVersion, Sessions: map[string]aiPathsEntry{}}
 		if data, err := os.ReadFile(aiPathsLedgerPath()); err == nil {
 			var onDisk aiPathsLedger
-			if json.Unmarshal(data, &onDisk) == nil && onDisk.SessionID == sessionID && onDisk.Paths != nil {
+			// A v1 ledger (single sessionId + paths) unmarshals with no Sessions
+			// map; drop it rather than migrate. It is a heuristic attribution
+			// cache, not a record — and every v1 entry is keyed by the device id
+			// this change stops using anyway.
+			if json.Unmarshal(data, &onDisk) == nil && onDisk.V == aiPathsLedgerVersion && onDisk.Sessions != nil {
 				ledger = onDisk
 			}
 		}
-		ledger.Paths[relPath] = true
+
+		nowMs := time.Now().UnixMilli()
+		entry, ok := ledger.Sessions[sessionID]
+		if !ok || entry.Paths == nil {
+			entry = aiPathsEntry{Paths: map[string]bool{}}
+		}
+		entry.Paths[relPath] = true
+		entry.TsMs = nowMs
+		ledger.Sessions[sessionID] = entry
+		pruneAiPaths(&ledger, nowMs)
+
 		data, err := json.Marshal(ledger)
 		if err != nil {
 			return err
@@ -78,6 +114,27 @@ func recordAiTouchedPath(sessionID, relPath string) {
 		}
 		return os.Rename(tmp, aiPathsLedgerPath())
 	})
+}
+
+// pruneAiPaths bounds the ledger by TTL, then by session count (oldest first).
+// Runs AFTER the active session's entry is stamped, so an actively-editing
+// session can never evict itself.
+func pruneAiPaths(ledger *aiPathsLedger, nowMs int64) {
+	ttlMs := aiPathsTTL.Milliseconds()
+	for sid, e := range ledger.Sessions {
+		if nowMs-e.TsMs > ttlMs {
+			delete(ledger.Sessions, sid)
+		}
+	}
+	for len(ledger.Sessions) > aiPathsMaxSessions {
+		oldest, oldestTs := "", int64(0)
+		for sid, e := range ledger.Sessions {
+			if oldest == "" || e.TsMs < oldestTs || (e.TsMs == oldestTs && sid < oldest) {
+				oldest, oldestTs = sid, e.TsMs
+			}
+		}
+		delete(ledger.Sessions, oldest)
+	}
 }
 
 // fileContentSHA returns a hex sha256 of the file's current contents.
