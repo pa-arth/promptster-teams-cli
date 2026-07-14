@@ -13,10 +13,12 @@ import (
 type stubPolicy struct {
 	enabled bool
 	pinned  string
+	min     string
 }
 
 func (s stubPolicy) AutoUpdateEnabled() bool  { return s.enabled }
 func (s stubPolicy) PinnedCliVersion() string { return s.pinned }
+func (s stubPolicy) MinCliVersion() string    { return s.min }
 
 // buildUpdater is the primary test constructor: it returns the updater plus a
 // pointer to the applied-staged-paths slice and a route registration func.
@@ -259,6 +261,63 @@ func TestLocalInstallNeverGetsAGlobalHint(t *testing.T) {
 			continue
 		}
 		t.Fatalf("local install %q got a -g hint: %q", self, got)
+	}
+}
+
+func TestCheckIntervalEscalatesBelowMinCliVersion(t *testing.T) {
+	cases := []struct {
+		name    string
+		current string
+		pol     PolicyView
+		want    time.Duration
+	}{
+		{"no policy", "0.5.2", nil, updateCheckInterval},
+		{"no floor set", "0.5.2", stubPolicy{enabled: true}, updateCheckInterval},
+		{"below floor escalates", "0.5.2", stubPolicy{enabled: true, min: "0.6.0"}, belowMinCheckInterval},
+		{"below floor, v-prefixed", "0.5.2", stubPolicy{enabled: true, min: "v0.6.0"}, belowMinCheckInterval},
+		{"at floor", "0.6.0", stubPolicy{enabled: true, min: "0.6.0"}, updateCheckInterval},
+		{"above floor", "0.7.0", stubPolicy{enabled: true, min: "0.6.0"}, updateCheckInterval},
+		// The floor escalates the CADENCE only. checkAndApply still enforces the
+		// org switch and the pin, so a disabled org polls a no-op cheaply rather
+		// than being dragged forward against its policy.
+		{"below floor but org disabled", "0.5.2", stubPolicy{enabled: false, min: "0.6.0"}, belowMinCheckInterval},
+		{"below floor but pinned", "0.5.2", stubPolicy{enabled: true, pinned: "0.5.4", min: "0.6.0"}, belowMinCheckInterval},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &updater{currentVersion: tc.current, policy: tc.pol}
+			if got := u.checkInterval(); got != tc.want {
+				t.Fatalf("checkInterval() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// A floor must not become a licence to install something the normal gates would
+// refuse: an org that disabled auto-update stays disabled even while below it.
+func TestMinCliVersionDoesNotOverrideDisabledOrg(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: false, min: "9.9.9"})
+	wireHappyRelease(addRoute)
+	if got := u.checkAndApply(); got != outcomeSkippedPolicy {
+		t.Fatalf("disabled org below floor = %v, want skippedPolicy", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("a min-version floor must not override the org auto-update switch")
+	}
+}
+
+// A floor must not drag a pinned fleet past its pin.
+func TestMinCliVersionDoesNotOverridePin(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, pinned: "0.5.4", min: "9.9.9"})
+	wireHappyRelease(addRoute)
+	addRoute("github.test/pa-arth/promptster-teams-cli/releases/download/v0.5.4/SHA256SUMS", "", 404)
+	if got := u.checkAndApply(); got == outcomeApplied {
+		t.Fatal("a min-version floor must not override an org pin")
+	}
+	for _, p := range *applied {
+		if strings.Contains(p, "9.9.9") {
+			t.Fatalf("installed the floor %q instead of the pin", p)
+		}
 	}
 }
 

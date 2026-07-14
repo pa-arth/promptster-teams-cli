@@ -70,6 +70,7 @@ type apiResponse struct {
 	CaptureAssistantProse bool   `json:"captureAssistantProse"`
 	AutoUpdate            *bool  `json:"autoUpdate"`
 	PinnedCliVersion      string `json:"pinnedCliVersion"`
+	MinCliVersion         string `json:"minCliVersion"`
 }
 
 // diskCache is the on-disk shape: the resolved flags plus when they were
@@ -79,6 +80,7 @@ type diskCache struct {
 	CaptureAssistantProse bool      `json:"captureAssistantProse"`
 	AutoUpdate            *bool     `json:"autoUpdate"`
 	PinnedCliVersion      string    `json:"pinnedCliVersion"`
+	MinCliVersion         string    `json:"minCliVersion"`
 	FetchedAt             time.Time `json:"fetchedAt"`
 }
 
@@ -98,6 +100,10 @@ type Resolver struct {
 	autoUpdate bool
 	// pinnedCliVersion, when non-empty, pins the fleet to an exact CLI tag.
 	pinnedCliVersion string
+	// minCliVersion, when non-empty, is the floor the org wants the fleet on.
+	// It does not change WHAT gets installed — only how soon the updater looks
+	// (see selfupdate.runAutoUpdate).
+	minCliVersion string
 }
 
 // NewResolver builds a Resolver for the given PSE engineer key. If a recent
@@ -118,6 +124,7 @@ func NewResolver(apiKey string) *Resolver {
 			r.autoUpdate = *c.AutoUpdate
 		}
 		r.pinnedCliVersion = c.PinnedCliVersion
+		r.minCliVersion = c.MinCliVersion
 	}
 	return r
 }
@@ -155,6 +162,17 @@ func (r *Resolver) PinnedCliVersion() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.pinnedCliVersion
+}
+
+// MinCliVersion returns the version floor the org wants the fleet on, or "".
+// Like the other self-update fields it uses the last known value with no TTL
+// decay. It is an ESCALATION lever only: it makes a lagging watcher check
+// sooner than the 24h cadence, and never overrides the autoUpdate switch or a
+// pin — both of those are still enforced in selfupdate.checkAndApply.
+func (r *Resolver) MinCliVersion() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.minCliVersion
 }
 
 // StartBackground runs policy refreshes OFF the caller's hot path: it fires an
@@ -206,11 +224,13 @@ func (r *Resolver) Refresh() {
 	r.fetchedAt = now
 	r.autoUpdate = autoUpdate
 	r.pinnedCliVersion = parsed.PinnedCliVersion
+	r.minCliVersion = parsed.MinCliVersion
 	r.mu.Unlock()
 	writeDiskCache(diskCache{
 		CaptureAssistantProse: parsed.CaptureAssistantProse,
 		AutoUpdate:            parsed.AutoUpdate,
 		PinnedCliVersion:      parsed.PinnedCliVersion,
+		MinCliVersion:         parsed.MinCliVersion,
 		FetchedAt:             now,
 	})
 }

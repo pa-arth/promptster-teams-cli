@@ -114,6 +114,39 @@ func TestAutoUpdateExplicitDisableAndPin(t *testing.T) {
 	}
 }
 
+// TestMinCliVersionParsesAndSurvivesDiskCache proves the floor makes it from the
+// wire into the resolver AND back out of the on-disk cache — the hop a freshly
+// started watcher depends on, and the one a missing diskCache field would break
+// silently (the wire parse would still pass).
+func TestMinCliVersionParsesAndSurvivesDiskCache(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"autoUpdate":true,"minCliVersion":"0.6.0"}`))
+	})
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if r.MinCliVersion() != "0.6.0" {
+		t.Fatalf("min = %q, want 0.6.0", r.MinCliVersion())
+	}
+	// A second resolver over the same state dir must adopt the floor without a
+	// fetch, exactly as it does for the pin.
+	if got := NewResolver("PSE-TEST").MinCliVersion(); got != "0.6.0" {
+		t.Fatalf("min from disk cache = %q, want 0.6.0", got)
+	}
+}
+
+// TestMinCliVersionAbsentIsEmpty proves a policy body without the key leaves the
+// floor unset — an unknown floor must never escalate anything.
+func TestMinCliVersionAbsentIsEmpty(t *testing.T) {
+	setup(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"captureAssistantProse":true}`))
+	})
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if r.MinCliVersion() != "" {
+		t.Fatalf("absent minCliVersion = %q, want empty", r.MinCliVersion())
+	}
+}
+
 // TestAutoUpdateAbsentFieldStaysOpen proves that a policy body WITHOUT the
 // autoUpdate key (unknown, not false) leaves auto-update ON.
 func TestAutoUpdateAbsentFieldStaysOpen(t *testing.T) {
