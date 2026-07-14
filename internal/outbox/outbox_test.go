@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -620,4 +621,135 @@ func TestDrainAnnouncesRecovery(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("a stuck queue that recovers must say so; warnings=%q", warnings.String())
+}
+
+// failCursorAfter makes writeCursor succeed for the first n calls, then fail
+// forever — simulating a disk that fills mid-drain.
+func failCursorAfter(t *testing.T, n int32) *int32 {
+	t.Helper()
+	var calls int32
+	prev := writeCursor
+	writeCursor = func(v int64) error {
+		if atomic.AddInt32(&calls, 1) <= n {
+			return prev(v)
+		}
+		return errors.New("write /outbox.jsonl.cursor.tmp: no space left on device")
+	}
+	t.Cleanup(func() { writeCursor = prev })
+	return &calls
+}
+
+// TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond is the
+// regression for the stale cursor found in review.
+//
+// If writeCursor fails AFTER deliver already succeeded, the durable cursor still
+// names the previous event, so the next pass re-reads and re-POSTs one the
+// backend already accepted. Under a persistent cursor fault (disk full,
+// read-only FS) that repeats FOREVER — the duplicate-send bug this package
+// exists to remove, coming back through a local-IO fault.
+//
+// MEASURED, because the shape is easy to get wrong: the old code did NOT spin at
+// line rate. `delivered++` sits AFTER the cursor write, so a pass whose first
+// write fails returns delivered==0 and Drain takes the idle sleep anyway. The
+// real behaviour was a re-POST every drainIdleInterval — 14 POSTs in 12s with the
+// inter-POST gap pinned at exactly 1.0s. That is ~60/min against the 100/min
+// bucket: quieter than "line rate", still ruinous, still forever.
+//
+// So the discriminator is the GAP, not the count. Old is deterministically capped
+// at drainIdleInterval; backed-off retries climb past it (measured 2.7-4.0s here,
+// heading for backoffCap). A gap above ~1s proves a real backoff is in the loop.
+func TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond(t *testing.T) {
+	newOutboxTest(t)
+	warnings := captureWarnings(t)
+	// Real base: the fix's value is that the ramp escapes drainIdleInterval.
+	backoffBase = 500 * time.Millisecond
+
+	var mu sync.Mutex
+	var stamps []time.Time
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		stamps = append(stamps, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+
+	// The first cursor write lands, every later one fails: exactly the
+	// delivered>0 + error shape, which also took Drain's "don't idle" fast path.
+	failCursorAfter(t, 1)
+	enqueue(t, "prompt", "command")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	time.Sleep(12 * time.Second)
+	cancel()
+	<-finished
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(stamps) < 2 {
+		t.Fatalf("expected the drain to deliver and then retry; posts = %d", len(stamps))
+	}
+	var maxGap time.Duration
+	for i := 1; i < len(stamps); i++ {
+		if g := stamps[i].Sub(stamps[i-1]); g > maxGap {
+			maxGap = g
+		}
+	}
+	if maxGap <= 1500*time.Millisecond {
+		t.Errorf("re-sends of an already-delivered event never backed off (maxGap = %v, %d posts in 12s) — "+
+			"a cursor-persist fault must ramp past drainIdleInterval (%v), not re-POST on every idle tick",
+			maxGap.Round(10*time.Millisecond), len(stamps), drainIdleInterval)
+	}
+	if len(stamps) > 10 {
+		t.Errorf("too many duplicate re-sends in 12s: %d (un-backed-off is ~14, backed-off is ~6-8)", len(stamps))
+	}
+	if w := warnings.String(); !strings.Contains(w, "cannot record delivery progress") {
+		t.Errorf("a cursor-write failure is a local disk fault the user can act on and must be surfaced loudly; warnings = %q", w)
+	}
+}
+
+// TestCursorPersistRecovers: once the disk frees up, the drain must converge
+// and stop re-sending.
+func TestCursorPersistRecovers(t *testing.T) {
+	newOutboxTest(t)
+	captureWarnings(t)
+
+	var posts int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&posts, 1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+
+	// Fail the first few cursor writes, then let them through.
+	var calls int32
+	prev := writeCursor
+	writeCursor = func(v int64) error {
+		if atomic.AddInt32(&calls, 1) <= 2 {
+			return errors.New("no space left on device")
+		}
+		return prev(v)
+	}
+	t.Cleanup(func() { writeCursor = prev })
+
+	enqueue(t, "prompt")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	defer func() { cancel(); <-finished }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if PendingCount() == 0 {
+			return // converged: cursor durable, queue drained
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Errorf("drain never converged after the cursor became writable; pending = %d, posts = %d",
+		PendingCount(), atomic.LoadInt32(&posts))
 }

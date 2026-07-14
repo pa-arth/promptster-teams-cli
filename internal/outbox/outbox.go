@@ -132,10 +132,14 @@ func readCursor() int64 {
 	return n
 }
 
-// writeCursor commits the offset via temp+rename so a crash mid-write cannot
+// writeCursor commits the offset. A var so tests can inject IO faults; nothing
+// else should reassign it.
+var writeCursor = writeCursorFile
+
+// writeCursorFile commits the offset via temp+rename so a crash mid-write cannot
 // leave a half-written number that parses as a smaller offset (which would
 // re-send) or a larger one (which would skip).
-func writeCursor(n int64) error {
+func writeCursorFile(n int64) error {
 	p := state.OutboxCursorPath()
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(n, 10)), 0o600); err != nil {
@@ -210,14 +214,43 @@ func StartDrain(client *http.Client, apiKey string) {
 // Only 2xx and 400/422 advance. Everything else retries in place forever, which
 // is correct: the queue is bounded by OutboxMaxBytes, not by giving up.
 func Drain(ctx context.Context, client *http.Client, apiKey string) {
+	failures := 0
+	var lastWarn time.Time
 	for {
 		n, err := drainOnce(ctx, client, apiKey)
-		if err != nil {
-			warnf("drain error: %v", err)
-		}
 		if ctx.Err() != nil {
 			return
 		}
+		if err != nil {
+			// A drainOnce error is a LOCAL fault — in practice the cursor write
+			// failing (disk full, read-only FS). It MUST back off.
+			//
+			// The durable cursor still names the last event we managed to
+			// record, so the next pass re-reads and re-POSTs everything
+			// delivered since — events the backend already accepted. Looping
+			// straight back therefore re-sends accepted events indefinitely:
+			// the duplicate-send bug this whole change removes, reintroduced on
+			// a local-IO fault. Backing off bounds that to one duplicate per
+			// (capped, jittered) cycle instead of one per second, and never
+			// takes the `n > 0` fast path below, which would skip the sleep and
+			// spin. Deliberately no give-up: the cursor may yet become
+			// writable, and dropping capture over a transient disk blip is
+			// worse than a bounded duplicate the backend already dedupes.
+			failures++
+			if failures == 1 || time.Since(lastWarn) >= stuckRepeatInterval {
+				warnf("cannot record delivery progress (%d consecutive failure(s)): %v — "+
+					"events are captured and queued, but %s cannot be written, so already-delivered "+
+					"events may be re-sent until this clears. Check free disk space and that the "+
+					"state directory is writable.",
+					failures, err, state.OutboxCursorPath())
+				lastWarn = time.Now()
+			}
+			if !sleepCtx(ctx, backoffFor(failures-1)) {
+				return
+			}
+			continue
+		}
+		failures = 0
 		// Only idle when the queue is empty; a non-empty queue loops straight
 		// back so a backlog drains at line rate rather than one event/second.
 		if n == 0 {
@@ -280,8 +313,12 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string) (int, er
 		}
 		cursor += int64(len(line))
 		if err := writeCursor(cursor); err != nil {
-			// Cannot persist progress: stop before sending more, or a restart
-			// would re-send everything after the last durable cursor.
+			// Stop this pass immediately: without a durable cursor, every event
+			// we send from here on is one we cannot prove we sent, and a restart
+			// would re-send the lot. Drain treats this as a local fault and backs
+			// off (it must — see the comment there); returning is not enough on
+			// its own, because the caller would otherwise loop straight back and
+			// re-POST this same, already-accepted event at line rate.
 			return delivered, fmt.Errorf("persist cursor: %w", err)
 		}
 		delivered++
