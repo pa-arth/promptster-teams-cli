@@ -110,6 +110,48 @@ func TestLedgerRotationBoundsDiskUse(t *testing.T) {
 	}
 }
 
+// TestFailedShiftDoesNotOverwriteRetainedSegment pins that a partially-applied
+// rotation cascade never destroys a segment. rename replaces its destination, so
+// if .2 -> .3 fails while .2 still exists, carrying on to .1 -> .2 would rename
+// over the only copy of .2 — losing any chain tips that lived only there.
+//
+// Blocks the shift by parking a non-empty directory at .3, which both Remove and
+// Rename refuse. On Windows this shape is reachable simply by another process
+// holding a segment open.
+func TestFailedShiftDoesNotOverwriteRetainedSegment(t *testing.T) {
+	setupChainTest(t)
+
+	seg1, seg2 := state.LedgerSegmentPath(1), state.LedgerSegmentPath(2)
+	if err := os.WriteFile(seg1, []byte("segment-one\n"), 0o600); err != nil {
+		t.Fatalf("seed .1: %v", err)
+	}
+	if err := os.WriteFile(seg2, []byte("segment-two\n"), 0o600); err != nil {
+		t.Fatalf("seed .2: %v", err)
+	}
+
+	blocker := state.LedgerSegmentPath(state.LedgerRetainedSegments)
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatalf("park blocker dir: %v", err)
+	}
+	if err := os.WriteFile(blocker+"/occupied", []byte("x"), 0o600); err != nil {
+		t.Fatalf("occupy blocker dir: %v", err)
+	}
+
+	fillLedgerPastRotation(t)
+	appendEvent(t, "command", "sess-a")
+
+	got, err := os.ReadFile(seg2)
+	if err != nil {
+		t.Fatalf("read .2: %v", err)
+	}
+	if string(got) != "segment-two\n" {
+		t.Errorf(".2 = %q, want %q — a failed shift overwrote a retained segment and destroyed its chain tips", got, "segment-two\n")
+	}
+	if got, err := os.ReadFile(seg1); err != nil || string(got) != "segment-one\n" {
+		t.Errorf(".1 = %q (err %v), want %q — the cascade should have aborted intact", got, err, "segment-one\n")
+	}
+}
+
 // TestRotationPreservesLockExclusion pins the reason the lock is a sentinel
 // rather than the buffer itself: rotation renames the buffer, and flock follows
 // the inode, so locking the buffer would let a concurrent opener lock a fresh

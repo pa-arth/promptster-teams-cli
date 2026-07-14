@@ -39,13 +39,23 @@ func rotateLedgerIfLarge() {
 		return
 	}
 
+	// Dropping the oldest is allowed to fail: the shift below renames over it
+	// anyway, which is the same outcome we wanted.
 	oldest := state.LedgerSegmentPath(state.LedgerRetainedSegments)
 	if err := os.Remove(oldest); err != nil && !os.IsNotExist(err) {
 		chainWarnf("could not drop oldest ledger segment: %v", err)
 	}
+
+	// Shift newest-last. A failure here MUST abort the whole cascade: if .2 -> .3
+	// fails while .2 still exists, carrying on to .1 -> .2 renames over the only
+	// copy of .2 and destroys it, taking any chain tips that lived only there.
+	// rename replaces its destination, so a partially-applied cascade loses data
+	// while an abandoned one loses nothing — the ledger simply keeps growing
+	// until the next append retries, which is the status quo we are improving on.
 	for n := state.LedgerRetainedSegments - 1; n >= 1; n-- {
 		if err := os.Rename(state.LedgerSegmentPath(n), state.LedgerSegmentPath(n+1)); err != nil && !os.IsNotExist(err) {
-			chainWarnf("could not shift ledger segment %d: %v", n, err)
+			chainWarnf("could not shift ledger segment %d (%v) — leaving the ledger unrotated rather than overwriting a retained segment", n, err)
+			return
 		}
 	}
 	if err := os.Rename(live, state.LedgerSegmentPath(1)); err != nil {
