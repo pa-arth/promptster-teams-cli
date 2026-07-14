@@ -47,6 +47,47 @@ func BufferLockPath() string {
 	return HookBufferPath() + ".lock"
 }
 
+// --- outbox -----------------------------------------------------------------
+//
+// The outbox is the durable SEND QUEUE, deliberately separate from the ledger
+// (HookBufferPath). They answer different questions and have incompatible
+// lifecycles:
+//
+//   - buffer.jsonl is a signed, tamper-evident TRUST ARTIFACT. It is append-only
+//     and ROTATES (sign/rotate.go renames it aside at 16MiB and drops the oldest
+//     segment). A byte cursor into a rotating file is the same identity-vs-
+//     position bug as path-keyed transcript offsets: after a rename the file
+//     restarts at 0 and a stale cursor silently skips or replays. It is also
+//     device-wide — presence and census append to it and POST themselves — so
+//     draining it would re-send their events.
+//   - outbox.jsonl is an unsigned QUEUE owned solely by the drain. Nothing
+//     audits it, so it may be freely truncated once delivered.
+//
+// Do not merge them. The ledger's value is that nothing mutates it; the
+// outbox's value is that the drain can.
+
+func OutboxPath() string {
+	if p := os.Getenv("PROMPTSTER_OUTBOX_PATH"); p != "" {
+		return p
+	}
+	return filepath.Join(StateDir(), "outbox.jsonl")
+}
+
+// OutboxCursorPath holds the byte offset of the next undelivered event. Derived
+// from OutboxPath so the two can never be mismatched (same idiom as
+// ChainStatePath).
+func OutboxCursorPath() string {
+	return OutboxPath() + ".cursor"
+}
+
+// OutboxLockPath is the sentinel guarding append/drain/compact. Like
+// BufferLockPath it is NOT the queue file itself: compaction truncates the
+// queue, and holding the lock on a sentinel keeps mutual exclusion intact
+// regardless of what happens to the queue's inode.
+func OutboxLockPath() string {
+	return OutboxPath() + ".lock"
+}
+
 // LedgerRetainedSegments is how many rotated segments are kept alongside the
 // live buffer, bounding the ledger to (1+N) * the rotation threshold.
 const LedgerRetainedSegments = 3

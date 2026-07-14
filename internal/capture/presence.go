@@ -111,6 +111,18 @@ func buildPresenceEvent(session Session) event.Event {
 // emitPresenceEvent builds one presence event and runs it through the SAME
 // redact/sign/buffer/ingest funnel as captured events. Best-effort: a heartbeat
 // that fails to send is logged only under debug and never interrupts capture.
+//
+// DELIBERATELY NOT QUEUED — do not "fix" this to use internal/outbox the way
+// the census and the watchers do. A heartbeat is a liveness claim stamped with
+// its own `ts`: retrying it three minutes later delivers "I was alive at
+// 10:04", which is not durability, it is a stale assertion arriving as though
+// it were news. Dropping a failed heartbeat is the CORRECT semantic — the next
+// one is presenceInterval away and carries a truthful timestamp, and fleet
+// health wants the latest ping, not a replay of every ping ever attempted. The
+// event is still appended to the signed ledger, so the audit trail stays whole.
+//
+// The census is the opposite case (rare, expensive, not time-sensitive) and is
+// queued; see emitConfigCensus.
 func emitPresenceEvent(session Session) {
 	ev := buildPresenceEvent(session)
 	// captureAssistantProse=false: a presence event carries no ai_response text,
