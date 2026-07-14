@@ -68,15 +68,43 @@ Anything that never reaches `watch` never checks.
 
 ### Timing
 
-- `updateCheckInterval = 24 * time.Hour`, `updateCheckPoll = time.Hour` (`selfupdate.go`).
+- `updateCheckInterval = 24 * time.Hour`, `updateCheckPoll = 5 * time.Minute` (`selfupdate.go`).
 - `runAutoUpdate` checks **once at startup unconditionally** — it ignores the persisted
   cursor. So a restart always forces a check.
-- Steady state: an hourly ticker compares now against the cursor and acts once 24h have
-  elapsed. Worst case release→update is therefore **~24–25h**, not 24h.
+- Steady state: the poll compares now against the cursor and acts once the current
+  interval has elapsed. Worst case release→update is **~24h05m**.
+- The poll is deliberately far below the interval: it is a file read and a compare, with
+  no network unless an interval actually elapsed, so it costs nothing — and it bounds how
+  fast a `minCliVersion` floor can escalate (below).
 - Cursor: `state.GlobalPromptsterDir()/last-update-check`, RFC3339, mode 0600. Unreadable
   or unparseable → zero time → treated as stale → checks on the next tick.
 - **No backoff.** The cursor advances after every check including failures, so a broken
-  release is retried at most once per 24h rather than hot-looping.
+  release is retried at most once per interval rather than hot-looping.
+
+### The minCliVersion escalation floor
+
+`u.checkInterval()` returns `belowMinCheckInterval` (15m) instead of the 24h cadence while
+the running version is below the org's `minCliVersion`. It is the emergency lever for a
+security fix. Absent/empty field ⇒ nothing changes.
+
+Three properties that are load-bearing, in descending order of how badly you'd regret
+breaking them:
+
+- **The floor moves the CADENCE only.** `checkAndApply` still enforces the org auto-update
+  switch and any pin, so a floor can neither override an opt-out nor drag a pinned fleet
+  past its pin. It never changes *which* tag is installed.
+- **15m is a RETRY FLOOR, not a target.** A fleet below the floor that cannot update
+  (upstream down, release yanked) would otherwise re-hit the releases API every poll and
+  exhaust the 60/hr unauthenticated per-IP limit — starving the update it is chasing. That
+  bites hardest behind a corporate NAT, where the whole fleet shares one IP.
+- **Do NOT "simplify" this into a shorter global interval.** Self-update is forward-only
+  (`isNewer` gates every target, pins included), so **a bad release cannot be recalled**.
+  The 24h stagger is the only canary window that exists. The floor keeps it by default and
+  lets us opt into speed per-release.
+
+The lever only works on CLIs that already understand the field, and the CLI is the
+slow-propagating side — so it cannot help the fleet that is live when you need it. That is
+why it shipped before there was a server to send it.
 
 ### npm installs DO auto-update
 
