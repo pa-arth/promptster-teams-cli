@@ -19,8 +19,12 @@ updates:
     open-pull-requests-limit: 5
 
   # Keep the SHA-pinned GitHub Actions current (Dependabot bumps the pin and
-  # the trailing version comment together).
+  # the trailing version comment together). Grouped into one PR: codeql-action's
+  # sub-actions must all run the same version, so per-action PRs are unmergeable.
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
