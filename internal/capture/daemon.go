@@ -143,8 +143,8 @@ func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, 
 		_ = os.Setenv("PROMPTSTER_TEAMS_NO_AUTO_UPDATE", "1")
 	}
 
-	// #nosec G204 -- re-execs our own resolved install binary (state.PromptsterBin()); the subcommand is a constant.
-	cmd := exec.Command(state.PromptsterBin(), "watch")
+	// #nosec G204 -- re-execs our own running binary (state.SelfBin()); the subcommand is a constant.
+	cmd := exec.Command(state.SelfBin(), "watch")
 	cmd.Stdin = devNull
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

@@ -1,7 +1,6 @@
 package service
 
 import (
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -24,16 +23,6 @@ func TestStopIsNoOpWhenNotInstalled(t *testing.T) {
 	}
 	if err := mgr.Stop(); err != nil {
 		t.Errorf("Stop() on a host without autostart installed = %v, want nil (must be a no-op)", err)
-	}
-}
-
-// TestBinPathExists guards the npm-path trap: the binary the service registers
-// must actually exist. os.Executable() (the running binary) always does; a
-// hardcoded ~/.promptster-teams/bin path does not for npm installs.
-func TestBinPathExists(t *testing.T) {
-	p := binPath()
-	if _, err := os.Stat(p); err != nil {
-		t.Fatalf("binPath()=%q must point at an existing executable: %v", p, err)
 	}
 }
 

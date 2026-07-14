@@ -52,7 +52,7 @@ func (darwinManager) Enable() error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	if err := os.WriteFile(p, []byte(renderPlist(binPath(), logPath(), home)), 0o600); err != nil {
+	if err := os.WriteFile(p, []byte(renderPlist(state.SelfBin(), logPath(), home)), 0o600); err != nil {
 		return err
 	}
 	// Clear any stale registration first (ignore errors — it may not be loaded),

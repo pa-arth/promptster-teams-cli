@@ -5,6 +5,8 @@ package service
 import (
 	"fmt"
 	"os/exec"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 type windowsManager struct{}
@@ -14,8 +16,8 @@ func New() Manager { return windowsManager{} }
 
 func (windowsManager) Enable() error {
 	// #nosec G204 -- constant subcommands; the only interpolated value is
-	// state.PromptsterBin() (the install path), not user input.
-	if out, err := exec.Command("schtasks", renderTaskArgs(binPath())...).CombinedOutput(); err != nil {
+	// state.SelfBin() (our own running binary), not user input.
+	if out, err := exec.Command("schtasks", renderTaskArgs(state.SelfBin())...).CombinedOutput(); err != nil {
 		return fmt.Errorf("schtasks /Create failed: %v: %s", err, out)
 	}
 	// The task only auto-runs at the next logon, so start it now too.
