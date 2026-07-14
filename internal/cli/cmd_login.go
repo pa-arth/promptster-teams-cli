@@ -12,6 +12,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 )
 
 // cmdLogin onboards an individual contributor: it takes the per-engineer key
@@ -109,7 +110,40 @@ func cmdLogin(args []string) {
 		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, pid))
 		printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(watchDir)) + dimStyle.Render(" · stop with ") + bodyStyle.Render("promptster-teams stop"))
 	}
+
+	if startErr == nil {
+		enableAutostartOnLogin()
+	}
 	fmt.Println()
+}
+
+// enableAutostartOnLogin installs the login-time service so capture survives a
+// reboot, and reports it. Without this, `login` starts a watcher that dies at
+// the next restart and never returns — the engineer sees a success line, the
+// dashboard silently goes quiet days later, and nobody connects the two. The
+// service is the only way capture comes back, so login installs it rather than
+// leaving it to an `autostart enable` most people never run.
+//
+// A failure here is a warning, not an error: capture IS running (the caller only
+// reaches this after StartDaemon succeeded), so login has already delivered its
+// main promise. Only the reboot guarantee is missing, and `autostart enable`
+// recovers it.
+//
+// The service kicks off its own watcher immediately, which loses the
+// single-instance lock race against the daemon we just started and exits 0. That
+// bow-out is deliberate on both platforms: the mac plist's
+// KeepAlive{SuccessfulExit:false} and the systemd unit's Restart=on-failure both
+// decline to revive a clean exit, so the installed job simply idles until the
+// next login instead of fighting the running daemon.
+func enableAutostartOnLogin() {
+	mgr := service.New()
+	if err := mgr.Enable(); err != nil {
+		printlnIndent(fmt.Sprintf("%s capture won't resume after a reboot: %v", warnGlyph, err))
+		printlnIndent(dimStyle.Render("Retry with ") + bodyStyle.Render("promptster-teams autostart enable") + dimStyle.Render("."))
+		return
+	}
+	printlnIndent(fmt.Sprintf("%s autostart enabled — capture resumes at every login", okGlyph))
+	printlnIndent(dimStyle.Render("Turn it off with ") + bodyStyle.Render("promptster-teams autostart disable") + dimStyle.Render("."))
 }
 
 // stdinIsTTY reports whether stdin is an interactive terminal (vs a pipe/CI),

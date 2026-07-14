@@ -57,8 +57,11 @@ func codexSessionsDir() string {
 
 // codexWatcherState tracks the background rollout-tailing process.
 type codexWatcherState struct {
-	PID           int    `json:"pid"`
-	StartedAt     string `json:"startedAt"`
+	PID       int    `json:"pid"`
+	StartedAt string `json:"startedAt"`
+	// WatchDir is the workspace this watcher is scoped to — see the field of the
+	// same name on claudeWatcherState for why it is recorded.
+	WatchDir      string `json:"watchDir,omitempty"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
 	EventsSent    int    `json:"eventsSent,omitempty"`
@@ -170,7 +173,8 @@ func RunCodexWatcher() error {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveCodexWatcherState(codexWatcherState{
-		PID: os.Getpid(), StartedAt: now, LogPath: codexWatcherLogPath(), LastHeartbeat: now,
+		PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
+		LogPath: codexWatcherLogPath(), LastHeartbeat: now,
 	}); err != nil {
 		return err
 	}
@@ -219,7 +223,8 @@ func RunCodexWatcher() error {
 		eventsSent += sent
 
 		_ = saveCodexWatcherState(codexWatcherState{
-			PID: os.Getpid(), StartedAt: now, LogPath: codexWatcherLogPath(),
+			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
+			LogPath:       codexWatcherLogPath(),
 			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano), EventsSent: eventsSent,
 		})
 
