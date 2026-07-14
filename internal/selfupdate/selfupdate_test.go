@@ -203,14 +203,32 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 		self string
 		want string
 	}{
-		{"npm global unix", "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64", nudgeNpm},
-		{"npm local unix", "/home/e/proj/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgeNpm},
-		{"pnpm store", "/home/e/proj/node_modules/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgeNpm},
-		{"npm global windows", `C:\Users\e\AppData\Roaming\npm\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`, nudgeNpm},
+		{"npm global unix", "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64", nudgeNpmGlobal},
+		{"npm global windows", `C:\Users\e\AppData\Roaming\npm\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`, nudgeNpmGlobal},
+		{"pnpm global", "/home/e/Library/pnpm/global/5/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgePnpmGlobal},
 		{"curl installer", "/usr/local/bin/promptster-teams", nudgeCurl},
 		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeCurl},
 		// A directory merely containing the substring must not read as npm.
 		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeCurl},
+
+		// The cases the review caught: a global command against a project-local
+		// install updates the global prefix and leaves this copy stale, so these
+		// must name the project instead of prescribing `npm i -g`.
+		{
+			"npm project-local unix",
+			"/home/e/proj/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64",
+			"promptster-teams: update available — update " + npmPackage + " in /home/e/proj",
+		},
+		{
+			"pnpm project-local store",
+			"/home/e/proj/node_modules/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64",
+			"promptster-teams: update available — update " + npmPackage + " in /home/e/proj",
+		},
+		{
+			"npm project-local windows",
+			`C:\Users\e\proj\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`,
+			"promptster-teams: update available — update " + npmPackage + ` in C:\Users\e\proj`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -218,6 +236,29 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 				t.Fatalf("nudgeFor(%q) = %q, want %q", tc.self, got, tc.want)
 			}
 		})
+	}
+}
+
+// A global hint must never be printed for a project-local install: it updates a
+// different copy and leaves this one stale, which is the bug the whole
+// channel-matching exercise exists to prevent.
+func TestLocalInstallNeverGetsAGlobalHint(t *testing.T) {
+	locals := []string{
+		"/home/e/proj/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64",
+		"/home/e/proj/node_modules/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64",
+		`C:\Users\e\proj\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`,
+	}
+	for _, self := range locals {
+		got := nudgeFor(self)
+		for _, bad := range []string{nudgeNpmGlobal, nudgePnpmGlobal, nudgeCurl} {
+			if got == bad {
+				t.Fatalf("local install %q got global/curl hint %q", self, got)
+			}
+		}
+		if !strings.Contains(got, "-g ") {
+			continue
+		}
+		t.Fatalf("local install %q got a -g hint: %q", self, got)
 	}
 }
 

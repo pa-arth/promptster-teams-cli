@@ -95,16 +95,28 @@ binary underneath self-updates, so `npm ls` / `npm outdated` will lie, and a rei
 writes the older binary back. It self-heals within 24h because `isNewer` only moves
 forward — cosmetic, but it will confuse fleet debugging.
 
-### The not-writable nudge is channel-aware
+### The not-writable nudge must update THE COPY THAT PRINTED IT
 
 When the install dir fails the `dirWritable` probe, `checkAndApply` prints `nudgeFor(self)`.
-`isNpmInstall` looks for a `node_modules` **path segment** (not a substring) and splits on
-both `/` and `\` — deliberately NOT `filepath.ToSlash`, which only rewrites `\` when
-GOOS=windows and would make the check host-dependent and untestable from a unix CI runner.
 
-Keep the hint matched to the channel: telling an npm-installed engineer to run the curl
-installer drops a second binary in a different PATH entry and leaves a coin flip over
-which one runs, while their stale copy stays stale.
+The invariant: any hint that installs somewhere other than `self` drops a second binary in
+a different PATH entry, leaves a coin flip over which one runs, and leaves the stale copy
+stale — the exact failure the hint exists to fix. Two ways to violate it, and both are easy
+to walk back into:
+
+- Telling an npm-installed engineer to run the curl installer.
+- Telling a **project-local** or pnpm install to `npm i -g` — that updates the global
+  prefix and leaves the local copy untouched. Global-vs-local matters more than
+  npm-vs-pnpm.
+
+So only the documented **global** layouts (`<prefix>/lib/node_modules`,
+`<AppData>\npm\node_modules`, pnpm's `global`) get a copyable command. Anything else under
+`node_modules` names the package and the project dir and stops there: the path cannot tell
+npm from yarn, and guessing is the same second-install bug again.
+
+Path checks match a `node_modules` **path segment** (not a substring) and split on both
+`/` and `\` — deliberately NOT `filepath.ToSlash`, which only rewrites `\` when
+GOOS=windows and would make the checks host-dependent and untestable from a unix CI runner.
 
 ### Gotchas when testing self-update locally
 

@@ -72,44 +72,103 @@ type PolicyView interface {
 // npmPackage is the published npm package name.
 const npmPackage = "@promptster/teams-cli"
 
-// nudgeCurl / nudgeNpm are the one-line hints printed when an update exists but
-// the install dir is not writable (e.g. a root-owned install run as a normal
-// user). The hint MUST match the channel the binary came from: telling an
-// npm-installed engineer to run the curl installer drops a SECOND binary in a
-// different PATH entry and leaves a coin flip over which one runs, while their
-// stale copy stays stale.
+// The one-line hints printed when an update exists but the install dir is not
+// writable (e.g. a root-owned install run as a normal user).
+//
+// The hint MUST name an action that updates THE COPY THAT PRINTED IT. Any hint
+// that installs somewhere else drops a SECOND binary in a different PATH entry,
+// leaves a coin flip over which one runs, and leaves the stale copy — the exact
+// failure it was supposed to fix. That rules out one global message: telling a
+// curl-installed engineer to use npm is wrong, and so is telling a
+// project-local or pnpm install to `npm i -g`.
 const (
-	nudgeCurl = "promptster-teams: update available — run: curl -fsSL https://get.promptster.ai | sh"
-	nudgeNpm  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
+	nudgeCurl       = "promptster-teams: update available — run: curl -fsSL https://get.promptster.ai | sh"
+	nudgeNpmGlobal  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
+	nudgePnpmGlobal = "promptster-teams: update available — run: pnpm add -g " + npmPackage + "@latest"
 )
 
-// isNpmInstall reports whether self sits under a node_modules tree, which means
-// the binary was shipped by the npm package rather than the curl installer.
-// A path segment match (not a substring) so a directory merely NAMED e.g.
-// "my-node_modules-backup" does not trip it. Covers pnpm/yarn layouts too: they
-// still nest the package under a node_modules segment.
-//
-// Splits on BOTH separators rather than filepath.ToSlash, which rewrites "\" only
-// when GOOS=windows — that would make this host-dependent and leave the Windows
-// layout untestable from a unix CI runner. A unix directory whose name literally
-// contains a backslash could false-positive; that costs one wrong hint line and
-// nothing else, which is well worth host-independent behavior.
-func isNpmInstall(self string) bool {
-	segs := strings.FieldsFunc(self, func(c rune) bool { return c == '/' || c == '\\' })
-	for _, seg := range segs {
-		if seg == "node_modules" {
+// pathSegments splits a path on BOTH separators rather than using
+// filepath.ToSlash, which rewrites "\" only when GOOS=windows — that would make
+// every check here host-dependent and leave the Windows layouts untestable from
+// a unix CI runner. A unix directory whose name literally contains a backslash
+// could false-positive; that costs one wrong hint line and nothing else, which
+// is well worth host-independent behavior.
+func pathSegments(p string) []string {
+	return strings.FieldsFunc(p, func(c rune) bool { return c == '/' || c == '\\' })
+}
+
+func hasSegment(segs []string, want string) bool {
+	for _, s := range segs {
+		if s == want {
 			return true
 		}
 	}
 	return false
 }
 
-// nudgeFor picks the hint matching the install channel of the running binary.
-func nudgeFor(self string) string {
-	if isNpmInstall(self) {
-		return nudgeNpm
+// hasAdjacent reports whether segs contains a immediately followed by b.
+func hasAdjacent(segs []string, a, b string) bool {
+	for i := 0; i+1 < len(segs); i++ {
+		if segs[i] == a && segs[i+1] == b {
+			return true
+		}
 	}
-	return nudgeCurl
+	return false
+}
+
+// nodeProjectRoot returns the directory containing the OUTERMOST node_modules
+// segment of self — the project (or global prefix) the package was installed
+// into — or "" when self is not under a node_modules tree.
+//
+// Scans the raw string rather than filepath.Dir-walking for the same
+// host-independence reason as pathSegments.
+func nodeProjectRoot(self string) string {
+	for i := 0; i < len(self); i++ {
+		if self[i] != '/' && self[i] != '\\' {
+			continue
+		}
+		rest := self[i+1:]
+		if !strings.HasPrefix(rest, "node_modules") {
+			continue
+		}
+		after := rest[len("node_modules"):]
+		if after == "" || after[0] == '/' || after[0] == '\\' {
+			return self[:i]
+		}
+	}
+	return ""
+}
+
+// nudgeFor picks the hint that updates the running binary in place.
+//
+// Global-vs-local matters more than npm-vs-pnpm: `npm i -g` against a
+// project-local install updates the global prefix and leaves the local copy
+// exactly as stale as it was. Only the documented global layouts get a copyable
+// command; anything else names the package and the directory and lets the
+// engineer use whatever package manager owns it, because the path alone cannot
+// tell npm from yarn and a guess there is the same second-install bug again.
+func nudgeFor(self string) string {
+	segs := pathSegments(self)
+	if !hasSegment(segs, "node_modules") {
+		return nudgeCurl
+	}
+	pnpm := hasSegment(segs, ".pnpm") || hasSegment(segs, "pnpm")
+	switch {
+	// pnpm's global prefix, e.g. ~/Library/pnpm/global/5/node_modules/...
+	case pnpm && hasSegment(segs, "global"):
+		return nudgePnpmGlobal
+	// npm's global prefix: <prefix>/lib/node_modules (unix) or
+	// <AppData>\npm\node_modules (windows).
+	case !pnpm && (hasAdjacent(segs, "lib", "node_modules") || hasAdjacent(segs, "npm", "node_modules")):
+		return nudgeNpmGlobal
+	}
+	root := nodeProjectRoot(self)
+	if root == "" {
+		// Under node_modules but with no resolvable root (relative path). Say
+		// nothing prescriptive rather than risk sending them to the wrong copy.
+		return "promptster-teams: update available — update " + npmPackage + " in this project"
+	}
+	return "promptster-teams: update available — update " + npmPackage + " in " + root
 }
 
 // outcome is the result of one checkAndApply, used to drive the startup banner
