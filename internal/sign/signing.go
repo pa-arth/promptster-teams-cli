@@ -1,7 +1,6 @@
 package sign
 
 import (
-	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,7 +8,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -198,44 +196,6 @@ func signEvent(e event.Event, prevSigHex string, priv ed25519.PrivateKey) (sigHe
 	sig := ed25519.Sign(priv, msg)
 	hash := sha256.Sum256(msg)
 	return hex.EncodeToString(sig), hex.EncodeToString(hash[:]), nil
-}
-
-// readLastChainSig returns the `sig` field of the last line in the event
-// buffer, hex-encoded. Used to chain a new event to the previous one. Returns
-// "" if the buffer is empty or missing.
-func readLastChainSig(bufferPath string) (string, error) {
-	// #nosec G304 -- bufferPath is state.HookBufferPath(), derived from state.StateDir(), not user input.
-	f, err := os.Open(bufferPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-	var last string
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			last = line
-		}
-	}
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		return "", err
-	}
-	if last == "" {
-		return "", nil
-	}
-	var parsed struct {
-		Sig string `json:"sig"`
-	}
-	if err := json.Unmarshal([]byte(last), &parsed); err != nil {
-		return "", err
-	}
-	return parsed.Sig, nil
 }
 
 // withBufferLock acquires an exclusive lock on the buffer file for the
