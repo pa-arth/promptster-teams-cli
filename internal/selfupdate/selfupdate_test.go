@@ -197,6 +197,30 @@ func TestNonWritableDirNudges(t *testing.T) {
 	}
 }
 
+func TestNudgeMatchesInstallChannel(t *testing.T) {
+	cases := []struct {
+		name string
+		self string
+		want string
+	}{
+		{"npm global unix", "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64", nudgeNpm},
+		{"npm local unix", "/home/e/proj/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgeNpm},
+		{"pnpm store", "/home/e/proj/node_modules/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgeNpm},
+		{"npm global windows", `C:\Users\e\AppData\Roaming\npm\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`, nudgeNpm},
+		{"curl installer", "/usr/local/bin/promptster-teams", nudgeCurl},
+		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeCurl},
+		// A directory merely containing the substring must not read as npm.
+		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeCurl},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nudgeFor(tc.self); got != tc.want {
+				t.Fatalf("nudgeFor(%q) = %q, want %q", tc.self, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSha256MismatchRejected(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
 	addRoute("api.test/repos/pa-arth/promptster-teams-cli/releases/latest", `{"tag_name":"v9.9.9"}`, 200)

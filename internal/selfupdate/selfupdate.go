@@ -69,9 +69,48 @@ type PolicyView interface {
 	PinnedCliVersion() string
 }
 
-// nudgeMessage is the one-line hint printed when an update exists but the
-// install dir is not writable (e.g. a root-owned install run as a normal user).
-const nudgeMessage = "promptster-teams: update available — run: curl -fsSL https://get.promptster.ai | sh"
+// npmPackage is the published npm package name.
+const npmPackage = "@promptster/teams-cli"
+
+// nudgeCurl / nudgeNpm are the one-line hints printed when an update exists but
+// the install dir is not writable (e.g. a root-owned install run as a normal
+// user). The hint MUST match the channel the binary came from: telling an
+// npm-installed engineer to run the curl installer drops a SECOND binary in a
+// different PATH entry and leaves a coin flip over which one runs, while their
+// stale copy stays stale.
+const (
+	nudgeCurl = "promptster-teams: update available — run: curl -fsSL https://get.promptster.ai | sh"
+	nudgeNpm  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
+)
+
+// isNpmInstall reports whether self sits under a node_modules tree, which means
+// the binary was shipped by the npm package rather than the curl installer.
+// A path segment match (not a substring) so a directory merely NAMED e.g.
+// "my-node_modules-backup" does not trip it. Covers pnpm/yarn layouts too: they
+// still nest the package under a node_modules segment.
+//
+// Splits on BOTH separators rather than filepath.ToSlash, which rewrites "\" only
+// when GOOS=windows — that would make this host-dependent and leave the Windows
+// layout untestable from a unix CI runner. A unix directory whose name literally
+// contains a backslash could false-positive; that costs one wrong hint line and
+// nothing else, which is well worth host-independent behavior.
+func isNpmInstall(self string) bool {
+	segs := strings.FieldsFunc(self, func(c rune) bool { return c == '/' || c == '\\' })
+	for _, seg := range segs {
+		if seg == "node_modules" {
+			return true
+		}
+	}
+	return false
+}
+
+// nudgeFor picks the hint matching the install channel of the running binary.
+func nudgeFor(self string) string {
+	if isNpmInstall(self) {
+		return nudgeNpm
+	}
+	return nudgeCurl
+}
 
 // outcome is the result of one checkAndApply, used to drive the startup banner
 // and to make the gate logic assertable in tests.
@@ -181,7 +220,7 @@ func (u *updater) checkAndApply() outcome {
 	dir := filepath.Dir(self)
 	if !dirWritable(dir) {
 		u.logf("selfupdate: %s not writable — skipping swap to %s", dir, target)
-		fmt.Fprintln(os.Stderr, nudgeMessage)
+		fmt.Fprintln(os.Stderr, nudgeFor(self))
 		return outcomeBlockedNotWritable
 	}
 
