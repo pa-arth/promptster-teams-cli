@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -182,6 +183,17 @@ func StartTeamsDaemon(args []string) error {
 // `promptster-teams … watch` processes is not tied to this state dir, so it could
 // terminate another workspace's daemon. Safe to run when nothing is running.
 func StopTeamsDaemon() error {
+	// Disarm the OS supervisor BEFORE signaling. When autostart is enabled the
+	// watcher belongs to launchd/systemd, and their restart policies read the
+	// SIGKILL below as a crash — so a `stop` that escalated would report success
+	// and then watch capture come back ~10s later. Stopping the service (not
+	// disabling it) unloads the job now and leaves it registered for next login.
+	// Stop is a no-op when autostart isn't installed, so it needs no guard here.
+	// Best-effort: a supervisor we can't reach must not block killing the process.
+	if err := service.New().Stop(); err != nil {
+		fmt.Fprintf(os.Stderr, "promptster-teams: warning: could not stop the autostart service (%v) — it may restart capture\n", err)
+	}
+
 	// Collect candidate PIDs from every pidfile this install writes. The watchers
 	// run as in-process goroutines under one `watch` PID, so the supervisor and
 	// both watcher pidfiles usually point at the same process — the dedup set

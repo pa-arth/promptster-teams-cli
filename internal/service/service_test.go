@@ -7,6 +7,26 @@ import (
 	"testing"
 )
 
+// TestStopIsNoOpWhenNotInstalled pins the contract `stop` depends on: calling
+// Stop when autostart was never enabled must succeed silently rather than error,
+// so StopTeamsDaemon can call it unconditionally on every teardown.
+//
+// It skips when autostart IS installed — the assertion isn't worth booting out
+// the developer's own running capture to make.
+func TestStopIsNoOpWhenNotInstalled(t *testing.T) {
+	mgr := New()
+	installed, _, err := mgr.Status()
+	if err != nil {
+		t.Skipf("cannot read autostart status on this host: %v", err)
+	}
+	if installed {
+		t.Skip("autostart is enabled on this host; refusing to stop the real service in a test")
+	}
+	if err := mgr.Stop(); err != nil {
+		t.Errorf("Stop() on a host without autostart installed = %v, want nil (must be a no-op)", err)
+	}
+}
+
 // TestBinPathExists guards the npm-path trap: the binary the service registers
 // must actually exist. os.Executable() (the running binary) always does; a
 // hardcoded ~/.promptster-teams/bin path does not for npm installs.

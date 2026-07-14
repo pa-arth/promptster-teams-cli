@@ -37,8 +37,19 @@ func pidLooksLikeOurs(pid int) bool {
 	return strings.Contains(string(out), "promptster-teams")
 }
 
-// signalAndWaitForExit sends SIGINT to pid, waits up to 2s for it to exit,
-// then SIGKILLs if still alive. No-op if pid is invalid or already dead.
+// shutdownGrace is how long signalAndWaitForExit waits after SIGINT before
+// escalating to SIGKILL. It must exceed the watchers' worst-case time to reach
+// their signal check: they only select on the signal channel between poll
+// iterations, and a poll ships events over HTTP one at a time with a 5s client
+// timeout (see ingestClaudeWatchEvent). The old 2s budget was shorter than a
+// single hung send, so any busy watcher got SIGKILLed instead of exiting
+// cleanly. 8s covers a slow send plus margin; a watcher still parsing a large
+// burst can exceed it, which is why `stop` also disarms the OS supervisor
+// rather than relying on a clean exit to prevent a restart.
+const shutdownGrace = 8 * time.Second
+
+// signalAndWaitForExit sends SIGINT to pid, waits up to shutdownGrace for it to
+// exit, then SIGKILLs if still alive. No-op if pid is invalid or already dead.
 func signalAndWaitForExit(pid int) {
 	if pid <= 0 || pid == os.Getpid() || !processExists(pid) {
 		return
@@ -49,7 +60,7 @@ func signalAndWaitForExit(pid int) {
 	}
 	_ = proc.Signal(os.Interrupt)
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(shutdownGrace)
 	for time.Now().Before(deadline) {
 		if !processExists(pid) {
 			return

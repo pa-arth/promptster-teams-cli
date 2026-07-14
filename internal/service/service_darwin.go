@@ -68,6 +68,25 @@ func (darwinManager) Enable() error {
 	return nil
 }
 
+// Stop boots the job out of the current GUI domain, which disarms KeepAlive and
+// terminates the watcher, but leaves the plist on disk. launchd re-bootstraps
+// everything in ~/Library/LaunchAgents at the next login, so autostart survives
+// — this only ends the current session's capture.
+func (darwinManager) Stop() error {
+	if installed, _, _ := (darwinManager{}).Status(); !installed {
+		return nil
+	}
+	// #nosec G204 -- constant subcommands; target is gui/<uid>/<label>, not user input.
+	if out, err := exec.Command("launchctl", "bootout", guiTarget(true)).CombinedOutput(); err != nil {
+		// bootout exits non-zero when the job isn't loaded — that's the desired
+		// end state, not a failure. Only a still-loaded job is worth reporting.
+		if err := exec.Command("launchctl", "print", guiTarget(true)).Run(); err == nil {
+			return fmt.Errorf("launchctl bootout failed: %s", out)
+		}
+	}
+	return nil
+}
+
 func (darwinManager) Disable() error {
 	p, err := plistPath()
 	if err != nil {
