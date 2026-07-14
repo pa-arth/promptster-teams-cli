@@ -40,8 +40,18 @@ const (
 	updateCheckInterval = 24 * time.Hour
 	// updateCheckPoll is how often the ticker CHECKS whether the interval has
 	// elapsed (against the persisted cursor), so the cadence survives laptop
-	// sleeps and watch restarts.
-	updateCheckPoll = time.Hour
+	// sleeps and watch restarts. A poll is a file read and a compare — no
+	// network unless an interval actually elapsed — so it is cheap enough to run
+	// well below updateCheckInterval. It bounds how fast an org-set
+	// minCliVersion can escalate, which is the reason it is minutes not hours.
+	updateCheckPoll = 5 * time.Minute
+	// belowMinCheckInterval replaces updateCheckInterval while the running
+	// version is below the org's minCliVersion floor. It is the RETRY FLOOR for
+	// an escalated rollout, not a target: without it a fleet that is below the
+	// floor and failing to update (GitHub down, release yanked mid-rollout)
+	// would re-hit the releases API every poll and exhaust the 60/hr
+	// unauthenticated per-IP limit — starving the very update it is chasing.
+	belowMinCheckInterval = 15 * time.Minute
 
 	// repoSlug is the public releases repo.
 	repoSlug = "pa-arth/promptster-teams-cli"
@@ -67,6 +77,10 @@ type PolicyView interface {
 	AutoUpdateEnabled() bool
 	// PinnedCliVersion returns an exact tag the org pins the fleet to, or "".
 	PinnedCliVersion() string
+	// MinCliVersion returns the version floor the org wants the fleet on, or "".
+	// It is an escalation lever for the CHECK CADENCE only — it never overrides
+	// AutoUpdateEnabled or a pin, and it never changes which tag is installed.
+	MinCliVersion() string
 }
 
 // npmPackage is the published npm package name.
@@ -494,11 +508,34 @@ func saveLastUpdateCheck(t time.Time) {
 	_ = os.WriteFile(p, []byte(t.UTC().Format(time.RFC3339)), 0o600)
 }
 
+// checkInterval is how long this watcher waits between checks: the normal 24h
+// cadence, or the shorter escalated floor while the running version is below the
+// org's minCliVersion.
+//
+// The floor only moves the CADENCE. Whether an update is allowed at all, and
+// which tag it targets, stay entirely with checkAndApply — so an org that
+// disabled auto-update or pinned a tag is unaffected by a floor, and a floor can
+// never drag a fleet to a version the newer-only gate would reject.
+func (u *updater) checkInterval() time.Duration {
+	if u.policy == nil {
+		return updateCheckInterval
+	}
+	min := strings.TrimPrefix(u.policy.MinCliVersion(), "v")
+	if min == "" || !isNewer(u.currentVersion, min) {
+		return updateCheckInterval
+	}
+	return belowMinCheckInterval
+}
+
 // runAutoUpdate checks once immediately, prints a one-line banner if a newer
-// release was found but not applied, then re-checks whenever 24h have elapsed
-// since the persisted cursor, until stop is closed. The cursor advances after
-// every check (applied never returns) so a broken release retries at most once
-// per interval.
+// release was found but not applied, then re-checks whenever the current
+// interval has elapsed since the persisted cursor, until stop is closed. The
+// cursor advances after every check (applied never returns) so a broken release
+// retries at most once per interval.
+//
+// The interval is re-read every poll rather than captured once, so an org
+// raising minCliVersion mid-run escalates a watcher that is already up — which
+// is the entire point of the lever.
 func runAutoUpdate(u *updater, stop <-chan struct{}) {
 	res := u.checkAndApply()
 	saveLastUpdateCheck(u.now())
@@ -511,7 +548,7 @@ func runAutoUpdate(u *updater, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			if u.now().Sub(loadLastUpdateCheck()) >= updateCheckInterval {
+			if u.now().Sub(loadLastUpdateCheck()) >= u.checkInterval() {
 				_ = u.checkAndApply()
 				saveLastUpdateCheck(u.now())
 			}
