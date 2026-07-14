@@ -55,8 +55,9 @@ func AppendEventToLocalBuffer(ev *event.Event, captureAssistantProse bool) error
 		}
 
 		var cs chainState
+		var indexPersistable bool
 		if priv != nil {
-			cs = loadOrRebuildChainState(p, csPath)
+			cs, indexPersistable = loadOrRebuildChainState(p, csPath)
 			// Link to the tip of THIS event's session, not to whatever was
 			// appended last. Concurrent sessions interleave in the ledger, so a
 			// global tip would chain unrelated sessions together.
@@ -98,8 +99,22 @@ func AppendEventToLocalBuffer(ev *event.Event, captureAssistantProse bool) error
 			nowMs := time.Now().UnixMilli()
 			cs.setTip(ev.SessionID, ev.Sig, nowMs)
 			cs.prune(nowMs)
-			if err := writeChainState(csPath, cs); err != nil {
-				state.HookDebugf("write chain state: %v", err)
+			switch {
+			case !indexPersistable:
+				// The tips came from an incomplete rebuild, so writing them back
+				// would freeze a partial index in place and stop future rebuilds.
+				// Leave it absent and re-derive from the ledger next append.
+				// rebuildChainStateFromBuffer already warned.
+			case writeChainState(csPath, cs) != nil:
+				// A stale index is NOT self-healing: it stays valid JSON, so
+				// readChainState keeps accepting it and every later event of this
+				// session re-links to the same frozen tip — a silent star, not a
+				// chain. Drop the index so the next append rebuilds from the
+				// ledger, which already holds this event.
+				chainWarnf("could not write index — dropping it so the next append rebuilds from the ledger")
+				if err := os.Remove(csPath); err != nil && !os.IsNotExist(err) {
+					chainWarnf("could not drop stale index (%v) — subsequent events in this session may re-link to a stale tip", err)
+				}
 			}
 		}
 		return nil

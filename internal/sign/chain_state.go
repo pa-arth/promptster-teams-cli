@@ -3,13 +3,12 @@ package sign
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // chainState is a DERIVED INDEX of buffer.jsonl: the tip (last signature) of
@@ -46,10 +45,18 @@ const (
 	// loop between TTL sweeps. At the cap the file is ~100KB, still far cheaper
 	// to parse than the full-ledger scan this index replaces.
 	chainStateMaxEntries = 512
-	// chainRebuildMaxBytes stops a pathological ledger from stalling an append
-	// for seconds. Past this we start empty rather than block capture.
-	chainRebuildMaxBytes = 64 << 20
 )
+
+// chainWarnf reports a chain-integrity problem.
+//
+// Deliberately NOT routed through state.HookDebugf, which is gated behind
+// PROMPTSTER_DEBUG=1: a silently degraded chain is indistinguishable from a
+// working one, which is the exact failure this package exists to prevent. Same
+// rule the watchers use — errors and degraded states are never gated, only
+// chatty per-poll progress is.
+func chainWarnf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "promptster-teams: chain: "+format+"\n", args...)
+}
 
 // readChainState loads the index. ok=false means missing OR corrupt — both
 // callers should treat identically, since "rebuild from the ledger" is the
@@ -78,21 +85,25 @@ func readChainState(path string) (chainState, bool) {
 // so grouping by session yields one group in file order and the device-wide
 // chain continues unbroken. The new rule is a strict generalization of the old
 // one, which is why there is no migration discontinuity to reason about.
-func rebuildChainStateFromBuffer(bufferPath string) chainState {
-	cs := chainState{V: chainStateVersion, Sessions: map[string]chainEntry{}}
+//
+// complete=false means the scan did not see the whole ledger, so the result is
+// a LOWER BOUND on each session's tip: sessions may be missing entirely. It
+// must never be persisted, or a partial index would freeze in place and stop
+// future rebuilds — turning a transient read problem into a permanent silent
+// fork. There is deliberately no ledger size cap: a rebuild only happens when
+// the index is missing or corrupt, so paying one slow scan is strictly better
+// than silently restarting every session's chain.
+func rebuildChainStateFromBuffer(bufferPath string) (cs chainState, complete bool) {
+	cs = chainState{V: chainStateVersion, Sessions: map[string]chainEntry{}}
 
-	fi, err := os.Stat(bufferPath)
-	if err != nil {
-		return cs // no ledger yet == empty chain, not an error
-	}
-	if fi.Size() > chainRebuildMaxBytes {
-		state.HookDebugf("chain state: ledger is %d bytes, over the %d rebuild cap — starting empty", fi.Size(), chainRebuildMaxBytes)
-		return cs
-	}
 	// #nosec G304 -- bufferPath is state.HookBufferPath(), derived from state.StateDir(), not user input.
 	f, err := os.Open(bufferPath)
 	if err != nil {
-		return cs
+		if os.IsNotExist(err) {
+			return cs, true // no ledger yet == empty chain, and that IS the whole truth
+		}
+		chainWarnf("cannot read ledger to rebuild index (%v) — events will start new chain segments", err)
+		return cs, false
 	}
 	defer f.Close()
 
@@ -125,9 +136,14 @@ func rebuildChainStateFromBuffer(bufferPath string) chainState {
 		}
 	}
 	if err := scanner.Err(); err != nil && err != io.EOF {
-		state.HookDebugf("chain state: rebuild scan: %v", err)
+		// The scan stopped early (e.g. a line over the token limit), so sessions
+		// whose events live past that point are absent from cs. Say so loudly and
+		// report the result as incomplete rather than letting a partial index be
+		// mistaken for the whole ledger.
+		chainWarnf("index rebuild stopped early (%v) — result is partial and will not be persisted", err)
+		return cs, false
 	}
-	return cs
+	return cs, true
 }
 
 // chainEntryTsMs prefers the event's own timestamp so a rebuilt index prunes by
@@ -145,9 +161,11 @@ func chainEntryTsMs(ts string, fallbackMs int64) int64 {
 }
 
 // loadOrRebuildChainState is the single entry point for the append path.
-func loadOrRebuildChainState(bufferPath, statePath string) chainState {
+// persistable=false means the tips are a lower bound (an incomplete rebuild) and
+// the caller must not write the index back.
+func loadOrRebuildChainState(bufferPath, statePath string) (cs chainState, persistable bool) {
 	if cs, ok := readChainState(statePath); ok {
-		return cs
+		return cs, true
 	}
 	return rebuildChainStateFromBuffer(bufferPath)
 }

@@ -1,6 +1,7 @@
 package sign
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
@@ -293,6 +294,94 @@ func TestAppendSurvivesTornLastLine(t *testing.T) {
 	}
 	if last.PrevSig != firstTip {
 		t.Errorf("prevSig = %q, want %q (the last well-formed event)", last.PrevSig, firstTip)
+	}
+}
+
+// TestIndexWriteFailureDoesNotStrandStaleTip pins the subtlest failure here.
+//
+// A stale index is not self-healing: it stays valid JSON, so readChainState
+// keeps accepting it. If a write fails (disk full) and we left the old file in
+// place, EVERY later event of that session would re-link to the same frozen
+// tip — a silent star, not a chain, and not a one-off fork. So a failed write
+// must drop the index and let the ledger (which already holds the event)
+// re-derive it.
+//
+// Blocks the write by parking a directory on the temp path writeChainState
+// renames from, which leaves the real index file readable and removable —
+// exactly the disk-full shape.
+func TestIndexWriteFailureDoesNotStrandStaleTip(t *testing.T) {
+	pub := setupChainTest(t)
+
+	appendEvent(t, "prompt", "sess-a")
+
+	blocker := state.ChainStatePath() + ".tmp"
+	if err := os.Mkdir(blocker, 0o700); err != nil {
+		t.Fatalf("park blocker dir: %v", err)
+	}
+	if _, err := os.Stat(state.ChainStatePath()); err != nil {
+		t.Fatalf("index should still exist and be readable: %v", err)
+	}
+
+	// Write fails here; the fix drops the now-unmaintainable index.
+	appendEvent(t, "command", "sess-a")
+
+	if _, err := os.Stat(state.ChainStatePath()); !os.IsNotExist(err) {
+		t.Error("index survived a failed write — a stale tip will be trusted forever")
+	}
+
+	// Unblock so the index can be maintained again, then keep appending.
+	if err := os.Remove(blocker); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	appendEvent(t, "command", "sess-a")
+
+	evs := bySession(readBuffer(t))["sess-a"]
+	if len(evs) != 3 {
+		t.Fatalf("got %d events, want 3", len(evs))
+	}
+	// The regression: without dropping the index, evs[2] would re-link to
+	// evs[0].Sig — the same parent as evs[1] — forking the chain.
+	if evs[2].PrevSig == evs[1].PrevSig {
+		t.Error("two events share a parent — the chain forked off a stale tip")
+	}
+	verifyChain(t, pub, "sess-a", evs)
+}
+
+// TestIncompleteRebuildIsNotPersisted: if the scan cannot see the whole ledger,
+// the tips it found are a lower bound. Writing them back would freeze a partial
+// index in place and stop future rebuilds, turning a transient read problem into
+// a permanent silent fork.
+func TestIncompleteRebuildIsNotPersisted(t *testing.T) {
+	setupChainTest(t)
+
+	appendEvent(t, "prompt", "sess-a")
+	if err := os.Remove(state.ChainStatePath()); err != nil {
+		t.Fatalf("remove index: %v", err)
+	}
+
+	// Prepend a line past the scanner's token limit so the scan aborts before
+	// reaching sess-a's real event.
+	existing, err := os.ReadFile(state.HookBufferPath())
+	if err != nil {
+		t.Fatalf("read buffer: %v", err)
+	}
+	oversized := append([]byte(`{"sessionId":"x","sig":"`), bytes.Repeat([]byte("a"), 17<<20)...)
+	oversized = append(oversized, []byte("\"}\n")...)
+	if err := os.WriteFile(state.HookBufferPath(), append(oversized, existing...), 0o600); err != nil {
+		t.Fatalf("write oversized buffer: %v", err)
+	}
+
+	cs, complete := rebuildChainStateFromBuffer(state.HookBufferPath())
+	if complete {
+		t.Error("rebuild reported complete despite aborting mid-scan")
+	}
+	if len(cs.Sessions) != 0 {
+		t.Errorf("rebuild saw %d sessions past the oversized line, want 0", len(cs.Sessions))
+	}
+
+	appendEvent(t, "command", "sess-a")
+	if _, err := os.Stat(state.ChainStatePath()); !os.IsNotExist(err) {
+		t.Error("a partial index was persisted — future rebuilds are now suppressed")
 	}
 }
 
