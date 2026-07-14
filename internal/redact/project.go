@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // Client-side source exclusion — the on-device twin of the backend's teams
@@ -106,7 +107,12 @@ var projectFieldAllowlist = map[string][]string{
 	"heartbeat": {"device", "cliVersion", "os", "arch", "watching"},
 	"presence":  {"device", "cliVersion", "os", "arch", "watching", "state"},
 	// Config census: token-count inventory — counts and names only.
+	// workspaceKey is a git remote slug (owner/name) or an opaque sha256(path)
+	// hash — never a filesystem path and never file contents (pinned by
+	// TestConfigCensusWorkspaceKey) — and the backend keys workspace de-dupe on
+	// it, so it must survive projection.
 	"config_census": {
+		"workspaceKey",
 		"globalClaudeMdTokens", "projectClaudeMdTokens",
 		"skillListingTokens", "skillCount", "skills",
 		"pluginListingTokens", "pluginCount", "plugins",
@@ -445,6 +451,15 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 	e.RawPayload = ""
 	allowed := projectFieldAllowlist[e.Kind]
 	data, ok := e.Data.(map[string]interface{})
+	if !ok && e.Data != nil {
+		// Dropping a non-map payload is the correct, safe default — but when an
+		// emitter hands us one it is almost always a bug at the emitter (a typed
+		// payload struct assigned straight to Data never asserts to a map, so its
+		// whole payload silently becomes {} before signing; see
+		// capture.eventDataMap). The default-deny below stands either way; this
+		// log just means the next occurrence is discoverable instead of invisible.
+		state.HookDebugf("projectEvent: %s Data is %T, not map[string]interface{} — payload dropped", e.Kind, e.Data)
+	}
 	if !ok || len(allowed) == 0 {
 		e.Data = map[string]interface{}{}
 		return

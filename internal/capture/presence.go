@@ -78,16 +78,22 @@ func dirExists(path string) bool {
 // buildPresenceEvent constructs a presence event for the given session. It goes
 // through the ordinary Event envelope so it is scrubbed, signed, and chained
 // exactly like every other event (see appendEventToLocalBuffer).
+//
+// The payload goes through eventDataMap rather than being assigned directly:
+// Data must hold a map[string]interface{} or the redaction projector
+// default-denies it and the heartbeat ships with no cliVersion/device at all —
+// which is exactly the fleet-health signal this event exists to carry. See
+// eventDataMap.
 func buildPresenceEvent(session Session) event.Event {
 	e := event.NewEvent("presence", session.SessionID)
 	e.Source = presenceSource
-	e.Data = presenceData{
+	e.Data = eventDataMap(presenceData{
 		Device:     session.SessionID,
 		CLIVersion: version.Version,
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
 		Watching:   watchedTools(),
-	}
+	})
 	return e
 }
 

@@ -546,11 +546,15 @@ func saveLastCensusAt(t time.Time) {
 
 // buildConfigCensusEvent wraps the census in the ordinary event envelope so it
 // is signed and chained exactly like every other event.
+//
+// The census goes through eventDataMap rather than being assigned directly:
+// Data must hold a map[string]interface{} or the redaction projector
+// default-denies it and the whole census ships as {}. See eventDataMap.
 func buildConfigCensusEvent(session Session) event.Event {
 	e := event.NewEvent("config_census", session.SessionID)
 	e.Source = presenceSource
 	e.Actor = event.SystemActor()
-	e.Data = buildConfigCensus(defaultCensusEnv(session.TaskRoot))
+	e.Data = eventDataMap(buildConfigCensus(defaultCensusEnv(session.TaskRoot)))
 	return e
 }
 
