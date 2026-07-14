@@ -27,3 +27,11 @@ func HookBufferPath() string {
 	}
 	return filepath.Join(StateDir(), "buffer.jsonl")
 }
+
+// ChainStatePath is the per-session signature-chain index that pairs with
+// HookBufferPath. It is deliberately derived from the buffer path rather than
+// from StateDir so the two can never be mismatched: redirect
+// PROMPTSTER_BUFFER_PATH (as the tests do) and the index follows it.
+func ChainStatePath() string {
+	return HookBufferPath() + ".chain.json"
+}
