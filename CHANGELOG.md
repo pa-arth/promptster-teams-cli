@@ -6,6 +6,32 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.6] — 2026-07-14
+
+### Fixed
+- **The config census and presence heartbeats shipped empty.** Both built their
+  payload as a Go struct and assigned it to `Event.Data` (an `interface{}`). The
+  redaction pass requires a map and default-denies anything else, so the type
+  assertion failed and the entire payload was replaced with `{}` — before
+  signing, before the wire. Every census reported zero skills, zero MCP servers
+  and zero CLAUDE.md tokens regardless of the machine, and every heartbeat
+  arrived with no CLI version. Payloads now convert through their JSON tags
+  before projection, and a non-map `Data` is logged rather than dropped in
+  silence. Upgrading re-emits a correct census immediately on watch start.
+  - Downstream, this is what made **always-on config tax** and **dead-weight
+    skills** read `$0` for every engineer, and left fleet health with no CLI
+    version or heartbeat to report.
+- **`workspaceKey` is no longer stripped from the census.** It was collected but
+  missing from the projection allowlist, so the backend never received the field
+  it uses to count distinct workspaces — the denominator for CLAUDE.md coverage.
+  Needs the matching backend allowlist entry to take effect.
+- **Event signatures now chain per session rather than per device.** The chain
+  was global to the buffer file, so concurrent sessions interleaved into a single
+  chain no verifier could walk. Each session's tip now lives in a derived index,
+  rebuilt from the ledger whenever it is missing or corrupt; a pre-upgrade buffer
+  reproduces its old device-wide tip exactly, so the legacy chain continues
+  unbroken.
+
 ## [0.5.5] — 2026-07-13
 
 ### Fixed
@@ -141,7 +167,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...HEAD
+[0.5.6]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.2...v0.5.3
