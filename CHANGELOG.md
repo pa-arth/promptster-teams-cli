@@ -6,7 +6,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.7] — 2026-07-14
+
 ### Added
+- **An org `minCliVersion` floor can escalate the update cadence for an emergency
+  fix.** While the running version is below the org's `minCliVersion`, the
+  updater re-checks every 15 minutes instead of every 24 hours. Normal releases
+  keep the 24h stagger, which is the only canary window that exists — self-update
+  is forward-only, so a bad release cannot be recalled. The floor moves the
+  *cadence* only: the org auto-update switch and any version pin are still
+  enforced, so a floor can neither override an opt-out nor drag a pinned fleet
+  past its pin, and it never changes which tag gets installed. The 15m is a retry
+  floor rather than a target — a fleet below the floor that cannot update
+  (upstream down, release yanked) would otherwise re-hit the releases API every
+  poll and exhaust the 60/hr per-IP limit, starving the very update it is
+  chasing. The CLI has to understand the field before a backend can ever send it,
+  so this ships ahead of the server side and only works on versions from here on.
 - **`doctor` now reports delivery-queue health, so a stuck send queue is visible
   where engineers actually look.** The durable send queue drains in the
   background and shouts about failures on stderr — which lands in `daemon.log`,
@@ -27,6 +42,31 @@ follows [Semantic Versioning](https://semver.org/).
   ledger, or sends anything.
 
 ### Fixed
+- **The dashboard reported 1 session while 7 were running.** The envelope's
+  `sessionId` was actually the *device* id — `loadSession` set it from
+  `DeviceID()` and every watcher handed that to its normalizer, so all concurrent
+  sessions on a machine reported as one, and always had. Session ids now come
+  from the transcript each watcher tails, derived from its path so a processor
+  knows its session before reading a line. The real session id *was* being
+  captured into `data.meta.ideSessionId` and then silently dropped, because the
+  projector allowlists no `meta` key; identity now lives on the envelope, which
+  the projector cannot touch. `deviceId` ships as a separate unsigned envelope
+  field sourced from the environment, so the two cannot re-conflate. This also
+  defused two landmines that had not gone off yet: presence data read the
+  envelope session id, so every watch restart would have looked like a new device
+  and inflated seat counts, and the ai-paths ledger held a single session and
+  wiped itself on a new id, so concurrent Claude and Codex sessions would have
+  erased each other.
+- **`stop` reported success while the OS supervisor quietly revived capture.**
+  With autostart enabled, `stop` signalled the watcher's PID but left the
+  launchd/systemd job loaded and its restart policy armed. The 2s SIGINT→SIGKILL
+  budget was also shorter than a single 5s-timeout ingest send, so a busy watcher
+  got SIGKILLed — which the supervisor read as a crash and revived, verified live
+  on macOS at ~2s. `stop` now disarms the supervisor before signalling, the grace
+  window is 8s (guarded by a test asserting it exceeds the ingest client
+  timeout), watchers handle SIGTERM as well as SIGINT so supervisor-driven
+  teardown still runs their state cleanup, and the final report is derived from
+  an observed post-state rather than from intent.
 - **The same transcript was captured twice, and the duplicates blew the ingest
   rate limit.** Watcher progress was keyed by absolute path, but one Claude Code
   session is reachable under several `~/.claude/projects/` slugs — a git-worktree
@@ -69,6 +109,34 @@ follows [Semantic Versioning](https://semver.org/).
   reported every event ever captured as perpetually pending, and "all events
   shipped" could only appear on a device that had captured nothing at all. It now
   counts the send queue, so both states mean what they say.
+- **`start` could not launch capture on any install except the curl installer.**
+  It spawned its detached `watch` child from a hardcoded
+  `~/.promptster-teams/bin/promptster-teams`, a path that only exists for one
+  install channel — so npm, pnpm and `go build` users got `fork/exec ...: no such
+  file or directory` and could not start capture at all. What to exec is a
+  property of the running process, not the install channel, so it is now resolved
+  from the running executable (with symlinks resolved, since the npm global bin
+  is one). The install-path helper that caused this is no longer reachable as a
+  footgun: it survives only as a fallback for a host where the running executable
+  cannot be resolved. Autostart had already hit and locally fixed this same bug;
+  the two now share one resolver instead of each having their own.
+- **`login` started a watcher but never installed the login service**, so capture
+  died at the next reboot and never came back. The only signal was an
+  "autostart not enabled" warning in `status`/`doctor` that landed directly under
+  "capturing in the background (pid N)" and read as a failure rather than a
+  reboot gap. `login` now installs the service and says so. A failed enable stays
+  a warning: capture is already running, only the reboot guarantee is missing.
+  Separately, `status` recomputed the watch dir from its own cwd, so running it
+  inside a repo reported that repo while the daemon was really scoped to `$HOME`;
+  it now reports the scope live capture recorded at spawn.
+- **The "can't update in place" nudge pointed npm installs at the curl
+  installer**, which lands a *second* binary in a different PATH entry, leaves a
+  coin flip over which one runs, and leaves the stale copy stale — the exact
+  failure the hint exists to prevent. The hint is now chosen from the running
+  binary's path, and only the documented global layouts get a copyable command;
+  a project-local or pnpm install is named rather than guessed at, because
+  `npm i -g` there would update the global prefix and leave the copy that printed
+  the nudge untouched.
 
 ## [0.5.6] — 2026-07-14
 
@@ -231,7 +299,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.7...HEAD
+[0.5.7]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...v0.5.7
 [0.5.6]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.4...v0.5.5
 [0.5.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.3...v0.5.4

@@ -1,6 +1,6 @@
 {
   "name": "@promptster/teams-cli",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "description": "On-device, auditable AI-coding capture for internal engineering teams",
   "keywords": [
     "promptster",
