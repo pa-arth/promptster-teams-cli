@@ -8,7 +8,8 @@ import "time"
 type WatcherStat struct {
 	Name     string // "claude" | "codex"
 	Running  bool
-	Degraded bool // running but parsing nothing from bytes it consumed
+	Degraded bool   // running but parsing nothing from bytes it consumed
+	WatchDir string // workspace this watcher is scoped to; "" if unrecorded
 	PID      int
 	// EventsCaptured counts events parsed and queued for delivery, not events
 	// acknowledged by the backend — delivery is asynchronous (internal/outbox).
@@ -30,8 +31,16 @@ type CaptureSnapshot struct {
 	// DaemonPID is the supervisor pid, or the live watcher pid when no supervisor
 	// pidfile exists (they are the same process — the watchers are goroutines).
 	DaemonPID int
-	Claude    WatcherStat
-	Codex     WatcherStat
+	// WatchDir is the directory live capture is actually scoped to, as recorded at
+	// spawn by a running watcher. Callers must prefer this over recomputing from
+	// cwd: the watch dir is the gate that decides which transcripts get captured
+	// at all, and capture's is routinely not the caller's — `login` scopes it to
+	// $HOME and autostart to the home dir in the plist, while `status` gets run
+	// from inside some repo. Empty when no watcher is live, which is the caller's
+	// cue to fall back.
+	WatchDir string
+	Claude   WatcherStat
+	Codex    WatcherStat
 }
 
 // watcherStaleGrace bounds how long after its last heartbeat a watcher pidfile
@@ -76,6 +85,7 @@ func claudeWatcherStat(now time.Time) WatcherStat {
 		Name:           "claude",
 		Running:        watcherLive(st.PID, hb, now),
 		Degraded:       st.Degraded,
+		WatchDir:       st.WatchDir,
 		PID:            st.PID,
 		EventsCaptured: st.EventsCaptured,
 		BytesConsumed:  st.BytesConsumed,
@@ -93,6 +103,7 @@ func codexWatcherStat(now time.Time) WatcherStat {
 	return WatcherStat{
 		Name:           "codex",
 		Running:        watcherLive(st.PID, hb, now),
+		WatchDir:       st.WatchDir,
 		PID:            st.PID,
 		EventsCaptured: st.EventsCaptured,
 		LastHeartbeat:  hb,
@@ -108,6 +119,27 @@ func Snapshot() CaptureSnapshot {
 	codex := codexWatcherStat(now)
 	pid, running := DaemonStatus()
 
+	// Resolve the live scope from a running watcher, and ONLY from a running
+	// watcher. supervisor.json records a WatchDir too, but reading it is a trap:
+	// the supervisor owns both watchers as goroutines in its own process, so
+	// whenever it is genuinely up they are up and answer first — meaning the
+	// supervisor branch is only ever *reached* when no watcher is live, which is
+	// exactly the state where it cannot be trusted. DaemonStatus() proves only
+	// that the recorded PID exists, so a crashed supervisor whose PID the OS
+	// recycled would hand back a stale dir and point debugging at a directory
+	// nothing is watching. watcherLive() demands a recent heartbeat and can't be
+	// fooled that way.
+	//
+	// Reading watchers also covers autostart, which runs a bare `watch` and writes
+	// no supervisor.json at all — the deployment most engineers are on.
+	var watchDir string
+	switch {
+	case claude.Running && claude.WatchDir != "":
+		watchDir = claude.WatchDir
+	case codex.Running && codex.WatchDir != "":
+		watchDir = codex.WatchDir
+	}
+
 	effPID := pid
 	if effPID == 0 {
 		if claude.Running {
@@ -119,6 +151,7 @@ func Snapshot() CaptureSnapshot {
 	return CaptureSnapshot{
 		Live:      running || claude.Running || codex.Running,
 		DaemonPID: effPID,
+		WatchDir:  watchDir,
 		Claude:    claude,
 		Codex:     codex,
 	}

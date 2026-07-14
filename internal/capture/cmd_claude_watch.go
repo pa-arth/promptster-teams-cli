@@ -74,8 +74,14 @@ func ClaudeProjectsDir() string {
 
 // claudeWatcherState tracks the background transcript-tailing process.
 type claudeWatcherState struct {
-	PID           int    `json:"pid"`
-	StartedAt     string `json:"startedAt"`
+	PID       int    `json:"pid"`
+	StartedAt string `json:"startedAt"`
+	// WatchDir is the workspace this watcher is scoped to. Recorded because it
+	// decides which transcripts are captured, and a watcher started by the
+	// autostart service writes no supervisor.json — without it, `status` has no
+	// way to report the live scope and falls back to its own cwd, which is
+	// routinely wrong.
+	WatchDir      string `json:"watchDir,omitempty"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
 	// EventsCaptured counts events PARSED and queued, not delivered — delivery
@@ -343,7 +349,8 @@ func RunClaudeWatcher() error {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if err := saveClaudeWatcherState(claudeWatcherState{
-		PID: os.Getpid(), StartedAt: now, LogPath: claudeWatcherLogPath(), LastHeartbeat: now,
+		PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
+		LogPath: claudeWatcherLogPath(), LastHeartbeat: now,
 	}); err != nil {
 		return err
 	}
@@ -426,7 +433,8 @@ func RunClaudeWatcher() error {
 		}
 
 		_ = saveClaudeWatcherState(claudeWatcherState{
-			PID: os.Getpid(), StartedAt: now, LogPath: claudeWatcherLogPath(),
+			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
+			LogPath:        claudeWatcherLogPath(),
 			LastHeartbeat:  time.Now().UTC().Format(time.RFC3339Nano),
 			EventsCaptured: eventsCaptured,
 			BytesConsumed:  bytesConsumed,
