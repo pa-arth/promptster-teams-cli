@@ -67,6 +67,11 @@ type queueInputs struct {
 	size       int64 // outbox bytes on disk
 	haveOutbox bool  // false on a machine that has never captured
 
+	// unreadable is set when the outbox exists but cannot be opened. It has to be
+	// tracked separately because PendingCount reports 0 for an unreadable queue
+	// exactly as it does for an empty one, and the two must not read the same.
+	unreadable bool
+
 	// lastProgress is when delivery last made progress: the cursor's mtime, or
 	// the newest live watcher's start time when no cursor exists at all.
 	lastProgress time.Time
@@ -97,6 +102,18 @@ func checkQueueHealth(in queueInputs) []queueLine {
 		return []queueLine{{queueErr, fmt.Sprintf(
 			"delivery queue FULL (%s) — new events are being DROPPED. Delivery has failed long enough to fill the queue; see %s",
 			humanizeBytes(in.size), capture.DaemonLogPath())}}
+	}
+
+	// An outbox we cannot read cannot be counted. PendingCount returns 0 on any
+	// read error, so without this an unreadable queue renders as "empty — every
+	// captured event has shipped": a confident all-clear about a file whose
+	// contents are invisible, and one where Append is almost certainly failing to
+	// write too. Reported alone, because the depth is genuinely unknown and any
+	// number next to it would be a guess.
+	if in.haveOutbox && in.unreadable {
+		return []queueLine{{queueWarn, fmt.Sprintf(
+			"delivery queue unreadable (%s at %s) — cannot tell whether events are pending, and capture is likely failing to write; check permissions on the state dir, then see %s",
+			humanizeBytes(in.size), state.OutboxPath(), capture.DaemonLogPath())}}
 	}
 
 	// Approaching the cap: warn while there is still lead time to act. Nothing is
@@ -148,10 +165,12 @@ func gatherQueueInputs(now time.Time, snap capture.CaptureSnapshot) queueInputs 
 		now:      now,
 	}
 
-	// A missing outbox is the fresh-install state, not a fault.
+	// A missing outbox is the fresh-install state, not a fault. Stat succeeds on a
+	// file the process cannot open, so readability is probed separately.
 	if fi, err := os.Stat(state.OutboxPath()); err == nil {
 		in.haveOutbox = true
 		in.size = fi.Size()
+		in.unreadable = !outboxReadable()
 	}
 
 	// The cursor's mtime is the progress probe: it is rewritten (temp+rename)
@@ -173,6 +192,19 @@ func gatherQueueInputs(now time.Time, snap capture.CaptureSnapshot) queueInputs 
 		in.haveProgress = true
 	}
 	return in
+}
+
+// outboxReadable reports whether the queue can actually be opened for reading.
+// Opening and immediately closing is the same access PendingCount performs, so
+// this answers "would the count be trustworthy?" without duplicating the scan.
+func outboxReadable() bool {
+	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
+	f, err := os.Open(state.OutboxPath())
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return true
 }
 
 // watcherDraining reports whether a live watcher — and therefore the drain loop

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -184,6 +185,20 @@ func TestCheckQueueHealth(t *testing.T) {
 			want:     queueOK,
 			contains: []string{"empty"},
 		},
+		{
+			// PendingCount returns 0 for an unreadable queue exactly as it does for
+			// an empty one. Reporting "every captured event has shipped" about a
+			// file we cannot open is a confident all-clear about nothing.
+			name: "unreadable outbox does not masquerade as an empty one",
+			in: queueInputs{
+				pending: 0, haveOutbox: true, unreadable: true, size: 1 << 20,
+				draining: true, lastProgress: fresh, haveProgress: true, now: now,
+			},
+			want:      queueWarn,
+			contains:  []string{"unreadable", "permissions"},
+			omits:     []string{"empty", "shipped"},
+			wantLines: 1,
+		},
 	}
 
 	for _, tc := range cases {
@@ -352,6 +367,43 @@ func TestGatherQueueInputsStaleSupervisorIsNotDraining(t *testing.T) {
 	}
 	if text := allText(lines); strings.Contains(text, "stuck") || strings.Contains(text, "401") {
 		t.Errorf("doctor blamed delivery for a queue nothing is draining:\n%s", text)
+	}
+}
+
+// The real-filesystem half of the unreadable case: os.Stat succeeds on a file
+// the process cannot open, so haveOutbox/size look fine while PendingCount
+// silently reports 0. Without the readability probe this renders as "delivery
+// queue empty — every captured event has shipped".
+func TestGatherQueueInputsUnreadableOutbox(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod does not deny read access on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	seedOutbox(t, 4210)
+
+	if err := os.Chmod(state.OutboxPath(), 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(state.OutboxPath(), 0o600) }) // let TempDir clean up
+
+	in := gatherQueueInputs(time.Now(), liveSnapshot(time.Now().Add(-time.Minute)))
+
+	if !in.haveOutbox {
+		t.Fatal("precondition: stat should still see the outbox")
+	}
+	if !in.unreadable {
+		t.Fatal("unreadable = false for an outbox that cannot be opened")
+	}
+	lines := checkQueueHealth(in)
+	if got := worstLevel(lines); got != queueWarn {
+		t.Errorf("unreadable outbox reported %s, want warn\nlines:\n%s", levelName(got), allText(lines))
+	}
+	if text := allText(lines); strings.Contains(text, "shipped") {
+		t.Errorf("doctor gave an all-clear about a queue it cannot read:\n%s", text)
 	}
 }
 
