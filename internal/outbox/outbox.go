@@ -409,6 +409,20 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, line []byt
 	}
 }
 
+// backoffJitter spreads a computed backoff ceiling over (0, d]. Full jitter, so
+// the returned delay is a random DRAW bounded by d, not d itself.
+//
+// A var rather than an inline call so a test can pin the ramp. That is not
+// cosmetic: a test asserting "the delay exceeded X" against a uniform draw is
+// flaky by construction, and this one was — it failed ~1 run in 37 by dice
+// alone, which is frequent enough to train everyone to wave off a red CI.
+// Substitute an identity here and the schedule becomes the exact ramp.
+//
+// Never 0 — a zero wait would busy-loop.
+var backoffJitter = func(d time.Duration) time.Duration {
+	return time.Duration(rand.Int63n(int64(d))) + 1 // #nosec G404 -- jitter, not security
+}
+
 // backoffFor returns an exponentially-growing delay with full jitter, capped at
 // backoffCap. Jitter matters here: every watcher on every machine in an org
 // backs off against the SAME endpoint, and a deterministic schedule would
@@ -418,9 +432,7 @@ func backoffFor(attempt int) time.Duration {
 	if d > backoffCap || d <= 0 {
 		d = backoffCap
 	}
-	// Full jitter: uniform in (0, d]. Never 0 — a zero wait would busy-loop.
-	jittered := time.Duration(rand.Int63n(int64(d))) + 1 // #nosec G404 -- jitter, not security
-	return jittered
+	return backoffJitter(d)
 }
 
 // compact resets a fully-delivered queue to empty so it does not grow forever.
