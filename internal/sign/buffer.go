@@ -39,15 +39,21 @@ func AppendEventToLocalBuffer(ev *event.Event, captureAssistantProse bool) error
 	redact.ScrubEvent(ev)
 	p := state.HookBufferPath()
 	csPath := state.ChainStatePath()
-	// One lock covers both the ledger append and the index update. flock is
-	// advisory and protects whatever fn touches, not the bytes of p — so taking
-	// the buffer lock and only ever touching chain-state.json from inside it
-	// makes the whole read->sign->append->commit sequence atomic against the
-	// four concurrent emitters (both watchers, presence, census) and against
-	// other processes. Do not add a second lock or a sync.Mutex: the former
-	// invents a lock-ordering invariant, the latter is redundant in-process and
-	// useless across processes.
-	return WithBufferLock(p, func() error {
+	// One lock covers the rotation, the ledger append, and the index update.
+	// flock is advisory and protects whatever fn touches, not the bytes of the
+	// locked file — so locking one sentinel and only ever touching the ledger and
+	// the index from inside it makes the whole rotate->read->sign->append->commit
+	// sequence atomic against the four concurrent emitters (both watchers,
+	// presence, census) and against other processes.
+	//
+	// The sentinel is deliberately not the buffer itself: flock lives on an
+	// inode, and rotation renames the buffer away, which would carry the lock
+	// with it and let a concurrent opener lock a fresh inode instead. Do not add
+	// a second lock or a sync.Mutex: the former invents a lock-ordering
+	// invariant, the latter is redundant in-process and useless across processes.
+	return WithBufferLock(state.BufferLockPath(), func() error {
+		rotateLedgerIfLarge()
+
 		priv, err := LoadSessionKeypair()
 		if err != nil {
 			state.HookDebugf("load session keypair: %v", err)
@@ -57,7 +63,7 @@ func AppendEventToLocalBuffer(ev *event.Event, captureAssistantProse bool) error
 		var cs chainState
 		var indexPersistable bool
 		if priv != nil {
-			cs, indexPersistable = loadOrRebuildChainState(p, csPath)
+			cs, indexPersistable = loadOrRebuildChainState(csPath)
 			// Link to the tip of THIS event's session, not to whatever was
 			// appended last. Concurrent sessions interleave in the ledger, so a
 			// global tip would chain unrelated sessions together.

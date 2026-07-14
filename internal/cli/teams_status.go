@@ -165,8 +165,20 @@ func printAutoUpdateStatus() {
 	printlnIndent(fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph))
 }
 
+// countBufferedEvents counts every retained ledger segment, not just the live
+// one: the ledger rotates once it gets large, and counting only the live segment
+// would make the number collapse at each rotation as if events had been lost.
 func countBufferedEvents() int {
-	f, err := os.Open(state.HookBufferPath())
+	n := 0
+	for seg := 0; seg <= state.LedgerRetainedSegments; seg++ {
+		n += countSegmentLines(state.LedgerSegmentPath(seg))
+	}
+	return n
+}
+
+func countSegmentLines(path string) int {
+	// #nosec G304 -- path is derived from state.HookBufferPath(), not user input.
+	f, err := os.Open(path)
 	if err != nil {
 		return 0
 	}
