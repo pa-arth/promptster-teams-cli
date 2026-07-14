@@ -99,9 +99,12 @@ func printStatusStatic() {
 	fmt.Println()
 }
 
-// cmdTeamsDoctor diagnoses the credential, ingest reachability, and transcript
-// dir. The reachability probe is a plain GET to the API base (not an auth probe
-// against the ingest endpoint), so it never writes anything.
+// cmdTeamsDoctor diagnoses the credential, ingest reachability, the transcript
+// dir, and the delivery queue. The reachability probe is a plain GET to the API
+// base (not an auth probe against the ingest endpoint), and the queue check only
+// stats files: doctor never advances the cursor, compacts the queue, touches the
+// ledger, or sends anything. (Reading capture state can clear a stale supervisor
+// pidfile — DaemonStatus's own long-standing self-heal, not a queue write.)
 func cmdTeamsDoctor() {
 	token, source := ingest.ResolveToken("")
 	apiURL := ingest.ResolveAPIURL("")
@@ -137,6 +140,13 @@ func cmdTeamsDoctor() {
 	}
 
 	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, capture.PresenceHeartbeatInterval))
+
+	// Delivery-queue health. Deliberately does not touch `ok`: a stuck or full
+	// queue is not a login problem, and `ok` only chooses between the "run watch"
+	// and "run login" closing lines.
+	for _, l := range checkQueueHealth(gatherQueueInputs(time.Now(), capture.Snapshot())) {
+		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
+	}
 
 	if installed, detail, serr := service.New().Status(); serr == nil && installed {
 		printlnIndent(fmt.Sprintf("%s autostart %s", okGlyph, detail))
