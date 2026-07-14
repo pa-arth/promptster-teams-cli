@@ -34,7 +34,7 @@ func loadSession() (Session, error) {
 	}
 
 	return Session{
-		SessionID:    DeviceID(),
+		DeviceID:     DeviceID(),
 		SessionToken: token,
 		TaskRoot:     root,
 		ApiURL:       apiURL,

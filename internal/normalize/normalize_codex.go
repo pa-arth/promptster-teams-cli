@@ -125,6 +125,12 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 
 func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, raw string) []event.Event {
 	// The session id is stable per rollout (and identical in a forked copy).
+	// The rollout filename normally supplies it before the first line is read;
+	// fall back to session_meta here if that path did not parse, so events are
+	// never stamped "unknown" and pooled into a shared cross-session chain.
+	if p.sessionID == "" {
+		p.sessionID = stringField(payload, "id")
+	}
 	e := p.newCodexEvent("session_start", ts, stringField(payload, "id"))
 	data := map[string]interface{}{
 		"ideSessionId": stringField(payload, "id"),

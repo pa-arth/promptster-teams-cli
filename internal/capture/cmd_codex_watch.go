@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -31,6 +32,23 @@ func codexHome() string {
 	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".codex")
+}
+
+// codexRolloutSessionID matches the uuid Codex tails onto a rollout filename:
+// rollout-2026-06-11T11-24-52-019eb780-3081-7ce0-9ba0-8a0bad13b532.jsonl. The
+// leading timestamp also contains dashes, so anchor on the uuid shape at the
+// end rather than splitting on "-".
+var codexRolloutSessionID = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
+
+// codexSessionIDFromPath derives the rollout's session uuid from its filename,
+// so a processor knows its session before reading a line. It equals
+// session_meta.payload.id (verified), which the normalizer falls back to if the
+// filename does not match — one rollout file is exactly one Codex session.
+func codexSessionIDFromPath(path string) string {
+	if m := codexRolloutSessionID.FindStringSubmatch(filepath.Base(path)); m != nil {
+		return m[1]
+	}
+	return ""
 }
 
 func codexSessionsDir() string {
@@ -258,7 +276,7 @@ func pollCodexRollouts(
 
 		proc := processors[path]
 		if proc == nil {
-			proc = normalize.NewCodexRolloutProcessor(session.SessionID)
+			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
 			processors[path] = proc
 		}
 		n := tailCodexRollout(path, progress, proc, session, client, captureProse)
@@ -347,6 +365,11 @@ func tailCodexRollout(
 		redacted := redact.RedactBytes([]byte(trimmed))
 		for _, ev := range proc.Process(redacted) {
 			ev := ev
+			// SessionID comes from the rollout; DeviceID comes from the
+			// environment. Stamped here rather than in the normalizer, which has
+			// no business knowing what machine it runs on — keeping the two
+			// sourced separately is what stops them collapsing into one value.
+			ev.DeviceID = session.DeviceID
 			normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 			// Idempotency: skip a file_diff whose resulting content the git
 			// watcher (or another channel) has already emitted, so an apply_patch

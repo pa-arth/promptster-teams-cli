@@ -19,7 +19,7 @@ func TestIngestClaudeWatchEventToleratesRejection(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
 	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
 
-	session := Session{SessionID: "dev-test", SessionToken: "PSE-TEST", TaskRoot: tmp}
+	session := Session{DeviceID: "dev-test", SessionToken: "PSE-TEST", TaskRoot: tmp}
 
 	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
@@ -27,7 +27,7 @@ func TestIngestClaudeWatchEventToleratesRejection(t *testing.T) {
 	}))
 	defer rejecting.Close()
 	t.Setenv("PROMPTSTER_API_URL", rejecting.URL)
-	if !ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, rejecting.Client(), false) {
+	if !ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.DeviceID), session, rejecting.Client(), false) {
 		t.Error("4xx rejection must count as handled (no degradation, no retry)")
 	}
 
@@ -36,7 +36,7 @@ func TestIngestClaudeWatchEventToleratesRejection(t *testing.T) {
 	}))
 	defer failing.Close()
 	t.Setenv("PROMPTSTER_API_URL", failing.URL)
-	if ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.SessionID), session, failing.Client(), false) {
+	if ingestClaudeWatchEvent(event.NewEvent("subagent_usage", session.DeviceID), session, failing.Client(), false) {
 		t.Error("5xx must still count as a send failure")
 	}
 }

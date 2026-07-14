@@ -1,6 +1,8 @@
 package redact
 
 import (
+	"fmt"
+	"os"
 	"regexp"
 	"strings"
 
@@ -57,8 +59,13 @@ var projectFieldAllowlist = map[string][]string{
 	"interrupt": {"subtype", "cutTool", "variant"},
 	// ai_response deliberately carries NO text: assistant messages routinely
 	// embed source (patches, file bodies). Usage/model metadata only.
-	"ai_response":    projectUsageFields,
-	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId"),
+	"ai_response": projectUsageFields,
+	// `sidechain` marks work done by a subagent. Its events roll up to the
+	// PARENT session's id (a subagent transcript records its parent's sessionId),
+	// so without this flag subagent work is indistinguishable from the main
+	// chain's. The normalizer has always set it; it was silently dropped here.
+	// Keep in lockstep with the backend's TEAMS_FIELD_ALLOWLIST.
+	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
 	"file_diff":    {"path", "linesAdded", "linesRemoved"},
 	"file_create":  {"path", "linesAdded", "sizeBytes"},
@@ -459,6 +466,17 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		// capture.eventDataMap). The default-deny below stands either way; this
 		// log just means the next occurrence is discoverable instead of invisible.
 		state.HookDebugf("projectEvent: %s Data is %T, not map[string]interface{} — payload dropped", e.Kind, e.Data)
+	}
+	if ok && len(allowed) == 0 && len(data) > 0 {
+		// A kind we actually emit, carrying a payload, with no allowlist entry:
+		// the whole payload is about to become {} and nothing downstream will
+		// ever know it existed. Default-deny is right, but silence is not — this
+		// exact shape shipped census and presence as empty objects for a release.
+		//
+		// Ungated on purpose (unlike HookDebugf, which needs PROMPTSTER_DEBUG=1):
+		// it fires once per unknown kind, not per event, and a payload vanishing
+		// without a trace is indistinguishable from one that was never set.
+		fmt.Fprintf(os.Stderr, "promptster-teams: redact: kind %q has no field allowlist — its entire payload (%d field(s)) is being dropped\n", e.Kind, len(data))
 	}
 	if !ok || len(allowed) == 0 {
 		e.Data = map[string]interface{}{}
