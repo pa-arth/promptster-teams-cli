@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
@@ -64,7 +64,10 @@ type codexWatcherState struct {
 	WatchDir      string `json:"watchDir,omitempty"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
-	EventsSent    int    `json:"eventsSent,omitempty"`
+	// EventsCaptured counts events parsed and queued, not delivered — delivery
+	// is asynchronous (internal/outbox). In-process counter, re-derived from
+	// zero each run, so renaming the tag breaks no compatibility.
+	EventsCaptured int `json:"eventsCaptured,omitempty"`
 }
 
 func codexWatcherStatePath() string { return filepath.Join(state.StateDir(), "codex-watcher.json") }
@@ -200,7 +203,14 @@ func RunCodexWatcher() error {
 	// One processor per rollout file, kept in memory for the daemon's life so
 	// tool-call/output correlation survives across polls.
 	processors := map[string]*normalize.CodexRolloutProcessor{}
-	eventsSent := 0
+	eventsCaptured := 0
+
+	// Delivery runs off the poll loop — see the claude watcher for the full
+	// rationale. Both watchers share ONE device-wide queue and run as goroutines
+	// in the same supervisor process, so StartDrain is a process-wide singleton:
+	// whichever watcher gets there first starts the only drain, and it delivers
+	// both watchers' events.
+	outbox.StartDrain(client, session.SessionToken)
 
 	// Org capture policy (opt-in assistant prose), fail-closed. Refreshed in the
 	// background (immediate + every RefreshInterval) so the poll loop never
@@ -219,18 +229,18 @@ func RunCodexWatcher() error {
 
 	for {
 		captureProse := policyResolver.CaptureAssistantProse()
-		sent := pollCodexRollouts(session, workspace, startCutoff, processors, client, captureProse)
-		eventsSent += sent
+		queued := pollCodexRollouts(session, workspace, startCutoff, processors, captureProse)
+		eventsCaptured += queued
 
 		_ = saveCodexWatcherState(codexWatcherState{
 			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
 			LogPath:       codexWatcherLogPath(),
-			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano), EventsSent: eventsSent,
+			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano), EventsCaptured: eventsCaptured,
 		})
 
 		select {
 		case <-signals:
-			fmt.Fprintf(os.Stderr, "codex-watcher: shutting down (sent %d events)\n", eventsSent)
+			fmt.Fprintf(os.Stderr, "codex-watcher: shutting down (captured %d events)\n", eventsCaptured)
 			return nil
 		case <-time.After(codexWatchInterval):
 		}
@@ -244,7 +254,6 @@ func pollCodexRollouts(
 	workspace string,
 	startCutoff time.Time,
 	processors map[string]*normalize.CodexRolloutProcessor,
-	client *http.Client,
 	captureProse bool,
 ) int {
 	dir := codexSessionsDir()
@@ -284,7 +293,7 @@ func pollCodexRollouts(
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
 			processors[path] = proc
 		}
-		n := tailCodexRollout(path, progress, proc, session, client, captureProse)
+		n := tailCodexRollout(path, progress, proc, session, captureProse)
 		sent += n
 		return nil
 	})
@@ -328,14 +337,18 @@ func codexRolloutMatchesWorkspace(path, workspace string, startCutoff time.Time)
 }
 
 // tailCodexRollout reads new complete lines from path (starting at the stored
-// offset), processes them, ingests resulting events, and advances the offset.
-// A trailing partial line (no newline yet) is left for the next poll.
+// offset), processes them, queues resulting events, and advances the offset.
+// A trailing partial line (no newline yet) is left for the next poll. Returns
+// the number of events parsed and queued.
+//
+// As in the claude watcher, advancing the offset unconditionally is only safe
+// because delivery is now durable: this loop used to POST inline and advance
+// regardless, so any 429/5xx/timeout destroyed the event permanently.
 func tailCodexRollout(
 	path string,
 	progress codexWatchProgress,
 	proc *normalize.CodexRolloutProcessor,
 	session Session,
-	client *http.Client,
 	captureProse bool,
 ) int {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
@@ -352,7 +365,7 @@ func tailCodexRollout(
 
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
-	sent := 0
+	queued := 0
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -382,33 +395,26 @@ func tailCodexRollout(
 			if !dedupeFileDiff(session.TaskRoot, &ev) {
 				continue
 			}
+			// Ledger first — it projects, scrubs, and signs ev in place, so the
+			// queued copy is the exact bytes to ship. See queueClaudeWatchEvent.
 			if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 				fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
 			}
-			if err := ingest.IngestEventWithClient(client, ev, session.SessionToken); err != nil {
-				// Schema/kind rejections (4xx) are dropped without retry and
-				// logged quietly — the channel is healthy, the deployed
-				// backend just doesn't accept this event yet (see
-				// ingestClaudeWatchEvent for the rationale).
-				if ingest.IsIngestRejection(err) {
-					state.HookDebugf("codex-watcher: event rejected by backend (%s): %v", ev.Kind, err)
-					sent++
-					continue
-				}
-				fmt.Fprintf(os.Stderr, "codex-watcher: send error (%s): %v\n", ev.Kind, err)
+			if err := outbox.Append(ev); err != nil {
+				fmt.Fprintf(os.Stderr, "codex-watcher: queue error (%s): %v\n", ev.Kind, err)
 				continue
 			}
-			sent++
+			queued++
 		}
 	}
 
 	if consumed > 0 {
 		progress.Offsets[path] = offset + consumed
-		if sent > 0 && verboseWatch() {
-			fmt.Fprintf(os.Stderr, "codex-watcher: sent %d event(s) from %s\n", sent, filepath.Base(path))
+		if queued > 0 && verboseWatch() {
+			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
 	}
-	return sent
+	return queued
 }
 
 // resolvePath resolves symlinks (falling back to a cleaned path) so workspace

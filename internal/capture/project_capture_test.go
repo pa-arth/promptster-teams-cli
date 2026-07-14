@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -9,8 +10,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 )
 
@@ -54,16 +57,27 @@ func TestProjectedEventSignsAndVerifies(t *testing.T) {
 }
 
 // TestWireBodyCarriesNoSource is the end-to-end "never sent" proof: run a
-// source-bearing event through the real funnel (buffer + POST) and assert the
-// HTTP body the server receives carries no source fields.
+// source-bearing event through the real funnel and assert the HTTP body the
+// server receives carries no source fields.
+//
+// The funnel now has two stages — queue, then drain — so this drives BOTH. That
+// is the point: source-exclusion must survive the event being persisted to an
+// intermediate queue and shipped later by a different goroutine. The queued
+// bytes are the projected+scrubbed+signed ones, so the wire body must be
+// identical to what the old inline POST produced.
 func TestWireBodyCarriesNoSource(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
 	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
 
-	var received []byte
+	bodies := make(chan []byte, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		received, _ = io.ReadAll(r.Body)
+		b, _ := io.ReadAll(r.Body)
+		select {
+		case bodies <- b:
+		default:
+		}
 		w.WriteHeader(http.StatusCreated)
 	}))
 	defer srv.Close()
@@ -76,8 +90,21 @@ func TestWireBodyCarriesNoSource(t *testing.T) {
 		"stdout":   "output " + leakCanary,
 		"stderr":   "error " + leakCanary,
 	})
-	if !ingestClaudeWatchEvent(e, session, srv.Client(), false) {
-		t.Fatal("event was not sent")
+	queueClaudeWatchEvent(e, session, false)
+
+	// Cancel AND wait for the drain to exit before the test returns: t.TempDir's
+	// cleanup runs after this, and a still-running drain writing its cursor into
+	// that dir would race the RemoveAll.
+	ctx, cancel := context.WithCancel(context.Background())
+	drained := make(chan struct{})
+	go func() { defer close(drained); outbox.Drain(ctx, srv.Client(), session.SessionToken) }()
+	defer func() { cancel(); <-drained }()
+
+	var received []byte
+	select {
+	case received = <-bodies:
+	case <-time.After(5 * time.Second):
+		t.Fatal("drain never delivered the queued event")
 	}
 	if len(received) == 0 {
 		t.Fatal("server received no body")

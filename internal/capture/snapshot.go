@@ -6,15 +6,17 @@ import "time"
 // pidfile under StateDir(). The zero value (Running=false) means there is no
 // live watcher of that kind.
 type WatcherStat struct {
-	Name          string // "claude" | "codex"
-	Running       bool
-	Degraded      bool   // running but parsing nothing from bytes it consumed
-	WatchDir      string // workspace this watcher is scoped to; "" if unrecorded
-	PID           int
-	EventsSent    int
-	BytesConsumed int64
-	LastHeartbeat time.Time // zero if unknown
-	StartedAt     time.Time // zero if unknown
+	Name     string // "claude" | "codex"
+	Running  bool
+	Degraded bool   // running but parsing nothing from bytes it consumed
+	WatchDir string // workspace this watcher is scoped to; "" if unrecorded
+	PID      int
+	// EventsCaptured counts events parsed and queued for delivery, not events
+	// acknowledged by the backend — delivery is asynchronous (internal/outbox).
+	EventsCaptured int
+	BytesConsumed  int64
+	LastHeartbeat  time.Time // zero if unknown
+	StartedAt      time.Time // zero if unknown
 }
 
 // CaptureSnapshot is a point-in-time view of background capture for the status
@@ -80,15 +82,15 @@ func claudeWatcherStat(now time.Time) WatcherStat {
 	}
 	hb := parseWatchTime(st.LastHeartbeat)
 	return WatcherStat{
-		Name:          "claude",
-		Running:       watcherLive(st.PID, hb, now),
-		Degraded:      st.Degraded,
-		WatchDir:      st.WatchDir,
-		PID:           st.PID,
-		EventsSent:    st.EventsSent,
-		BytesConsumed: st.BytesConsumed,
-		LastHeartbeat: hb,
-		StartedAt:     parseWatchTime(st.StartedAt),
+		Name:           "claude",
+		Running:        watcherLive(st.PID, hb, now),
+		Degraded:       st.Degraded,
+		WatchDir:       st.WatchDir,
+		PID:            st.PID,
+		EventsCaptured: st.EventsCaptured,
+		BytesConsumed:  st.BytesConsumed,
+		LastHeartbeat:  hb,
+		StartedAt:      parseWatchTime(st.StartedAt),
 	}
 }
 
@@ -99,13 +101,13 @@ func codexWatcherStat(now time.Time) WatcherStat {
 	}
 	hb := parseWatchTime(st.LastHeartbeat)
 	return WatcherStat{
-		Name:          "codex",
-		Running:       watcherLive(st.PID, hb, now),
-		WatchDir:      st.WatchDir,
-		PID:           st.PID,
-		EventsSent:    st.EventsSent,
-		LastHeartbeat: hb,
-		StartedAt:     parseWatchTime(st.StartedAt),
+		Name:           "codex",
+		Running:        watcherLive(st.PID, hb, now),
+		WatchDir:       st.WatchDir,
+		PID:            st.PID,
+		EventsCaptured: st.EventsCaptured,
+		LastHeartbeat:  hb,
+		StartedAt:      parseWatchTime(st.StartedAt),
 	}
 }
 

@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
@@ -84,8 +84,13 @@ type claudeWatcherState struct {
 	WatchDir      string `json:"watchDir,omitempty"`
 	LogPath       string `json:"logPath,omitempty"`
 	LastHeartbeat string `json:"lastHeartbeat,omitempty"`
-	EventsSent    int    `json:"eventsSent,omitempty"`
-	BytesConsumed int64  `json:"bytesConsumed,omitempty"`
+	// EventsCaptured counts events PARSED and queued, not delivered — delivery
+	// is asynchronous (internal/outbox) and may lag or retry. Formerly
+	// "eventsSent", which stopped being true once sending moved off this loop.
+	// It is an in-process counter re-derived from zero each run, so the tag
+	// rename carries no compatibility concern.
+	EventsCaptured int   `json:"eventsCaptured,omitempty"`
+	BytesConsumed  int64 `json:"bytesConsumed,omitempty"`
 	// Degraded means the watcher is running but parsing nothing from a
 	// transcript it consumed substantial bytes from — treat as unhealthy.
 	Degraded bool `json:"degraded,omitempty"`
@@ -97,9 +102,25 @@ func claudeWatcherLogPath() string   { return filepath.Join(state.StateDir(), "c
 // claudeWatchProgress persists per-transcript byte offsets and the
 // workspace-match decision so each line is processed exactly once across polls
 // and watcher restarts.
+//
+// KEYED BY TRANSCRIPT IDENTITY, NOT PATH. Both maps are keyed by the path
+// RELATIVE to the project-slug directory (claudeProgressKey), e.g.
+// "<session-uuid>.jsonl" or "<session-uuid>/subagents/agent-<id>.jsonl".
+//
+// Absolute paths are NOT a stable identity: Claude Code files a transcript
+// under a slug derived from the session's cwd, so one session is reachable
+// under several slugs — a git-worktree slug
+// (-Users-me-repo--claude-worktrees-x) and the bare repo slug (-Users-me-repo)
+// — and the file moves between them when a worktree is removed. Path-keyed
+// offsets treated each slug as a brand-new file, re-read it from 0, and
+// re-emitted the whole transcript; that duplicate traffic (measured: 2,182
+// events sent exactly twice, ~32% of all traffic) is what blew the ingest rate
+// limit. Session UUIDs and agent IDs are globally unique, so slug-relative keys
+// collapse every alias of one transcript onto ONE offset — portable, no inode
+// syscalls, works on Windows.
 type claudeWatchProgress struct {
 	Offsets map[string]int64 `json:"offsets"`
-	// Match: path -> "yes"|"no". Unlike codex rollouts (whose first line is
+	// Match: key -> "yes"|"no". Unlike codex rollouts (whose first line is
 	// always session_meta), a transcript's early lines may not carry cwd yet,
 	// so absence of a cached decision means "retry next poll" — only a
 	// definitive cwd mismatch or a line-budget exhaustion caches "no".
@@ -108,6 +129,61 @@ type claudeWatchProgress struct {
 
 func claudeWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "claude-watcher-progress.json")
+}
+
+// claudeProgressKey reduces a transcript path to its slug-relative identity by
+// stripping the <ClaudeProjectsDir()>/<project-slug>/ prefix. A path outside
+// the projects dir (or with no slug component) has no such identity and falls
+// back to itself, which is no worse than the old behavior.
+func claudeProgressKey(path string) string {
+	rel, err := filepath.Rel(ClaudeProjectsDir(), path)
+	if err != nil {
+		return path
+	}
+	slashed := filepath.ToSlash(rel)
+	if slashed == ".." || strings.HasPrefix(slashed, "../") {
+		return path // not under the projects dir
+	}
+	// rel is "<slug>/<rest>"; drop the slug — that is the whole point.
+	parts := strings.SplitN(slashed, "/", 2)
+	if len(parts) < 2 {
+		return path // bare file directly in the projects dir: no slug to strip
+	}
+	return parts[1]
+}
+
+// migrateClaudeProgressKeys re-keys a progress file written by a build that
+// keyed on absolute paths.
+//
+// On collision (the two-slug case this exists to fix — several old absolute
+// keys folding onto one identity) it keeps the MAXIMUM offset. Keeping the
+// minimum would re-read the difference and re-emit those events, which is
+// precisely the duplicate storm being fixed; keeping the max means at worst a
+// few never-parsed lines are skipped, which is the strictly safer error.
+func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
+	out := claudeWatchProgress{
+		Offsets: make(map[string]int64, len(p.Offsets)),
+		Match:   make(map[string]string, len(p.Match)),
+	}
+	for k, v := range p.Offsets {
+		nk := claudeProgressKey(k)
+		if cur, ok := out.Offsets[nk]; !ok || v > cur {
+			out.Offsets[nk] = v
+		}
+	}
+	for k, v := range p.Match {
+		nk := claudeProgressKey(k)
+		// Aliases of one transcript have identical content and therefore
+		// identical cwd, so a yes/no conflict is unreachable in practice. If it
+		// somehow happens, "yes" wins: a wrong "no" is cached forever and
+		// silently loses the whole session, while a wrong "yes" only costs a
+		// re-read. Prefer the recoverable error.
+		if cur, ok := out.Match[nk]; ok && cur == "yes" {
+			continue
+		}
+		out.Match[nk] = v
+	}
+	return out
 }
 
 func loadClaudeWatchProgress() claudeWatchProgress {
@@ -123,7 +199,9 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	if p.Match == nil {
 		p.Match = map[string]string{}
 	}
-	return p
+	// Idempotent: already-relative keys map to themselves, so this runs
+	// harmlessly on every load and needs no version flag.
+	return migrateClaudeProgressKeys(p)
 }
 
 func saveClaudeWatchProgress(p claudeWatchProgress) {
@@ -304,9 +382,16 @@ func RunClaudeWatcher() error {
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
-	eventsSent := 0
+	eventsCaptured := 0
 	var bytesConsumed, bytesSinceEvent int64
 	degraded := false
+
+	// Delivery runs off the poll loop, so a slow or rate-limited backend can no
+	// longer stall parsing, advance transcript offsets past undelivered events,
+	// or (via the old send-derived count) masquerade as a broken parser.
+	// StartDrain is a process-wide singleton — the codex watcher shares this
+	// queue and calls it too (see its doc comment).
+	outbox.StartDrain(client, session.SessionToken)
 
 	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
 	// successful fetch says otherwise. Refreshed in the background (immediate +
@@ -333,7 +418,7 @@ func RunClaudeWatcher() error {
 		// owns emission and hooks suppress again. This handoff means neither a
 		// real mid-session format break nor a false-positive degradation can
 		// double-emit or lose events.
-		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, client, degraded, captureProse)
+		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
 		wasDegraded := degraded
 		degraded, bytesSinceEvent = claudeDegradationStep(degraded, parsed, consumed, bytesSinceEvent)
@@ -344,21 +429,29 @@ func RunClaudeWatcher() error {
 		case !wasDegraded && degraded:
 			fmt.Fprintf(os.Stderr, "claude-watcher: degraded — %d bytes consumed since last parsed event; hooks take over\n", bytesSinceEvent)
 		case !wasDegraded:
-			eventsSent += parsed
+			eventsCaptured += parsed
 		}
 
 		_ = saveClaudeWatcherState(claudeWatcherState{
 			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
-			LogPath:       claudeWatcherLogPath(),
-			LastHeartbeat: time.Now().UTC().Format(time.RFC3339Nano),
-			EventsSent:    eventsSent,
-			BytesConsumed: bytesConsumed,
-			Degraded:      degraded,
+			LogPath:        claudeWatcherLogPath(),
+			LastHeartbeat:  time.Now().UTC().Format(time.RFC3339Nano),
+			EventsCaptured: eventsCaptured,
+			BytesConsumed:  bytesConsumed,
+			Degraded:       degraded,
 		})
 
 		select {
 		case <-signals:
-			fmt.Fprintf(os.Stderr, "claude-watcher: shutting down (sent %d events)\n", eventsSent)
+			// Return immediately and let the drain die with the process. There
+			// is deliberately no flush-on-exit: whatever is still queued stays
+			// in the outbox with its cursor unadvanced, and the next start
+			// delivers it. Waiting here would only add shutdown latency to a
+			// SIGTERM (which #49 now handles, and which supervisors follow with
+			// SIGKILL on a timeout) to buy something durability already gives.
+			// Worst case is an event POSTed but not yet cursor-committed, which
+			// is re-sent once on restart — at-least-once, and the backend dedupes.
+			fmt.Fprintf(os.Stderr, "claude-watcher: shutting down (captured %d events)\n", eventsCaptured)
 			return nil
 		case <-time.After(claudeWatchInterval):
 		}
@@ -366,26 +459,35 @@ func RunClaudeWatcher() error {
 }
 
 // pollClaudeTranscripts scans for transcript files, tails matched ones from
-// their stored byte offset, and ingests normalized events. Returns (events
-// parsed, bytes consumed). With dryRun set (degraded mode), events are parsed
-// and counted — proving the parser works — but NOT ingested: hooks own
-// emission for that window.
+// their stored byte offset, and QUEUES normalized events for async delivery.
+// Returns (events parsed, bytes consumed).
+//
+// The returned count is events the PARSER produced — not events delivered.
+// That distinction is the point: this number feeds claudeDegradationStep, whose
+// job is to detect a broken PARSER. It used to return a send count, so a total
+// network outage (429 storm, offline laptop) tripped a parser-break detector
+// and handed capture to hooks, which only cover the live tail — the outage
+// window then died twice. Sending is now the outbox's problem and cannot
+// influence this number.
+//
+// With dryRun set (degraded mode), events are parsed and counted — proving the
+// parser works — but NOT queued: hooks own emission for that window.
 func pollClaudeTranscripts(
 	session Session,
 	workspace string,
 	startCutoff time.Time,
 	processors map[string]*normalize.ClaudeTranscriptProcessor,
-	client *http.Client,
 	dryRun bool,
 	captureProse bool,
 ) (int, int64) {
 	progress := loadClaudeWatchProgress()
-	sent := 0
+	parsed := 0
 	var consumed int64
 	roots := workspaceMatchRoots(workspace)
 
 	for _, path := range candidateClaudeTranscripts(startCutoff) {
-		switch progress.Match[path] {
+		key := claudeProgressKey(path)
+		switch progress.Match[key] {
 		case "no":
 			continue
 		case "yes":
@@ -393,16 +495,19 @@ func pollClaudeTranscripts(
 		default:
 			switch classifyClaudeTranscript(path, roots, startCutoff) {
 			case claudeMatchYes:
-				progress.Match[path] = "yes"
+				progress.Match[key] = "yes"
 			case claudeMatchNo:
-				progress.Match[path] = "no"
+				progress.Match[key] = "no"
 				continue
 			default: // undecided — no cwd line yet; retry next poll
 				continue
 			}
 		}
 
-		proc := processors[path]
+		// Keyed by identity, like the offsets: two slugs of one transcript must
+		// share a processor, or the second alias would accumulate a partial
+		// assistant message against half the lines.
+		proc := processors[key]
 		if proc == nil {
 			proc = normalize.NewClaudeTranscriptProcessor(claudeSessionIDFromPath(path))
 			if isClaudeSidechainFile(path) {
@@ -412,10 +517,10 @@ func pollClaudeTranscripts(
 				// survive even if they don't.
 				proc.AgentID = claudeAgentIDFromPath(path)
 			}
-			processors[path] = proc
+			processors[key] = proc
 		}
-		n, c := tailClaudeTranscript(path, progress, proc, session, client, dryRun, captureProse)
-		sent += n
+		n, c := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse)
+		parsed += n
 		consumed += c
 	}
 
@@ -423,18 +528,16 @@ func pollClaudeTranscripts(
 	// without a prompt boundary yet).
 	for _, proc := range processors {
 		for _, ev := range proc.FlushStale(claudeAccumFlushAge) {
+			parsed++
 			if dryRun {
-				sent++
 				continue
 			}
-			if ingestClaudeWatchEvent(ev, session, client, captureProse) {
-				sent++
-			}
+			queueClaudeWatchEvent(ev, session, captureProse)
 		}
 	}
 
 	saveClaudeWatchProgress(progress)
-	return sent, consumed
+	return parsed, consumed
 }
 
 // candidateClaudeTranscripts lists transcript files modified at/after the
@@ -592,31 +695,42 @@ func fastForwardClaudeTranscripts(workspace string, startCutoff time.Time) {
 	progress := loadClaudeWatchProgress()
 	roots := workspaceMatchRoots(workspace)
 	for _, path := range candidateClaudeTranscripts(startCutoff) {
-		if progress.Match[path] == "no" {
+		key := claudeProgressKey(path)
+		if progress.Match[key] == "no" {
 			continue
 		}
-		if progress.Match[path] != "yes" {
+		if progress.Match[key] != "yes" {
 			if classifyClaudeTranscript(path, roots, startCutoff) != claudeMatchYes {
 				continue
 			}
-			progress.Match[path] = "yes"
+			progress.Match[key] = "yes"
 		}
-		if info, err := os.Stat(path); err == nil {
-			progress.Offsets[path] = info.Size()
+		// Aliases of one transcript share a key, so take the furthest EOF —
+		// same MAX rule as the key migration, and for the same reason: a lower
+		// offset would re-read and re-emit.
+		if info, err := os.Stat(path); err == nil && info.Size() > progress.Offsets[key] {
+			progress.Offsets[key] = info.Size()
 		}
 	}
 	saveClaudeWatchProgress(progress)
 }
 
 // tailClaudeTranscript reads new complete lines from path starting at the
-// stored offset, processes them, ingests resulting events, and advances the
-// offset. A trailing partial line is left for the next poll.
+// stored offset, processes them, queues resulting events, and advances the
+// offset. A trailing partial line is left for the next poll. Returns (events
+// parsed, bytes consumed).
+//
+// Advancing the offset unconditionally is now SAFE, which it was not before.
+// This loop used to POST inline and advance regardless of the result, so a
+// 429/5xx/timeout silently and permanently destroyed the event — there was no
+// retry anywhere in the CLI. Durability now lives in the outbox: once an event
+// is queued it will be delivered or loudly dropped, so the transcript offset no
+// longer has to double as a delivery receipt.
 func tailClaudeTranscript(
 	path string,
 	progress claudeWatchProgress,
 	proc *normalize.ClaudeTranscriptProcessor,
 	session Session,
-	client *http.Client,
 	dryRun bool,
 	captureProse bool,
 ) (int, int64) {
@@ -627,14 +741,18 @@ func tailClaudeTranscript(
 	}
 	defer f.Close()
 
-	offset := progress.Offsets[path]
+	key := claudeProgressKey(path)
+	offset := progress.Offsets[key]
+	// Seeking past EOF is not an error, so a shorter alias of an
+	// already-tailed transcript reads nothing and contributes nothing. That is
+	// exactly the desired outcome — the alias is not new content.
 	if _, err := f.Seek(offset, 0); err != nil {
 		return 0, 0
 	}
 
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
-	sent := 0
+	parsed := 0
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -645,63 +763,66 @@ func tailClaudeTranscript(
 		if trimmed == "" {
 			continue
 		}
-		// Scrub secrets before parsing/ingest — transcript lines carry prompt
-		// text, command output, and file content.
+		// Scrub secrets BEFORE parsing and before anything is persisted or
+		// queued — transcript lines carry prompt text, command output, and file
+		// content. This ordering is load-bearing; do not move it.
 		redacted := redact.RedactBytes([]byte(trimmed))
 		for _, ev := range proc.Process(redacted) {
+			parsed++
 			if dryRun {
-				sent++
 				continue
 			}
-			ev := ev
-			if ingestClaudeWatchEvent(ev, session, client, captureProse) {
-				sent++
-			}
+			queueClaudeWatchEvent(ev, session, captureProse)
 		}
 	}
 
 	if consumed > 0 {
-		progress.Offsets[path] = offset + consumed
-		if sent > 0 && verboseWatch() {
-			fmt.Fprintf(os.Stderr, "claude-watcher: sent %d event(s) from %s\n", sent, filepath.Base(path))
+		progress.Offsets[key] = offset + consumed
+		if parsed > 0 && verboseWatch() {
+			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
 	}
-	return sent, consumed
+	return parsed, consumed
 }
 
-// ingestClaudeWatchEvent runs the shared per-event funnel (path relativize,
-// cross-channel file_diff dedup, local signed buffer, ingest POST). Returns
-// true when the event was sent.
-func ingestClaudeWatchEvent(ev event.Event, session Session, client *http.Client, captureProse bool) bool {
-	// Device identity is stamped here, at the funnel, rather than inside the
-	// normalizer: the normalizer's job is to read a transcript, and it has no
-	// business knowing what machine it runs on. SessionID comes from the
-	// transcript; DeviceID comes from the environment. Keeping the two sourced
-	// separately is what stops them collapsing back into one value.
+// queueClaudeWatchEvent runs the shared per-event funnel: stamp device
+// identity, path relativize, cross-channel file_diff dedup, local signed
+// ledger, then the send queue.
+//
+// Ordering here is load-bearing twice over, and the two rules compose:
+//
+//  1. The DeviceID stamp MUST precede the ledger append — but NOT because of
+//     signing. BuildSigningMessage covers version/id/sessionId/ts/kind/source/
+//     v/dataHash/prevSig only; DeviceID is deliberately outside the signature,
+//     so stamping it later would still verify. The real reason is that
+//     AppendEventToLocalBuffer writes the LEDGER copy: stamp afterwards and the
+//     audit trail records an event with no device while the wire copy has one.
+//     Verified: stamping after leaves deviceId absent from buffer.jsonl and
+//     present in the outbox — the two disagreeing about who produced the event,
+//     in the one artifact whose whole job is to be trustworthy.
+//  2. The ledger append MUST precede the queue append. It applies
+//     source-exclusion + secret scrubbing and mutates ev in place with
+//     Sig/PrevSig, so queuing afterwards enqueues exactly the projected,
+//     redacted, signed bytes the backend should receive. Queue first and you
+//     would ship an unsigned, unprojected event — a source leak.
+//
+// Device identity is stamped at this funnel rather than inside the normalizer:
+// the normalizer's job is to read a transcript, and it has no business knowing
+// what machine it runs on. SessionID comes from the transcript; DeviceID comes
+// from the environment. Keeping the two sourced separately is what stops them
+// collapsing back into one value.
+func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
 	ev.DeviceID = session.DeviceID
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.
 	if !dedupeFileDiff(session.TaskRoot, &ev) {
-		return false
+		return
 	}
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: buffer error: %v\n", err)
 	}
-	if err := ingest.IngestEventWithClient(client, ev, session.SessionToken); err != nil {
-		// A 4xx schema/kind rejection (e.g. subagent_usage/config_census before
-		// the backend that accepts them deploys) is NOT a channel failure: the
-		// parser and transport are fine. Count the event as handled — otherwise
-		// a stream of rejected sidechain usage would accumulate bytes-without-
-		// events and trip the degraded state machine, silently stopping ALL
-		// capture. Rejections are dropped without retry (offsets advance
-		// regardless) and logged only under debug to avoid stderr spam.
-		if ingest.IsIngestRejection(err) {
-			state.HookDebugf("claude-watcher: event rejected by backend (%s): %v", ev.Kind, err)
-			return true
-		}
-		fmt.Fprintf(os.Stderr, "claude-watcher: send error (%s): %v\n", ev.Kind, err)
-		return false
+	if err := outbox.Append(ev); err != nil {
+		fmt.Fprintf(os.Stderr, "claude-watcher: queue error (%s): %v\n", ev.Kind, err)
 	}
-	return true
 }
