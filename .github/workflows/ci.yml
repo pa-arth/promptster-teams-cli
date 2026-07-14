@@ -45,12 +45,17 @@ jobs:
         run: GOOS=windows go build ./...
 
   # Exercise the per-user autostart service managers end-to-end on the two
-  # platforms a dev Mac can't drive: register -> status -> deregister. This is
-  # the only coverage that runs the real `schtasks` (Windows) and
+  # platforms a dev Mac can't drive: register -> status -> stop -> deregister.
+  # This is the only coverage that runs the real `schtasks` (Windows) and
   # `systemctl --user` (Linux) round-trips — the rest of CI only compiles them.
   # The schtasks /TR quoting round-trip in particular can't be verified any
   # other way. Credentials point at a dead localhost so a watcher the service
   # starts has zero external egress.
+  #
+  # The `stop` leg pins Manager.Stop's defining semantic: halt the service now,
+  # but leave it REGISTERED so it returns at next login. That's what separates it
+  # from `autostart disable`, and getting it wrong (deregistering, or leaving the
+  # restart policy armed) is exactly the bug `stop` exists to fix.
   autostart-smoke:
     name: autostart smoke (${{ matrix.os }})
     strategy:
@@ -83,9 +88,18 @@ jobs:
           grep -q "systemd --user" /tmp/s1                       # enabled
           test -f ~/.config/systemd/user/promptster-teams.service
           grep -q "Restart=on-failure" ~/.config/systemd/user/promptster-teams.service
-          /tmp/pt autostart disable
+          # `stop` halts the unit but must NOT deregister it: still enabled, now
+          # inactive. A systemd-initiated stop also parks it for good — unlike a
+          # SIGKILLed watcher, which Restart=on-failure would revive.
+          /tmp/pt stop
+          systemctl --user is-enabled promptster-teams.service     # still registered for next login
+          test -f ~/.config/systemd/user/promptster-teams.service  # unit survives stop
+          ! systemctl --user is-active --quiet promptster-teams.service   # really halted
           /tmp/pt autostart status | tee /tmp/s2
-          grep -qi "not enabled" /tmp/s2                          # deregistered
+          grep -q "systemd --user" /tmp/s2                         # still reports enabled
+          /tmp/pt autostart disable
+          /tmp/pt autostart status | tee /tmp/s3
+          grep -qi "not enabled" /tmp/s3                           # deregistered
           test ! -f ~/.config/systemd/user/promptster-teams.service
 
       # Windows: Task Scheduler round-trip — the real test of the schtasks /TR
@@ -104,9 +118,14 @@ jobs:
           /tmp/pt.exe autostart status | tee /tmp/s1
           grep -q "Task Scheduler" /tmp/s1                        # enabled
           schtasks //Query //TN "Promptster Teams"                # task really registered
-          /tmp/pt.exe autostart disable
+          # `stop` ends the running instance but must leave the task registered.
+          /tmp/pt.exe stop
+          schtasks //Query //TN "Promptster Teams"                # survives stop
           /tmp/pt.exe autostart status | tee /tmp/s2
-          grep -qi "not enabled" /tmp/s2                          # deregistered
+          grep -q "Task Scheduler" /tmp/s2                        # still reports enabled
+          /tmp/pt.exe autostart disable
+          /tmp/pt.exe autostart status | tee /tmp/s3
+          grep -qi "not enabled" /tmp/s3                          # deregistered
 
   # Race detector + coverage. Requires cgo (a C toolchain), which the hosted
   # ubuntu runner has; kept separate from the matrix so Windows (no default

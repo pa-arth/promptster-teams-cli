@@ -48,6 +48,21 @@ func (linuxManager) Enable() error {
 	return nil
 }
 
+// Stop halts the unit without disabling it: the default.target.wants symlink
+// stays, so systemd starts it again at the next login. `stop` (unlike `disable
+// --now`) also means Restart=on-failure won't revive it — a systemd-initiated
+// stop is never a failure, whatever exit status or signal follows.
+func (linuxManager) Stop() error {
+	if installed, _, _ := (linuxManager{}).Status(); !installed {
+		return nil
+	}
+	// #nosec G204 -- constant subcommands + fixed unit name.
+	if out, err := exec.Command("systemctl", "--user", "stop", unitName).CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl --user stop failed: %v: %s", err, out)
+	}
+	return nil
+}
+
 func (linuxManager) Disable() error {
 	p, err := unitPath()
 	if err != nil {

@@ -35,6 +35,14 @@ const (
 type Manager interface {
 	// Enable registers the service and starts it now (and at every login).
 	Enable() error
+	// Stop halts the service now but leaves it registered, so it still returns at
+	// the next login. Idempotent; a no-op when autostart isn't installed.
+	//
+	// This exists so `stop` can disarm the supervisor's restart policy before
+	// signaling the watcher. Without it, `stop`'s SIGKILL escalation reads as a
+	// crash to launchd's KeepAlive / systemd's Restart=on-failure and capture is
+	// resurrected seconds later — while `stop` reports success.
+	Stop() error
 	// Disable stops and deregisters the service. Idempotent.
 	Disable() error
 	// Status reports whether autostart is installed plus a human-readable detail.

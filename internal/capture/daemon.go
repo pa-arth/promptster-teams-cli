@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -22,6 +23,12 @@ type daemonState struct {
 	WatchDir  string `json:"watchDir,omitempty"`
 	LogPath   string `json:"logPath,omitempty"`
 }
+
+// newServiceManager builds the autostart manager StopTeamsDaemon disarms. It is
+// a var so tests can inject a manager whose Stop() really terminates a process:
+// `stop`'s reporting hinges on sampling watcher liveness BEFORE the service stop
+// kills it, and that ordering can't be exercised against a no-op manager.
+var newServiceManager = service.New
 
 func daemonStatePath() string { return filepath.Join(state.StateDir(), "supervisor.json") }
 func daemonLogPath() string   { return filepath.Join(state.StateDir(), "daemon.log") }
@@ -205,14 +212,45 @@ func StopTeamsDaemon() error {
 		addPID(st.PID)
 	}
 
-	stopped := false
+	// Resolve which PIDs are live and ours BEFORE touching the service. Stopping
+	// the service kills the watcher it owns, so a liveness check afterwards would
+	// find nothing and `stop` would report "nothing was running" about capture it
+	// had just stopped itself — sending the user off to hunt with pgrep for a
+	// process that no longer exists.
+	//
+	// pidLooksLikeOurs guards against a stale pidfile whose PID the OS has reused
+	// for an unrelated process — processExists only proves the number is live, so
+	// without this a reused PID would get signaled by mistake.
+	var targets []int
 	for pid := range seen {
-		// pidLooksLikeOurs guards against a stale pidfile whose PID the OS has
-		// reused for an unrelated process — processExists only proves the number
-		// is live, so without this a reused PID would get signaled by mistake.
 		if processExists(pid) && pidLooksLikeOurs(pid) {
+			targets = append(targets, pid)
+		}
+	}
+	// The capture flock is the authoritative liveness signal: it catches a live
+	// watcher whose pidfile is missing or stale, and (unlike a PID) a dead
+	// holder's lock is released by the kernel, so it can't report a phantom.
+	_, watcherAlive := watchRunning()
+	wasRunning := len(targets) > 0 || watcherAlive
+
+	// Disarm the OS supervisor before signaling. When autostart is enabled the
+	// watcher belongs to launchd/systemd, and their restart policies read the
+	// SIGKILL escalation below as a crash — so a `stop` that escalated would
+	// report success and then watch capture come back seconds later (launchd
+	// respawns almost immediately; ThrottleInterval caps the restart *rate*, it
+	// does not delay the first restart). Stopping the service — not disabling it
+	// — unloads the job now and leaves it registered for next login. Stop is a
+	// no-op when autostart isn't installed, so it needs no guard here.
+	// Best-effort: a supervisor we can't reach must not block killing the process.
+	if err := newServiceManager().Stop(); err != nil {
+		fmt.Fprintf(os.Stderr, "promptster-teams: warning: could not stop the autostart service (%v) — it may restart capture\n", err)
+	}
+
+	for _, pid := range targets {
+		// Stopping the service usually took the watcher down already; skip the
+		// ones that are already gone rather than burning the grace window on them.
+		if processExists(pid) {
 			signalAndWaitForExit(pid)
-			stopped = true
 		}
 	}
 
@@ -224,9 +262,15 @@ func StopTeamsDaemon() error {
 	clearCodexWatcherState()
 	_ = os.Remove(claudeHookTakeoverPath())
 
-	if stopped {
+	// Report the outcome we can observe, not the one we intended — this command
+	// exists because a `stop` that reports success while capture is still running
+	// (or comes back) is worse than one that admits it failed.
+	switch _, stillAlive := watchRunning(); {
+	case stillAlive:
+		fmt.Fprintln(os.Stderr, "promptster-teams: warning: capture is STILL running after stop — find it with `pgrep -fl promptster-teams` and stop it manually")
+	case wasRunning:
 		fmt.Fprintln(os.Stderr, "promptster-teams: background capture stopped")
-	} else {
+	default:
 		fmt.Fprintln(os.Stderr, "promptster-teams: no tracked background capture was running — if one is running without a pidfile, find it with `pgrep -fl promptster-teams` and stop it manually")
 	}
 	return nil

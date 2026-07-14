@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
@@ -168,8 +169,9 @@ func RunCodexWatcher() error {
 	// began, so we never replay unrelated prior codex sessions.
 	startCutoff := session.StartedAt.Add(-2 * time.Minute)
 
+	// SIGTERM as well as SIGINT — see the matching note in RunClaudeWatcher.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 
 	client := &http.Client{Timeout: 5 * time.Second}

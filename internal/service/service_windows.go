@@ -24,6 +24,22 @@ func (windowsManager) Enable() error {
 	return nil
 }
 
+// Stop ends the running task instance but leaves it registered, so it runs
+// again at the next logon. The ONLOGON task carries no restart-on-failure
+// policy, so Windows never resurrects a killed watcher the way launchd and
+// systemd do — this exists to keep the Manager contract uniform and to end the
+// instance Task Scheduler is tracking.
+func (windowsManager) Stop() error {
+	if installed, _, _ := (windowsManager{}).Status(); !installed {
+		return nil
+	}
+	// /End exits non-zero when the task isn't currently running, which is the
+	// desired end state — best-effort, not an error.
+	// #nosec G204 -- constant subcommands + fixed task name.
+	_ = exec.Command("schtasks", "/End", "/TN", taskName).Run()
+	return nil
+}
+
 func (windowsManager) Disable() error {
 	if installed, _, _ := (windowsManager{}).Status(); !installed {
 		return nil

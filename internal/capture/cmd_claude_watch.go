@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -285,8 +286,13 @@ func RunClaudeWatcher() error {
 		fmt.Fprintf(os.Stderr, "claude-watcher: hooks covered an outage window — fast-forwarded past existing transcript content\n")
 	}
 
+	// SIGTERM as well as SIGINT: `stop` sends SIGINT, but every supervisor-driven
+	// teardown (launchctl bootout, systemctl --user stop) sends SIGTERM. Without
+	// it registered, Go's default handler kills the process outright and the
+	// deferred state cleanup below never runs, leaving stale pidfiles that make
+	// `status` lie until the next liveness check heals them.
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 	defer signal.Stop(signals)
 
 	client := &http.Client{Timeout: 5 * time.Second}
