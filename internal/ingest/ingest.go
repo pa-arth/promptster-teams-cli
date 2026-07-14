@@ -10,7 +10,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
@@ -50,14 +52,27 @@ func IngestEventWithAPIKey(ev event.Event, apiKey string) error {
 	return IngestEventWithClient(httpClient, ev, apiKey)
 }
 
-// ingestEventWithClient POSTs a single normalized, redacted, signed event to
+// IngestEventWithClient POSTs a single normalized, redacted, signed event to
 // the configured teams ingest endpoint.
 func IngestEventWithClient(client *http.Client, ev event.Event, apiKey string) error {
 	body, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
+	return IngestRawEventWithClient(client, body, apiKey)
+}
 
+// IngestRawEventWithClient POSTs pre-marshalled event bytes VERBATIM.
+//
+// The outbox drain uses this deliberately instead of unmarshalling to an
+// event.Event and re-marshalling. The backend verifies the ed25519 signature by
+// recomputing canonical JSON from the body it receives, and Event.Data is an
+// interface{}: a round-trip through encoding/json turns every number into a
+// float64, so a value above 2^53 would re-serialize differently
+// (1234567890123456789 -> 1234567890123456800) and silently fail signature
+// verification. Shipping the exact bytes that were signed removes that class of
+// bug entirely rather than relying on round-trip fidelity.
+func IngestRawEventWithClient(client *http.Client, body []byte, apiKey string) error {
 	req, err := http.NewRequest(http.MethodPost, apiURL()+ingestEndpoint(), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
@@ -77,9 +92,43 @@ func IngestEventWithClient(client *http.Client, ev event.Event, apiKey string) e
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode >= 300 {
-		return &ingestHTTPError{status: resp.StatusCode, body: strings.TrimSpace(string(respBody))}
+		return &ingestHTTPError{
+			status:     resp.StatusCode,
+			body:       strings.TrimSpace(string(respBody)),
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 	return nil
+}
+
+// retryAfterCap bounds a server-supplied Retry-After. The backend's rate limit
+// is per-minute, so a value beyond this is a misconfiguration or a hostile
+// intermediary; honoring it verbatim would wedge the drain for hours.
+const retryAfterCap = 5 * time.Minute
+
+// parseRetryAfter reads an RFC 7231 Retry-After: delta-seconds or an HTTP-date.
+// Returns 0 when absent/unparseable/non-positive — callers fall back to their
+// own backoff rather than hammering.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return min(time.Duration(secs)*time.Second, retryAfterCap)
+	}
+	// HTTP-date form. The backend sends seconds, but an intermediary (proxy,
+	// CDN, WAF) may rewrite it to a date, and treating that as "no header" would
+	// silently drop back to blind backoff during exactly the storm it describes.
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return min(d, retryAfterCap)
+		}
+	}
+	return 0
 }
 
 // ingestHTTPError is a non-2xx ingest response, kept typed so callers can tell
@@ -87,10 +136,27 @@ func IngestEventWithClient(client *http.Client, ev event.Event, apiKey string) e
 type ingestHTTPError struct {
 	status int
 	body   string
+	// retryAfter is the parsed Retry-After header (0 when absent). The backend
+	// returns it on 429 alongside x-ratelimit-*; the drain honors it instead of
+	// guessing a backoff.
+	retryAfter time.Duration
 }
 
 func (e *ingestHTTPError) Error() string {
 	return fmt.Sprintf("ingest failed: HTTP %d: %s", e.status, e.body)
+}
+
+// IsRateLimited reports whether err is a 429, and returns the server's
+// Retry-After delay (0 when the header was absent or unparseable).
+func IsRateLimited(err error) (time.Duration, bool) {
+	var httpErr *ingestHTTPError
+	if !errors.As(err, &httpErr) {
+		return 0, false
+	}
+	if httpErr.status != http.StatusTooManyRequests {
+		return 0, false
+	}
+	return httpErr.retryAfter, true
 }
 
 // isIngestRejection reports whether err is the backend REJECTING the event's

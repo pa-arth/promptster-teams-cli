@@ -169,7 +169,7 @@ func watcherLine(w capture.WatcherStat, now time.Time, showBytes bool) string {
 	default:
 		dot, label = dotOK.Render("●"), "healthy"
 	}
-	parts := []string{fmt.Sprintf("%d events", w.EventsSent)}
+	parts := []string{fmt.Sprintf("%d events", w.EventsCaptured)}
 	if showBytes && w.BytesConsumed > 0 {
 		parts = append(parts, humanizeBytes(w.BytesConsumed))
 	}

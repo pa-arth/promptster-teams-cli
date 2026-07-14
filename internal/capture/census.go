@@ -12,6 +12,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -563,10 +564,20 @@ func buildConfigCensusEvent(session Session) event.Event {
 }
 
 // emitConfigCensus builds one census and runs it through the SAME
-// buffer/sign/ingest funnel as captured events. Best-effort and 400-tolerant:
-// a backend that doesn't accept config_census yet rejects it with a 4xx, which
-// is logged under debug and dropped — no retries, and the cursor still
-// advances so a rejecting backend is probed at most once per interval.
+// buffer/sign/queue funnel as captured events.
+//
+// The census is QUEUED rather than POSTed inline, unlike the presence heartbeat
+// next door. It is emitted at most once per 24h and the cursor
+// (saveLastCensusAt) advances whether or not the send worked — so an inline
+// POST that hit a 429 or a backend blip silently lost the whole census for a
+// day, and fleet-health's "no census" signal would fire for a device that had
+// dutifully collected one. That is bug 2's exact shape: a cursor advancing past
+// an event the network dropped. A rare, expensive, non-time-sensitive event is
+// precisely what a durable queue is for.
+//
+// Still 400-tolerant: a backend that doesn't accept config_census yet rejects
+// it with a 4xx and the drain skips it (see outbox.deliver), so a rejecting
+// backend is still probed at most once per interval.
 func emitConfigCensus(session Session) {
 	ev := buildConfigCensusEvent(session)
 	// captureAssistantProse=false: a config_census event carries no ai_response
@@ -574,8 +585,8 @@ func emitConfigCensus(session Session) {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("config census buffer error: %v", err)
 	}
-	if err := ingest.IngestEventWithAPIKey(ev, session.SessionToken); err != nil {
-		state.HookDebugf("config census send error: %v", err)
+	if err := outbox.Append(ev); err != nil {
+		state.HookDebugf("config census queue error: %v", err)
 	}
 	saveLastCensusAt(time.Now())
 }

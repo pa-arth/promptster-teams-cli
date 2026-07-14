@@ -1,16 +1,15 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	"github.com/pa-arth/promptster-teams-cli/internal/version"
 )
 
@@ -165,31 +164,14 @@ func printAutoUpdateStatus() {
 	printlnIndent(fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph))
 }
 
-// countBufferedEvents counts every retained ledger segment, not just the live
-// one: the ledger rotates once it gets large, and counting only the live segment
-// would make the number collapse at each rotation as if events had been lost.
+// countBufferedEvents reports how many captured events are still waiting to be
+// uploaded — the undelivered depth of the send queue.
+//
+// It used to count the LEDGER (buffer.jsonl + its rotated segments), which was
+// never an upload backlog: the ledger is an append-only audit trail that
+// nothing drains, so the panel reported every event ever captured as "pending
+// upload" indefinitely, and could only say "all events shipped" on a device
+// that had captured nothing at all. The outbox is the real queue — ask it.
 func countBufferedEvents() int {
-	n := 0
-	for seg := 0; seg <= state.LedgerRetainedSegments; seg++ {
-		n += countSegmentLines(state.LedgerSegmentPath(seg))
-	}
-	return n
-}
-
-func countSegmentLines(path string) int {
-	// #nosec G304 -- path is derived from state.HookBufferPath(), not user input.
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-	n := 0
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
-	for sc.Scan() {
-		if len(sc.Bytes()) > 0 {
-			n++
-		}
-	}
-	return n
+	return outbox.PendingCount()
 }

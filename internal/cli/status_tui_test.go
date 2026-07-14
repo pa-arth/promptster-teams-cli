@@ -32,7 +32,7 @@ func TestStatusModelViewLive(t *testing.T) {
 	// heartbeat, not just a live PID, to reject stale/reused-PID pidfiles).
 	hb := time.Now().UTC().Format(time.RFC3339)
 	writeWatcherPidfile(t, dir, "claude-watcher.json",
-		`{"pid":`+itoa(pid)+`,"startedAt":"`+hb+`","lastHeartbeat":"`+hb+`","eventsSent":299,"bytesConsumed":3581277}`)
+		`{"pid":`+itoa(pid)+`,"startedAt":"`+hb+`","lastHeartbeat":"`+hb+`","eventsCaptured":299,"bytesConsumed":3581277}`)
 
 	m := newStatusModel()
 	if !m.snap.Live {
@@ -75,7 +75,7 @@ func TestStatusModelStaleHeartbeatNotLive(t *testing.T) {
 	// as live capture.
 	pid := os.Getpid()
 	writeWatcherPidfile(t, dir, "claude-watcher.json",
-		`{"pid":`+itoa(pid)+`,"startedAt":"2020-01-01T00:00:00Z","lastHeartbeat":"2020-01-01T00:00:00Z","eventsSent":1}`)
+		`{"pid":`+itoa(pid)+`,"startedAt":"2020-01-01T00:00:00Z","lastHeartbeat":"2020-01-01T00:00:00Z","eventsCaptured":1}`)
 
 	m := newStatusModel()
 	if m.snap.Live {

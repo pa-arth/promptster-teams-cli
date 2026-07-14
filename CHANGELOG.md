@@ -6,6 +6,50 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **The same transcript was captured twice, and the duplicates blew the ingest
+  rate limit.** Watcher progress was keyed by absolute path, but one Claude Code
+  session is reachable under several `~/.claude/projects/` slugs — a git-worktree
+  slug and the bare repo slug — and the file moves between them when a worktree
+  is removed. Each slug looked like a brand-new file, so the watcher re-read it
+  from offset 0 and re-emitted the whole transcript: 25 tracked paths did exactly
+  this, sending 2,182 events twice (~32% of all traffic) and pushing a real
+  rolling-60s peak of 105 against the 100/min cap. Progress is now keyed by the
+  transcript's identity — its slug-relative path, i.e. the globally-unique
+  session UUID — so every alias of one transcript shares one offset. Existing
+  progress files are re-keyed on load, keeping the highest offset on collision so
+  the upgrade itself can never re-emit. The rate limit is correct and has not
+  been raised.
+- **Rate-limited and failed events were destroyed, not retried.** The parse loop
+  POSTed inline and advanced the transcript offset regardless of the outcome, and
+  there was no retry anywhere in the CLI — so every 429, 5xx, timeout and offline
+  moment permanently dropped the event (653+ lost to 429s alone). Parsing and
+  sending are now separate: the parse loop appends to a durable on-disk queue, and
+  advancing the offset is safe because the queue, not the network, is what
+  remembers. A background drain delivers in order from a persisted cursor,
+  honouring the backend's `Retry-After` on 429 and backing off exponentially with
+  jitter on 5xx/network errors. Only a 2xx or a permanent 400/422 rejection
+  advances the cursor. A head-of-queue that keeps failing — a revoked engineer
+  key, an unreachable API — is now reported loudly instead of retrying in silence.
+- **A network outage masqueraded as a broken parser.** The degraded-watcher
+  detector exists to notice the transcript format changing under us, but it was
+  fed a *send* count, so a total delivery failure looked identical to a dead
+  parser (`degraded — 271744 bytes consumed`). It then handed capture to the
+  hooks, which only cover the live tail and cannot replay — so the outage window
+  died twice. With delivery moved off the poll loop the detector counts real
+  parses and is unaffected by the network.
+- **The config census is queued rather than fired inline.** It is emitted at most
+  once per 24h and its cursor advances whether or not the send lands, so a single
+  429 silently cost a full day of census — and fleet health reported "no census"
+  for a device that had dutifully collected one. Presence heartbeats deliberately
+  stay fire-and-forget: a heartbeat redelivered minutes later is a stale liveness
+  claim, and the next one is seconds away.
+- **`promptster-teams status` stopped inventing an upload backlog.** "N events
+  pending upload" counted the local signed ledger, which nothing drains — so it
+  reported every event ever captured as perpetually pending, and "all events
+  shipped" could only appear on a device that had captured nothing at all. It now
+  counts the send queue, so both states mean what they say.
+
 ## [0.5.6] — 2026-07-14
 
 ### Fixed
