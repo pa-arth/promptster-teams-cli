@@ -219,6 +219,10 @@ func TestNonWritableDirNudges(t *testing.T) {
 	}
 }
 
+// testCurlDest stands in for install.sh's ${HOME}/.promptster-teams/bin
+// destination, injected so these cases do not depend on the runner's $HOME.
+const testCurlDest = "/home/e/.promptster-teams/bin/promptster-teams"
+
 func TestNudgeMatchesInstallChannel(t *testing.T) {
 	cases := []struct {
 		name string
@@ -228,10 +232,18 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 		{"npm global unix", "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64", nudgeNpmGlobal},
 		{"npm global windows", `C:\Users\e\AppData\Roaming\npm\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`, nudgeNpmGlobal},
 		{"pnpm global", "/home/e/Library/pnpm/global/5/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgePnpmGlobal},
-		{"curl installer", "/usr/local/bin/promptster-teams", nudgeCurl},
-		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeCurl},
+
+		// ONLY a self already at install.sh's destination may be told to re-run
+		// install.sh — that is the one case where it overwrites this binary.
+		{"curl install dest", testCurlDest, nudgeCurl},
+
+		// These previously asserted nudgeCurl, which was the bug: install.sh
+		// hardcodes ${HOME}/.promptster-teams/bin, so re-running it from any of
+		// these leaves a second binary and this copy stale.
+		{"standalone /usr/local/bin", "/usr/local/bin/promptster-teams", nudgeStandalone("/usr/local/bin/promptster-teams")},
+		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeStandalone("/opt/homebrew/bin/promptster-teams")},
 		// A directory merely containing the substring must not read as npm.
-		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeCurl},
+		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeStandalone("/home/e/my-node_modules-backup/promptster-teams")},
 
 		// The cases the review caught: a global command against a project-local
 		// install updates the global prefix and leaves this copy stale, so these
@@ -254,10 +266,38 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := nudgeFor(tc.self); got != tc.want {
+			if got := nudgeFor(tc.self, testCurlDest); got != tc.want {
 				t.Fatalf("nudgeFor(%q) = %q, want %q", tc.self, got, tc.want)
 			}
 		})
+	}
+}
+
+// install.sh writes ONE fixed path (${HOME}/.promptster-teams/bin). Telling a
+// binary that lives anywhere else to run it leaves a second copy and keeps this
+// one stale — PATH order then decides which runs, which is the whole failure
+// nudgeFor exists to prevent. Caught by review on PR #63.
+func TestOnlyTheCurlDestIsToldToRunInstallSh(t *testing.T) {
+	elsewhere := []string{
+		"/usr/local/bin/promptster-teams",
+		"/opt/homebrew/bin/promptster-teams",
+		"/usr/bin/promptster-teams",
+		"/home/e/bin/promptster-teams",
+		"/home/e/.promptster-teams/promptster-teams",      // near miss: no /bin
+		"/home/e/.promptster-teams/bin/promptster-teams2", // near miss: wrong file
+	}
+	for _, self := range elsewhere {
+		if got := nudgeFor(self, testCurlDest); got == nudgeCurl {
+			t.Fatalf("%q was told to run install.sh, which writes %q instead", self, testCurlDest)
+		}
+	}
+	// The one case that IS allowed to.
+	if got := nudgeFor(testCurlDest, testCurlDest); got != nudgeCurl {
+		t.Fatalf("nudgeFor(curlDest) = %q, want nudgeCurl", got)
+	}
+	// An unknown home must degrade to the safe hint, never to install.sh.
+	if got := nudgeFor("/usr/local/bin/promptster-teams", ""); got == nudgeCurl {
+		t.Fatal("empty curlDest must not match anything")
 	}
 }
 
@@ -292,7 +332,7 @@ func TestLocalInstallNeverGetsAGlobalHint(t *testing.T) {
 		`C:\Users\e\proj\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`,
 	}
 	for _, self := range locals {
-		got := nudgeFor(self)
+		got := nudgeFor(self, testCurlDest)
 		for _, bad := range []string{nudgeNpmGlobal, nudgePnpmGlobal, nudgeCurl} {
 			if got == bad {
 				t.Fatalf("local install %q got global/curl hint %q", self, got)

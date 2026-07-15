@@ -175,11 +175,20 @@ walk back into:
   (`promptster` from `pa-arth/promptster-cli-releases` into `~/.promptster/bin`). It
   installed an unrelated product and left promptster-teams exactly as stale as it was.
   `nudgeCurl` must name **this** repo's `install.sh`
-  (`raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh`), which writes
-  `~/.promptster-teams/bin/promptster-teams` — the same path a curl-installed `self`
-  resolves to. `TestNudgeCurlInstallsThisProduct` pins the CONTENT; every other nudge test
-  compares against the `nudgeCurl` *constant* and therefore stayed green for the entire
-  life of the bug. **A constant-vs-constant assertion proves nothing about a URL.**
+  (`raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh`).
+  `TestNudgeCurlInstallsThisProduct` pins the CONTENT; every other nudge test compares
+  against the `nudgeCurl` *constant* and therefore stayed green for the entire life of the
+  bug. **A constant-vs-constant assertion proves nothing about a URL.**
+- **Sending a standalone binary to `install.sh` at all.** `install.sh` hardcodes
+  `INSTALL_DIR="${HOME}/.promptster-teams/bin"` — it writes ONE path. So `nudgeCurl` is
+  correct *only* when `self` is already that exact file; a root-owned
+  `/usr/local/bin/promptster-teams` or a Homebrew-prefix copy that re-runs it gets a
+  second binary in a different PATH entry and stays stale. `nudgeFor(self, curlDest)` gates
+  on `samePath`, and everything else falls to `nudgeStandalone`, which names the file and
+  the releases URL and prescribes nothing. `curlInstallDest` derives the path from
+  `state.GlobalPromptsterDir()` — but **`install.sh` owns the `/bin/promptster-teams` tail,
+  so that is the half to re-check if the script's `INSTALL_DIR` ever moves.** Caught by
+  review on PR #63, after the wrong-product fix had already been written and tested.
 - Telling an npm-installed engineer to run the curl installer.
 - Telling a **project-local** or pnpm install to `npm i -g` — that updates the global
   prefix and leaves the local copy untouched. Global-vs-local matters more than

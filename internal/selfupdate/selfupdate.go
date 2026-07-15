@@ -131,11 +131,57 @@ const npmPackage = "@promptster/teams-cli"
 // one install.sh and the README document, and it writes
 // ~/.promptster-teams/bin/promptster-teams — the same path a curl-installed
 // self resolves to, so re-running it updates the copy that printed the nudge.
+// nudgeCurl is correct ONLY when self already lives at the path install.sh
+// writes. install.sh hardcodes INSTALL_DIR="${HOME}/.promptster-teams/bin", so
+// telling (say) a root-owned /usr/local/bin/promptster-teams to re-run it drops
+// a SECOND binary in ~/.promptster-teams/bin, leaves PATH order to pick a
+// winner, and leaves the copy that printed the nudge stale — the invariant
+// again, one layer below the wrong-product bug. curlInstallDest gates it.
 const (
 	nudgeCurl       = "promptster-teams: update available — run: curl -fsSL https://raw.githubusercontent.com/" + repoSlug + "/main/install.sh | sh"
 	nudgeNpmGlobal  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
 	nudgePnpmGlobal = "promptster-teams: update available — run: pnpm add -g " + npmPackage + "@latest"
 )
+
+// nudgeStandalone is the honest answer for a binary that is not under
+// node_modules and is not at install.sh's destination: a manual drop into
+// /usr/local/bin, a Homebrew prefix, a packaged image. Nothing in the path says
+// how it got there, and every guess re-creates the second-install bug, so it
+// names the file to replace and the release to take, and stops.
+func nudgeStandalone(self string) string {
+	return "promptster-teams: update available — replace " + self +
+		" from https://github.com/" + repoSlug + latestPath
+}
+
+// curlInstallDest returns the exact path install.sh writes
+// (${HOME}/.promptster-teams/bin/promptster-teams), or "" when home is
+// unknown. Derived from state.GlobalPromptsterDir so it cannot drift from the
+// rest of the CLI's idea of that directory — but note install.sh owns the
+// "/bin/promptster-teams" tail, so THIS is the half to re-check if that script
+// ever changes its INSTALL_DIR.
+func curlInstallDest() string {
+	dir := state.GlobalPromptsterDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "bin", "promptster-teams")
+}
+
+// samePath compares two paths for "these name the same install slot". Both
+// sides are cleaned; self is already symlink-resolved by resolveSelfPath, and
+// the destination is resolved best-effort so a symlinked home still matches. A
+// false negative is safe (it downgrades to nudgeStandalone, which is never
+// wrong, only vaguer); a false positive would print a command that updates a
+// different file, so the comparison stays strict rather than fuzzy.
+func samePath(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	if resolved, err := filepath.EvalSymlinks(b); err == nil {
+		b = resolved
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
 
 // pathSegments splits a path on BOTH separators rather than using
 // filepath.ToSlash, which rewrites "\" only when GOOS=windows — that would make
@@ -189,7 +235,9 @@ func nodeProjectRoot(self string) string {
 	return ""
 }
 
-// nudgeFor picks the hint that updates the running binary in place.
+// nudgeFor picks the hint that updates the running binary in place. curlDest is
+// install.sh's destination, injected so the choice is a pure function of paths
+// and stays testable without depending on the runner's $HOME.
 //
 // Global-vs-local matters more than npm-vs-pnpm: `npm i -g` against a
 // project-local install updates the global prefix and leaves the local copy
@@ -197,10 +245,16 @@ func nodeProjectRoot(self string) string {
 // command; anything else names the package and the directory and lets the
 // engineer use whatever package manager owns it, because the path alone cannot
 // tell npm from yarn and a guess there is the same second-install bug again.
-func nudgeFor(self string) string {
+//
+// The same rule governs standalone binaries: install.sh writes one fixed path,
+// so only a self already sitting there may be told to re-run it.
+func nudgeFor(self, curlDest string) string {
 	segs := pathSegments(self)
 	if !hasSegment(segs, "node_modules") {
-		return nudgeCurl
+		if samePath(self, curlDest) {
+			return nudgeCurl
+		}
+		return nudgeStandalone(self)
 	}
 	pnpm := hasSegment(segs, ".pnpm") || hasSegment(segs, "pnpm")
 	switch {
@@ -332,7 +386,7 @@ func (u *updater) checkAndApply() outcome {
 	dir := filepath.Dir(self)
 	if !dirWritable(dir) {
 		u.logf("selfupdate: %s not writable — skipping swap to %s", dir, target)
-		fmt.Fprintln(os.Stderr, nudgeFor(self))
+		fmt.Fprintln(os.Stderr, nudgeFor(self, curlInstallDest()))
 		return outcomeBlockedNotWritable
 	}
 
