@@ -19,6 +19,7 @@ const path = require("path");
 const {
   bundledBinPath,
   managedBinPath,
+  isGlobalInstall,
   isNewer,
   platformKey,
 } = require("../lib/resolve");
@@ -53,6 +54,20 @@ function binVersion(bin) {
 }
 
 function main() {
+  // A project-local install must not touch the shared managed binary. The
+  // lockfile is a per-PROJECT pin; the managed binary is per-USER. Letting a
+  // local install write it means two repos pinning different versions fight
+  // over one file and neither gets what its lockfile selected — a worse bug
+  // than the npm-ls drift this whole design removes. Local installs keep
+  // running out of their own node_modules, exactly as before.
+  if (!isGlobalInstall()) {
+    console.log(
+      "promptster-teams: project-local install — leaving ~/.promptster-teams/bin alone " +
+        "and running the version your lockfile pins"
+    );
+    return;
+  }
+
   const bundled = bundledBinPath();
   if (!bundled) {
     warn(`unsupported platform ${platformKey()} — skipping binary install`);
@@ -102,6 +117,27 @@ function main() {
     const tmp = `${managed}.tmp-${process.pid}`;
     fs.copyFileSync(bundled, tmp);
     fs.chmodSync(tmp, 0o755);
+
+    // Re-check immediately before the swap. The guard above and this rename are
+    // not atomic with respect to the Go self-updater, which renames onto this
+    // same path from a live daemon: read 1.0.0 -> daemon installs 1.2.0 ->
+    // rename 1.1.0 over it, and the guard has been defeated.
+    //
+    // This narrows the window from "the whole copy" to the microseconds around
+    // the rename rather than closing it. Closing it needs a lock protocol shared
+    // by a Node script and a Go daemon, which is a lot of machinery for this
+    // failure: rename is atomic so the file is always ONE whole valid binary
+    // (never corrupt), the only cost is running an older version, and the daemon
+    // re-updates forward within one check interval (<=30m). Deliberate tradeoff,
+    // not an oversight — see CLAUDE.md.
+    const stillCurrent = binVersion(managed);
+    if (stillCurrent && !isNewer(incoming, stillCurrent)) {
+      fs.unlinkSync(tmp);
+      console.log(
+        `promptster-teams: ${managed} changed to ${stillCurrent} mid-install; leaving it`
+      );
+      return;
+    }
     fs.renameSync(tmp, managed);
     console.log(
       `promptster-teams: installed ${incoming} to ${managed}${

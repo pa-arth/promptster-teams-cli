@@ -236,6 +236,34 @@ func nodeProjectRoot(self string) string {
 //
 // The same rule governs standalone binaries: install.sh writes one fixed path,
 // so only a self already sitting there may be told to re-run it.
+// isProjectLocalInstall reports whether self lives in a PROJECT's node_modules
+// rather than a global prefix.
+//
+// Such an install is pinned by that project's lockfile, and self-update must
+// leave it alone. Swapping the binary would silently diverge the developer from
+// `npm ci` — dev runs 0.7.0, CI installs what the lockfile says, and nobody
+// knows. A lockfile is a deliberate pin and gets the same respect as the org's
+// PinnedCliVersion. These installs get a nudge naming the project instead.
+//
+// The npm launcher enforces the mirror-image rule (npm/lib/resolve.js
+// isGlobalInstall): a local install never runs the shared managed binary. Both
+// halves are needed — this one stops us updating a pinned copy, that one stops a
+// pinned project executing someone else's version.
+func isProjectLocalInstall(self string) bool {
+	segs := pathSegments(self)
+	if !hasSegment(segs, "node_modules") {
+		return false
+	}
+	pnpm := hasSegment(segs, ".pnpm") || hasSegment(segs, "pnpm")
+	if pnpm && hasSegment(segs, "global") {
+		return false
+	}
+	if !pnpm && (hasAdjacent(segs, "lib", "node_modules") || hasAdjacent(segs, "npm", "node_modules")) {
+		return false
+	}
+	return true
+}
+
 func nudgeFor(self, curlDest string) string {
 	segs := pathSegments(self)
 	if !hasSegment(segs, "node_modules") {
@@ -268,13 +296,14 @@ func nudgeFor(self, curlDest string) string {
 type outcome int
 
 const (
-	outcomeSkippedDev         outcome = iota // dev/empty build — never self-updates
-	outcomeSkippedFlag                       // --no-auto-update or env opt-out
-	outcomeSkippedPolicy                     // org policy disabled auto-update
-	outcomeUpToDate                          // no newer (or pinned-not-newer) release
-	outcomeBlockedNotWritable                // newer release found, install dir read-only
-	outcomeError                             // best-effort failure (network/verify/io)
-	outcomeApplied                           // swapped + re-exec'd (does not return in prod)
+	outcomeSkippedDev          outcome = iota // dev/empty build — never self-updates
+	outcomeSkippedFlag                        // --no-auto-update or env opt-out
+	outcomeSkippedPolicy                      // org policy disabled auto-update
+	outcomeUpToDate                           // no newer (or pinned-not-newer) release
+	outcomeBlockedNotWritable                 // newer release found, install dir read-only
+	outcomeBlockedProjectLocal                // newer release found, but a lockfile pins this copy
+	outcomeError                              // best-effort failure (network/verify/io)
+	outcomeApplied                            // swapped + re-exec'd (does not return in prod)
 )
 
 // updater carries everything one check needs. Impure edges (HTTP, self-path,
@@ -370,6 +399,16 @@ func (u *updater) checkAndApply() outcome {
 	if err != nil {
 		u.logf("selfupdate: could not resolve own path: %v", err)
 		return outcomeError
+	}
+	// A project-local install is pinned by its lockfile. Its node_modules is
+	// almost always WRITABLE, so without this gate we would happily swap it and
+	// silently diverge the developer from `npm ci` — dev on 0.7.0, CI on
+	// whatever the lockfile says. Checked before dirWritable precisely because
+	// writability is not the question here; ownership is.
+	if isProjectLocalInstall(self) {
+		u.logf("selfupdate: %s is a project-local install — leaving its lockfile-pinned version alone", self)
+		fmt.Fprintln(os.Stderr, nudgeFor(self, state.CanonicalInstallBin()))
+		return outcomeBlockedProjectLocal
 	}
 	dir := filepath.Dir(self)
 	if !dirWritable(dir) {

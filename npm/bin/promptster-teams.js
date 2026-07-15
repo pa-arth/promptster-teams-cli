@@ -12,7 +12,12 @@
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 
-const { bundledBinPath, managedBinPath, platformKey } = require("../lib/resolve");
+const {
+  bundledBinPath,
+  managedBinPath,
+  isGlobalInstall,
+  platformKey,
+} = require("../lib/resolve");
 
 function usable(p) {
   if (!p) return false;
@@ -30,11 +35,16 @@ if (!bundled) {
   process.exit(1);
 }
 
-// Managed first. If postinstall could not write it (--ignore-scripts, read-only
-// home, unresolvable HOME), fall back to bundled so the CLI still runs — it just
-// self-updates in place inside node_modules the way it used to, and npm ls goes
+// A project-local install runs ITS OWN binary, never the shared managed one.
+// The managed binary is per-user; a lockfile is a per-project pin. Pointing a
+// local install at the shared file would mean a repo pinning 0.5.0 executes
+// whatever another repo last installed — the lockfile would select nothing.
+//
+// Otherwise: managed first. If postinstall could not write it (--ignore-scripts,
+// read-only home, unresolvable HOME), fall back to bundled so the CLI still runs
+// — it just self-updates inside node_modules the way it used to, and npm ls goes
 // back to drifting. Working-but-drifting beats not working.
-const managed = managedBinPath();
+const managed = isGlobalInstall() ? managedBinPath() : null;
 const binPath = usable(managed) ? managed : bundled;
 
 if (!usable(binPath)) {

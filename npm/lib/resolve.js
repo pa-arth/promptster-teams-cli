@@ -59,6 +59,45 @@ function managedBinPath() {
   return path.join(home, ".promptster-teams", "bin", name);
 }
 
+// isGlobalInstall reports whether this package was installed into a GLOBAL
+// prefix rather than a project's node_modules.
+//
+// This gate is why a project-local install does not touch the managed binary at
+// all. The managed binary is per-USER and shared; a project's lockfile is a
+// deliberate per-PROJECT pin. If a local install pointed at the shared binary,
+// a repo pinning 0.5.0 and one pinning 0.6.1 would both execute whichever
+// version happens to be in ~/.promptster-teams/bin — the lockfile would select
+// nothing at all. That is strictly worse than the npm-ls drift this design
+// removes, so local installs stay entirely inside their own node_modules.
+//
+// Mirrors nudgeFor's layout rules in internal/selfupdate/selfupdate.go: match
+// path SEGMENTS (never substrings — a directory called my-node_modules-backup
+// is not npm), and split on both separators so the check is host-independent.
+function pathSegments(p) {
+  return String(p || "").split(/[/\\]/).filter(Boolean);
+}
+
+function isGlobalInstall(selfDir) {
+  const segs = pathSegments(selfDir === undefined ? __dirname : selfDir);
+  if (!segs.includes("node_modules")) {
+    // Not under node_modules at all (e.g. `npm link`, a checkout). Not a
+    // project-local install, so it may manage the shared binary.
+    return true;
+  }
+  const pnpm = segs.includes(".pnpm") || segs.includes("pnpm");
+  const adjacent = (a, b) =>
+    segs.some((s, i) => s === a && segs[i + 1] === b);
+
+  // pnpm's global prefix, e.g. ~/Library/pnpm/global/5/node_modules/...
+  if (pnpm && segs.includes("global")) return true;
+  // npm's global prefix: <prefix>/lib/node_modules (unix) or
+  // <AppData>\npm\node_modules (windows).
+  if (!pnpm && (adjacent("lib", "node_modules") || adjacent("npm", "node_modules"))) {
+    return true;
+  }
+  return false;
+}
+
 // parseVersion turns "1.2.3" into [1,2,3]; returns null for anything that is
 // not a plain 3-part numeric version. Deliberately strict rather than a semver
 // dependency: the release pipeline only ever produces x.y.z, and an unparseable
@@ -84,6 +123,7 @@ module.exports = {
   platformKey,
   bundledBinPath,
   managedBinPath,
+  isGlobalInstall,
   parseVersion,
   isNewer,
 };
