@@ -6,6 +6,47 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-15
+
+### Fixed
+- **Bash mode was shipping command output off the machine.** The `!` prefix
+  writes both the invocation and its captured stdout/stderr into the transcript
+  as user lines, so `<bash-input>` / `<bash-stdout>` / `<bash-stderr>` were
+  leaving as `prompt.text` — shell commands, absolute filesystem paths, infra
+  hostnames and raw output. This is the exact category the redaction projector
+  exists to exclude ("Command-family: invocation + result metadata — never
+  stdout/stderr"), and none of the three layers caught it: the projector
+  allowlists `prompt.text` because it is the product, `scrubInlineCommand` only
+  runs on shell-command kinds, and the source-exclusion DB constraint guards a
+  `stdout` *key*, not stdout *inside* text. Secrets were still redacted upstream,
+  so no credential left the machine. They are now dropped at capture rather than
+  filtered later: source exclusion is a guarantee, not a preference the server
+  may revisit, and a source-bearing line that reaches the buffer has already
+  broken the promise.
+
+### Added
+- **`promptSource` is now emitted, so the server can tell a turn you typed from
+  one the harness injected.** Claude Code writes background-task notifications
+  into the transcript as ordinary `user` messages; they are indistinguishable
+  from prompts by shape, and roughly a quarter of captured "prompts" are these.
+  Nothing downstream could separate them, so they were being graded as an
+  engineer's own weak prompting. The CLI deliberately does **not** drop them: a
+  client-side drop is irreversible and bakes into every installed build forever,
+  while a server-side filter can change its mind. Ship the signal, not the
+  verdict. The value is shape-clamped to a short lower-snake token rather than
+  matched against a fixed vocabulary, so an unknown future value is carried
+  without waiting for a CLI release — and a value that is not enum-shaped can
+  never reach the wire.
+
+### Removed
+- **The unused `meta` map on prompt events.** It assembled `ideSessionId`,
+  `permissionMode`, `promptId` and `cwd` — an absolute filesystem path — and was
+  stripped before the buffer, the signature and the wire, so nothing ever
+  received it. It had already been removed once and grew back. The projector
+  allowlists *keys*, so a map can only ever be kept whole: keeping any field
+  inside it would have taken `cwd` along. Fields that are genuinely needed now go
+  on the envelope or get their own individually-allowlistable key.
+
 ## [0.6.0] — 2026-07-14
 
 ### Added
@@ -300,6 +341,7 @@ follows [Semantic Versioning](https://semver.org/).
   tamper-evident chain, and streams to a team backend.
 
 [Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.0...HEAD
+[0.6.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...v0.6.0
 [0.5.6]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...v0.5.6
 [0.5.5]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.4...v0.5.5
