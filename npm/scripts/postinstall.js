@@ -17,11 +17,13 @@ const fs = require("fs");
 const path = require("path");
 
 const {
+  PLATFORMS,
   bundledBinPath,
   managedBinPath,
   isGlobalInstall,
   isNewer,
   platformKey,
+  platformPackage,
 } = require("../lib/resolve");
 
 function warn(msg) {
@@ -53,6 +55,41 @@ function binVersion(bin) {
   }
 }
 
+// repairAutostart re-points an existing launchd/systemd/schtasks unit at the
+// managed binary.
+//
+// THIS IS A MIGRATION, and without it this package is a silent regression for
+// every engineer who has run `autostart enable`. The unit bakes an ABSOLUTE
+// path at enable time. Installs predating the managed-binary layout baked
+// <pkg>/binaries/promptster-teams-<platform> — a path that no longer exists in
+// the package, because the binary moved to a per-platform dependency and the
+// wrapper stopped shipping binaries/ entirely. So `npm i -g` deletes the exact
+// file the supervisor is pointed at.
+//
+// Nothing about that fails loudly. The running daemon holds its inode and keeps
+// capturing, so the upgrade looks clean; the unit only breaks at the NEXT LOGIN,
+// when launchd runs a path that is gone. Capture never comes back — the precise
+// failure autostart exists to prevent.
+//
+// Delegated to the Go binary (`autostart repair`) rather than reimplemented
+// here: this must not grow a plist writer, a systemd unit writer and a schtasks
+// caller in Node, three platforms out of sync with the Go ones. `repair` is a
+// no-op when autostart was never enabled and never exits non-zero.
+function repairAutostart(managed) {
+  try {
+    const r = spawnSync(managed, ["autostart", "repair"], {
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    const out = `${r.stdout || ""}${r.stderr || ""}`.trim();
+    if (out) console.log(out);
+  } catch {
+    // Best-effort: a failed repair leaves autostart pointing at the old path,
+    // which the engineer can fix with `promptster-teams autostart enable`.
+    // Aborting the install over it would be strictly worse.
+  }
+}
+
 function main() {
   // A project-local install must not touch the shared managed binary. The
   // lockfile is a per-PROJECT pin; the managed binary is per-USER. Letting a
@@ -70,11 +107,16 @@ function main() {
 
   const bundled = bundledBinPath();
   if (!bundled) {
-    warn(`unsupported platform ${platformKey()} — skipping binary install`);
-    return;
-  }
-  if (!fs.existsSync(bundled)) {
-    warn(`bundled binary missing at ${bundled} — skipping`);
+    // Either an unsupported platform, or the optionalDependency carrying the
+    // binary is absent. npm treats a missing optional dep as SUCCESS and says
+    // nothing, so this warning is the only signal the engineer will ever get
+    // that they have a CLI with no binary behind it. Say which package.
+    if (!PLATFORMS.includes(platformKey())) {
+      warn(`unsupported platform ${platformKey()} — no binary to install`);
+      return;
+    }
+    warn(`${platformPackage()} is not installed, so there is no binary to install.`);
+    warn("If you used --omit=optional or --no-optional, reinstall without it.");
     return;
   }
   const managed = managedBinPath();
@@ -144,6 +186,7 @@ function main() {
         current ? ` (was ${current})` : ""
       }`
     );
+    repairAutostart(managed);
   } catch (err) {
     // Falls back to the bundled binary via bin/promptster-teams.js.
     warn(`could not install to ${managed}: ${err.message}`);

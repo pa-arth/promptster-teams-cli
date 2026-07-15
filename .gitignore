@@ -3,6 +3,9 @@
 /bin/
 /dist/
 npm/binaries/
+# Generated per-platform packages (one binary each). Built by scripts/build.js,
+# published by release.yml; never committed.
+npm/platforms/
 node_modules/
 .DS_Store
 .claude/

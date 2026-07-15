@@ -28,7 +28,6 @@
     "bin/",
     "lib/",
     "scripts/postinstall.js",
-    "binaries/",
     "README.md"
   ],
   "engines": {
@@ -36,5 +35,13 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "optionalDependencies": {
+    "@promptster/teams-cli-linux-x64": "0.6.1",
+    "@promptster/teams-cli-linux-arm64": "0.6.1",
+    "@promptster/teams-cli-darwin-x64": "0.6.1",
+    "@promptster/teams-cli-darwin-arm64": "0.6.1",
+    "@promptster/teams-cli-win32-x64": "0.6.1",
+    "@promptster/teams-cli-win32-arm64": "0.6.1"
   }
 }

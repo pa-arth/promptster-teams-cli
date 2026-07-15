@@ -213,6 +213,94 @@ org's `PinnedCliVersion`.
   hard-fails the publish — because losing the postinstall reverts everything **silently**:
   the CLI keeps working, so nothing breaks until someone notices `npm ls` lying weeks later.
 
+### autostart bakes an ABSOLUTE path — moving the binary is a migration
+
+`autostart enable` renders `state.SelfBin()` into the launchd plist / systemd unit /
+scheduled task **once**, and nothing revisits it. So any change to where the binary lives
+silently orphans every already-enabled unit.
+
+That is not hypothetical — it was caught on a real machine mid-review. A live plist read:
+
+```
+ProgramArguments: [.../node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64, watch]
+```
+
+The wrapper no longer ships `binaries/` at all, so the next `npm i -g` deletes exactly that
+file. **Nothing fails loudly**: the running daemon holds its inode and capture looks fine,
+then at the next login launchd runs a path that is gone and capture never comes back — the
+precise failure autostart exists to prevent.
+
+`autostart repair` (`internal/cli/autostart.go`) is the migration, and npm's postinstall
+calls it after installing the managed binary. Rules:
+
+- **It must never exit non-zero.** It runs inside `npm install`, where a non-zero exit
+  aborts the install and leaves the engineer with no CLI at all — far worse than a stale
+  unit path.
+- **It re-renders unconditionally** rather than reading the unit's current path back:
+  that would mean a plist parser, a systemd-unit parser and a schtasks-XML parser, three
+  platforms to avoid one idempotent bootout/bootstrap.
+- **It skips the key check** `autostart enable` does. The unit only exists because the
+  engineer had a key when they enabled it; a transient key problem is no reason to leave
+  the path broken.
+- The linux smoke test in `ci.yml` proves it end-to-end: bake a unit with a path, delete
+  that path, repair, assert the unit now names a binary that exists and the stale one is
+  gone — plus the no-op-when-not-enabled case.
+
+**macOS autostart is NOT covered by CI** (the smoke matrix is ubuntu + windows). It CAN be
+tested on a dev machine, but NOT by sandboxing `HOME`: `launchctl bootout/bootstrap` target
+`gui/$UID` by LABEL, so a sandboxed HOME still tears down the developer's real
+`ai.promptster.teams` job and bootstraps the sandbox plist in its place. `Status()` is the
+exception — it reads the plist under `os.UserHomeDir()`, so a sandboxed HOME correctly
+reports "not enabled" and `repair` returns before touching launchctl.
+
+To test it for real (done once, 2026-07-15, and it is how the stale-path bug was proven):
+back up `~/Library/LaunchAgents/ai.promptster.teams.plist`, run the round-trip, then restore
+the file and `launchctl bootstrap` it. Verify the restore by sha256 of the plist, and check
+that the binary left capturing matches the published `SHA256SUMS` — a local build stamped
+with the CURRENT version will NOT self-update away (`isNewer` is strict), so leaving one
+behind strands the machine on unreleased code indefinitely.
+
+Two traps that cost real time here:
+
+- **`stop` boots the job out of the launchd domain** (it disarms the supervisor before
+  signalling the watcher — see Manager.Stop). After a `stop`, `launchctl kickstart` fails
+  with `Could not find service ... in domain`; you must `launchctl bootstrap` the plist
+  again, which is also exactly what a real login does.
+- **A running daemon holds the single-instance lock, so launchd's spawn exits 0** and the
+  job reads `state = not running`. That is SUCCESS, not failure — and `last exit code = 0`
+  is itself the proof launchd could execute the binary at that path (a missing path gives a
+  spawn error instead). To see it actually capture, free the lock first.
+
+### The binary ships as a per-platform optionalDependency
+
+The wrapper carries **no binary**. It declares six packages
+(`@promptster/teams-cli-darwin-arm64`, …) as `optionalDependencies` pinned to its exact
+version; each carries one binary and is gated by npm's `os`/`cpu` fields. npm installs only
+the match, so an install pulls **12MB instead of 74.5MB** (measured: wrapper 28KB + one
+stripped binary; the old all-in-one tarball was 74.5MB unpacked). Same pattern as
+esbuild/swc/rollup, and as Claude Code (`@anthropic-ai/claude-code-darwin-arm64`, each
+pinned to the wrapper's exact version).
+
+`npm/binaries/` still exists — it is the GitHub Release assets + `SHA256SUMS` that
+`install.sh` and the Go self-updater download. It just no longer ships inside the npm
+wrapper. `scripts/build.js` emits both from one compile and is the source of truth; it also
+SYNCS `optionalDependencies` to the version so six pins cannot drift on a release bump.
+
+**The tradeoff, and it is a sharp one: a missing optionalDependency is a SILENT SUCCESS.**
+npm exits 0 with no warning (verified: installed the wrapper with the platform package
+unresolvable — `npm i` reported success and the CLI had no binary). Three defences:
+
+- **Publish order in `release.yml` is load-bearing.** Platform packages publish FIRST, then
+  a step asserts every pin resolves on the registry, and only then the wrapper. Publishing
+  the wrapper first would open a window where `npm i -g` yields a silently broken install;
+  this way the worst case is a loud release failure with no wrapper published.
+- **`check-binaries.js` (prepublishOnly)** fails if any pin ≠ the wrapper version (a
+  split-brain release: binary from one release, wrapper from another) or any platform
+  package was not built. Mutation-tested: both exit 1 naming the exact package.
+- **`bundledBinPath()` returns null and every caller degrades.** The launcher names the
+  missing package and the likely cause (`--omit=optional`) rather than printing "binary not
+  found", because that error is the only signal the engineer will ever get.
+
 **Remaining npm gaps** (all real, none fixed here):
 
 - **postinstall races the daemon (known, accepted).** The version guard and the rename are
@@ -225,11 +313,15 @@ org's `PinnedCliVersion`.
   forward within ≤30m. Raised by review on PR #64.
 - `--ignore-scripts` skips postinstall, so the launcher falls back to the bundled binary and
   the old in-node_modules drift returns. Working-but-drifting beats not working.
-- We ship all six platform binaries in one package. Claude Code uses per-platform
-  `optionalDependencies` (`@anthropic-ai/claude-code-darwin-arm64`, …) plus a postinstall
-  that hardlinks the right one over `bin/claude.exe`, so an install downloads ONE binary and
-  no node process stays resident. Ours still keeps a node wrapper on the hot path of every
-  invocation.
+- **The node wrapper stays, and it is now load-bearing** — do not "optimise" it away.
+  Claude Code's postinstall hardlinks the native binary over `bin/claude.exe` so npm's bin
+  IS the binary and no node process is involved. Copying that would put `os.Executable()`
+  back inside node_modules, self-update would swap it, and the npm drift would return — it
+  would undo this whole design. They can do it only because they do NOT auto-update the npm
+  copy; we must, because nobody reads a daemon's stderr. The cost is ~30ms of node startup
+  on short foreground commands ONLY: the daemon does not run under node (autostart writes
+  `state.SelfBin()` — the Go binary — into the launchd plist / systemd ExecStart, and a live
+  daemon shows PPID 1, no node parent).
 
 ### The not-writable nudge must update THE COPY THAT PRINTED IT
 
@@ -282,6 +374,13 @@ GOOS=windows and would make the checks host-dependent and untestable from a unix
   makes `watch` print `capture already running (pid N) — not starting a second watcher`.
   Set `HOME` and `PROMPTSTER_STATE_DIR` to throwaway dirs. Never kill the developer's
   real capture process to free the lock.
+- **Killing the npm shim does NOT kill the daemon.** `npm/bin/promptster-teams.js` is a node
+  wrapper that `spawnSync`s the Go binary, so backgrounding the shim and `kill`ing that pid
+  leaves the Go child alive, reparented to pid 1, pointing at a sandbox you are about to
+  delete. Four such orphans accumulated in one session this way. Kill the Go pid
+  (`pgrep -f 'promptster-teams.*watch'`), or use `promptster-teams stop`, and check for
+  strays before finishing — filter by the scratchpad path so the developer's real daemon is
+  never in the blast radius.
 - **macOS has no `timeout(1)`.** Background the process and `kill` it, or a
   `timeout ... | grep` pipeline fails and silently looks like "the feature didn't fire".
 

@@ -13,10 +13,12 @@ const { spawnSync } = require("child_process");
 const fs = require("fs");
 
 const {
+  PLATFORMS,
   bundledBinPath,
   managedBinPath,
   isGlobalInstall,
   platformKey,
+  platformPackage,
 } = require("../lib/resolve");
 
 function usable(p) {
@@ -30,10 +32,6 @@ function usable(p) {
 }
 
 const bundled = bundledBinPath();
-if (!bundled) {
-  console.error(`promptster-teams: unsupported platform ${platformKey()}`);
-  process.exit(1);
-}
 
 // A project-local install runs ITS OWN binary, never the shared managed one.
 // The managed binary is per-user; a lockfile is a per-project pin. Pointing a
@@ -48,8 +46,21 @@ const managed = isGlobalInstall() ? managedBinPath() : null;
 const binPath = usable(managed) ? managed : bundled;
 
 if (!usable(binPath)) {
-  console.error(`promptster-teams: binary not found at ${binPath}`);
-  console.error("The package may have installed incorrectly; try reinstalling.");
+  // The binary now arrives as a per-platform optionalDependency, and npm treats
+  // a missing optional dep as a SUCCESSFUL install — no error, no warning. So
+  // this is the first and only place an engineer learns anything is wrong, and
+  // a bare "binary not found" would send them hunting the wrong thing. Name the
+  // package that is actually missing and the most likely cause.
+  if (!PLATFORMS.includes(platformKey())) {
+    console.error(`promptster-teams: unsupported platform ${platformKey()}`);
+    console.error(`Supported: ${PLATFORMS.join(", ")}`);
+    process.exit(1);
+  }
+  console.error(
+    `promptster-teams: no binary found — ${platformPackage()} is not installed.`
+  );
+  console.error("This usually means the install used --omit=optional/--no-optional.");
+  console.error("Fix: npm i -g @promptster/teams-cli   (without omitting optional deps)");
   process.exit(1);
 }
 

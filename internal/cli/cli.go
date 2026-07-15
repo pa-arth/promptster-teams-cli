@@ -81,7 +81,7 @@ Commands:
   login        Save your developer key (PSE-XXXX-…) — paste it or pass --key
   start        Capture in the background (detaches and returns your shell)
   stop         Stop background capture
-  autostart    Keep capture alive across reboots (enable|disable|status) — starts at login
+  autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   watch        Foreground capture — tail transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)

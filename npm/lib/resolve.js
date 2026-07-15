@@ -21,30 +21,66 @@
 // self-update stays fully automatic — which matters because this is a daemon:
 // unlike claude/codex, there is no human reading a "please upgrade" nudge.
 //
+// That pristine copy arrives via a per-platform optionalDependency gated on
+// npm's os/cpu fields, so an install downloads ONE binary (~18MB) instead of the
+// six (~74.5MB) that used to ship in a single tarball. The tradeoff: optional
+// deps fail SILENTLY, so every consumer of bundledBinPath() must handle null.
+//
 // Keep this file dependency-free: postinstall must run before anything is
 // installed, and the launcher is on the hot path of every invocation.
 
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 
-// Maps node's platform-arch to the binary shipped in binaries/.
-const PLATFORMS = {
-  "darwin-x64": "promptster-teams-darwin-x64",
-  "darwin-arm64": "promptster-teams-darwin-arm64",
-  "linux-x64": "promptster-teams-linux-x64",
-  "linux-arm64": "promptster-teams-linux-arm64",
-  "win32-x64": "promptster-teams-win32-x64.exe",
-  "win32-arm64": "promptster-teams-win32-arm64.exe",
-};
+// The platform-arch keys we publish a binary package for. The package name is
+// always `<wrapper>-<key>` and the binary inside is always named canonically,
+// so the key is the only thing that varies.
+const PLATFORMS = [
+  "darwin-x64",
+  "darwin-arm64",
+  "linux-x64",
+  "linux-arm64",
+  "win32-x64",
+  "win32-arm64",
+];
+
+const PKG_PREFIX = "@promptster/teams-cli";
 
 function platformKey() {
   return `${process.platform}-${process.arch}`;
 }
 
-// bundledBinPath is the pristine copy npm installed. Never mutated.
+function platformPackage(key) {
+  return `${PKG_PREFIX}-${key || platformKey()}`;
+}
+
+// bundledBinPath is the pristine copy npm installed — now inside the per-platform
+// optionalDependency (@promptster/teams-cli-darwin-arm64, …) rather than a
+// binaries/ directory carrying all six. npm skips the packages whose os/cpu do
+// not match the host, so exactly one is ever present.
+//
+// Returns null when the platform package is absent. That is a REAL state, not a
+// theoretical one: optional dependencies fail SILENTLY by design, so
+// --omit=optional, a partial registry publish, or an unsupported platform all
+// land here with npm reporting success. Callers must degrade, never assume.
+//
+// Resolved via require.resolve rather than a hardcoded ../../ path so it works
+// wherever the package manager actually put it — hoisted to a root
+// node_modules, nested, or in a pnpm store.
 function bundledBinPath() {
-  const name = PLATFORMS[platformKey()];
-  return name ? path.join(__dirname, "..", "binaries", name) : null;
+  const key = platformKey();
+  if (!PLATFORMS.includes(key)) return null;
+  const binName = key.startsWith("win32-")
+    ? "promptster-teams.exe"
+    : "promptster-teams";
+  try {
+    const pkgJson = require.resolve(`${platformPackage(key)}/package.json`);
+    const p = path.join(path.dirname(pkgJson), binName);
+    return fs.existsSync(p) ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 // managedBinPath MUST stay in lockstep with Go's state.CanonicalInstallBin and
@@ -121,6 +157,7 @@ function isNewer(a, b) {
 module.exports = {
   PLATFORMS,
   platformKey,
+  platformPackage,
   bundledBinPath,
   managedBinPath,
   isGlobalInstall,
