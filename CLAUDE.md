@@ -66,41 +66,79 @@ so the detached child runs the normal watch startup check within a second. Same 
 
 Anything that never reaches `watch` never checks.
 
+### How the check resolves a version (NOT the JSON API)
+
+`fetchLatestTag` issues a **HEAD that does not follow redirects** against
+`github.com/<slug>/releases/latest` and reads the tag out of the `Location`
+(`.../releases/tag/v0.6.1`). It deliberately does **not** touch
+`api.github.com/repos/.../releases/latest`. Measured difference:
+
+| | releases/latest redirect | api.github.com JSON |
+|---|---|---|
+| Response | ~0 bytes (headers only) | **~20,600 bytes** |
+| Rate limit | none (CDN, no `x-ratelimit` at all) | **60/hr unauthenticated per IP** |
+
+That 60/hr per-IP ceiling — shared by an entire fleet behind one corporate NAT — is the
+sole reason the cadence used to be 24h. Reading the redirect removes the cage, which is
+what makes a 30m cadence affordable. **Do not "simplify" this back to the JSON API for a
+tidier parse**; the parse is not the point, the rate limit is. `LatestVersionBestEffort`
+(`doctor`) reads the same redirect for the same reason — it is the one command engineers
+run repeatedly while something is already wrong.
+
+The tag is treated as untrusted input (it is interpolated into the download URL), so
+`tagFromReleaseLocation` rejects anything with a path separator. That is defence in depth,
+not the trust boundary: minisign-over-SHA256SUMS still gates every installed byte.
+
 ### Timing
 
-- `updateCheckInterval = 24 * time.Hour`, `updateCheckPoll = 5 * time.Minute` (`selfupdate.go`).
+- `updateCheckInterval = 30 * time.Minute`, `updateCheckPoll = 5 * time.Minute`
+  (`selfupdate.go`). Worst case release→installed is **~35m** (was ~24h05m).
 - `runAutoUpdate` checks **once at startup unconditionally** — it ignores the persisted
   cursor. So a restart always forces a check.
 - Steady state: the poll compares now against the cursor and acts once the current
-  interval has elapsed. Worst case release→update is **~24h05m**.
-- The poll is deliberately far below the interval: it is a file read and a compare, with
-  no network unless an interval actually elapsed, so it costs nothing — and it bounds how
-  fast a `minCliVersion` floor can escalate (below).
+  interval has elapsed.
 - Cursor: `state.GlobalPromptsterDir()/last-update-check`, RFC3339, mode 0600. Unreadable
   or unparseable → zero time → treated as stale → checks on the next tick.
 - **No backoff.** The cursor advances after every check including failures, so a broken
   release is retried at most once per interval rather than hot-looping.
 
+### Why 30m, and what the 24h was actually buying
+
+The old note here claimed *"the 24h stagger is the only canary window that exists"*. That
+was half-true and the half that was false mattered: the stagger is keyed to whenever each
+daemon happened to start, so it was never a **deliberate** canary — just randomly-spread
+blast radius. What it did genuinely buy is time to **yank a bad release** before most of
+the fleet took it, and that lever still works at 30m: a deleted release stops being
+`releases/latest`, so machines that have not updated never will.
+
+What tips the balance: **a fast cadence cuts time-to-RECOVER by the same factor it cuts
+time-to-break.** At 24h a bad release poisons machines for a day *and* the fix takes
+another day to land. At 30m, both are 30m.
+
+A real canary is a **channel** — a `stable` pointer lagging `latest`, which is what Claude
+Code does (`downloads.claude.ai/claude-code-releases/{latest,stable}` were 8 versions apart
+when measured). That is the follow-up. **Do not re-approximate it by raising the
+interval.**
+
 ### The minCliVersion escalation floor
 
-`u.checkInterval()` returns `belowMinCheckInterval` (15m) instead of the 24h cadence while
+`u.checkInterval()` returns `belowMinCheckInterval` (15m) instead of the 30m cadence while
 the running version is below the org's `minCliVersion`. It is the emergency lever for a
 security fix. Absent/empty field ⇒ nothing changes.
 
-Three properties that are load-bearing, in descending order of how badly you'd regret
-breaking them:
+Note the floor now buys much less than it did: 15m against a 30m base, versus 15m against
+24h. It is kept because it still halves the worst case under an active security rollout and
+costs nothing when unset — **not** because it is still the load-bearing thing it was.
+
+Two properties that remain load-bearing:
 
 - **The floor moves the CADENCE only.** `checkAndApply` still enforces the org auto-update
   switch and any pin, so a floor can neither override an opt-out nor drag a pinned fleet
   past its pin. It never changes *which* tag is installed.
 - **15m is a RETRY FLOOR, not a target.** A fleet below the floor that cannot update
-  (upstream down, release yanked) would otherwise re-hit the releases API every poll and
-  exhaust the 60/hr unauthenticated per-IP limit — starving the update it is chasing. That
-  bites hardest behind a corporate NAT, where the whole fleet shares one IP.
-- **Do NOT "simplify" this into a shorter global interval.** Self-update is forward-only
-  (`isNewer` gates every target, pins included), so **a bad release cannot be recalled**.
-  The 24h stagger is the only canary window that exists. The floor keeps it by default and
-  lets us opt into speed per-release.
+  (upstream down, release yanked) should not re-check every poll. The 60/hr rate limit that
+  originally made this critical is gone (the check no longer hits the JSON API), so this is
+  now ordinary politeness rather than self-preservation.
 
 The lever only works on CLIs that already understand the field, and the CLI is the
 slow-propagating side — so it cannot help the fleet that is live when you need it. That is
@@ -120,7 +158,7 @@ triggers a check. That is the only npm gap.
 
 **Known drift:** `npm/package.json` stays pinned at its published version while the
 binary underneath self-updates, so `npm ls` / `npm outdated` will lie, and a reinstall
-writes the older binary back. It self-heals within 24h because `isNewer` only moves
+writes the older binary back. It self-heals within 30m because `isNewer` only moves
 forward — cosmetic, but it will confuse fleet debugging.
 
 ### The not-writable nudge must update THE COPY THAT PRINTED IT
@@ -129,9 +167,28 @@ When the install dir fails the `dirWritable` probe, `checkAndApply` prints `nudg
 
 The invariant: any hint that installs somewhere other than `self` drops a second binary in
 a different PATH entry, leaves a coin flip over which one runs, and leaves the stale copy
-stale — the exact failure the hint exists to fix. Two ways to violate it, and both are easy
-to walk back into:
+stale — the exact failure the hint exists to fix. Three ways to violate it, all easy to
+walk back into:
 
+- **Pointing `nudgeCurl` at the wrong PRODUCT.** It shipped as
+  `curl -fsSL https://get.promptster.ai | sh` — which is the **hiring CLI's** installer
+  (`promptster` from `pa-arth/promptster-cli-releases` into `~/.promptster/bin`). It
+  installed an unrelated product and left promptster-teams exactly as stale as it was.
+  `nudgeCurl` must name **this** repo's `install.sh`
+  (`raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh`).
+  `TestNudgeCurlInstallsThisProduct` pins the CONTENT; every other nudge test compares
+  against the `nudgeCurl` *constant* and therefore stayed green for the entire life of the
+  bug. **A constant-vs-constant assertion proves nothing about a URL.**
+- **Sending a standalone binary to `install.sh` at all.** `install.sh` hardcodes
+  `INSTALL_DIR="${HOME}/.promptster-teams/bin"` — it writes ONE path. So `nudgeCurl` is
+  correct *only* when `self` is already that exact file; a root-owned
+  `/usr/local/bin/promptster-teams` or a Homebrew-prefix copy that re-runs it gets a
+  second binary in a different PATH entry and stays stale. `nudgeFor(self, curlDest)` gates
+  on `samePath`, and everything else falls to `nudgeStandalone`, which names the file and
+  the releases URL and prescribes nothing. `curlInstallDest` derives the path from
+  `state.GlobalPromptsterDir()` — but **`install.sh` owns the `/bin/promptster-teams` tail,
+  so that is the half to re-check if the script's `INSTALL_DIR` ever moves.** Caught by
+  review on PR #63, after the wrong-product fix had already been written and tested.
 - Telling an npm-installed engineer to run the curl installer.
 - Telling a **project-local** or pnpm install to `npm i -g` — that updates the global
   prefix and leaves the local copy untouched. Global-vs-local matters more than
@@ -158,10 +215,22 @@ GOOS=windows and would make the checks host-dependent and untestable from a unix
 - **macOS has no `timeout(1)`.** Background the process and `kill` it, or a
   `timeout ... | grep` pipeline fails and silently looks like "the feature didn't fire".
 
-### Open edge
+- **A fake key is enough.** `watch` exits early with `no developer key configured` before
+  it ever reaches `StartAutoUpdate`. Any format-valid key gets you past it
+  (`PSE-` + six 4-char groups, base32 alphabet — no `I`/`O`/`0`/`1`); ingest then 401s
+  harmlessly, which does not touch the update path.
+- **Evidence the swap really happened**: the binary's sha256 changes, and the startup
+  banner prints **twice** — the second is the `syscall.Exec` re-exec. Confirm the installed
+  bytes against the published `SHA256SUMS` rather than trusting the version string.
+
+### Open edge (largely defused, not gone)
 
 `runAutoUpdate`'s startup check ignores the cursor, so a crash-looping watch under launchd
-(`ThrottleInterval` 10s, `internal/service/service.go`) hits
-`api.github.com/repos/.../releases/latest` on every respawn and can burn the 60/hr
-unauthenticated rate limit. `KeepAlive{SuccessfulExit: false}` limits this to genuine
-crashes. Fix would be to honor the cursor at startup unless it is older than ~1h.
+(`ThrottleInterval` 10s, `internal/service/service.go`) re-checks on every respawn.
+`KeepAlive{SuccessfulExit: false}` limits this to genuine crashes.
+
+This used to risk burning the 60/hr `api.github.com` limit. Since the check is now a
+header-only HEAD against a CDN with no rate limit, the blast radius is down to wasted
+requests. Still worth honoring the cursor at startup unless it is older than ~1h — but note
+that the unconditional startup check is also **the documented way to force an update now**
+(restart the daemon), so anything here must keep that escape hatch.

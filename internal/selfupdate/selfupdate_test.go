@@ -39,26 +39,38 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 	routes := map[string]resp{}
 	var app []string
 
+	// Longest matching substring wins so "/SHA256SUMS.minisig" beats
+	// "/SHA256SUMS". A registered code of 0 means "network error".
+	match := func(url string) (resp, bool) {
+		best, bestLen := resp{code: 404}, -1
+		for sub, r := range routes {
+			if strings.Contains(url, sub) && len(sub) > bestLen {
+				best, bestLen = r, len(sub)
+			}
+		}
+		return best, best.code != 0
+	}
+
 	u = &updater{
 		currentVersion: current,
 		policy:         pol,
 		goos:           "darwin",
 		goarch:         "arm64",
-		apiBaseURL:     "https://api.test",
 		releaseBaseURL: "https://rel.test",
 		httpGet: func(url string, limit int64) ([]byte, int, error) {
-			// Longest matching substring wins so "/SHA256SUMS.minisig" beats
-			// "/SHA256SUMS".
-			best, bestLen := resp{code: 404}, -1
-			for sub, r := range routes {
-				if strings.Contains(url, sub) && len(sub) > bestLen {
-					best, bestLen = r, len(sub)
-				}
-			}
-			if best.code == 0 {
+			best, ok := match(url)
+			if !ok {
 				return nil, 0, fmt.Errorf("network error: %s", url)
 			}
 			return []byte(best.body), best.code, nil
+		},
+		// Redirect routes reuse the same table: body IS the Location header.
+		httpRedirect: func(url string) (string, int, error) {
+			best, ok := match(url)
+			if !ok {
+				return "", 0, fmt.Errorf("network error: %s", url)
+			}
+			return best.body, best.code, nil
 		},
 		resolveSelf: func() (string, error) { return self, nil },
 		apply: func(selfPath, staged string) error {
@@ -72,9 +84,17 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 	return u, &app, addRoute
 }
 
+// latestRoute is the releases/latest redirect route: the substring the stub
+// matches, and the Location it answers with.
+const latestRoute = "rel.test/pa-arth/promptster-teams-cli/releases/latest"
+
+func locationForTag(tag string) string {
+	return "https://rel.test/pa-arth/promptster-teams-cli/releases/tag/" + tag
+}
+
 // wireHappyRelease registers a full valid release at tag v9.9.9.
 func wireHappyRelease(addRoute func(sub, body string, code int)) {
-	addRoute("api.test/repos/pa-arth/promptster-teams-cli/releases/latest", `{"tag_name":"v9.9.9"}`, 200)
+	addRoute(latestRoute, locationForTag("v9.9.9"), 302)
 	addRoute("releases/download/v9.9.9/SHA256SUMS.minisig", sampleSig, 200)
 	addRoute("releases/download/v9.9.9/SHA256SUMS", sampleSums, 200)
 	addRoute("releases/download/v9.9.9/promptster-teams-darwin-arm64", "darwin-binary-content-v1\n", 200)
@@ -199,6 +219,10 @@ func TestNonWritableDirNudges(t *testing.T) {
 	}
 }
 
+// testCurlDest stands in for install.sh's ${HOME}/.promptster-teams/bin
+// destination, injected so these cases do not depend on the runner's $HOME.
+const testCurlDest = "/home/e/.promptster-teams/bin/promptster-teams"
+
 func TestNudgeMatchesInstallChannel(t *testing.T) {
 	cases := []struct {
 		name string
@@ -208,10 +232,18 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 		{"npm global unix", "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64", nudgeNpmGlobal},
 		{"npm global windows", `C:\Users\e\AppData\Roaming\npm\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`, nudgeNpmGlobal},
 		{"pnpm global", "/home/e/Library/pnpm/global/5/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-linux-x64", nudgePnpmGlobal},
-		{"curl installer", "/usr/local/bin/promptster-teams", nudgeCurl},
-		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeCurl},
+
+		// ONLY a self already at install.sh's destination may be told to re-run
+		// install.sh — that is the one case where it overwrites this binary.
+		{"curl install dest", testCurlDest, nudgeCurl},
+
+		// These previously asserted nudgeCurl, which was the bug: install.sh
+		// hardcodes ${HOME}/.promptster-teams/bin, so re-running it from any of
+		// these leaves a second binary and this copy stale.
+		{"standalone /usr/local/bin", "/usr/local/bin/promptster-teams", nudgeStandalone("/usr/local/bin/promptster-teams")},
+		{"homebrew", "/opt/homebrew/bin/promptster-teams", nudgeStandalone("/opt/homebrew/bin/promptster-teams")},
 		// A directory merely containing the substring must not read as npm.
-		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeCurl},
+		{"lookalike dir", "/home/e/my-node_modules-backup/promptster-teams", nudgeStandalone("/home/e/my-node_modules-backup/promptster-teams")},
 
 		// The cases the review caught: a global command against a project-local
 		// install updates the global prefix and leaves this copy stale, so these
@@ -234,10 +266,59 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := nudgeFor(tc.self); got != tc.want {
+			if got := nudgeFor(tc.self, testCurlDest); got != tc.want {
 				t.Fatalf("nudgeFor(%q) = %q, want %q", tc.self, got, tc.want)
 			}
 		})
+	}
+}
+
+// install.sh writes ONE fixed path (${HOME}/.promptster-teams/bin). Telling a
+// binary that lives anywhere else to run it leaves a second copy and keeps this
+// one stale — PATH order then decides which runs, which is the whole failure
+// nudgeFor exists to prevent. Caught by review on PR #63.
+func TestOnlyTheCurlDestIsToldToRunInstallSh(t *testing.T) {
+	elsewhere := []string{
+		"/usr/local/bin/promptster-teams",
+		"/opt/homebrew/bin/promptster-teams",
+		"/usr/bin/promptster-teams",
+		"/home/e/bin/promptster-teams",
+		"/home/e/.promptster-teams/promptster-teams",      // near miss: no /bin
+		"/home/e/.promptster-teams/bin/promptster-teams2", // near miss: wrong file
+	}
+	for _, self := range elsewhere {
+		if got := nudgeFor(self, testCurlDest); got == nudgeCurl {
+			t.Fatalf("%q was told to run install.sh, which writes %q instead", self, testCurlDest)
+		}
+	}
+	// The one case that IS allowed to.
+	if got := nudgeFor(testCurlDest, testCurlDest); got != nudgeCurl {
+		t.Fatalf("nudgeFor(curlDest) = %q, want nudgeCurl", got)
+	}
+	// An unknown home must degrade to the safe hint, never to install.sh.
+	if got := nudgeFor("/usr/local/bin/promptster-teams", ""); got == nudgeCurl {
+		t.Fatal("empty curlDest must not match anything")
+	}
+}
+
+// nudgeCurl once pointed at https://get.promptster.ai — the HIRING CLI's
+// installer, which drops `promptster` from pa-arth/promptster-cli-releases into
+// ~/.promptster/bin and leaves promptster-teams exactly as stale as it was.
+//
+// Every other nudge test compares against the nudgeCurl CONSTANT, so all of
+// them stayed green while it named the wrong product. This one pins the
+// CONTENT, which is the only way that class of bug gets caught.
+func TestNudgeCurlInstallsThisProduct(t *testing.T) {
+	if !strings.Contains(nudgeCurl, repoSlug) {
+		t.Fatalf("nudgeCurl does not name %s: %q", repoSlug, nudgeCurl)
+	}
+	if !strings.Contains(nudgeCurl, "install.sh") {
+		t.Fatalf("nudgeCurl does not run this repo's install.sh: %q", nudgeCurl)
+	}
+	// The hiring CLI's installer, in any form.
+	if strings.Contains(nudgeCurl, "get.promptster.ai") ||
+		strings.Contains(nudgeCurl, "promptster-cli-releases") {
+		t.Fatalf("nudgeCurl points at the hiring CLI installer: %q", nudgeCurl)
 	}
 }
 
@@ -251,7 +332,7 @@ func TestLocalInstallNeverGetsAGlobalHint(t *testing.T) {
 		`C:\Users\e\proj\node_modules\@promptster\teams-cli\binaries\promptster-teams-win32-x64.exe`,
 	}
 	for _, self := range locals {
-		got := nudgeFor(self)
+		got := nudgeFor(self, testCurlDest)
 		for _, bad := range []string{nudgeNpmGlobal, nudgePnpmGlobal, nudgeCurl} {
 			if got == bad {
 				t.Fatalf("local install %q got global/curl hint %q", self, got)
@@ -323,7 +404,7 @@ func TestMinCliVersionDoesNotOverridePin(t *testing.T) {
 
 func TestSha256MismatchRejected(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
-	addRoute("api.test/repos/pa-arth/promptster-teams-cli/releases/latest", `{"tag_name":"v9.9.9"}`, 200)
+	addRoute(latestRoute, locationForTag("v9.9.9"), 302)
 	addRoute("releases/download/v9.9.9/SHA256SUMS.minisig", sampleSig, 200)
 	addRoute("releases/download/v9.9.9/SHA256SUMS", sampleSums, 200)
 	// Serve a binary whose bytes do NOT match the signed checksum.
@@ -338,7 +419,7 @@ func TestSha256MismatchRejected(t *testing.T) {
 
 func TestBadSignatureRejected(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
-	addRoute("api.test/repos/pa-arth/promptster-teams-cli/releases/latest", `{"tag_name":"v9.9.9"}`, 200)
+	addRoute(latestRoute, locationForTag("v9.9.9"), 302)
 	// A validly-formatted but wrong signature (SHA256SUMS content changed after
 	// signing) must reject the whole update.
 	addRoute("releases/download/v9.9.9/SHA256SUMS.minisig", sampleSig, 200)
@@ -354,8 +435,116 @@ func TestBadSignatureRejected(t *testing.T) {
 
 func TestFetchLatestError(t *testing.T) {
 	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
-	addRoute("api.test/repos/pa-arth/promptster-teams-cli/releases/latest", "", 0) // network error
+	addRoute(latestRoute, "", 0) // network error
 	if got := u.checkAndApply(); got != outcomeError {
 		t.Fatalf("latest-fetch error outcome = %v, want error", got)
+	}
+}
+
+// The tag now comes from a redirect target rather than a JSON field, so the
+// parse is the new failure surface.
+func TestTagFromReleaseLocation(t *testing.T) {
+	ok := []struct{ name, loc, want string }{
+		{"absolute", "https://github.com/pa-arth/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
+		{"relative", "/pa-arth/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
+		{"trailing slash", "https://github.com/x/y/releases/tag/v1.2.3/", "v1.2.3"},
+		{"percent-escaped", "https://github.com/x/y/releases/tag/v1.2.3%2Brc1", "v1.2.3+rc1"},
+		{"no v prefix", "https://github.com/x/y/releases/tag/1.2.3", "1.2.3"},
+	}
+	for _, tc := range ok {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tagFromReleaseLocation(tc.loc)
+			if err != nil {
+				t.Fatalf("tagFromReleaseLocation(%q) errored: %v", tc.loc, err)
+			}
+			if got != tc.want {
+				t.Fatalf("tagFromReleaseLocation(%q) = %q, want %q", tc.loc, got, tc.want)
+			}
+		})
+	}
+
+	bad := []struct{ name, loc string }{
+		{"empty", ""},
+		{"no marker", "https://github.com/pa-arth/promptster-teams-cli/releases"},
+		{"empty tag", "https://github.com/x/y/releases/tag/"},
+		{"login redirect", "https://github.com/login?return_to=%2Fx%2Fy"},
+		// The tag is interpolated into the download URL, so a separator that
+		// could climb out of /releases/download/<tag>/ must be refused.
+		{"traversal escaped", "https://github.com/x/y/releases/tag/..%2F..%2Fevil"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			if got, err := tagFromReleaseLocation(tc.loc); err == nil {
+				t.Fatalf("tagFromReleaseLocation(%q) = %q, want error", tc.loc, got)
+			}
+		})
+	}
+}
+
+// A repo with no releases answers 200 (the releases index) instead of
+// redirecting; a 200 must never be mistaken for a usable tag.
+func TestFetchLatestTagRequiresRedirect(t *testing.T) {
+	cases := []struct {
+		name, body string
+		code       int
+	}{
+		{"200 index page", "<html>no releases</html>", 200},
+		{"404", "", 404},
+		{"3xx with no Location", "", 302},
+		// Isolates the status check from the Location parse: a perfectly
+		// well-formed tag target that arrives on a NON-redirect status (a proxy
+		// or captive portal answering 200 with a Location header) must still be
+		// refused. Without this case the status guard can be deleted and every
+		// other case here stays green, because their Locations fail the parse
+		// anyway.
+		{"200 carrying a valid tag Location", locationForTag("v9.9.9"), 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+			// Wire a COMPLETE, valid release at v9.9.9 first, then override only
+			// the latest-redirect. Without this the assets would 404 and every
+			// case would reach outcomeError via a failed download no matter what
+			// fetchLatestTag decided — the failure would mask the thing under
+			// test. With it, a tag that wrongly resolves goes on to APPLY, so
+			// outcomeError is evidence the resolve itself refused.
+			wireHappyRelease(addRoute)
+			addRoute(latestRoute, tc.body, tc.code)
+			if got := u.checkAndApply(); got != outcomeError {
+				t.Fatalf("outcome = %v, want error", got)
+			}
+			if len(*applied) != 0 {
+				t.Fatal("must not apply without a resolved tag")
+			}
+		})
+	}
+}
+
+// The whole point of the change: no check may touch api.github.com, whose
+// 60/hr per-IP limit is what forced the old 24h cadence.
+func TestChecksNeverHitTheGitHubAPI(t *testing.T) {
+	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+
+	var seen []string
+	wrappedGet, wrappedRedirect := u.httpGet, u.httpRedirect
+	u.httpGet = func(url string, limit int64) ([]byte, int, error) {
+		seen = append(seen, url)
+		return wrappedGet(url, limit)
+	}
+	u.httpRedirect = func(url string) (string, int, error) {
+		seen = append(seen, url)
+		return wrappedRedirect(url)
+	}
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("outcome = %v, want applied", got)
+	}
+	if len(seen) == 0 {
+		t.Fatal("no requests recorded — the test is not exercising the fetch path")
+	}
+	for _, url := range seen {
+		if strings.Contains(url, "api.github.com") || strings.Contains(url, "/repos/") {
+			t.Fatalf("check hit the rate-limited JSON API: %q", url)
+		}
 	}
 }
