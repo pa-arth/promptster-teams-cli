@@ -213,6 +213,47 @@ org's `PinnedCliVersion`.
   hard-fails the publish — because losing the postinstall reverts everything **silently**:
   the CLI keeps working, so nothing breaks until someone notices `npm ls` lying weeks later.
 
+### autostart bakes an ABSOLUTE path — moving the binary is a migration
+
+`autostart enable` renders `state.SelfBin()` into the launchd plist / systemd unit /
+scheduled task **once**, and nothing revisits it. So any change to where the binary lives
+silently orphans every already-enabled unit.
+
+That is not hypothetical — it was caught on a real machine mid-review. A live plist read:
+
+```
+ProgramArguments: [.../node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64, watch]
+```
+
+The wrapper no longer ships `binaries/` at all, so the next `npm i -g` deletes exactly that
+file. **Nothing fails loudly**: the running daemon holds its inode and capture looks fine,
+then at the next login launchd runs a path that is gone and capture never comes back — the
+precise failure autostart exists to prevent.
+
+`autostart repair` (`internal/cli/autostart.go`) is the migration, and npm's postinstall
+calls it after installing the managed binary. Rules:
+
+- **It must never exit non-zero.** It runs inside `npm install`, where a non-zero exit
+  aborts the install and leaves the engineer with no CLI at all — far worse than a stale
+  unit path.
+- **It re-renders unconditionally** rather than reading the unit's current path back:
+  that would mean a plist parser, a systemd-unit parser and a schtasks-XML parser, three
+  platforms to avoid one idempotent bootout/bootstrap.
+- **It skips the key check** `autostart enable` does. The unit only exists because the
+  engineer had a key when they enabled it; a transient key problem is no reason to leave
+  the path broken.
+- The linux smoke test in `ci.yml` proves it end-to-end: bake a unit with a path, delete
+  that path, repair, assert the unit now names a binary that exists and the stale one is
+  gone — plus the no-op-when-not-enabled case.
+
+**macOS autostart is NOT covered by CI** (the smoke matrix is ubuntu + windows), and it
+cannot be tested on a dev machine either: `launchctl bootout/bootstrap` target
+`gui/$UID` by LABEL, so even with a sandboxed `HOME` they tear down the developer's real
+`ai.promptster.teams` job and bootstrap the sandbox plist in its place. Only `Status()` and
+`repair`'s no-op path are safe to exercise locally — `Status()` reads the plist under
+`os.UserHomeDir()`, so a sandboxed HOME makes it correctly report "not enabled" and repair
+returns before touching launchctl.
+
 ### The binary ships as a per-platform optionalDependency
 
 The wrapper carries **no binary**. It declares six packages

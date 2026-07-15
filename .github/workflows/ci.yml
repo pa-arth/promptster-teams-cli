@@ -97,9 +97,34 @@ jobs:
           ! systemctl --user is-active --quiet promptster-teams.service   # really halted
           /tmp/pt autostart status | tee /tmp/s2
           grep -q "systemd --user" /tmp/s2                         # still reports enabled
+          # `autostart repair` re-points an enabled unit at the binary running
+          # NOW. It is the migration for engineers whose unit still names the old
+          # in-node_modules path: the npm wrapper no longer ships binaries/, so
+          # that path disappears on upgrade and the unit silently fails at the
+          # next login. Simulate exactly that — a unit baked with a path we then
+          # delete — and prove repair rescues it.
+          cp /tmp/pt /tmp/pt-old
+          /tmp/pt-old autostart enable
+          grep -q "/tmp/pt-old" ~/.config/systemd/user/promptster-teams.service   # baked the old path
+          rm -f /tmp/pt-old                                                       # the npm upgrade deletes it
+          ! grep -q "^ExecStart=/tmp/pt " ~/.config/systemd/user/promptster-teams.service  # unit is now stale
+          /tmp/pt autostart repair | tee /tmp/r1
+          grep -q "re-pointed at" /tmp/r1
+          grep -q "/tmp/pt" ~/.config/systemd/user/promptster-teams.service       # now names a binary that exists
+          ! grep -q "pt-old" ~/.config/systemd/user/promptster-teams.service      # stale path gone
+          systemctl --user is-enabled promptster-teams.service                    # still registered
+          /tmp/pt stop
+
           /tmp/pt autostart disable
           /tmp/pt autostart status | tee /tmp/s3
           grep -qi "not enabled" /tmp/s3                           # deregistered
+          test ! -f ~/.config/systemd/user/promptster-teams.service
+
+          # repair must be a silent no-op (exit 0) when autostart was never
+          # enabled — it runs inside `npm install`, where any non-zero exit
+          # aborts the install and leaves the engineer with no CLI at all.
+          /tmp/pt autostart repair | tee /tmp/r2
+          test ! -s /tmp/r2
           test ! -f ~/.config/systemd/user/promptster-teams.service
 
       # Windows: Task Scheduler round-trip — the real test of the schtasks /TR
