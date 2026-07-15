@@ -80,7 +80,55 @@ jobs:
           echo "Signed SHA256SUMS (verified against committed minisign.pub):"
           cat npm/binaries/SHA256SUMS.minisig
 
-      - name: Publish to npm (idempotent)
+      # ORDER IS LOAD-BEARING. The wrapper's optionalDependencies pin these six
+      # exactly, and npm treats an UNRESOLVABLE optional dep as a SUCCESSFUL
+      # install — no error, no warning, just a CLI with no binary. So every
+      # platform package must exist on the registry BEFORE the wrapper that
+      # references them can be installed by anyone.
+      #
+      # Publishing the wrapper first would open a window where `npm i -g` yields
+      # a silently broken install; publishing it last means the worst case is a
+      # loud release failure with no wrapper published at all, which is the
+      # failure we want.
+      - name: Publish platform packages to npm (idempotent)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.VERSION }}"
+          for dir in npm/platforms/*/; do
+            NAME="$(node -p "require('./${dir}package.json').name")"
+            if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+              echo "Already published ${NAME}@${VER}; skipping."
+            else
+              (cd "${dir}" && npm publish --provenance --access public)
+            fi
+          done
+
+      # Belt and braces: the loop above could publish 5/6 and still exit 0 if a
+      # dir were missing entirely. Assert every pin the wrapper is about to ship
+      # actually resolves on the registry before we ship it.
+      - name: Verify every optionalDependency resolves before publishing wrapper
+        run: |
+          set -euo pipefail
+          VER="${{ steps.version.outputs.VERSION }}"
+          MISSING=""
+          for NAME in $(node -p "Object.keys(require('./npm/package.json').optionalDependencies||{}).join('\n')"); do
+            if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+              echo "  ok ${NAME}@${VER}"
+            else
+              echo "  MISSING ${NAME}@${VER}"
+              MISSING="${MISSING} ${NAME}"
+            fi
+          done
+          if [ -n "${MISSING}" ]; then
+            echo "::error::Refusing to publish the wrapper: unresolvable optionalDependencies:${MISSING}"
+            echo "npm treats a missing optional dep as a successful install, so shipping the"
+            echo "wrapper now would give engineers a CLI with no binary and no error."
+            exit 1
+          fi
+
+      - name: Publish wrapper to npm (idempotent)
         working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

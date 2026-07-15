@@ -69,3 +69,51 @@ if (absent.length > 0) {
 }
 
 console.log("✓ postinstall + resolve ship in the tarball");
+
+// The wrapper carries NO binary now — it declares six per-platform packages as
+// optionalDependencies, each pinned to the wrapper's exact version. Two ways
+// that goes wrong, both silent at install time:
+//
+//  - A pin that does not match this version resolves a binary from a DIFFERENT
+//    release than the wrapper. The seven tarballs are one artifact; a mismatched
+//    pin is a split-brain release.
+//  - A platform package that was never built cannot be published, and npm treats
+//    a MISSING optional dep as a successful install — so engineers on that
+//    platform get a working `promptster-teams` command with no binary behind it
+//    and no error. Fail here instead.
+const pkg = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")
+);
+const optDeps = pkg.optionalDependencies || {};
+const platformsDir = path.join(__dirname, "..", "platforms");
+
+const KEYS = ["darwin-x64", "darwin-arm64", "linux-x64", "linux-arm64", "win32-x64", "win32-arm64"];
+const problems = [];
+
+for (const key of KEYS) {
+  const name = `${pkg.name}-${key}`;
+  if (optDeps[name] !== pkg.version) {
+    problems.push(
+      `${name}: pinned to ${optDeps[name] || "(absent)"}, wrapper is ${pkg.version}`
+    );
+  }
+  const dir = path.join(platformsDir, key);
+  const bin = key.startsWith("win32-") ? "promptster-teams.exe" : "promptster-teams";
+  if (!fs.existsSync(path.join(dir, bin))) {
+    problems.push(`${name}: platforms/${key}/${bin} was not built`);
+  }
+}
+for (const name of Object.keys(optDeps)) {
+  if (!KEYS.some((k) => `${pkg.name}-${k}` === name)) {
+    problems.push(`${name}: optionalDependency has no matching platform package`);
+  }
+}
+
+if (problems.length > 0) {
+  console.error("ERROR: platform packages are not release-ready:");
+  for (const p of problems) console.error("  - " + p);
+  console.error("\nRun: node scripts/build.js <version>");
+  process.exit(1);
+}
+
+console.log(`✓ ${KEYS.length} platform packages built and pinned to ${pkg.version}`);

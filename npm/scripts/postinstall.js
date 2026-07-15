@@ -17,11 +17,13 @@ const fs = require("fs");
 const path = require("path");
 
 const {
+  PLATFORMS,
   bundledBinPath,
   managedBinPath,
   isGlobalInstall,
   isNewer,
   platformKey,
+  platformPackage,
 } = require("../lib/resolve");
 
 function warn(msg) {
@@ -70,11 +72,16 @@ function main() {
 
   const bundled = bundledBinPath();
   if (!bundled) {
-    warn(`unsupported platform ${platformKey()} — skipping binary install`);
-    return;
-  }
-  if (!fs.existsSync(bundled)) {
-    warn(`bundled binary missing at ${bundled} — skipping`);
+    // Either an unsupported platform, or the optionalDependency carrying the
+    // binary is absent. npm treats a missing optional dep as SUCCESS and says
+    // nothing, so this warning is the only signal the engineer will ever get
+    // that they have a CLI with no binary behind it. Say which package.
+    if (!PLATFORMS.includes(platformKey())) {
+      warn(`unsupported platform ${platformKey()} — no binary to install`);
+      return;
+    }
+    warn(`${platformPackage()} is not installed, so there is no binary to install.`);
+    warn("If you used --omit=optional or --no-optional, reinstall without it.");
     return;
   }
   const managed = managedBinPath();

@@ -213,6 +213,36 @@ org's `PinnedCliVersion`.
   hard-fails the publish — because losing the postinstall reverts everything **silently**:
   the CLI keeps working, so nothing breaks until someone notices `npm ls` lying weeks later.
 
+### The binary ships as a per-platform optionalDependency
+
+The wrapper carries **no binary**. It declares six packages
+(`@promptster/teams-cli-darwin-arm64`, …) as `optionalDependencies` pinned to its exact
+version; each carries one binary and is gated by npm's `os`/`cpu` fields. npm installs only
+the match, so an install pulls **12MB instead of 74.5MB** (measured: wrapper 28KB + one
+stripped binary; the old all-in-one tarball was 74.5MB unpacked). Same pattern as
+esbuild/swc/rollup, and as Claude Code (`@anthropic-ai/claude-code-darwin-arm64`, each
+pinned to the wrapper's exact version).
+
+`npm/binaries/` still exists — it is the GitHub Release assets + `SHA256SUMS` that
+`install.sh` and the Go self-updater download. It just no longer ships inside the npm
+wrapper. `scripts/build.js` emits both from one compile and is the source of truth; it also
+SYNCS `optionalDependencies` to the version so six pins cannot drift on a release bump.
+
+**The tradeoff, and it is a sharp one: a missing optionalDependency is a SILENT SUCCESS.**
+npm exits 0 with no warning (verified: installed the wrapper with the platform package
+unresolvable — `npm i` reported success and the CLI had no binary). Three defences:
+
+- **Publish order in `release.yml` is load-bearing.** Platform packages publish FIRST, then
+  a step asserts every pin resolves on the registry, and only then the wrapper. Publishing
+  the wrapper first would open a window where `npm i -g` yields a silently broken install;
+  this way the worst case is a loud release failure with no wrapper published.
+- **`check-binaries.js` (prepublishOnly)** fails if any pin ≠ the wrapper version (a
+  split-brain release: binary from one release, wrapper from another) or any platform
+  package was not built. Mutation-tested: both exit 1 naming the exact package.
+- **`bundledBinPath()` returns null and every caller degrades.** The launcher names the
+  missing package and the likely cause (`--omit=optional`) rather than printing "binary not
+  found", because that error is the only signal the engineer will ever get.
+
 **Remaining npm gaps** (all real, none fixed here):
 
 - **postinstall races the daemon (known, accepted).** The version guard and the rename are
@@ -225,11 +255,15 @@ org's `PinnedCliVersion`.
   forward within ≤30m. Raised by review on PR #64.
 - `--ignore-scripts` skips postinstall, so the launcher falls back to the bundled binary and
   the old in-node_modules drift returns. Working-but-drifting beats not working.
-- We ship all six platform binaries in one package. Claude Code uses per-platform
-  `optionalDependencies` (`@anthropic-ai/claude-code-darwin-arm64`, …) plus a postinstall
-  that hardlinks the right one over `bin/claude.exe`, so an install downloads ONE binary and
-  no node process stays resident. Ours still keeps a node wrapper on the hot path of every
-  invocation.
+- **The node wrapper stays, and it is now load-bearing** — do not "optimise" it away.
+  Claude Code's postinstall hardlinks the native binary over `bin/claude.exe` so npm's bin
+  IS the binary and no node process is involved. Copying that would put `os.Executable()`
+  back inside node_modules, self-update would swap it, and the npm drift would return — it
+  would undo this whole design. They can do it only because they do NOT auto-update the npm
+  copy; we must, because nobody reads a daemon's stderr. The cost is ~30ms of node startup
+  on short foreground commands ONLY: the daemon does not run under node (autostart writes
+  `state.SelfBin()` — the Go binary — into the launchd plist / systemd ExecStart, and a live
+  daemon shows PPID 1, no node parent).
 
 ### The not-writable nudge must update THE COPY THAT PRINTED IT
 
