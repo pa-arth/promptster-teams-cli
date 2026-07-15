@@ -165,6 +165,41 @@ jobs:
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
 
+  # The binary ships as six per-platform npm packages pinned to the wrapper's
+  # exact version. The platform set is written out in FOUR files that nothing
+  # cross-checks (build.js, resolve.js, check-binaries.js, package.json's
+  # optionalDependencies), and both drift directions fail SILENTLY on the one
+  # platform that was missed:
+  #
+  #   compiled but not resolved -> that platform gets "no binary found"
+  #   pinned but not published  -> a missing OPTIONAL dep is a SUCCESSFUL npm
+  #                                install, so the CLI just has no binary
+  #
+  # check-binaries.js catches some of this, but only at prepublish — after a tag
+  # is cut. This runs on every PR, needs no Go build (~50ms of source parsing),
+  # so drift dies at review time instead of release time.
+  npm-platforms:
+    name: npm platform lists in lockstep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # Same pinned SHA release.yml already uses — do not swap it for a
+      # different pin without checking that one first.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "20"
+      - name: platform lists + version pins agree
+        working-directory: npm
+        run: node scripts/check-platform-lists.js
+      - name: npm scripts parse
+        working-directory: npm
+        run: |
+          for f in lib/resolve.js bin/promptster-teams.js scripts/postinstall.js \
+                   scripts/build.js scripts/check-binaries.js scripts/check-platform-lists.js; do
+            node --check "$f" || exit 1
+          done
+          echo "✓ all npm scripts parse"
+
   # Static application security testing. All findings (any severity) are
   # published to the GitHub Security tab as SARIF so reviewers can see them;
   # the gate itself fails only on HIGH-severity/HIGH-confidence findings.
