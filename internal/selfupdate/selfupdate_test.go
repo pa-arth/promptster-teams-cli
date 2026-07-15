@@ -273,6 +273,51 @@ func TestNudgeMatchesInstallChannel(t *testing.T) {
 	}
 }
 
+// A project-local install is pinned by its lockfile, and its node_modules is
+// writable — so without an explicit gate self-update would cheerfully swap it and
+// silently diverge the developer from `npm ci`. Caught by review on PR #64.
+func TestProjectLocalInstallIsNeverSwapped(t *testing.T) {
+	locals := []string{
+		"/home/e/proj/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64",
+		"/home/e/proj/node_modules/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64",
+		`C:\Users\e\proj\node_modules\@promptster\teams-cli\binaries\promptster-teams-darwin-arm64`,
+	}
+	for _, self := range locals {
+		t.Run(self, func(t *testing.T) {
+			u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+			wireHappyRelease(addRoute)
+			// A fully-valid, newer release AND a writable dir: the ONLY thing
+			// that may stop the swap is the project-local gate itself.
+			u.resolveSelf = func() (string, error) { return self, nil }
+			if got := u.checkAndApply(); got != outcomeBlockedProjectLocal {
+				t.Fatalf("outcome = %v, want blockedProjectLocal", got)
+			}
+			if len(*applied) != 0 {
+				t.Fatal("must never swap a lockfile-pinned copy")
+			}
+		})
+	}
+}
+
+// The mirror of the above: a GLOBAL npm install has no lockfile pinning it, so
+// it must still self-update. Without this, "don't touch local" could be
+// over-applied into "never update any npm install" and nobody would notice.
+func TestGlobalNpmInstallStillSelfUpdates(t *testing.T) {
+	globals := []string{
+		"/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64",
+		"/home/e/Library/pnpm/global/5/.pnpm/@promptster+teams-cli@0.5.6/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64",
+	}
+	for _, self := range globals {
+		if isProjectLocalInstall(self) {
+			t.Fatalf("global install %q misclassified as project-local", self)
+		}
+	}
+	// A managed/standalone path is not project-local either.
+	if isProjectLocalInstall(testCurlDest) {
+		t.Fatalf("%q misclassified as project-local", testCurlDest)
+	}
+}
+
 // install.sh writes ONE fixed path (${HOME}/.promptster-teams/bin). Telling a
 // binary that lives anywhere else to run it leaves a second copy and keeps this
 // one stale — PATH order then decides which runs, which is the whole failure

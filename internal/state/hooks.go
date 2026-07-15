@@ -29,11 +29,23 @@ func SelfBin() string {
 	return canonicalInstallBin()
 }
 
-// canonicalInstallBin is where the curl installer puts the binary
-// (~/.promptster-teams/bin/promptster-teams). It is deliberately unexported: it
-// is an assumption about the install layout that only holds for one channel, so
-// it is sound only as SelfBin's last-resort fallback for a host where
-// os.Executable fails. Callers that want "our binary" want SelfBin.
+// CanonicalInstallBin is the MANAGED install path
+// (~/.promptster-teams/bin/promptster-teams[.exe]) — the one location this CLI
+// owns and updates in place.
+//
+// It used to be unexported, on the grounds that the layout "only holds for one
+// channel" (the curl installer). That is no longer true: npm's postinstall
+// installs here too, and the node_modules copy is only a launcher that execs
+// this path. Both managed channels therefore land on the same file, which is
+// what keeps npm's metadata honest — self-update rewrites THIS binary and never
+// the one npm is tracking.
+//
+// Still not a substitute for SelfBin: a `go build` or a hand-placed binary runs
+// from wherever it landed, and callers that want "the running image" want
+// SelfBin. Use this only to ask "is self the managed install?" or as SelfBin's
+// last-resort fallback where os.Executable fails.
+func CanonicalInstallBin() string { return canonicalInstallBin() }
+
 func canonicalInstallBin() string {
 	home, _ := os.UserHomeDir()
 	name := "promptster-teams"

@@ -60,7 +60,7 @@ Only **two** call sites outside the package:
   display for `doctor`. Never applies anything.
 
 **`start` DOES check.** It is not a separate capture path — `StartTeamsDaemon` →
-`StartDaemon` → `exec.Command(state.PromptsterBin(), "watch")` (`internal/capture/daemon.go`),
+`StartDaemon` → `exec.Command(state.SelfBin(), "watch")` (`internal/capture/daemon.go:147`),
 so the detached child runs the normal watch startup check within a second. Same for
 `autostart`: launchd/systemd run `watch`, and `RunAtLoad` means a check every login.
 
@@ -144,22 +144,92 @@ The lever only works on CLIs that already understand the field, and the CLI is t
 slow-propagating side — so it cannot help the fleet that is live when you need it. That is
 why it shipped before there was a server to send it.
 
-### npm installs DO auto-update
+### npm installs DO auto-update — and the binary does NOT run from node_modules
 
-The npm package is a wrapper: `npm/bin/promptster-teams.js` `spawnSync`s the real Go
-binary from `<pkg>/binaries/promptster-teams-<platform>`. Self-update is a property of
-the **running binary, not the install channel** — `os.Executable()` resolves to that
-path inside `node_modules`, and the rename-over-self + `syscall.Exec` swap happens right
-there. The node wrapper is waiting on a PID and does not care that the image changed
-underneath it.
+**The binary that runs is never the copy npm is tracking.** `npm/scripts/postinstall.js`
+copies the platform binary out of `node_modules` to the MANAGED path
+(`~/.promptster-teams/bin/promptster-teams` — the same file install.sh writes), and
+`npm/bin/promptster-teams.js` execs that. So `os.Executable()` resolves to the managed
+path, self-update swaps THAT file, and node_modules keeps a pristine copy nothing ever
+mutates.
 
-What is genuinely absent: there is **no `postinstall`**, so `npm install` itself never
-triggers a check. That is the only npm gap.
+That is the whole point, and it is load-bearing: **`npm ls` / `npm outdated` stay true by
+construction**, because npm's copy genuinely never changes.
 
-**Known drift:** `npm/package.json` stays pinned at its published version while the
-binary underneath self-updates, so `npm ls` / `npm outdated` will lie, and a reinstall
-writes the older binary back. It self-heals within 30m because `isNewer` only moves
-forward — cosmetic, but it will confuse fleet debugging.
+Three paths must name the same file or an npm install and a curl install manage two
+different binaries on one box and PATH decides which one actually runs:
+
+- Go: `state.CanonicalInstallBin()` (`internal/state/hooks.go`) — handles the Windows
+  `.exe` tail.
+- npm: `managedBinPath()` in `npm/lib/resolve.js`.
+- shell: `INSTALL_DIR` in `install.sh`.
+
+**Why not the obvious alternatives** (both were evaluated and rejected on evidence):
+
+- *Rewrite `package.json` after the swap.* Verified to work for global installs, but it is
+  a hack no mature CLI does, it couples us to npm internals, and it does **nothing** for
+  project-local installs — `npm ls` reads the lockfile there, not the installed
+  package.json (verified: rewriting package.json to 0.6.1 left `npm ls` reporting 0.5.6).
+- *Update by re-running npm*, which is what **claude and codex actually do** (Claude Code's
+  binary contains `npm/bun global installs → npm view @anthropic-ai/claude-code@<channel>
+  version --registry ...` and an `update_apply_no_permissions` path for a failed global
+  npm install; Codex's `run_update_action` shells out to npm/bun/pnpm/brew). Correct for
+  them, wrong for us: **they are interactive and we are a daemon.** Their nudge reaches a
+  human who acts; ours reaches a log nobody reads, so "ask the package manager to update"
+  degrades to "never update" — the original bug this package exists to fix.
+
+**GLOBAL installs only. A project-local install is pinned by its lockfile** and is left
+entirely alone — it keeps running its own copy out of `node_modules`. Two halves enforce
+this and BOTH are needed:
+
+- `isGlobalInstall()` (`npm/lib/resolve.js`) — postinstall skips, and the launcher runs the
+  bundled binary, so a pinned project never executes the shared managed one.
+- `isProjectLocalInstall()` (`internal/selfupdate`) — self-update refuses to swap it
+  (`outcomeBlockedProjectLocal`) and nudges instead. Checked BEFORE `dirWritable`, because a
+  project's `node_modules` is almost always writable: writability is not the question,
+  ownership is.
+
+Without the first half, a repo pinning 0.5.0 and one pinning 0.6.1 both execute whatever is
+in `~/.promptster-teams/bin` and the lockfile selects *nothing* — strictly worse than the
+drift. Without the second, the daemon swaps a pinned copy and the developer silently
+diverges from `npm ci`. A lockfile is a deliberate pin and gets the same respect as the
+org's `PinnedCliVersion`.
+
+**Invariants, in descending order of how badly you'd regret breaking them:**
+
+- **postinstall must never fail an install.** A non-zero exit aborts `npm i -g` and leaves
+  the engineer with no CLI at all — far worse than the drift. Every path warns and exits 0;
+  the launcher then falls back to the bundled binary and behaves exactly as it did before
+  this existed.
+- **postinstall must never downgrade.** The managed binary self-updates forward on its own,
+  so it is routinely NEWER than the version npm is installing — that is the steady state,
+  not an error. The guard compares the BUNDLED BINARY's `--version` against the MANAGED
+  binary's, not `package.json`'s: package.json describing bytes it does not actually
+  contain is exactly how a guard ends up deciding on a fiction.
+- **`scripts/postinstall.js` and `lib/resolve.js` must ship in the tarball.** `.npmignore`
+  lists `scripts/`; `files` in package.json currently wins (verified via
+  `npm pack --dry-run`), but that hinges on a precedence rule between two files that both
+  look authoritative. `check-binaries.js` (prepublishOnly) asks the packer directly and
+  hard-fails the publish — because losing the postinstall reverts everything **silently**:
+  the CLI keeps working, so nothing breaks until someone notices `npm ls` lying weeks later.
+
+**Remaining npm gaps** (all real, none fixed here):
+
+- **postinstall races the daemon (known, accepted).** The version guard and the rename are
+  not atomic against the Go self-updater, which renames onto the same path: read 1.0.0 →
+  daemon installs 1.2.0 → postinstall renames 1.1.0 over it, guard defeated. postinstall
+  re-checks immediately before the rename, which narrows the window to microseconds but does
+  not close it. Closing it needs a lock protocol shared between a Node script and a Go
+  daemon. Not worth it: rename is atomic so the file is always ONE whole valid binary
+  (never corrupt), the only cost is running an older version, and the daemon re-updates
+  forward within ≤30m. Raised by review on PR #64.
+- `--ignore-scripts` skips postinstall, so the launcher falls back to the bundled binary and
+  the old in-node_modules drift returns. Working-but-drifting beats not working.
+- We ship all six platform binaries in one package. Claude Code uses per-platform
+  `optionalDependencies` (`@anthropic-ai/claude-code-darwin-arm64`, …) plus a postinstall
+  that hardlinks the right one over `bin/claude.exe`, so an install downloads ONE binary and
+  no node process stays resident. Ours still keeps a node wrapper on the hot path of every
+  invocation.
 
 ### The not-writable nudge must update THE COPY THAT PRINTED IT
 
@@ -185,10 +255,10 @@ walk back into:
   `/usr/local/bin/promptster-teams` or a Homebrew-prefix copy that re-runs it gets a
   second binary in a different PATH entry and stays stale. `nudgeFor(self, curlDest)` gates
   on `samePath`, and everything else falls to `nudgeStandalone`, which names the file and
-  the releases URL and prescribes nothing. `curlInstallDest` derives the path from
-  `state.GlobalPromptsterDir()` — but **`install.sh` owns the `/bin/promptster-teams` tail,
-  so that is the half to re-check if the script's `INSTALL_DIR` ever moves.** Caught by
-  review on PR #63, after the wrong-product fix had already been written and tested.
+  the releases URL and prescribes nothing. The path comes from
+  `state.CanonicalInstallBin()` — the same helper npm's postinstall and install.sh target,
+  and the one place that gets the Windows `.exe` tail right. Caught by review on PR #63,
+  after the wrong-product fix had already been written and tested.
 - Telling an npm-installed engineer to run the curl installer.
 - Telling a **project-local** or pnpm install to `npm i -g` — that updates the global
   prefix and leaves the local copy untouched. Global-vs-local matters more than

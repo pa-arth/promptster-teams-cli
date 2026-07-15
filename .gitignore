@@ -10,3 +10,10 @@ node_modules/
 # Scratch / working notes — never committed. Durable, reviewer-facing docs
 # live directly under docs/.
 docs/internal/
+
+# Staged self-update binaries. downloadAndVerify writes .promptster-teams-update-*
+# next to the binary it is replacing; these are transient and must never be
+# committed. A dev poking at selfupdate can leave one in the source tree (a
+# Windows-style test path has Dir() == "." on unix, which stages into the package
+# dir), and `git add -A` will happily sweep it up — it already did once.
+.promptster-teams-update-*
