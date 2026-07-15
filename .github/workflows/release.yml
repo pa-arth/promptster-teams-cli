@@ -98,8 +98,39 @@ jobs:
           VER="${{ steps.version.outputs.VERSION }}"
           for dir in npm/platforms/*/; do
             NAME="$(node -p "require('./${dir}package.json').name")"
+            KEY="$(basename "${dir}")"
+            case "${KEY}" in win32-*) BIN="promptster-teams.exe" ;; *) BIN="promptster-teams" ;; esac
+
             if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
-              echo "Already published ${NAME}@${VER}; skipping."
+              # Already published. npm versions are IMMUTABLE, so "skip" is only
+              # safe if what is up there is what we just built. It is not always:
+              # if a release publishes 3/6 packages, fails, and the tag is then
+              # MOVED to a corrected commit and re-run, the 3 already up there
+              # keep the OLD binary while the other 3 get the new one — and the
+              # wrapper would ship pointing at that mix. darwin users would run
+              # different code from linux users under one version number, and no
+              # step would notice.
+              #
+              # So compare CONTENT, not just the version. sha256 the binary
+              # inside the published tarball against the one we just compiled.
+              # (Tarball-level integrity is useless here: tar embeds timestamps,
+              # so a byte-identical build still produces a different tarball hash.)
+              TMP="$(mktemp -d)"
+              npm pack "${NAME}@${VER}" --pack-destination "${TMP}" --silent >/dev/null 2>&1
+              tar -xzf "${TMP}"/*.tgz -C "${TMP}"
+              PUBLISHED="$(shasum -a 256 "${TMP}/package/${BIN}" | awk '{print $1}')"
+              LOCAL="$(shasum -a 256 "${dir}${BIN}" | awk '{print $1}')"
+              rm -rf "${TMP}"
+              if [ "${PUBLISHED}" != "${LOCAL}" ]; then
+                echo "::error::${NAME}@${VER} is already published with a DIFFERENT binary."
+                echo "  published sha256: ${PUBLISHED}"
+                echo "  locally built:    ${LOCAL}"
+                echo "npm versions are immutable, so this cannot be corrected in place —"
+                echo "publishing the wrapper now would ship a mix of old and new binaries"
+                echo "under one version. Bump to a new version instead of moving the tag."
+                exit 1
+              fi
+              echo "Already published ${NAME}@${VER} (binary matches); skipping."
             else
               (cd "${dir}" && npm publish --provenance --access public)
             fi
@@ -113,11 +144,25 @@ jobs:
           set -euo pipefail
           VER="${{ steps.version.outputs.VERSION }}"
           MISSING=""
+          # Retry with backoff. A package npm has ACCEPTED can take a moment to
+          # become visible to `npm view` (registry/CDN propagation), so a single
+          # lookup here would abort an otherwise-valid release — and worse, it
+          # would abort it AFTER the platform packages are published, i.e. in the
+          # one state that cannot be undone. Only a package still unresolvable
+          # after ~1m is treated as genuinely absent.
           for NAME in $(node -p "Object.keys(require('./npm/package.json').optionalDependencies||{}).join('\n')"); do
-            if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+            FOUND=""
+            for DELAY in 0 2 4 8 15 30; do
+              [ "${DELAY}" -gt 0 ] && sleep "${DELAY}"
+              if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+                FOUND=1
+                break
+              fi
+            done
+            if [ -n "${FOUND}" ]; then
               echo "  ok ${NAME}@${VER}"
             else
-              echo "  MISSING ${NAME}@${VER}"
+              echo "  MISSING ${NAME}@${VER} (still unresolvable after ~1m)"
               MISSING="${MISSING} ${NAME}"
             fi
           done
