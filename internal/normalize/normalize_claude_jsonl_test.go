@@ -1000,6 +1000,38 @@ func TestClaudeTranscriptTaskUpdateStatusFallsBackToInput(t *testing.T) {
 	}
 }
 
+// A REJECTED TaskCreate must produce no planning event. tool_input carries the
+// requested subject whether or not the call worked, so recording off the input
+// alone invents a plan that never existed.
+func TestClaudeTranscriptRejectedTaskCreateIsNotPlanning(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_e1","name":"TaskCreate","input":{"subject":"A plan that was never created"}}]},"timestamp":"2026-06-29T18:17:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_e1","type":"tool_result","is_error":true,"content":"InputValidationError: required parameter 'subject' is missing"}]},"toolUseResult":{"error":"InputValidationError: required parameter 'subject' is missing"},"timestamp":"2026-06-29T18:17:00.100Z"}`,
+	)
+	for i := range events {
+		if events[i].Kind == "planning" {
+			t.Fatalf("a rejected TaskCreate must not emit planning: %+v", dm(events[i]))
+		}
+	}
+}
+
+// A REJECTED TaskUpdate must produce no planning event — and in particular must
+// not report the REQUESTED status as though it had been applied, which would be
+// fabricated plan progress.
+func TestClaudeTranscriptRejectedTaskUpdateIsNotPlanning(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_e2","name":"TaskUpdate","input":{"taskId":"99","status":"completed"}}]},"timestamp":"2026-06-29T18:18:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_e2","type":"tool_result","is_error":true,"content":"Task 99 not found"}]},"toolUseResult":{"success":false,"error":"Task 99 not found"},"timestamp":"2026-06-29T18:18:00.100Z"}`,
+	)
+	for i := range events {
+		if events[i].Kind == "planning" {
+			t.Fatalf("a rejected TaskUpdate must not emit planning (status would be a lie): %+v", dm(events[i]))
+		}
+	}
+}
+
 // TestClaudeTranscriptTaskListIsRead pins TaskList as planning_read, NOT
 // planning: it is a pure observation and must not inflate planning volume.
 func TestClaudeTranscriptTaskListIsRead(t *testing.T) {

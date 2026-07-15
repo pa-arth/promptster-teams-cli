@@ -150,6 +150,32 @@ func intFromJSON(v interface{}) int {
 // taskStatusFromResponse returns the status TaskUpdate actually resolved to,
 // from {"statusChange":{"from":"pending","to":"in_progress"}}. A short
 // fixed-vocabulary token (pending/in_progress/completed), never prose.
+// taskCallSucceeded reports whether a Task* response is positive evidence the
+// call actually did what it was asked. Verified response shapes:
+//
+//	TaskCreate → {"task": {"id": "1", "subject": "..."}}
+//	TaskUpdate → {"success": true, "taskId": "1", "statusChange": {"from","to"}}
+//
+// Only TaskCreate/TaskUpdate are judged. TodoWrite predates this shape and is
+// always treated as succeeded — it has no known success marker, and inventing a
+// check for one would silently drop every legacy client's planning events.
+func taskCallSucceeded(toolName string, toolResponse map[string]interface{}) bool {
+	switch toolName {
+	case "TaskCreate":
+		task, ok := toolResponse["task"].(map[string]interface{})
+		return ok && len(task) > 0
+	case "TaskUpdate":
+		if ok, isBool := toolResponse["success"].(bool); isBool {
+			return ok
+		}
+		// No explicit success flag: a resolved transition is proof enough.
+		_, ok := taskStatusFromResponse(toolResponse)
+		return ok
+	default:
+		return true
+	}
+}
+
 func taskStatusFromResponse(toolResponse map[string]interface{}) (string, bool) {
 	change, ok := toolResponse["statusChange"].(map[string]interface{})
 	if !ok {
@@ -311,6 +337,24 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 	// list each call; TaskCreate creates exactly ONE task per call and TaskUpdate
 	// flips ONE status.
 	case toolName == "TodoWrite" || toolName == "TaskCreate" || toolName == "TaskUpdate":
+		// A REJECTED call is not planning. The tool_input carries what the agent
+		// ASKED for, and it is populated identically whether the call succeeded or
+		// failed — so recording off the input alone turns an InputValidationError
+		// into a plan that never existed, and a failed status flip into progress
+		// that never happened.
+		//
+		// Gated on POSITIVE proof of success (the response's own `task` /
+		// `statusChange`), not on the absence of an error: error shapes for these
+		// tools aren't pinned down, and "no error field I recognise" is not
+		// evidence a thing worked. Same trap as the debug-arc resolver that marked
+		// arcs fixed because nothing said otherwise.
+		//
+		// A wholly ABSENT response stays permissive — legacy clients and TodoWrite
+		// predate this shape, and dropping their events would trade a small
+		// fabrication for a large blind spot.
+		if len(toolResponse) > 0 && !taskCallSucceeded(toolName, toolResponse) {
+			return event.Event{}, false
+		}
 		e := event.NewEvent("planning", sessionID)
 		data := map[string]interface{}{}
 		if todos, ok := toolInput["todos"].([]interface{}); ok {
@@ -338,7 +382,16 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		// class this case exists to fix: a number that looks measured and isn't.
 		if toolName == "TaskUpdate" {
 			// A status flip EXECUTES a plan, it doesn't define one. Prefer the
-			// response's resolved transition over the requested input status.
+			// response's RESOLVED transition; fall back to the requested input
+			// status only for the ~19-in-786 real responses that come back
+			// {success:true, updatedFields:[...]} with no statusChange.
+			//
+			// That fallback is only sound because the success gate above already
+			// dropped rejected calls: toolInput["status"] is what was ASKED for, so
+			// on a failure it would report the wished-for status as if it had been
+			// applied. Reached here, the call is known to have succeeded, which
+			// makes the requested status also the applied one. Do not move this
+			// above the gate.
 			if status, ok := taskStatusFromResponse(toolResponse); ok {
 				data["status"] = status
 			} else if status, ok := toolInput["status"].(string); ok && status != "" {
