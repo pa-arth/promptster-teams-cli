@@ -246,13 +246,30 @@ calls it after installing the managed binary. Rules:
   that path, repair, assert the unit now names a binary that exists and the stale one is
   gone — plus the no-op-when-not-enabled case.
 
-**macOS autostart is NOT covered by CI** (the smoke matrix is ubuntu + windows), and it
-cannot be tested on a dev machine either: `launchctl bootout/bootstrap` target
-`gui/$UID` by LABEL, so even with a sandboxed `HOME` they tear down the developer's real
-`ai.promptster.teams` job and bootstrap the sandbox plist in its place. Only `Status()` and
-`repair`'s no-op path are safe to exercise locally — `Status()` reads the plist under
-`os.UserHomeDir()`, so a sandboxed HOME makes it correctly report "not enabled" and repair
-returns before touching launchctl.
+**macOS autostart is NOT covered by CI** (the smoke matrix is ubuntu + windows). It CAN be
+tested on a dev machine, but NOT by sandboxing `HOME`: `launchctl bootout/bootstrap` target
+`gui/$UID` by LABEL, so a sandboxed HOME still tears down the developer's real
+`ai.promptster.teams` job and bootstraps the sandbox plist in its place. `Status()` is the
+exception — it reads the plist under `os.UserHomeDir()`, so a sandboxed HOME correctly
+reports "not enabled" and `repair` returns before touching launchctl.
+
+To test it for real (done once, 2026-07-15, and it is how the stale-path bug was proven):
+back up `~/Library/LaunchAgents/ai.promptster.teams.plist`, run the round-trip, then restore
+the file and `launchctl bootstrap` it. Verify the restore by sha256 of the plist, and check
+that the binary left capturing matches the published `SHA256SUMS` — a local build stamped
+with the CURRENT version will NOT self-update away (`isNewer` is strict), so leaving one
+behind strands the machine on unreleased code indefinitely.
+
+Two traps that cost real time here:
+
+- **`stop` boots the job out of the launchd domain** (it disarms the supervisor before
+  signalling the watcher — see Manager.Stop). After a `stop`, `launchctl kickstart` fails
+  with `Could not find service ... in domain`; you must `launchctl bootstrap` the plist
+  again, which is also exactly what a real login does.
+- **A running daemon holds the single-instance lock, so launchd's spawn exits 0** and the
+  job reads `state = not running`. That is SUCCESS, not failure — and `last exit code = 0`
+  is itself the proof launchd could execute the binary at that path (a missing path gives a
+  spawn error instead). To see it actually capture, free the lock first.
 
 ### The binary ships as a per-platform optionalDependency
 
@@ -357,6 +374,13 @@ GOOS=windows and would make the checks host-dependent and untestable from a unix
   makes `watch` print `capture already running (pid N) — not starting a second watcher`.
   Set `HOME` and `PROMPTSTER_STATE_DIR` to throwaway dirs. Never kill the developer's
   real capture process to free the lock.
+- **Killing the npm shim does NOT kill the daemon.** `npm/bin/promptster-teams.js` is a node
+  wrapper that `spawnSync`s the Go binary, so backgrounding the shim and `kill`ing that pid
+  leaves the Go child alive, reparented to pid 1, pointing at a sandbox you are about to
+  delete. Four such orphans accumulated in one session this way. Kill the Go pid
+  (`pgrep -f 'promptster-teams.*watch'`), or use `promptster-teams stop`, and check for
+  strays before finishing — filter by the scratchpad path so the developer's real daemon is
+  never in the blast radius.
 - **macOS has no `timeout(1)`.** Background the process and `kill` it, or a
   `timeout ... | grep` pipeline fails and silently looks like "the feature didn't fire".
 
