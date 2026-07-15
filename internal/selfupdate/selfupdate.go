@@ -131,12 +131,14 @@ const npmPackage = "@promptster/teams-cli"
 // one install.sh and the README document, and it writes
 // ~/.promptster-teams/bin/promptster-teams — the same path a curl-installed
 // self resolves to, so re-running it updates the copy that printed the nudge.
-// nudgeCurl is correct ONLY when self already lives at the path install.sh
-// writes. install.sh hardcodes INSTALL_DIR="${HOME}/.promptster-teams/bin", so
-// telling (say) a root-owned /usr/local/bin/promptster-teams to re-run it drops
-// a SECOND binary in ~/.promptster-teams/bin, leaves PATH order to pick a
-// winner, and leaves the copy that printed the nudge stale — the invariant
-// again, one layer below the wrong-product bug. curlInstallDest gates it.
+// nudgeCurl is correct ONLY when self already lives at the MANAGED path
+// (state.CanonicalInstallBin, ~/.promptster-teams/bin/promptster-teams), which
+// is the single location install.sh and npm's postinstall both write and the
+// only one self-update touches. Telling (say) a root-owned
+// /usr/local/bin/promptster-teams to re-run install.sh drops a SECOND binary in
+// the managed dir, leaves PATH order to pick a winner, and leaves the copy that
+// printed the nudge stale — the invariant again, one layer below the
+// wrong-product bug. nudgeFor's curlDest argument gates it.
 const (
 	nudgeCurl       = "promptster-teams: update available — run: curl -fsSL https://raw.githubusercontent.com/" + repoSlug + "/main/install.sh | sh"
 	nudgeNpmGlobal  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
@@ -151,20 +153,6 @@ const (
 func nudgeStandalone(self string) string {
 	return "promptster-teams: update available — replace " + self +
 		" from https://github.com/" + repoSlug + latestPath
-}
-
-// curlInstallDest returns the exact path install.sh writes
-// (${HOME}/.promptster-teams/bin/promptster-teams), or "" when home is
-// unknown. Derived from state.GlobalPromptsterDir so it cannot drift from the
-// rest of the CLI's idea of that directory — but note install.sh owns the
-// "/bin/promptster-teams" tail, so THIS is the half to re-check if that script
-// ever changes its INSTALL_DIR.
-func curlInstallDest() string {
-	dir := state.GlobalPromptsterDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "bin", "promptster-teams")
 }
 
 // samePath compares two paths for "these name the same install slot". Both
@@ -386,7 +374,7 @@ func (u *updater) checkAndApply() outcome {
 	dir := filepath.Dir(self)
 	if !dirWritable(dir) {
 		u.logf("selfupdate: %s not writable — skipping swap to %s", dir, target)
-		fmt.Fprintln(os.Stderr, nudgeFor(self, curlInstallDest()))
+		fmt.Fprintln(os.Stderr, nudgeFor(self, state.CanonicalInstallBin()))
 		return outcomeBlockedNotWritable
 	}
 

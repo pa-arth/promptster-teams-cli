@@ -21,10 +21,13 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
+    "postinstall": "node scripts/postinstall.js",
     "prepublishOnly": "node scripts/build.js && node scripts/check-binaries.js"
   },
   "files": [
     "bin/",
+    "lib/",
+    "scripts/postinstall.js",
     "binaries/",
     "README.md"
   ],

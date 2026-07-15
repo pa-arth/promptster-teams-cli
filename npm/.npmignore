@@ -1,3 +1,15 @@
+# scripts/ is dev-only tooling (build.js, check-binaries.js) and must not ship.
+#
+# EXCEPT scripts/postinstall.js, which MUST ship: it installs the binary to the
+# managed dir (~/.promptster-teams/bin) so the binary that RUNS is not the copy
+# npm is tracking. Without it, every npm install silently reverts to executing
+# out of node_modules and `npm ls` starts lying the first time the daemon
+# self-updates. See npm/lib/resolve.js.
+#
+# package.json's `files` allowlist is what actually pulls it into the tarball —
+# `files` beats .npmignore, verified with `npm pack --dry-run`. The negation
+# below is belt-and-braces so the intent survives if `files` is ever trimmed.
 scripts/
+!scripts/postinstall.js
 *.sh
 .DS_Store

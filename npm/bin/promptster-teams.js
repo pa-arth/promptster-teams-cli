@@ -1,29 +1,43 @@
 #!/usr/bin/env node
 "use strict";
 
-// Platform shim: selects and execs the right prebuilt Go binary for this OS/arch.
+// Launcher: execs the MANAGED binary (~/.promptster-teams/bin), falling back to
+// the copy bundled in node_modules. See lib/resolve.js for why the binary that
+// runs must not be the one npm is tracking.
+//
+// Preferring `managed` is what keeps npm honest: self-update rewrites the
+// managed file, node_modules is never touched, so `npm ls` keeps telling the
+// truth about what npm installed.
+
 const { spawnSync } = require("child_process");
-const path = require("path");
 const fs = require("fs");
 
-const MAP = {
-  "darwin-x64": "promptster-teams-darwin-x64",
-  "darwin-arm64": "promptster-teams-darwin-arm64",
-  "linux-x64": "promptster-teams-linux-x64",
-  "linux-arm64": "promptster-teams-linux-arm64",
-  "win32-x64": "promptster-teams-win32-x64.exe",
-  "win32-arm64": "promptster-teams-win32-arm64.exe",
-};
+const { bundledBinPath, managedBinPath, platformKey } = require("../lib/resolve");
 
-const key = `${process.platform}-${process.arch}`;
-const binName = MAP[key];
-if (!binName) {
-  console.error(`promptster-teams: unsupported platform ${key}`);
+function usable(p) {
+  if (!p) return false;
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const bundled = bundledBinPath();
+if (!bundled) {
+  console.error(`promptster-teams: unsupported platform ${platformKey()}`);
   process.exit(1);
 }
 
-const binPath = path.join(__dirname, "..", "binaries", binName);
-if (!fs.existsSync(binPath)) {
+// Managed first. If postinstall could not write it (--ignore-scripts, read-only
+// home, unresolvable HOME), fall back to bundled so the CLI still runs — it just
+// self-updates in place inside node_modules the way it used to, and npm ls goes
+// back to drifting. Working-but-drifting beats not working.
+const managed = managedBinPath();
+const binPath = usable(managed) ? managed : bundled;
+
+if (!usable(binPath)) {
   console.error(`promptster-teams: binary not found at ${binPath}`);
   console.error("The package may have installed incorrectly; try reinstalling.");
   process.exit(1);
