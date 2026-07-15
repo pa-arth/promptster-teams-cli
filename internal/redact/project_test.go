@@ -91,6 +91,21 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			wantDropped: []string{"todos"},
 		},
 		{
+			// The TaskCreate/TaskUpdate shape (post-rename). `title` carries the
+			// task subject and `status` the resolved transition; the task
+			// description is a prose BODY and must never survive.
+			name: "planning keeps task title+status, drops description",
+			kind: "planning",
+			data: map[string]interface{}{
+				"title": "Inspect & land rubric branch (Phase 0b)", "status": "in_progress",
+				"description": leakCanary, "activeForm": leakCanary,
+			},
+			wantKept: map[string]interface{}{
+				"title": "Inspect & land rubric branch (Phase 0b)", "status": "in_progress",
+			},
+			wantDropped: []string{"description", "activeForm"},
+		},
+		{
 			name: "plan_decision drops plan/response previews",
 			kind: "plan_decision",
 			data: map[string]interface{}{

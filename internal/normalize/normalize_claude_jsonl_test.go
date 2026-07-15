@@ -904,3 +904,164 @@ func TestToolResultTextArrayContent(t *testing.T) {
 		t.Fatalf("expected 1 interrupt from array-shaped sentinel, got %d: %+v", interrupts, events)
 	}
 }
+
+// --- Planning: Claude Code's TodoWrite -> TaskCreate/TaskUpdate/TaskList rename ---
+//
+// Every Task* line below is COPIED VERBATIM from a real transcript in
+// ~/.claude/projects (only the session/tool ids are left as-is). The rename is
+// total: across a full month of local transcripts (Jun 15 - Jul 15) there are
+// ZERO `"name":"TodoWrite"` and ZERO `"name":"TodoRead"` invocations, and 1237
+// Task* ones. That is why `planning` had never produced a row.
+
+// TestClaudeTranscriptTaskCreatePlanning pins the shape that actually arrives:
+// ONE task per call as {subject, description, activeForm} -- no `todos` key and
+// no array anywhere.
+func TestClaudeTranscriptTaskCreatePlanning(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","uuid":"1aa8edb1-2f7e-4429-92fd-85a990b1f54f","timestamp":"2026-06-29T18:15:19.807Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01SJTxrmoVumpdRxgcfxf7fP","name":"TaskCreate","input":{"subject":"Inspect & land rubric branch (Phase 0b)","description":"Inspect origin/worktree-fluttering-sniffing-dawn; merge or cherry-pick the Part-A rubric extraction (src/data/rubric/* + thin loaders) into this worktree's branch.","activeForm":"Landing the rubric foundation branch"},"caller":{"type":"direct"}}]}}`,
+		`{"type":"user","uuid":"1966e408-8fe8-49cd-bb0e-ba6fdf86618d","timestamp":"2026-06-29T18:15:19.819Z","toolUseResult":{"task":{"id":"1","subject":"Inspect & land rubric branch (Phase 0b)"}},"message":{"role":"user","content":[{"tool_use_id":"toolu_01SJTxrmoVumpdRxgcfxf7fP","type":"tool_result","content":"Task #1 created successfully: Inspect & land rubric branch (Phase 0b)"}]}}`,
+	)
+	var plan *event.Event
+	for i := range events {
+		if events[i].Kind == "planning" {
+			plan = &events[i]
+		}
+	}
+	if plan == nil {
+		t.Fatalf("TaskCreate produced no planning event: %+v", events)
+	}
+	if plan.Source != "claude-code" {
+		t.Errorf("source = %s", plan.Source)
+	}
+	// subject rides as `title` so it survives redact projection (which allows
+	// {summary,title,status} for planning). A `subject` key would be stripped.
+	if dm(*plan)["title"] != "Inspect & land rubric branch (Phase 0b)" {
+		t.Errorf("title = %v", dm(*plan)["title"])
+	}
+	// The response counter is a SESSION-WIDE ordinal, not the current plan's
+	// size, so no count is emitted under any name.
+	for _, k := range []string{"itemCount", "todoCount", "count", "sessionTaskOrdinal"} {
+		if _, present := dm(*plan)[k]; present {
+			t.Errorf("planning must not carry a plan-size count; found %q = %v", k, dm(*plan)[k])
+		}
+	}
+	// description is the task BODY (prose) and must never be assembled on.
+	if _, present := dm(*plan)["description"]; present {
+		t.Errorf("description leaked onto planning: %v", dm(*plan)["description"])
+	}
+}
+
+// TestClaudeTranscriptTaskUpdatePlanning pins that a status flip becomes
+// planning carrying the RESOLVED transition, and never a plan size.
+func TestClaudeTranscriptTaskUpdatePlanning(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","uuid":"fa2f2a1a-994d-4f4a-9dbb-9db328232145","timestamp":"2026-06-29T18:15:37.244Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01BArXqCYsv1dC9xzWvaRcpQ","name":"TaskUpdate","input":{"taskId":"1","status":"in_progress"},"caller":{"type":"direct"}}]}}`,
+		`{"type":"user","uuid":"49ef337a-d67c-4179-9f2f-c1125a4500b2","timestamp":"2026-06-29T18:15:37.270Z","toolUseResult":{"success":true,"taskId":"1","updatedFields":["status"],"statusChange":{"from":"pending","to":"in_progress"}},"message":{"role":"user","content":[{"tool_use_id":"toolu_01BArXqCYsv1dC9xzWvaRcpQ","type":"tool_result","content":"Updated task #1 status"}]}}`,
+	)
+	var plan *event.Event
+	for i := range events {
+		if events[i].Kind == "planning" {
+			plan = &events[i]
+		}
+	}
+	if plan == nil {
+		t.Fatalf("TaskUpdate produced no planning event: %+v", events)
+	}
+	if dm(*plan)["status"] != "in_progress" {
+		t.Errorf("status = %v, want in_progress", dm(*plan)["status"])
+	}
+	// A status flip EXECUTES a plan; it must not read as "the agent planned N steps".
+	if _, present := dm(*plan)["itemCount"]; present {
+		t.Errorf("TaskUpdate must not carry itemCount: %v", dm(*plan)["itemCount"])
+	}
+}
+
+// TestClaudeTranscriptTaskUpdateStatusFallsBackToInput covers the 19-in-786 real
+// responses that carry {success,taskId,updatedFields} with NO statusChange.
+func TestClaudeTranscriptTaskUpdateStatusFallsBackToInput(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_x1","name":"TaskUpdate","input":{"taskId":"2","status":"completed"}}]},"timestamp":"2026-06-29T18:16:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_x1","type":"tool_result","content":"Updated task #2"}]},"toolUseResult":{"success":true,"taskId":"2","updatedFields":["description"]},"timestamp":"2026-06-29T18:16:00.100Z"}`,
+	)
+	var plan *event.Event
+	for i := range events {
+		if events[i].Kind == "planning" {
+			plan = &events[i]
+		}
+	}
+	if plan == nil {
+		t.Fatalf("no planning event: %+v", events)
+	}
+	if dm(*plan)["status"] != "completed" {
+		t.Errorf("status = %v, want completed (input fallback)", dm(*plan)["status"])
+	}
+}
+
+// TestClaudeTranscriptTaskListIsRead pins TaskList as planning_read, NOT
+// planning: it is a pure observation and must not inflate planning volume.
+func TestClaudeTranscriptTaskListIsRead(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","uuid":"0a4afb77-a7bf-4872-89c9-c3faebbe7e93","timestamp":"2026-07-14T17:32:11.527Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01CbxxqQMr9CAJ25cVZGVQVN","name":"TaskList","input":{},"caller":{"type":"direct"}}]}}`,
+		`{"type":"user","uuid":"095954a9-9464-4a78-8344-a9996deaac47","timestamp":"2026-07-14T17:32:11.531Z","toolUseResult":{"tasks":[]},"message":{"role":"user","content":[{"tool_use_id":"toolu_01CbxxqQMr9CAJ25cVZGVQVN","type":"tool_result","content":"No tasks found"}]}}`,
+	)
+	var read *event.Event
+	for i := range events {
+		if events[i].Kind == "planning" {
+			t.Fatalf("TaskList must not emit planning (it is a READ): %+v", events[i])
+		}
+		if events[i].Kind == "planning_read" {
+			read = &events[i]
+		}
+	}
+	if read == nil {
+		t.Fatalf("TaskList produced no planning_read event: %+v", events)
+	}
+}
+
+// TestClaudeTranscriptTodoWriteBackCompat keeps the legacy client path alive.
+// NOTE: unlike the Task* fixtures above, this payload is NOT copied from a local
+// transcript -- no real TodoWrite call survives anywhere in ~/.claude/projects
+// (that absence is the bug this file documents). It mirrors the repo's own
+// existing TodoWrite fixture in redact/project_test.go instead.
+func TestClaudeTranscriptTodoWriteBackCompat(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_t1","name":"TodoWrite","input":{"todos":[{"content":"land the rubric branch","status":"pending","activeForm":"Landing the rubric branch"},{"content":"repoint consumers","status":"in_progress","activeForm":"Repointing consumers"}]}}]},"timestamp":"2026-06-10T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_t1","type":"tool_result","content":"Todos have been modified successfully."}]},"toolUseResult":{"oldTodos":[],"newTodos":[]},"timestamp":"2026-06-10T10:00:01.000Z"}`,
+	)
+	var plan *event.Event
+	for i := range events {
+		if events[i].Kind == "planning" {
+			plan = &events[i]
+		}
+	}
+	if plan == nil {
+		t.Fatalf("TodoWrite produced no planning event: %+v", events)
+	}
+	todos, _ := dm(*plan)["todos"].([]interface{})
+	if len(todos) != 2 {
+		t.Errorf("todos = %v, want 2 (legacy array preserved pre-redaction)", dm(*plan)["todos"])
+	}
+}
+
+// TestClaudeTranscriptTodoReadBackCompat keeps the legacy read path alive.
+func TestClaudeTranscriptTodoReadBackCompat(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_t2","name":"TodoRead","input":{}}]},"timestamp":"2026-06-10T10:00:00.000Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"tool_use_id":"toolu_t2","type":"tool_result","content":"[]"}]},"toolUseResult":"[]","timestamp":"2026-06-10T10:00:01.000Z"}`,
+	)
+	found := false
+	for i := range events {
+		if events[i].Kind == "planning_read" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("TodoRead produced no planning_read event: %+v", events)
+	}
+}

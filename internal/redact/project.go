@@ -107,7 +107,13 @@ var projectFieldAllowlist = map[string][]string{
 	"subagent_start": {"name", "status"},
 	"subagent_stop":  {"name", "status"},
 	// Planning / decisions: engineer-authored prose (prompt-context).
-	"planning":        {"summary", "title"},
+	// planning.status is TaskUpdate's resolved transition — a short token from a
+	// fixed vendor vocabulary (pending/in_progress/completed), same class as the
+	// status already kept for tool_use/subagent_*. It is what distinguishes plan
+	// PROGRESS from plan definition; without it a TaskUpdate projects to {}.
+	// NOTE: planning.todos is absent on purpose — legacy TodoWrite task bodies are
+	// prose (pinned by TestProjectEvent "planning drops todo bodies").
+	"planning":        {"summary", "title", "status"},
 	"planning_read":   {"summary", "title"},
 	"plan_decision":   {"summary", "title"},
 	"context_compact": {"summary", "trigger"},

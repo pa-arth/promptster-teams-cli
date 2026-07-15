@@ -147,6 +147,21 @@ func intFromJSON(v interface{}) int {
 	return 0
 }
 
+// taskStatusFromResponse returns the status TaskUpdate actually resolved to,
+// from {"statusChange":{"from":"pending","to":"in_progress"}}. A short
+// fixed-vocabulary token (pending/in_progress/completed), never prose.
+func taskStatusFromResponse(toolResponse map[string]interface{}) (string, bool) {
+	change, ok := toolResponse["statusChange"].(map[string]interface{})
+	if !ok {
+		return "", false
+	}
+	to, ok := change["to"].(string)
+	if !ok || to == "" {
+		return "", false
+	}
+	return to, true
+}
+
 // normalizePostToolUseByTool converts a PostToolUse/postToolUse payload into a
 // rich, tool-specific Event. Shared between Claude Code and Cursor normalizers.
 func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[string]interface{}, sessionID, raw string) (event.Event, bool) {
@@ -283,12 +298,54 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
-	case toolName == "TodoWrite":
-		todos, _ := toolInput["todos"].([]interface{})
+	// Claude Code renamed its todo tool: TodoWrite/TodoRead became
+	// TaskCreate/TaskUpdate/TaskList. A rename doesn't throw, so `planning` went
+	// to ZERO rows product-wide without a single error — while plan_decision
+	// stayed alive purely because ExitPlanMode wasn't renamed. The old names are
+	// kept for older clients still in the field.
+	//
+	// The new tools are NOT shape-compatible with the old one. There is no
+	// `todos` key and no array anywhere in them (checked against ~450 real
+	// TaskCreate calls: every todos/tasks-array variant in the wild is a model
+	// mis-call that came back InputValidationError). TodoWrite rewrote the WHOLE
+	// list each call; TaskCreate creates exactly ONE task per call and TaskUpdate
+	// flips ONE status.
+	case toolName == "TodoWrite" || toolName == "TaskCreate" || toolName == "TaskUpdate":
 		e := event.NewEvent("planning", sessionID)
-		e.Data = map[string]interface{}{
-			"todos": todos,
+		data := map[string]interface{}{}
+		if todos, ok := toolInput["todos"].([]interface{}); ok {
+			// Legacy TodoWrite: the whole list arrives as one array. Kept verbatim
+			// for shape-compatibility with older clients (redaction drops the
+			// bodies — see projectFieldAllowlist).
+			data["todos"] = todos
 		}
+		// `subject` rides as `title` deliberately: it is the same class of short
+		// engineer-facing label the allowlist already keeps for this kind, so it
+		// survives projection on BOTH sides today. A new `subject` key would be
+		// stripped until the backend allowlist landed too — a field that never
+		// survives is a fake fix.
+		if subject, ok := toolInput["subject"].(string); ok && subject != "" {
+			data["title"] = subject
+		}
+		// NO item/plan-size count is emitted, deliberately. TaskCreate's response
+		// counter ("Task #3 created successfully") is the SESSION's cumulative task
+		// ordinal, not the size of the current plan: a second plan in the same
+		// session starts at the first plan's high-water mark, so a fresh 1-task plan
+		// would report 6. Deleted tasks overcount the same way. Recovering a true
+		// plan size needs a plan-boundary tracker — state this normalizer
+		// deliberately doesn't keep — and nothing in this repo consumes a count at
+		// all. Emitting the ordinal under a plan-size name would be exactly the bug
+		// class this case exists to fix: a number that looks measured and isn't.
+		if toolName == "TaskUpdate" {
+			// A status flip EXECUTES a plan, it doesn't define one. Prefer the
+			// response's resolved transition over the requested input status.
+			if status, ok := taskStatusFromResponse(toolResponse); ok {
+				data["status"] = status
+			} else if status, ok := toolInput["status"].(string); ok && status != "" {
+				data["status"] = status
+			}
+		}
+		e.Data = data
 		e.RawPayload = raw
 		return e, true
 
@@ -314,7 +371,10 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
-	case toolName == "TodoRead":
+	// TaskList is the rename of TodoRead: a pure READ of the current plan. It
+	// belongs here and not in `planning` above — routing observation into
+	// `planning` would inflate planning volume with calls that changed nothing.
+	case toolName == "TodoRead" || toolName == "TaskList":
 		e := event.NewEvent("planning_read", sessionID)
 		e.Data = map[string]interface{}{}
 		e.RawPayload = raw
