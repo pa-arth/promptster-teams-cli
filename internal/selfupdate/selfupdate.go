@@ -19,10 +19,10 @@
 package selfupdate
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -36,8 +36,33 @@ import (
 
 const (
 	// updateCheckInterval is how often a long-running watch re-checks for a
-	// newer release — the same 24h cadence as the config census.
-	updateCheckInterval = 24 * time.Hour
+	// newer release.
+	//
+	// This was 24h for one reason: the check used to GET
+	// api.github.com/repos/.../releases/latest, a ~20KB JSON response behind a
+	// 60/hr UNAUTHENTICATED PER-IP limit. Behind a corporate NAT the whole fleet
+	// shares that one IP, so a short interval would have exhausted the quota and
+	// starved the very update it was chasing. fetchLatestTag no longer touches
+	// the API — it reads the tag off the releases/latest REDIRECT on github.com,
+	// which is CDN-served and carries no x-ratelimit at all — so the cage is
+	// gone and the cadence is free to track what we actually want.
+	//
+	// 30m is chosen so release→installed is ~30m worst case instead of ~24h05m.
+	// The old comment claimed the 24h stagger was "the only canary window that
+	// exists". That was half-true and worth being honest about: the stagger is
+	// keyed to whenever each daemon happened to start, so it was never a
+	// deliberate canary — just randomly-spread blast radius. It did buy time to
+	// YANK a bad release before most of the fleet took it, and that lever still
+	// works (a deleted release stops being releases/latest, so machines that
+	// have not updated never will). What tips the balance is that a fast cadence
+	// cuts time-to-RECOVER by the same factor it cuts time-to-break: at 24h a
+	// bad release poisons machines for a day AND the fix takes another day to
+	// land. At 30m, both are 30m.
+	//
+	// A real canary is a CHANNEL (a `stable` pointer lagging `latest`), not a
+	// slow clock. That is the follow-up; do not re-approximate it by raising
+	// this number.
+	updateCheckInterval = 30 * time.Minute
 	// updateCheckPoll is how often the ticker CHECKS whether the interval has
 	// elapsed (against the persisted cursor), so the cadence survives laptop
 	// sleeps and watch restarts. A poll is a file read and a compare — no
@@ -47,10 +72,11 @@ const (
 	updateCheckPoll = 5 * time.Minute
 	// belowMinCheckInterval replaces updateCheckInterval while the running
 	// version is below the org's minCliVersion floor. It is the RETRY FLOOR for
-	// an escalated rollout, not a target: without it a fleet that is below the
-	// floor and failing to update (GitHub down, release yanked mid-rollout)
-	// would re-hit the releases API every poll and exhaust the 60/hr
-	// unauthenticated per-IP limit — starving the very update it is chasing.
+	// an escalated rollout, not a target: a fleet below the floor and failing to
+	// update (GitHub down, release yanked mid-rollout) should not re-check every
+	// poll. It is closer to updateCheckInterval than it used to be, which is
+	// fine — it now buys urgency over 30m rather than over 24h, and the rate
+	// limit that made the floor load-bearing is gone.
 	belowMinCheckInterval = 15 * time.Minute
 
 	// repoSlug is the public releases repo.
@@ -95,8 +121,18 @@ const npmPackage = "@promptster/teams-cli"
 // failure it was supposed to fix. That rules out one global message: telling a
 // curl-installed engineer to use npm is wrong, and so is telling a
 // project-local or pnpm install to `npm i -g`.
+//
+// nudgeCurl MUST point at THIS repo's install.sh. It previously pointed at
+// https://get.promptster.ai, which is the HIRING CLI's installer: it fetches
+// `promptster` from pa-arth/promptster-cli-releases into ~/.promptster/bin.
+// Running it left promptster-teams exactly as stale as it was and dropped an
+// unrelated product on the box — the invariant above, violated in the worst
+// available way (wrong PROGRAM, not merely wrong path). The URL below is the
+// one install.sh and the README document, and it writes
+// ~/.promptster-teams/bin/promptster-teams — the same path a curl-installed
+// self resolves to, so re-running it updates the copy that printed the nudge.
 const (
-	nudgeCurl       = "promptster-teams: update available — run: curl -fsSL https://get.promptster.ai | sh"
+	nudgeCurl       = "promptster-teams: update available — run: curl -fsSL https://raw.githubusercontent.com/" + repoSlug + "/main/install.sh | sh"
 	nudgeNpmGlobal  = "promptster-teams: update available — run: npm i -g " + npmPackage + "@latest"
 	nudgePnpmGlobal = "promptster-teams: update available — run: pnpm add -g " + npmPackage + "@latest"
 )
@@ -209,15 +245,18 @@ type updater struct {
 
 	goos, goarch string
 
-	// apiBaseURL is the GitHub API base (default https://api.github.com),
-	// overridable in tests. releaseBaseURL is the release-download base
-	// (default https://github.com), overridable in tests.
-	apiBaseURL     string
+	// releaseBaseURL is the release base (default https://github.com),
+	// overridable in tests. It serves BOTH the latest-tag redirect and the
+	// asset downloads; there is deliberately no api.github.com base any more
+	// (see updateCheckInterval).
 	releaseBaseURL string
 
 	// httpGet fetches a URL and returns (body, statusCode, err), bounded to
 	// limit bytes. Injected so tests serve fixtures.
 	httpGet func(url string, limit int64) ([]byte, int, error)
+	// httpRedirect issues a request that does NOT follow redirects and returns
+	// (locationHeader, statusCode, err). Injected so tests serve fixtures.
+	httpRedirect func(url string) (string, int, error)
 	// resolveSelf returns the absolute, symlink-resolved path of the running
 	// binary. Injected so tests point at a temp file.
 	resolveSelf func() (string, error)
@@ -237,9 +276,9 @@ func newDefaultUpdater(currentVersion string, noAutoUpdate bool, pol PolicyView)
 		policy:         pol,
 		goos:           runtime.GOOS,
 		goarch:         runtime.GOARCH,
-		apiBaseURL:     "https://api.github.com",
 		releaseBaseURL: "https://github.com",
 		httpGet:        httpGetLimited,
+		httpRedirect:   httpRedirectLocation,
 		resolveSelf:    resolveSelfPath,
 		apply:          applySwapAndReexec,
 		logf:           state.HookDebugf,
@@ -385,26 +424,58 @@ func httpErr(what string, code int, err error) error {
 	return fmt.Errorf("download %s: status %d", what, code)
 }
 
-// fetchLatestTag reads the latest release's tag_name from the GitHub API.
+// latestPath is the un-authenticated, CDN-served endpoint that names the newest
+// release. github.com/<slug>/releases/latest answers 302 with
+// Location: .../releases/tag/<tag>. Deliberately NOT the api.github.com JSON
+// route, which is the same answer wrapped in ~20KB and a 60/hr per-IP limit.
+const latestPath = "/releases/latest"
+
+// tagFromReleaseLocation extracts "v1.2.3" from a
+// ".../releases/tag/v1.2.3" redirect target.
+//
+// The tag is interpolated into the download URLs, so it is treated as untrusted
+// input: anything with a path separator is rejected rather than allowed to
+// traverse out of /releases/download/<tag>/. That is defence in depth, not the
+// trust boundary — minisign-over-SHA256SUMS still gates every byte that gets
+// installed, so a hostile tag can at worst point the download at a 404.
+func tagFromReleaseLocation(loc string) (string, error) {
+	parsed, err := url.Parse(loc)
+	if err != nil {
+		return "", fmt.Errorf("parse redirect target %q: %w", loc, err)
+	}
+	const marker = "/releases/tag/"
+	i := strings.LastIndex(parsed.Path, marker)
+	if i < 0 {
+		return "", fmt.Errorf("unexpected redirect target %q (no %s)", loc, marker)
+	}
+	tag, err := url.PathUnescape(strings.Trim(parsed.Path[i+len(marker):], "/"))
+	if err != nil {
+		return "", fmt.Errorf("unescape tag in %q: %w", loc, err)
+	}
+	if tag == "" {
+		return "", fmt.Errorf("redirect target %q has an empty tag", loc)
+	}
+	if strings.ContainsAny(tag, "/\\") || tag == ".." {
+		return "", fmt.Errorf("refusing suspicious tag %q", tag)
+	}
+	return tag, nil
+}
+
+// fetchLatestTag reads the newest release tag off the releases/latest redirect.
 func (u *updater) fetchLatestTag() (string, error) {
-	url := strings.TrimRight(u.apiBaseURL, "/") + "/repos/" + repoSlug + "/releases/latest"
-	body, code, err := u.httpGet(url, maxSumsBytes)
+	loc, code, err := u.httpRedirect(strings.TrimRight(u.releaseBaseURL, "/") + "/" + repoSlug + latestPath)
 	if err != nil {
 		return "", err
 	}
-	if code != http.StatusOK {
-		return "", fmt.Errorf("GitHub API status %d", code)
+	// A repo with no releases at all answers 200 (the releases index) rather
+	// than redirecting, so a non-3xx is a real "there is nothing to update to".
+	if code < 300 || code > 399 {
+		return "", fmt.Errorf("releases/latest: want redirect, got status %d", code)
 	}
-	var parsed struct {
-		TagName string `json:"tag_name"`
+	if strings.TrimSpace(loc) == "" {
+		return "", fmt.Errorf("releases/latest: redirect carried no Location")
 	}
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(parsed.TagName) == "" {
-		return "", fmt.Errorf("latest release has no tag_name")
-	}
-	return parsed.TagName, nil
+	return tagFromReleaseLocation(loc)
 }
 
 // --- production edges --------------------------------------------------------
@@ -431,6 +502,40 @@ func httpGetLimited(url string, limit int64) ([]byte, int, error) {
 		return nil, resp.StatusCode, err
 	}
 	return body, resp.StatusCode, nil
+}
+
+// noRedirectClient returns a client that reports redirects instead of following
+// them. It SHALLOW-COPIES the shared CLI client rather than mutating it: the
+// copy keeps the versionTransport (and its connection pool, which is safe for
+// concurrent use) while confining CheckRedirect to this one call — mutating the
+// shared client would silently break every other caller's redirect handling.
+func noRedirectClient(timeout time.Duration) *http.Client {
+	c := *ingest.HTTPClient()
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	if timeout > 0 {
+		c.Timeout = timeout
+	}
+	return &c
+}
+
+// httpRedirectLocation issues a HEAD that does not follow redirects and returns
+// the Location header plus the status code. HEAD keeps this to response headers
+// only — the reason the check is now cheap enough to run every 30m.
+func httpRedirectLocation(url string) (string, int, error) {
+	req, err := http.NewRequest(http.MethodHead, url, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	req.Header.Set("Accept", "*/*")
+	resp, err := noRedirectClient(0).Do(req)
+	if err != nil {
+		return "", 0, err
+	}
+	defer resp.Body.Close()
+	// HEAD carries no body, but draining keeps the conn reusable if that ever
+	// changes (e.g. a proxy answering with an error page).
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxSigBytes))
+	return resp.Header.Get("Location"), resp.StatusCode, nil
 }
 
 // resolveSelfPath returns the running binary's absolute, symlink-resolved path.
@@ -582,30 +687,26 @@ func StartAutoUpdate(noAutoUpdate bool, pol PolicyView) (stop func()) {
 // LatestVersionBestEffort fetches the latest release tag (stripped of "v") with
 // a short timeout, for read-only display in `doctor`. It degrades silently:
 // ok=false on any error, never blocking the command meaningfully.
+// It reads the same releases/latest redirect as fetchLatestTag rather than the
+// JSON API: `doctor` is the one command an engineer runs REPEATEDLY while
+// something is already wrong, so it is the last place that should be able to
+// burn a 60/hr per-IP budget shared with the watch daemon behind a NAT.
 func LatestVersionBestEffort(timeout time.Duration) (string, bool) {
-	url := "https://api.github.com/repos/" + repoSlug + "/releases/latest"
-	client := &http.Client{Timeout: timeout}
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	req, err := http.NewRequest(http.MethodHead, "https://github.com/"+repoSlug+latestPath, nil)
 	if err != nil {
 		return "", false
 	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
+	req.Header.Set("Accept", "*/*")
+	resp, err := noRedirectClient(timeout).Do(req)
 	if err != nil {
 		return "", false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 300 || resp.StatusCode > 399 {
 		return "", false
 	}
-	var parsed struct {
-		TagName string `json:"tag_name"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSumsBytes)).Decode(&parsed); err != nil {
-		return "", false
-	}
-	tag := strings.TrimSpace(parsed.TagName)
-	if tag == "" {
+	tag, err := tagFromReleaseLocation(resp.Header.Get("Location"))
+	if err != nil {
 		return "", false
 	}
 	return strings.TrimPrefix(tag, "v"), true
