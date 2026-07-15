@@ -6,6 +6,57 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-07-15
+
+### Changed
+- **Updates now land in ~35 minutes instead of ~24 hours.** The check used to GET
+  `api.github.com/repos/.../releases/latest` — a ~20KB JSON response behind a **60/hr
+  unauthenticated per-IP limit**. Behind a corporate NAT an entire fleet shares that one
+  IP, so the interval could never drop without exhausting the quota and starving the very
+  update it was chasing. That limit, not the release process, is why the cadence was 24h.
+  The tag now comes from the `releases/latest` **redirect** on `github.com`, which is
+  CDN-served and carries no rate limit at all, so the cadence is free to be 30m. `doctor`
+  reads the same redirect — it is the one command engineers run repeatedly *while
+  something is already wrong*, so it is the last place that should share a rate-limit
+  budget with the daemon.
+- **An npm install now downloads ~12MB instead of ~74.5MB.** The package shipped all six
+  platform binaries to every engineer. The binary now arrives as a per-platform
+  `optionalDependency` gated on npm's `os`/`cpu` fields, so only the host's match is
+  fetched. The wrapper itself is 18.4kB.
+
+### Added
+- **`promptster-teams autostart repair`** re-points an existing launchd/systemd/scheduled
+  task at the binary running now. npm's postinstall calls it automatically. See the
+  autostart fix below for why it exists.
+
+### Fixed
+- **`npm ls` and `npm outdated` lied about the installed version.** Self-update renames a
+  verified build over its own executable; when that executable lived inside
+  `node_modules`, npm's metadata went stale the moment the daemon updated, and a reinstall
+  wrote the older binary back. The binary now installs to `~/.promptster-teams/bin` — the
+  same path `install.sh` writes — and npm's copy is never mutated, so npm's metadata is
+  correct by construction. Project-local installs are left alone entirely: a lockfile is a
+  deliberate pin, and self-update no longer touches a copy it selected.
+- **Autostart pointed at a binary that upgrading deletes.** `autostart enable` bakes an
+  absolute path in once and nothing revisits it, so units enabled before this release name
+  a path inside `node_modules` that no longer exists. Nothing failed loudly — the running
+  daemon holds its inode, so the upgrade looks clean and capture only dies at the **next
+  login**, which is precisely the failure autostart exists to prevent. postinstall now
+  repairs the unit during the upgrade.
+- **The "update available" hint installed a different product.** When the install
+  directory was not writable, a curl-installed engineer was told to run
+  `curl -fsSL https://get.promptster.ai | sh` — the **hiring** CLI's installer, which
+  fetches `promptster` into `~/.promptster/bin` and leaves `promptster-teams` exactly as
+  stale as it was. It now names this repo's `install.sh`, and only a binary already at the
+  managed path is told to re-run it: `install.sh` writes one fixed path, so telling a
+  root-owned `/usr/local/bin` copy to re-run it just drops a second binary and lets `PATH`
+  pick the winner. Anything else is told which file to replace and stops there.
+- **`planning` had zero rows, ever.** Claude Code renamed `TodoWrite`/`TodoRead` to
+  `TaskCreate`/`TaskUpdate`/`TaskList`; the normalizer matched only the old names, so the
+  kind never fired while the agent kept planning as much as ever. A rejected `Task` call
+  no longer records as planning either — `tool_input` holds what was *asked for*
+  regardless of outcome, so a failed create used to invent a plan.
+
 ## [0.6.1] — 2026-07-15
 
 ### Fixed
@@ -340,7 +391,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...v0.6.0
 [0.5.6]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.5...v0.5.6
