@@ -46,9 +46,87 @@ func TestClaudeTranscriptPrompt(t *testing.T) {
 	if dm(e)["text"] != "fix the rate limiter off-by-one" {
 		t.Errorf("text = %v", dm(e)["text"])
 	}
-	meta, _ := dm(e)["meta"].(map[string]interface{})
-	if meta == nil || meta["ideSessionId"] != "ide-1" || meta["promptSource"] != "typed" {
-		t.Errorf("meta = %v", meta)
+	// promptSource is TOP-LEVEL so the redact projector can allowlist it by key.
+	if dm(e)["promptSource"] != "typed" {
+		t.Errorf("promptSource = %v", dm(e)["promptSource"])
+	}
+	// The line carries cwd/sessionId/permissionMode/promptId; none of it may be
+	// assembled onto the event. A `meta` map is unprojectable (the allowlist keeps
+	// keys, so keeping it at all means keeping cwd — an absolute path) and grew
+	// back once already after being removed.
+	if dm(e)["meta"] != nil {
+		t.Errorf("meta reassembled: %v", dm(e)["meta"])
+	}
+	if dm(e)["cwd"] != nil {
+		t.Errorf("cwd stamped onto the event: %v", dm(e)["cwd"])
+	}
+}
+
+// A <task-notification> is harness-injected, and the CLI deliberately does NOT
+// drop it: a client-side drop is irreversible and bakes into every installed
+// CLI. It ships with promptSource:"system" so the backend can filter on read.
+// Do not "helpfully" turn this into a capture-side drop.
+func TestClaudeTranscriptKeepsTaskNotificationWithPromptSource(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"<task-notification><task-id>t-9</task-id>done</task-notification>"},"timestamp":"2026-06-10T10:00:00Z","promptSource":"system","uuid":"u1"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d: %+v", len(events), events)
+	}
+	if events[0].Kind != "prompt" {
+		t.Fatalf("kind = %s", events[0].Kind)
+	}
+	if dm(events[0])["promptSource"] != "system" {
+		t.Errorf("promptSource = %v, want system", dm(events[0])["promptSource"])
+	}
+}
+
+// The clamp is a SHAPE gate, not a value enum: unknown future vendor values ride
+// through (the CLI is the slow-propagating side), but nothing path/prose/URL
+// shaped can.
+func TestClaudeTranscriptPromptSourceShapeClamp(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want interface{}
+	}{
+		{"vendor token kept", "typed", "typed"},
+		{"unknown future vendor token kept", "hook_injected", "hook_injected"},
+		{"path shaped dropped", "/Users/x/secret", nil},
+		{"prose dropped", "has space", nil},
+		{"over-long dropped", strings.Repeat("a", 33), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := NewClaudeTranscriptProcessor("sess-1")
+			events := processAll(t, p,
+				`{"type":"user","message":{"role":"user","content":"a real prompt"},"timestamp":"2026-06-10T10:00:00Z","promptSource":"`+tc.raw+`","uuid":"u1"}`,
+			)
+			if len(events) != 1 {
+				t.Fatalf("expected 1 event, got %d", len(events))
+			}
+			if got := dm(events[0])["promptSource"]; got != tc.want {
+				t.Errorf("promptSource = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// `!`-mode bash lines are the invocation and its captured output written back
+// into the transcript as user lines. They shipped as prompt.text for real, so
+// this is a regression pin, not a hypothetical: stdout, absolute paths, shell
+// commands and infra hostnames all rode out on them. Source exclusion is a
+// capture-side guarantee — none of these may become an event at all.
+func TestClaudeTranscriptDropsBashModeLines(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"<bash-input>gh pr merge 350 --squash --admin --delete-branch</bash-input>"},"timestamp":"2026-06-10T10:00:00Z","uuid":"u1"}`,
+		`{"type":"user","message":{"role":"user","content":"<bash-stdout>DATABASE_URL=postgres://user:pw@host:5432/db</bash-stdout>"},"timestamp":"2026-06-10T10:00:01Z","uuid":"u2"}`,
+		`{"type":"user","message":{"role":"user","content":"<bash-stderr>fatal: not a git repository</bash-stderr>"},"timestamp":"2026-06-10T10:00:02Z","uuid":"u3"}`,
+	)
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events, got %d: %+v", len(events), events)
 	}
 }
 

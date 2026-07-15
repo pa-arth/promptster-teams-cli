@@ -66,14 +66,20 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			wantDropped: []string{"text", "lastAssistantMessage"},
 		},
 		{
-			name: "prompt keeps text (the product) + slash-command name, drops smuggled fields",
+			// meta stays pinned even though the emitter no longer builds one: this
+			// test feeds hand-built maps, so it is emitter-independent and holds the
+			// line if a meta map is ever smuggled back onto a prompt. Its cwd is the
+			// canary — an absolute path is exactly what allowlisting the map whole
+			// would have leaked.
+			name: "prompt keeps text (the product) + command name + promptSource, drops smuggled fields",
 			kind: "prompt",
 			data: map[string]interface{}{
-				"text": "fix the failing test", "command": "commit",
+				"text": "fix the failing test", "command": "commit", "promptSource": "system",
 				"meta": map[string]interface{}{"raw": leakCanary},
+				"cwd":  leakCanary,
 			},
-			wantKept:    map[string]interface{}{"text": "fix the failing test", "command": "commit"},
-			wantDropped: []string{"meta"},
+			wantKept:    map[string]interface{}{"text": "fix the failing test", "command": "commit", "promptSource": "system"},
+			wantDropped: []string{"meta", "cwd"},
 		},
 		{
 			name: "planning drops todo bodies",

@@ -3,6 +3,7 @@ package normalize
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -175,11 +176,18 @@ func (p *ClaudeTranscriptProcessor) newTranscriptEvent(kind, ts, sourceKey strin
 
 // Process parses one transcript line and returns zero or more canonical events.
 //
-// Lane identity used to be stamped here onto data.meta (ideSessionId / cwd).
-// That was dead code: the redaction projector allowlists no `meta` key for any
-// kind, so it was stripped before the buffer, the signature, and the wire —
-// nothing ever received it. The session id it was trying to carry now lives on
-// the envelope, where the projector cannot reach it.
+// Lane identity was twice stamped onto data.meta (ideSessionId / permissionMode
+// / promptId / cwd) and twice removed — it grew back after the first removal,
+// which is why this note is a prohibition and not a changelog. It is dead by
+// construction: the redaction projector allowlists no `meta` key for any kind,
+// so it was stripped before the buffer, the signature, and the wire — nothing
+// ever received it. Do not reassemble it. `cwd` is an absolute filesystem path,
+// and a map is not separable at the projector (it allowlists KEYS, so keeping
+// any field inside means allowlisting the map whole) — so the only thing
+// standing between cwd and the wire would be the absence of one allowlist line.
+// Anything genuinely needed downstream goes on the envelope (where the
+// projector cannot reach it) or gets hoisted to its own top-level, individually
+// allowlistable data key — see promptSource in promptEvent.
 func (p *ClaudeTranscriptProcessor) Process(line []byte) []event.Event {
 	return p.processLine(line)
 }
@@ -625,7 +633,25 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 		return nil
 	}
 	// Local command OUTPUT is not an invocation — drop it.
-	if strings.HasPrefix(trimmed, "<local-command") {
+	//
+	// The <bash-*> family is the `!`-prefixed bash mode: Claude Code writes the
+	// invocation AND its captured stdout/stderr into the transcript as user
+	// lines, so without this they ship as prompt.text — shell commands, absolute
+	// paths, infra hostnames and raw stdout, i.e. exactly what the redact
+	// projector exists to prevent ("never stdout/stderr"). None of its three
+	// layers catches them: the projector allowlists prompt.text (it is the
+	// product), scrubInlineCommand only runs on shellCommandKinds, and the DB
+	// CHECK guards a `stdout` KEY, not stdout INSIDE text.
+	//
+	// Unlike task-notifications below, dropping at capture is the correct
+	// boundary: source exclusion is a capture-side GUARANTEE ("source never
+	// leaves the engineer's machine"), not a filtering preference the backend
+	// may revisit. A source-bearing line that reaches the buffer has already
+	// broken the promise, so it must never be created.
+	if strings.HasPrefix(trimmed, "<local-command") ||
+		strings.HasPrefix(trimmed, "<bash-input") ||
+		strings.HasPrefix(trimmed, "<bash-stdout") ||
+		strings.HasPrefix(trimmed, "<bash-stderr") {
 		return nil
 	}
 	// Slash-command envelopes (<command-name>/foo</command-name>…) are typed
@@ -649,24 +675,26 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 		data["command"] = command
 	}
 
-	meta := map[string]interface{}{}
-	if v := stringField(rec, "sessionId"); v != "" {
-		meta["ideSessionId"] = v
-	}
-	if v := stringField(rec, "permissionMode"); v != "" {
-		meta["permissionMode"] = v
-	}
-	if v := stringField(rec, "promptSource"); v != "" {
-		meta["promptSource"] = v
-	}
-	if v := stringField(rec, "promptId"); v != "" {
-		meta["promptId"] = v
-	}
-	if v := stringField(rec, "cwd"); v != "" {
-		meta["cwd"] = v
-	}
-	if len(meta) > 0 {
-		data["meta"] = meta
+	// promptSource is Claude Code's own provenance marker for the turn: "typed"
+	// (a human at the keyboard) vs harness-injected values like "system" — which
+	// is what <task-notification> background-task blobs carry. The backend needs
+	// it to keep pseudo-prompts out of the fluency judge and the reps miner,
+	// where they score as an engineer's bad prompting.
+	//
+	// TOP-LEVEL, never nested on a map: the projector allowlists KEYS, so a map
+	// can only be kept whole — which is how `cwd` would ride along. Its own key
+	// is the only shape that is individually allowlistable (see the Process
+	// header above, and the "promptSource" entry in redact.projectFieldAllowlist
+	// — this key persists NOTHING until it is listed there and in the backend's
+	// eventFieldProjection.ts).
+	//
+	// Do NOT drop task-notifications here. Deliberate: a client-side drop is
+	// irreversible and bakes into every installed CLI forever (old CLIs stay
+	// installed), while the backend filters on read and can change its mind. Ship
+	// the signal, not the verdict. Contrast the <bash-*> drop above, which is a
+	// source-exclusion guarantee rather than a filtering preference.
+	if v := clampPromptSource(stringField(rec, "promptSource")); v != "" {
+		data["promptSource"] = v
 	}
 
 	// Track the previous human-prompt time as lane state only. No timing,
@@ -687,6 +715,33 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	e.Data = data
 	e.RawPayload = strPreview(string(line), 500)
 	return []event.Event{e}
+}
+
+// promptSourceMax / promptSourceRe SHAPE-clamp the vendor's promptSource token:
+// a lower-snake identifier, nothing else. Compiled at package level — promptEvent
+// is the event hot path.
+const promptSourceMax = 32
+
+var promptSourceRe = regexp.MustCompile(`^[a-z][a-z_]*$`)
+
+// clampPromptSource returns v when it is a plausible vendor enum token, else "".
+//
+// Shape, deliberately NOT a value enum. An enum set would have to name every
+// value Claude Code might ship (today: typed / queued / system /
+// suggestion_accepted) and would silently drop the next one — `resumed`,
+// `hook_injected` — until a CLI release adopted it, and the CLI is the
+// slow-propagating side of this contract (old builds stay installed for
+// months). The shape adopts unknown future values for free.
+//
+// It is still a real boundary, not a formality: a lower-snake token capped at 32
+// chars structurally cannot carry a path (no `/`), a URL, JSON, or prose (no
+// spaces, no digits, no punctuation) — so this field cannot become a source leak
+// however the vendor's shape drifts. That is what earns it its allowlist entry.
+func clampPromptSource(v string) string {
+	if len(v) == 0 || len(v) > promptSourceMax || !promptSourceRe.MatchString(v) {
+		return ""
+	}
+	return v
 }
 
 // leadingCommandName returns the slash-command name from a leading

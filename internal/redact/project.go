@@ -49,9 +49,21 @@ var projectFieldAllowlist = map[string][]string{
 	// followsInterrupt is a boolean flag marking a redirect prompt (the one
 	// typed right after an ESC/Ctrl+C interrupt); its relatedEventIds linkage
 	// lives on the envelope, outside Data.
+	// promptSource is Claude Code's own vendor enum for who authored the turn —
+	// "typed" vs harness-injected ("system", which is what <task-notification>
+	// blobs carry). Same class as a slash-command name: a short lower-snake token
+	// from a fixed vocabulary, shape-clamped at the emitter
+	// (normalize.clampPromptSource) so it structurally cannot carry a path, URL,
+	// or prose. It's what lets the backend keep pseudo-prompts out of the fluency
+	// judge instead of scoring them as an engineer's bad prompting.
+	// There is deliberately NO `meta` key: the emitter's meta map carried `cwd`
+	// (an absolute filesystem path), and this allowlist keeps KEYS — a map can
+	// only be kept whole, so allowlisting it would leak the path. The emitter no
+	// longer builds one; `meta` stays pinned as dropped in project_test.go so a
+	// smuggled one still dies here.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so
