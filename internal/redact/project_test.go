@@ -193,6 +193,9 @@ func TestProjectEventConfigCensusArrayElements(t *testing.T) {
 		"mcpServers": []interface{}{
 			map[string]interface{}{"name": "github", "deferred": true, "config": leakCanary},
 		},
+		// Capture-health counts must survive the default-deny projection.
+		"claudeTranscriptsTotal":    7,
+		"claudeTranscriptsActive7d": 3,
 	})
 	ProjectEvent(&e, false)
 	b, _ := json.Marshal(e)
@@ -206,6 +209,14 @@ func TestProjectEventConfigCensusArrayElements(t *testing.T) {
 	}
 	if skills[0].(map[string]interface{})["slug"] != "deep-research" {
 		t.Errorf("skill slug lost in projection: %v", skills[0])
+	}
+	// The two integer capture-health counts must pass through projection
+	// (they're on the config_census allowlist), unchanged.
+	if data["claudeTranscriptsTotal"] != 7 {
+		t.Errorf("claudeTranscriptsTotal lost in projection: %v", data["claudeTranscriptsTotal"])
+	}
+	if data["claudeTranscriptsActive7d"] != 3 {
+		t.Errorf("claudeTranscriptsActive7d lost in projection: %v", data["claudeTranscriptsActive7d"])
 	}
 }
 

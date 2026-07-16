@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeCensusFixture builds a fake Claude config dir + workspace under
@@ -132,12 +133,33 @@ func TestBuildConfigCensusFromFixture(t *testing.T) {
 // CLAUDE.md, skill bodies, plugin sources, or MCP server config values.
 func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 	env := writeCensusFixture(t)
+
+	// Point the transcript store at a fixture holding a distinctively-named
+	// slug dir + transcript filename, so we can assert those path-like strings
+	// never survive into the payload — the capture-health counts must ship as
+	// integers, not names.
+	cfgDir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfgDir)
+	transcript := filepath.Join(cfgDir, "projects", "SECRET-CAPTURE-SLUG", "SECRET-TRANSCRIPT.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(transcript, []byte(`{"secret":"transcript body"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	data := buildConfigCensus(env)
 	raw, err := json.Marshal(data)
 	if err != nil {
 		t.Fatal(err)
 	}
 	payload := string(raw)
+
+	// Sanity: the transcript store must actually have been counted, or the
+	// path-leak assertions below would be vacuous.
+	if data.ClaudeTranscriptsTotal < 1 {
+		t.Fatalf("expected transcript store to be counted, got total=%d", data.ClaudeTranscriptsTotal)
+	}
 	for _, leak := range []string{
 		"SECRET-SKILL-BODY",     // skill body
 		"SECRET-MCP-ENV",        // MCP env value
@@ -145,6 +167,10 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 		strings.Repeat("d", 40), // skill description VALUE (only its length may ship)
 		"https://x",             // MCP server URL
 		"npx",                   // MCP server command
+		"SECRET-CAPTURE-SLUG",   // transcript store slug/dir name
+		"SECRET-TRANSCRIPT",     // transcript filename
+		".jsonl",                // no transcript path may ship
+		"projects",              // no transcript store path may ship
 	} {
 		if strings.Contains(payload, leak) {
 			t.Errorf("census payload leaks content %q: %s", leak, payload)
@@ -166,6 +192,7 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 		"skills", "skillListingTokens", "skillCount",
 		"plugins", "pluginListingTokens", "pluginCount",
 		"mcpServers", "mcpDeferred",
+		"claudeTranscriptsTotal", "claudeTranscriptsActive7d",
 	}
 	if len(round) != len(want) {
 		t.Errorf("census shape changed: %v", round)
@@ -174,6 +201,55 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 		if _, ok := round[k]; !ok {
 			t.Errorf("missing field %s", k)
 		}
+	}
+}
+
+// TestCountClaudeTranscripts pins the capture-health counter: total .jsonl
+// files under ClaudeProjectsDir() (recursively, subagent sidechains included),
+// and how many are active within the last 7 days. Missing dir → (0, 0).
+func TestCountClaudeTranscripts(t *testing.T) {
+	// Missing projects dir (config dir exists but has no projects/) → (0, 0).
+	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
+	if total, active := countClaudeTranscripts(); total != 0 || active != 0 {
+		t.Errorf("missing projects dir must yield (0, 0), got (%d, %d)", total, active)
+	}
+
+	cfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	projects := filepath.Join(cfg, "projects")
+
+	mk := func(rel string) string {
+		t.Helper()
+		p := filepath.Join(projects, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// Two recent transcripts + a nested subagent sidechain (all active),
+	// one old transcript, plus a non-jsonl file that must be ignored.
+	mk("-repo-a/session1.jsonl")
+	mk("-repo-a/session2.jsonl")
+	mk("-repo-a/session3/subagents/agent-x.jsonl") // nested → counts recursively
+	old := mk("-repo-b/old.jsonl")
+	mk("-repo-a/notes.txt") // not a transcript → ignored
+
+	// Age the old transcript out of the 7-day window.
+	past := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatal(err)
+	}
+
+	total, active := countClaudeTranscripts()
+	if total != 4 {
+		t.Errorf("total = %d, want 4 (three recent + one old, .txt ignored)", total)
+	}
+	if active != 3 {
+		t.Errorf("active7d = %d, want 3 (old.jsonl excluded)", active)
 	}
 }
 

@@ -91,6 +91,16 @@ type configCensusData struct {
 	PluginCount           int               `json:"pluginCount"`
 	MCPServers            []censusMCPServer `json:"mcpServers"`
 	MCPDeferred           bool              `json:"mcpDeferred"`
+	// ClaudeTranscriptsTotal / ClaudeTranscriptsActive7d are content-free
+	// capture-health counts: how many Claude Code transcript JSONL files exist
+	// under ~/.claude/projects, and how many were modified in the last 7 days.
+	// They let the backend tell a BROKEN-capture engineer (transcripts on disk
+	// but nothing ingested) apart from a not-using-Claude-locally engineer (no
+	// transcripts at all). Two integers only — never a path, filename, or repo
+	// slug, so the "never store your code" guarantee holds (a dir/slug name is
+	// source metadata). Stat-only: file contents are never opened.
+	ClaudeTranscriptsTotal    int `json:"claudeTranscriptsTotal"`
+	ClaudeTranscriptsActive7d int `json:"claudeTranscriptsActive7d"`
 }
 
 // censusEnv points the census builder at the config surfaces it inventories.
@@ -267,7 +277,34 @@ func buildConfigCensus(env censusEnv) configCensusData {
 	// No config-level deferred-loading indicator is detectable today.
 	data.MCPDeferred = false
 
+	data.ClaudeTranscriptsTotal, data.ClaudeTranscriptsActive7d = countClaudeTranscripts()
+
 	return data
+}
+
+// countClaudeTranscripts tallies Claude Code transcript JSONL files under
+// ClaudeProjectsDir(): total, and how many were modified within the last 7
+// days. It is deliberately content-free — it STATS files (never opens them)
+// and returns only two integers, so no path, filename, or repo slug can leak.
+// A missing projects dir yields (0, 0). Mirrors candidateClaudeTranscripts'
+// walk shape (recursive; subagent sidechain files under <session>/subagents/
+// are counted — they are real transcript files on disk).
+func countClaudeTranscripts() (total int, active7d int) {
+	cutoff := time.Now().Add(-7 * 24 * time.Hour)
+	_ = filepath.Walk(ClaudeProjectsDir(), func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(filepath.Base(path), ".jsonl") {
+			return nil
+		}
+		total++
+		if info.ModTime().After(cutoff) {
+			active7d++
+		}
+		return nil
+	})
+	return total, active7d
 }
 
 // censusSkills enumerates <skillsDir>/*/SKILL.md: slug = dir name, name =
