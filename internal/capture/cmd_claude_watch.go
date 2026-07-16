@@ -125,7 +125,19 @@ type claudeWatchProgress struct {
 	// so absence of a cached decision means "retry next poll" — only a
 	// definitive cwd mismatch or a line-budget exhaustion caches "no".
 	Match map[string]string `json:"match"`
+	// V is the progress-file schema version. Bumped when a change to the
+	// classification rules invalidates cached decisions; loadClaudeWatchProgress
+	// runs a one-time migration when the stored V is behind claudeProgressSchemaV.
+	V int `json:"v"`
 }
+
+// claudeProgressSchemaV is the current progress-file schema version. v1 drops
+// every cached "no" once: the old timestamp rule cached a "no" for any session
+// that started before the watch cutoff (dropping long/resumed/restart-spanning
+// sessions forever), and the poll loop's `case "no": continue` never
+// re-evaluates them. Forcing one re-classification lets the go-forward rule pick
+// them up; genuinely cwd-mismatched files simply re-cache "no" next poll.
+const claudeProgressSchemaV = 1
 
 func claudeWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "claude-watcher-progress.json")
@@ -164,6 +176,7 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 	out := claudeWatchProgress{
 		Offsets: make(map[string]int64, len(p.Offsets)),
 		Match:   make(map[string]string, len(p.Match)),
+		V:       p.V,
 	}
 	for k, v := range p.Offsets {
 		nk := claudeProgressKey(k)
@@ -201,7 +214,20 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	}
 	// Idempotent: already-relative keys map to themselves, so this runs
 	// harmlessly on every load and needs no version flag.
-	return migrateClaudeProgressKeys(p)
+	migrated := migrateClaudeProgressKeys(p)
+	// One-time schema upgrade: drop every cached "no" so previously-dropped
+	// pre-cutoff sessions get re-classified under the go-forward rule (the poll
+	// loop's `case "no": continue` would otherwise never re-evaluate them).
+	// Genuinely cwd-mismatched files re-cache "no" on the next poll.
+	if migrated.V < claudeProgressSchemaV {
+		for k, v := range migrated.Match {
+			if v == "no" {
+				delete(migrated.Match, k)
+			}
+		}
+		migrated.V = claudeProgressSchemaV
+	}
+	return migrated
 }
 
 func saveClaudeWatchProgress(p claudeWatchProgress) {
@@ -496,6 +522,16 @@ func pollClaudeTranscripts(
 			switch classifyClaudeTranscript(path, roots, startCutoff) {
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
+			case claudeMatchYesPreexisting:
+				progress.Match[key] = "yes"
+				// Go-forward: capture ongoing activity but NOT the pre-watcher
+				// history. Seed the offset to current EOF so tailing starts at new
+				// content. Only when unseen — a real prior offset must be preserved.
+				if _, ok := progress.Offsets[key]; !ok {
+					if info, err := os.Stat(path); err == nil {
+						progress.Offsets[key] = info.Size()
+					}
+				}
 			case claudeMatchNo:
 				progress.Match[key] = "no"
 				continue
@@ -607,8 +643,9 @@ func claudeSessionIDFromPath(path string) string {
 type claudeMatchResult int
 
 const (
-	claudeMatchUndecided claudeMatchResult = iota
-	claudeMatchYes
+	claudeMatchUndecided      claudeMatchResult = iota
+	claudeMatchYes                              // matched; started at/after cutoff — tail from the start
+	claudeMatchYesPreexisting                   // matched; started BEFORE cutoff (long/resumed/restart-spanning) — capture GO-FORWARD from EOF
 	claudeMatchNo
 )
 
@@ -642,6 +679,14 @@ func workspaceMatchRoots(workspace string) []string {
 // it against the workspace or any of its registered worktrees. Early lines
 // (mode, permission-mode, ...) often lack cwd, so a file with no cwd yet stays
 // undecided rather than being cached as a mismatch.
+//
+// cwd is authoritative: a cwd match belongs to this session regardless of when
+// it started. The timestamp only distinguishes NEW from PRE-EXISTING. A session
+// whose first activity predates this watch start (a long/resumed session, or
+// one spanning a daemon restart — the daemon resets startCutoff every launch,
+// and laptop sleep/wake restarts it constantly) is returned as
+// claudeMatchYesPreexisting and captured GO-FORWARD from current EOF, not
+// dropped (the old bug, which silently lost every restart-spanning session).
 func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time) claudeMatchResult {
 	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -671,18 +716,29 @@ func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time
 		if rec.Cwd == "" {
 			continue
 		}
-		if rec.Timestamp != "" {
-			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
-				return claudeMatchNo
-			}
-		}
 		resolved := resolvePath(rec.Cwd)
+		matched := false
 		for _, root := range roots {
 			if pathWithin(resolved, root) {
-				return claudeMatchYes
+				matched = true
+				break
 			}
 		}
-		return claudeMatchNo
+		if !matched {
+			return claudeMatchNo
+		}
+		// cwd matches. A session whose first activity predates this watch start is
+		// pre-existing (a long/resumed session, or one that spans a daemon restart —
+		// the daemon resets startCutoff every launch, and laptop sleep/wake restarts
+		// it constantly). Capture it GO-FORWARD from current EOF rather than dropping
+		// it (the old bug) or re-uploading its whole history. A session started
+		// at/after the cutoff is genuinely new — tail from the start.
+		if rec.Timestamp != "" {
+			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
+				return claudeMatchYesPreexisting
+			}
+		}
+		return claudeMatchYes
 	}
 	// EOF without a cwd line: file just created, still growing — retry later.
 	return claudeMatchUndecided
