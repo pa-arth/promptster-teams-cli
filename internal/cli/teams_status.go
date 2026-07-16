@@ -139,6 +139,12 @@ func cmdTeamsDoctor() {
 		printlnIndent(fmt.Sprintf("%s Claude Code transcript dir not found yet: %s", warnGlyph, capture.ClaudeProjectsDir()))
 	}
 
+	if info, err := os.Stat(capture.ClaudeDesktopSessionsDir()); err == nil && info.IsDir() {
+		printlnIndent(fmt.Sprintf("%s Claude desktop app detected: %s", okGlyph, capture.ClaudeDesktopSessionsDir()))
+	} else {
+		printlnIndent(fmt.Sprintf("%s Claude desktop app not detected (no GUI sessions to capture): %s", warnGlyph, capture.ClaudeDesktopSessionsDir()))
+	}
+
 	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, capture.PresenceHeartbeatInterval))
 
 	// Delivery-queue health. Deliberately does not touch `ok`: a stuck or full

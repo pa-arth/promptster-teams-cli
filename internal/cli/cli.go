@@ -52,6 +52,11 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "codex watcher error: %v\n", err)
 			return 1
 		}
+	case "desktop-watch":
+		if err := capture.RunDesktopWatcher(); err != nil {
+			fmt.Fprintf(os.Stderr, "desktop watcher error: %v\n", err)
+			return 1
+		}
 	case "autostart":
 		// Register/remove the per-user OS service that relaunches capture at
 		// login so it survives reboots (launchd / systemd --user / Task Scheduler).

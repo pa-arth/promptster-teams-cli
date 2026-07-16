@@ -67,6 +67,9 @@ func watchedTools() []string {
 	if dirExists(codexSessionsDir()) {
 		tools = append(tools, "codex")
 	}
+	if dirExists(ClaudeDesktopSessionsDir()) {
+		tools = append(tools, "claude-desktop")
+	}
 	return tools
 }
 

@@ -96,10 +96,12 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdat
 	return token, apiURL, watchDir, *noUpdateFlag, nil
 }
 
-// runTeamsWatch runs the Claude + Codex transcript watchers concurrently in the
-// foreground. Each tails its tool's .jsonl, normalizes, redacts on-device,
-// signs, and ships to the configured ingest endpoint. Returns when either
-// watcher exits (e.g. Ctrl-C).
+// runTeamsWatch runs the Claude terminal + Codex + Claude-desktop watchers
+// concurrently in the foreground. The first two tail their tool's .jsonl; the
+// desktop watcher covers Claude Code's GUI-app single-blob session store that
+// the terminal watcher misses. Each normalizes, redacts on-device, signs, and
+// ships to the configured ingest endpoint. Returns when any watcher exits
+// (e.g. Ctrl-C).
 func RunTeamsWatch(args []string) error {
 	// Single-instance guard: only one supervisor may capture at a time, whatever
 	// launched it (manual `start`, this foreground `watch`, or the autostart
@@ -174,8 +176,9 @@ func RunTeamsWatch(args []string) error {
 	stopUpdate := selfupdate.StartAutoUpdate(noAutoUpdate, updatePolicy)
 	defer stopUpdate()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- RunClaudeWatcher() }()
 	go func() { errCh <- RunCodexWatcher() }()
+	go func() { errCh <- RunDesktopWatcher() }()
 	return <-errCh
 }

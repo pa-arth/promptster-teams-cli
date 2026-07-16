@@ -217,6 +217,9 @@ func StopTeamsDaemon() error {
 	if st, err := loadCodexWatcherState(); err == nil {
 		addPID(st.PID)
 	}
+	if st, err := loadDesktopWatcherState(); err == nil {
+		addPID(st.PID)
+	}
 
 	// Resolve which PIDs are live and ours BEFORE touching the service. Stopping
 	// the service kills the watcher it owns, so a liveness check afterwards would
@@ -266,6 +269,7 @@ func StopTeamsDaemon() error {
 	clearDaemonState()
 	clearClaudeWatcherState()
 	clearCodexWatcherState()
+	clearDesktopWatcherState()
 	_ = os.Remove(claudeHookTakeoverPath())
 
 	// Report the outcome we can observe, not the one we intended — this command
