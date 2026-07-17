@@ -55,11 +55,25 @@ func TestClassifyClaudeTranscript(t *testing.T) {
 		t.Errorf("young: got %v", got)
 	}
 
+	// A cwd-MATCHED session whose first activity predates the cutoff is
+	// pre-existing (long/resumed/restart-spanning), NOT dropped: cwd is
+	// authoritative, and the timestamp only routes new-vs-preexisting. It is
+	// captured go-forward from EOF. Returning claudeMatchNo here was the bug that
+	// silently lost every session spanning a daemon restart.
 	old := write("old.jsonl",
 		fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"2026-06-10T08:00:00Z","message":{"content":"hi"}}`, ws),
 	)
-	if got := classifyClaudeTranscript(old, []string{ws}, cutoff); got != claudeMatchNo {
-		t.Errorf("old session before cutoff: got %v", got)
+	if got := classifyClaudeTranscript(old, []string{ws}, cutoff); got != claudeMatchYesPreexisting {
+		t.Errorf("old cwd-matched session before cutoff: got %v, want claudeMatchYesPreexisting", got)
+	}
+
+	// cwd MISMATCH before the cutoff is still a hard no — timestamp is irrelevant
+	// once cwd fails to match.
+	oldOther := write("old-other.jsonl",
+		fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"2026-06-10T08:00:00Z","message":{"content":"hi"}}`, filepath.Join(tmp, "elsewhere")),
+	)
+	if got := classifyClaudeTranscript(oldOther, []string{ws}, cutoff); got != claudeMatchNo {
+		t.Errorf("old cwd-mismatch before cutoff: got %v, want claudeMatchNo", got)
 	}
 }
 
