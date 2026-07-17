@@ -447,3 +447,52 @@ func TestReadFrontmatter(t *testing.T) {
 		t.Error("missing file must return nil")
 	}
 }
+
+// TestProjectClaudeMdTokensNested pins the fix for the cc-audit "CLAUDE.md
+// coverage = 0%" bug: the census must find a CLAUDE.md nested in a sub-package,
+// not only one sitting at the workspace root. It also pins the exclusions that
+// keep the count honest — dependency/build trees, hidden dirs (.git,
+// .claude/worktrees), and anything past the depth bound must NOT contribute.
+func TestProjectClaudeMdTokensNested(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, chars int) {
+		t.Helper()
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(strings.Repeat("x", chars)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// No CLAUDE.md at the root — the exact monorepo shape (e.g.
+	// my-clerk-next-app/CLAUDE.md) that used to score 0%.
+	write("app/CLAUDE.md", 200)         // depth 1 → 50 tokens
+	write("packages/x/y/CLAUDE.md", 40) // depth 3 → 10 tokens
+
+	// Must all be ignored: dependency/build/vendor trees, hidden dirs (VCS +
+	// this repo's own .claude/worktrees copies), and beyond the depth bound.
+	write("node_modules/dep/CLAUDE.md", 4000)
+	write("vendor/lib/CLAUDE.md", 4000)
+	write("dist/CLAUDE.md", 4000)
+	write(".git/CLAUDE.md", 4000)
+	write(".claude/worktrees/wt/CLAUDE.md", 4000)
+	write("d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // past claudeMdMaxDepth
+
+	const want = 50 + 10
+	if got := projectClaudeMdTokens([]string{root}); got != want {
+		t.Errorf("projectClaudeMdTokens = %d, want %d", got, want)
+	}
+
+	// A duplicate root and an overlapping sub-root must not double-count: files
+	// are de-duped by absolute path.
+	if got := projectClaudeMdTokens([]string{root, root, filepath.Join(root, "app")}); got != want {
+		t.Errorf("overlapping roots double-counted: got %d, want %d", got, want)
+	}
+
+	// Empty / missing roots contribute nothing and never error.
+	if got := projectClaudeMdTokens([]string{"", filepath.Join(root, "does-not-exist")}); got != 0 {
+		t.Errorf("empty/missing roots = %d, want 0", got)
+	}
+}

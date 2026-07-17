@@ -144,6 +144,93 @@ func fileTokens(path string) int {
 	return approxTokens(int(info.Size()))
 }
 
+// claudeMdMaxDepth bounds how deep the project-CLAUDE.md scan descends below a
+// workspace root. Claude Code discovers CLAUDE.md HIERARCHICALLY (a repo may
+// keep its memory in a sub-package, e.g. my-clerk-next-app/CLAUDE.md), so the
+// census must too — but an unbounded walk on a large monorepo is a cost this
+// once-per-24h census should not pay. Sub-package CLAUDE.md files sit within a
+// few levels; 5 covers the real layouts (apps/api/CLAUDE.md, packages/x/CLAUDE.md)
+// with margin. Depth is counted from the root: root/CLAUDE.md is depth 0.
+const claudeMdMaxDepth = 5
+
+// projectClaudeMdSkipDirs are directory names the scan never descends into: a
+// CLAUDE.md inside a dependency/build/vendor tree belongs to a third party, not
+// to this workspace. Hidden directories (".*") are skipped separately by the
+// walker — that also excludes .git and, crucially, .claude/worktrees, whose
+// nested repo copies would otherwise be counted many times over.
+var projectClaudeMdSkipDirs = map[string]bool{
+	"node_modules": true,
+	"vendor":       true,
+	"dist":         true,
+	"build":        true,
+	"out":          true,
+	"target":       true,
+	"__pycache__":  true,
+}
+
+// projectClaudeMdTokens sums the token cost of every project CLAUDE.md Claude
+// Code would load for work anywhere under the given workspace roots, matching
+// its hierarchical discovery: a CLAUDE.md at the root OR nested in a sub-package
+// both count. The old behavior checked only <root>/CLAUDE.md, so it reported 0
+// tokens for every monorepo that keeps its CLAUDE.md in a sub-directory — which
+// read downstream as "no project CLAUDE.md" and scored the whole workspace 0% on
+// the cc-audit coverage check.
+//
+// Files are de-duped by absolute path so overlapping roots (a workspace and a
+// worktree that resolve into the same tree) can never double-count. Content is
+// never read — fileTokens stats size only, preserving the no-file-contents
+// guarantee. Every branch is best-effort: an unreadable subtree is skipped, not
+// surfaced as an error.
+func projectClaudeMdTokens(roots []string) int {
+	seenFiles := map[string]bool{}
+	seenRoots := map[string]bool{}
+	total := 0
+	for _, root := range roots {
+		if root == "" || seenRoots[root] {
+			continue
+		}
+		seenRoots[root] = true
+		rootDepth := strings.Count(filepath.Clean(root), string(os.PathSeparator))
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				// Unreadable entry: skip its subtree if a dir, else the file —
+				// never abort the whole scan.
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.IsDir() {
+				if path == root {
+					return nil
+				}
+				name := d.Name()
+				if strings.HasPrefix(name, ".") || projectClaudeMdSkipDirs[name] {
+					return filepath.SkipDir
+				}
+				if strings.Count(filepath.Clean(path), string(os.PathSeparator))-rootDepth >= claudeMdMaxDepth {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if d.Name() != "CLAUDE.md" {
+				return nil
+			}
+			abs := path
+			if a, absErr := filepath.Abs(path); absErr == nil {
+				abs = a
+			}
+			if seenFiles[abs] {
+				return nil
+			}
+			seenFiles[abs] = true
+			total += fileTokens(path)
+			return nil
+		})
+	}
+	return total
+}
+
 // primaryWorkspaceRoot returns the first non-empty workspace root — the
 // engineer's active workspace. Worktrees of the same repo share an origin
 // remote, so any of them yields the same WorkspaceKey; the first is canonical.
@@ -256,15 +343,8 @@ func buildConfigCensus(env censusEnv) configCensusData {
 		MCPServers:           []censusMCPServer{},
 	}
 
-	// Project CLAUDE.md files: one per watched workspace root, summed.
-	seenRoots := map[string]bool{}
-	for _, root := range env.workspaceRoots {
-		if root == "" || seenRoots[root] {
-			continue
-		}
-		seenRoots[root] = true
-		data.ProjectClaudeMdTokens += fileTokens(filepath.Join(root, "CLAUDE.md"))
-	}
+	// Project CLAUDE.md files across the watched workspace roots, summed.
+	data.ProjectClaudeMdTokens = projectClaudeMdTokens(env.workspaceRoots)
 
 	data.Skills = censusSkills(filepath.Join(env.claudeDir, "skills"))
 	for _, s := range data.Skills {
