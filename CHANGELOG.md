@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-07-17
+
+### Fixed
+- **Stop dropping sessions that started before the watcher launched.** The daemon reset its
+  capture window on every start, and the LaunchAgent restarts on every laptop sleep/wake — so
+  any long-running, resumed, or restart-spanning Claude Code session was classified as
+  out-of-window and silently never captured. A heavy user with few long sessions could show up
+  almost entirely uncaptured while a many-short-sessions user looked fine. Such sessions are now
+  captured go-forward from the point the watcher first sees them (from current end-of-file, so no
+  pre-existing history is re-uploaded), regardless of when they started.
+
+### Added
+- **Capture-health beacon.** The config census now reports two content-free counts — the total
+  number of Claude Code transcript files on disk and how many were active in the last 7 days
+  (stat-only: no paths, filenames, or repo names ever leave the machine). This lets the dashboard
+  distinguish an engineer whose capture is broken (transcripts on disk, nothing ingested) from one
+  who simply isn't running Claude Code locally. On an unreadable transcript tree the counts are
+  omitted rather than reported as a misleading zero.
+
 ## [0.7.0] — 2026-07-15
 
 ### Changed
