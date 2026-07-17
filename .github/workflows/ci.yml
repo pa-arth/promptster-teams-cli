@@ -279,6 +279,84 @@ jobs:
         continue-on-error: true
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
+  # install.sh verifies the minisign SIGNATURE over SHA256SUMS before trusting
+  # any checksum — the SAME trust root the auto-updater enforces (a checksum
+  # fetched from the same release only catches corruption, not an attacker who
+  # rewrites both the binary and SHA256SUMS). That verification embeds THREE
+  # copies of the release public key — install.sh (MINISIGN_PUBKEY + the derived
+  # SPKI PEM), internal/selfupdate/verify.go, and minisign.pub — which must never
+  # drift; on key rotation, a stale copy silently means "cannot verify" for that
+  # path. This job pins both properties: the keys agree, and the OpenSSL fallback
+  # in install.sh actually verifies a real (throwaway-key) signature on Linux —
+  # accepting an authentic one and rejecting a tampered or wrong-key one.
+  installer-signature:
+    name: installer signature verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: trust-root key material agrees (install.sh / minisign.pub / verify.go)
+        run: |
+          set -euo pipefail
+          PUB_FILE="$(sed -n '2p' minisign.pub)"
+          PUB_SH="$(grep -E '^MINISIGN_PUBKEY=' install.sh | sed -E 's/^MINISIGN_PUBKEY="([^"]*)"/\1/')"
+          PUB_GO="$(grep -E 'minisignPublicKey =' internal/selfupdate/verify.go | sed -E 's/.*"([^"]*)".*/\1/')"
+          [ "$PUB_SH" = "$PUB_FILE" ] || { echo "::error::install.sh MINISIGN_PUBKEY != minisign.pub"; exit 1; }
+          [ "$PUB_GO" = "$PUB_FILE" ] || { echo "::error::internal/selfupdate/verify.go key != minisign.pub"; exit 1; }
+          # The SPKI PEM embedded for the OpenSSL fallback must be the Ed25519
+          # half of that same key.
+          printf '%s' "$PUB_FILE" | openssl base64 -d -A | tail -c 32 > /tmp/rawpub
+          { printf '302a300506032b6570032100' | xxd -r -p; cat /tmp/rawpub; } > /tmp/spki.der
+          openssl pkey -pubin -inform DER -in /tmp/spki.der -out /tmp/derived.pem
+          awk '/SIGN_PUBKEY_PEM="-----BEGIN/{f=1} f{print} /END PUBLIC KEY-----"/{if(f)exit}' install.sh \
+            | sed -E 's/^SIGN_PUBKEY_PEM="//; s/"$//' > /tmp/embedded.pem
+          diff <(openssl pkey -pubin -in /tmp/derived.pem -outform PEM) \
+               <(openssl pkey -pubin -in /tmp/embedded.pem -outform PEM) \
+            || { echo "::error::install.sh SIGN_PUBKEY_PEM is not the Ed25519 half of minisign.pub"; exit 1; }
+          echo "trust-root key material consistent across all three files"
+      - name: OpenSSL fallback verifies a real signature on Linux
+        shell: bash
+        run: |
+          set -euo pipefail
+          # No release secret key in CI, so exercise the verification LOGIC with a
+          # throwaway keypair: the byte-slicing, BLAKE2b-512 prehash, Ed25519
+          # verify and keyid guard are all key-independent.
+          minisign -G -W -p /tmp/t.pub -s /tmp/t.key >/dev/null
+          echo "checksums-under-test" > /tmp/SUMS
+          minisign -S -s /tmp/t.key -m /tmp/SUMS >/dev/null
+          # Our releases sign prehashed ('ED'); assert the runner's minisign does too.
+          [ "$(sed -n '2p' /tmp/SUMS.minisig | openssl base64 -d -A | dd bs=1 count=2 2>/dev/null)" = "ED" ] \
+            || { echo "::error::test signature is not prehashed 'ED'"; exit 1; }
+          TPUB="$(sed -n '2p' /tmp/t.pub)"
+          printf '%s' "$TPUB" | openssl base64 -d -A | tail -c 32 > /tmp/traw
+          { printf '302a300506032b6570032100' | xxd -r -p; cat /tmp/traw; } > /tmp/tspki.der
+          openssl pkey -pubin -inform DER -in /tmp/tspki.der -out /tmp/tpem.pem
+          # Extract and source the REAL functions from install.sh (no copy that can
+          # drift). The block sits between the two '---' markers and does NOT define
+          # ok/warn/die, so stub those first. Then override the two key constants to
+          # the throwaway key before calling verify_with_openssl.
+          awk '/^# --- Release trust root/{p=1} p{print} /^# -{20,}$/{if(p)exit}' install.sh > /tmp/funcs.sh
+          ok(){ :; }; warn(){ :; }; die(){ echo "die: $*" >&2; return 1; }
+          # shellcheck disable=SC1091
+          . /tmp/funcs.sh
+          MINISIGN_PUBKEY="$TPUB"
+          SIGN_PUBKEY_PEM="$(cat /tmp/tpem.pem)"
+          O="$(find_capable_openssl)" || { echo "::error::no capable OpenSSL on runner"; exit 1; }
+          echo "using $O"
+          verify_with_openssl "$O" /tmp/SUMS /tmp/SUMS.minisig \
+            || { echo "::error::authentic signature rejected"; exit 1; }
+          echo "  authentic accepted"
+          cp /tmp/SUMS /tmp/tamp; echo tamper >> /tmp/tamp
+          verify_with_openssl "$O" /tmp/tamp /tmp/SUMS.minisig \
+            && { echo "::error::tampered file accepted"; exit 1; } || true
+          echo "  tampered rejected"
+          minisign -G -W -p /tmp/w.pub -s /tmp/w.key >/dev/null
+          minisign -S -s /tmp/w.key -m /tmp/SUMS -x /tmp/wrong.minisig >/dev/null
+          verify_with_openssl "$O" /tmp/SUMS /tmp/wrong.minisig \
+            && { echo "::error::signature from a different key accepted"; exit 1; } || true
+          echo "  wrong-key rejected"
+
   # Guardrail: the teams CLI must contain ONLY capture + redaction + signing.
   # Fail the build if the sibling hiring product's anti-cheat / surveillance
   # surface ever creeps back into this source.

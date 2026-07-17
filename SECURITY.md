@@ -51,6 +51,19 @@ installer.
 
 ## Verifying a release
 
-Every release publishes `SHA256SUMS`. `install.sh` verifies the downloaded
-binary against it before execution. The npm package is published with **build
-provenance** (SLSA attestation) — verify with `npm audit signatures`.
+Every release publishes `SHA256SUMS` alongside `SHA256SUMS.minisig`, a minisign
+signature made by the release key (public half committed as `minisign.pub`, and
+embedded in the CLI). Both installation paths verify that signature — the same
+trust root — before trusting anything:
+
+- **`install.sh`** verifies the signature over `SHA256SUMS` (via `minisign`, or
+  OpenSSL 3.x as a fallback) *before* checking the downloaded binary against
+  those checksums. This means a checksum swapped by an attacker who can rewrite
+  the release assets is rejected, not merely a corrupted download. If no verifier
+  is available it refuses to install unless `PROMPTSTER_TEAMS_SKIP_SIGNATURE=1`
+  is set.
+- **The auto-updater** (`internal/selfupdate`) enforces the same
+  minisign-over-`SHA256SUMS` check on every self-update.
+
+The npm package is additionally published with **build provenance** (SLSA
+attestation) — verify with `npm audit signatures`.
