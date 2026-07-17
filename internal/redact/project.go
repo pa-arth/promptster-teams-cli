@@ -142,6 +142,9 @@ var projectFieldAllowlist = map[string][]string{
 		"skillListingTokens", "skillCount", "skills",
 		"pluginListingTokens", "pluginCount", "plugins",
 		"mcpServers", "mcpDeferred",
+		// Capture-health counts: integers only (files on disk vs active in 7d),
+		// never a transcript path/filename/slug. Content-free by construction.
+		"claudeTranscriptsTotal", "claudeTranscriptsActive7d",
 	},
 }
 
