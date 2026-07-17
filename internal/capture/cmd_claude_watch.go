@@ -523,15 +523,20 @@ func pollClaudeTranscripts(
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
 			case claudeMatchYesPreexisting:
-				progress.Match[key] = "yes"
 				// Go-forward: capture ongoing activity but NOT the pre-watcher
 				// history. Seed the offset to current EOF so tailing starts at new
 				// content. Only when unseen — a real prior offset must be preserved.
+				// If the stat fails transiently, DON'T cache "yes" yet: leave the
+				// match undecided and retry next poll, so a later success seeds EOF
+				// instead of tailing the whole pre-watcher file from offset 0.
 				if _, ok := progress.Offsets[key]; !ok {
-					if info, err := os.Stat(path); err == nil {
-						progress.Offsets[key] = info.Size()
+					info, err := os.Stat(path)
+					if err != nil {
+						continue
 					}
+					progress.Offsets[key] = info.Size()
 				}
+				progress.Match[key] = "yes"
 			case claudeMatchNo:
 				progress.Match[key] = "no"
 				continue
