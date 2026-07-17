@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **CLAUDE.md coverage no longer reads 0% for monorepos.** The config census
+  looked for `CLAUDE.md` only at the workspace ROOT, but Claude Code discovers it
+  hierarchically — a repo may keep its memory in a sub-package (e.g.
+  `my-clerk-next-app/CLAUDE.md`). Any such repo reported zero project-CLAUDE.md
+  tokens, which the dashboard's cc-audit "CLAUDE.md coverage" check scored as 0%
+  even though the workspace carried a healthy memory file. The census still
+  reports the always-loaded root `CLAUDE.md` when present (so repos that already
+  worked are unchanged); only when no root file exists does it fall back to the
+  largest `CLAUDE.md` nested in a sub-package (bounded depth; skips
+  dependency/build/vendor and hidden trees, incl. `.claude/worktrees`). Sibling
+  packages' files are never summed — they don't co-load on one request.
+  Stat-only as before — no file contents leave the machine. Takes effect on the
+  next census (watch start, or within 24h of a running watch) after upgrading.
+
 ## [0.8.0] — 2026-07-17
 
 ### Fixed
