@@ -12,12 +12,14 @@ follows [Semantic Versioning](https://semver.org/).
   hierarchically — a repo may keep its memory in a sub-package (e.g.
   `my-clerk-next-app/CLAUDE.md`). Any such repo reported zero project-CLAUDE.md
   tokens, which the dashboard's cc-audit "CLAUDE.md coverage" check scored as 0%
-  even though the workspace carried a healthy memory file. The census now scans
-  each workspace root for nested `CLAUDE.md` files (bounded depth; skips
-  dependency/build/vendor and hidden trees so third-party or `.claude/worktrees`
-  copies never inflate the count), summing what it finds. Stat-only as before —
-  no file contents leave the machine. Takes effect on the next census (watch
-  start, or within 24h of a running watch) after upgrading.
+  even though the workspace carried a healthy memory file. The census still
+  reports the always-loaded root `CLAUDE.md` when present (so repos that already
+  worked are unchanged); only when no root file exists does it fall back to the
+  largest `CLAUDE.md` nested in a sub-package (bounded depth; skips
+  dependency/build/vendor and hidden trees, incl. `.claude/worktrees`). Sibling
+  packages' files are never summed — they don't co-load on one request.
+  Stat-only as before — no file contents leave the machine. Takes effect on the
+  next census (watch start, or within 24h of a running watch) after upgrading.
 
 ## [0.8.0] — 2026-07-17
 

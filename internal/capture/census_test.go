@@ -448,51 +448,90 @@ func TestReadFrontmatter(t *testing.T) {
 	}
 }
 
+// writeClaudeFixture writes a CLAUDE.md of `chars` bytes at `rel` under root.
+func writeClaudeFixture(t *testing.T, root, rel string, chars int) {
+	t.Helper()
+	p := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(strings.Repeat("x", chars)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestProjectClaudeMdTokensNested pins the fix for the cc-audit "CLAUDE.md
-// coverage = 0%" bug: the census must find a CLAUDE.md nested in a sub-package,
-// not only one sitting at the workspace root. It also pins the exclusions that
-// keep the count honest — dependency/build trees, hidden dirs (.git,
-// .claude/worktrees), and anything past the depth bound must NOT contribute.
+// coverage = 0%" bug: when the repo keeps its memory in a sub-package (no root
+// CLAUDE.md), the census falls back to the LARGEST nested file rather than 0.
+// Siblings are NOT summed (a request under one package doesn't load another's),
+// and dependency/build trees, hidden dirs (.git, .claude/worktrees), and
+// anything past the depth bound must NOT contribute.
 func TestProjectClaudeMdTokensNested(t *testing.T) {
 	root := t.TempDir()
-	write := func(rel string, chars int) {
-		t.Helper()
-		p := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(strings.Repeat("x", chars)), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
 
 	// No CLAUDE.md at the root — the exact monorepo shape (e.g.
 	// my-clerk-next-app/CLAUDE.md) that used to score 0%.
-	write("app/CLAUDE.md", 200)         // depth 1 → 50 tokens
-	write("packages/x/y/CLAUDE.md", 40) // depth 3 → 10 tokens
+	writeClaudeFixture(t, root, "app/CLAUDE.md", 200)         // 50 tokens (the max)
+	writeClaudeFixture(t, root, "packages/x/y/CLAUDE.md", 40) // 10 tokens — a sibling, must NOT add
 
 	// Must all be ignored: dependency/build/vendor trees, hidden dirs (VCS +
 	// this repo's own .claude/worktrees copies), and beyond the depth bound.
-	write("node_modules/dep/CLAUDE.md", 4000)
-	write("vendor/lib/CLAUDE.md", 4000)
-	write("dist/CLAUDE.md", 4000)
-	write(".git/CLAUDE.md", 4000)
-	write(".claude/worktrees/wt/CLAUDE.md", 4000)
-	write("d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // past claudeMdMaxDepth
+	writeClaudeFixture(t, root, "node_modules/dep/CLAUDE.md", 4000)
+	writeClaudeFixture(t, root, "vendor/lib/CLAUDE.md", 4000)
+	writeClaudeFixture(t, root, "dist/CLAUDE.md", 4000)
+	writeClaudeFixture(t, root, ".git/CLAUDE.md", 4000)
+	writeClaudeFixture(t, root, ".claude/worktrees/wt/CLAUDE.md", 4000)
+	writeClaudeFixture(t, root, "d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // dir d6 is 6 levels down → past bound
 
-	const want = 50 + 10
+	const want = 50 // max(app=50, packages/x/y=10), NOT the 60 sum
 	if got := projectClaudeMdTokens([]string{root}); got != want {
-		t.Errorf("projectClaudeMdTokens = %d, want %d", got, want)
+		t.Errorf("projectClaudeMdTokens = %d, want %d (largest nested, not summed)", got, want)
 	}
 
-	// A duplicate root and an overlapping sub-root must not double-count: files
-	// are de-duped by absolute path.
+	// Overlapping roots (a workspace + a sub-root resolving into the same tree)
+	// must not inflate — max is idempotent.
 	if got := projectClaudeMdTokens([]string{root, root, filepath.Join(root, "app")}); got != want {
-		t.Errorf("overlapping roots double-counted: got %d, want %d", got, want)
+		t.Errorf("overlapping roots inflated: got %d, want %d", got, want)
 	}
 
 	// Empty / missing roots contribute nothing and never error.
 	if got := projectClaudeMdTokens([]string{"", filepath.Join(root, "does-not-exist")}); got != 0 {
 		t.Errorf("empty/missing roots = %d, want 0", got)
+	}
+}
+
+// TestProjectClaudeMdTokensRootPreferred pins the always-loaded semantic: when a
+// root CLAUDE.md exists, it is the reported value and nested sibling packages are
+// ignored entirely (they aren't loaded on every request, so they must not inflate
+// the config-tax figure). This also guarantees repos that already worked keep
+// their exact prior number.
+func TestProjectClaudeMdTokensRootPreferred(t *testing.T) {
+	root := t.TempDir()
+	writeClaudeFixture(t, root, "CLAUDE.md", 80)              // 20 tokens — always-loaded root
+	writeClaudeFixture(t, root, "packages/a/CLAUDE.md", 4000) // huge nested sibling, must be ignored
+
+	const want = 20
+	if got := projectClaudeMdTokens([]string{root}); got != want {
+		t.Errorf("projectClaudeMdTokens = %d, want %d (root only, nested ignored)", got, want)
+	}
+}
+
+// TestProjectClaudeMdTokensDepthBound pins the depth boundary: a CLAUDE.md
+// exactly claudeMdMaxDepth (5) levels below the root is INCLUDED; one level
+// deeper is excluded. Guards the off-by-one that would drop the documented
+// boundary layout.
+func TestProjectClaudeMdTokensDepthBound(t *testing.T) {
+	// Depth 5 (l1/l2/l3/l4/l5/CLAUDE.md): dir l5 is 5 levels below root → included.
+	inRoot := t.TempDir()
+	writeClaudeFixture(t, inRoot, "l1/l2/l3/l4/l5/CLAUDE.md", 200)
+	if got := projectClaudeMdTokens([]string{inRoot}); got != 50 {
+		t.Errorf("depth-5 file: got %d, want 50 (must be included)", got)
+	}
+
+	// Depth 6 (m1/.../m6/CLAUDE.md): dir m6 is 6 levels below root → excluded.
+	outRoot := t.TempDir()
+	writeClaudeFixture(t, outRoot, "m1/m2/m3/m4/m5/m6/CLAUDE.md", 200)
+	if got := projectClaudeMdTokens([]string{outRoot}); got != 0 {
+		t.Errorf("depth-6 file: got %d, want 0 (must be excluded)", got)
 	}
 }

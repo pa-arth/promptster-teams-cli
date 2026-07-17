@@ -144,20 +144,23 @@ func fileTokens(path string) int {
 	return approxTokens(int(info.Size()))
 }
 
-// claudeMdMaxDepth bounds how deep the project-CLAUDE.md scan descends below a
-// workspace root. Claude Code discovers CLAUDE.md HIERARCHICALLY (a repo may
-// keep its memory in a sub-package, e.g. my-clerk-next-app/CLAUDE.md), so the
-// census must too — but an unbounded walk on a large monorepo is a cost this
-// once-per-24h census should not pay. Sub-package CLAUDE.md files sit within a
-// few levels; 5 covers the real layouts (apps/api/CLAUDE.md, packages/x/CLAUDE.md)
-// with margin. Depth is counted from the root: root/CLAUDE.md is depth 0.
+// claudeMdMaxDepth bounds how many directory levels below a workspace root the
+// nested-CLAUDE.md fallback scan descends. Claude Code discovers CLAUDE.md
+// HIERARCHICALLY (a repo may keep its memory in a sub-package, e.g.
+// my-clerk-next-app/CLAUDE.md), so the census must too — but an unbounded walk
+// on a large monorepo is a cost this once-per-24h census should not pay.
+// Sub-package CLAUDE.md files sit within a few levels; 5 covers the real layouts
+// (apps/api/CLAUDE.md, packages/x/CLAUDE.md) with margin. A file up to 5 levels
+// below the root is included; deeper is skipped.
 const claudeMdMaxDepth = 5
 
-// projectClaudeMdSkipDirs are directory names the scan never descends into: a
-// CLAUDE.md inside a dependency/build/vendor tree belongs to a third party, not
-// to this workspace. Hidden directories (".*") are skipped separately by the
-// walker — that also excludes .git and, crucially, .claude/worktrees, whose
-// nested repo copies would otherwise be counted many times over.
+// projectClaudeMdSkipDirs are directory names the nested scan never descends
+// into: a CLAUDE.md inside a dependency/build/vendor tree is either a third
+// party's or a build-time COPY of the repo's own memory, not authored project
+// memory — and counting it would overstate the fallback below. Hidden
+// directories (".*") are skipped separately by the walker — that also excludes
+// .git and, crucially, .claude/worktrees, whose nested repo copies would
+// otherwise be picked up.
 var projectClaudeMdSkipDirs = map[string]bool{
 	"node_modules": true,
 	"vendor":       true,
@@ -168,23 +171,46 @@ var projectClaudeMdSkipDirs = map[string]bool{
 	"__pycache__":  true,
 }
 
-// projectClaudeMdTokens sums the token cost of every project CLAUDE.md Claude
-// Code would load for work anywhere under the given workspace roots, matching
-// its hierarchical discovery: a CLAUDE.md at the root OR nested in a sub-package
-// both count. The old behavior checked only <root>/CLAUDE.md, so it reported 0
-// tokens for every monorepo that keeps its CLAUDE.md in a sub-directory — which
-// read downstream as "no project CLAUDE.md" and scored the whole workspace 0% on
-// the cc-audit coverage check.
+// projectClaudeMdTokens estimates the tokens of project CLAUDE.md Claude Code
+// loads for work in the given workspace roots.
 //
-// Files are de-duped by absolute path so overlapping roots (a workspace and a
-// worktree that resolve into the same tree) can never double-count. Content is
-// never read — fileTokens stats size only, preserving the no-file-contents
-// guarantee. Every branch is best-effort: an unreadable subtree is skipped, not
-// surfaced as an error.
+// It reports the ALWAYS-LOADED memory first: the CLAUDE.md at a workspace root,
+// which every request in that repo pays for (summed across the watched roots, as
+// the config-tax framing intends). ONLY when no root carries one does it fall
+// back to the largest CLAUDE.md nested in a sub-package — the monorepo shape
+// (e.g. my-clerk-next-app/CLAUDE.md) that otherwise reported 0 and scored the
+// whole workspace 0% on the cc-audit coverage check.
+//
+// The fallback takes the MAX single nested file, never a sum: sibling packages'
+// memories don't co-load on one request (a request under packages/a never loads
+// packages/b/CLAUDE.md), so summing them would overstate always-loaded context.
+// Preferring the root also means every repo that already had a root CLAUDE.md
+// reports exactly what it did before — this change only lifts the false 0 for
+// repos whose memory lives in a sub-directory. Content is never read —
+// fileTokens stats size only, preserving the no-file-contents guarantee.
 func projectClaudeMdTokens(roots []string) int {
-	seenFiles := map[string]bool{}
 	seenRoots := map[string]bool{}
-	total := 0
+	rootTokens := 0
+	for _, root := range roots {
+		if root == "" || seenRoots[root] {
+			continue
+		}
+		seenRoots[root] = true
+		rootTokens += fileTokens(filepath.Join(root, "CLAUDE.md"))
+	}
+	if rootTokens > 0 {
+		return rootTokens
+	}
+	return maxNestedClaudeMdTokens(roots)
+}
+
+// maxNestedClaudeMdTokens returns the token cost of the LARGEST CLAUDE.md nested
+// below any of the workspace roots, or 0 when none is found. Bounded by
+// claudeMdMaxDepth and projectClaudeMdSkipDirs (+ hidden dirs); every branch is
+// best-effort — an unreadable subtree is skipped, never surfaced as an error.
+func maxNestedClaudeMdTokens(roots []string) int {
+	best := 0
+	seenRoots := map[string]bool{}
 	for _, root := range roots {
 		if root == "" || seenRoots[root] {
 			continue
@@ -208,7 +234,7 @@ func projectClaudeMdTokens(roots []string) int {
 				if strings.HasPrefix(name, ".") || projectClaudeMdSkipDirs[name] {
 					return filepath.SkipDir
 				}
-				if strings.Count(filepath.Clean(path), string(os.PathSeparator))-rootDepth >= claudeMdMaxDepth {
+				if strings.Count(filepath.Clean(path), string(os.PathSeparator))-rootDepth > claudeMdMaxDepth {
 					return filepath.SkipDir
 				}
 				return nil
@@ -216,19 +242,13 @@ func projectClaudeMdTokens(roots []string) int {
 			if d.Name() != "CLAUDE.md" {
 				return nil
 			}
-			abs := path
-			if a, absErr := filepath.Abs(path); absErr == nil {
-				abs = a
+			if t := fileTokens(path); t > best {
+				best = t
 			}
-			if seenFiles[abs] {
-				return nil
-			}
-			seenFiles[abs] = true
-			total += fileTokens(path)
 			return nil
 		})
 	}
-	return total
+	return best
 }
 
 // primaryWorkspaceRoot returns the first non-empty workspace root — the
@@ -343,7 +363,8 @@ func buildConfigCensus(env censusEnv) configCensusData {
 		MCPServers:           []censusMCPServer{},
 	}
 
-	// Project CLAUDE.md files across the watched workspace roots, summed.
+	// Project CLAUDE.md: the always-loaded root file, or the largest nested one
+	// when the repo keeps its memory in a sub-package (see projectClaudeMdTokens).
 	data.ProjectClaudeMdTokens = projectClaudeMdTokens(env.workspaceRoots)
 
 	data.Skills = censusSkills(filepath.Join(env.claudeDir, "skills"))
