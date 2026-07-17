@@ -99,8 +99,13 @@ type configCensusData struct {
 	// transcripts at all). Two integers only — never a path, filename, or repo
 	// slug, so the "never store your code" guarantee holds (a dir/slug name is
 	// source metadata). Stat-only: file contents are never opened.
-	ClaudeTranscriptsTotal    int `json:"claudeTranscriptsTotal"`
-	ClaudeTranscriptsActive7d int `json:"claudeTranscriptsActive7d"`
+	//
+	// Pointers + omitempty: nil (omitted) means "could not read the projects
+	// tree" — the counts are unreliable, so the backend must read UNKNOWN, not a
+	// false zero that would look like "not using Claude Code". A present 0 is a
+	// definite zero (dir absent = genuinely no local transcripts).
+	ClaudeTranscriptsTotal    *int `json:"claudeTranscriptsTotal,omitempty"`
+	ClaudeTranscriptsActive7d *int `json:"claudeTranscriptsActive7d,omitempty"`
 }
 
 // censusEnv points the census builder at the config surfaces it inventories.
@@ -289,22 +294,48 @@ func buildConfigCensus(env censusEnv) configCensusData {
 // A missing projects dir yields (0, 0). Mirrors candidateClaudeTranscripts'
 // walk shape (recursive; subagent sidechain files under <session>/subagents/
 // are counted — they are real transcript files on disk).
-func countClaudeTranscripts() (total int, active7d int) {
+func countClaudeTranscripts() (total *int, active7d *int) {
+	dir := ClaudeProjectsDir()
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Projects dir absent = genuinely no local Claude Code transcripts: a
+			// DEFINITE zero (the backend reads it as "no local CC", not "unknown").
+			z0, z1 := 0, 0
+			return &z0, &z1
+		}
+		// Dir exists but can't be statted (e.g. permissions) → unreliable; omit.
+		return nil, nil
+	}
+	if !info.IsDir() {
+		return nil, nil
+	}
 	cutoff := time.Now().Add(-7 * 24 * time.Hour)
-	_ = filepath.Walk(ClaudeProjectsDir(), func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	var t, a int
+	walkFailed := false
+	_ = filepath.Walk(dir, func(path string, fi os.FileInfo, werr error) error {
+		if werr != nil {
+			// A subtree we cannot read → the tally would be partial/untrustworthy.
+			// Flag it so we report UNKNOWN rather than a false low count.
+			walkFailed = true
+			return nil
+		}
+		if fi.IsDir() {
 			return nil
 		}
 		if !strings.HasSuffix(filepath.Base(path), ".jsonl") {
 			return nil
 		}
-		total++
-		if info.ModTime().After(cutoff) {
-			active7d++
+		t++
+		if fi.ModTime().After(cutoff) {
+			a++
 		}
 		return nil
 	})
-	return total, active7d
+	if walkFailed {
+		return nil, nil
+	}
+	return &t, &a
 }
 
 // censusSkills enumerates <skillsDir>/*/SKILL.md: slug = dir name, name =

@@ -157,8 +157,8 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 
 	// Sanity: the transcript store must actually have been counted, or the
 	// path-leak assertions below would be vacuous.
-	if data.ClaudeTranscriptsTotal < 1 {
-		t.Fatalf("expected transcript store to be counted, got total=%d", data.ClaudeTranscriptsTotal)
+	if data.ClaudeTranscriptsTotal == nil || *data.ClaudeTranscriptsTotal < 1 {
+		t.Fatalf("expected transcript store to be counted, got total=%v", data.ClaudeTranscriptsTotal)
 	}
 	for _, leak := range []string{
 		"SECRET-SKILL-BODY",     // skill body
@@ -210,8 +210,8 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 func TestCountClaudeTranscripts(t *testing.T) {
 	// Missing projects dir (config dir exists but has no projects/) → (0, 0).
 	t.Setenv("CLAUDE_CONFIG_DIR", t.TempDir())
-	if total, active := countClaudeTranscripts(); total != 0 || active != 0 {
-		t.Errorf("missing projects dir must yield (0, 0), got (%d, %d)", total, active)
+	if total, active := countClaudeTranscripts(); total == nil || active == nil || *total != 0 || *active != 0 {
+		t.Errorf("missing projects dir must yield a definite (0, 0), got %v/%v", total, active)
 	}
 
 	cfg := t.TempDir()
@@ -245,11 +245,39 @@ func TestCountClaudeTranscripts(t *testing.T) {
 	}
 
 	total, active := countClaudeTranscripts()
-	if total != 4 {
-		t.Errorf("total = %d, want 4 (three recent + one old, .txt ignored)", total)
+	if total == nil || *total != 4 {
+		t.Errorf("total = %v, want 4 (three recent + one old, .txt ignored)", total)
 	}
-	if active != 3 {
-		t.Errorf("active7d = %d, want 3 (old.jsonl excluded)", active)
+	if active == nil || *active != 3 {
+		t.Errorf("active7d = %v, want 3 (old.jsonl excluded)", active)
+	}
+}
+
+// TestCountClaudeTranscriptsUnreadableTreeIsUnknown pins the P1 fix: an
+// unreadable projects subtree must yield (nil, nil) — omitted from the census →
+// the backend reads UNKNOWN — never a false low count that would read as "not
+// using Claude Code locally" when capture simply can't see the files.
+func TestCountClaudeTranscriptsUnreadableTreeIsUnknown(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses directory permissions; cannot simulate an unreadable subtree")
+	}
+	cfg := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+	blocked := filepath.Join(cfg, "projects", "-repo-locked")
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(blocked, "s.jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(blocked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(blocked, 0o755) }) // let TempDir cleanup remove it
+
+	total, active := countClaudeTranscripts()
+	if total != nil || active != nil {
+		t.Errorf("unreadable subtree must yield (nil, nil) = unknown, got %v/%v", total, active)
 	}
 }
 
