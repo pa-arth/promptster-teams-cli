@@ -68,10 +68,14 @@ type durTrackedRange struct {
 	BornTsMs  int64  `json:"bornTsMs"`
 }
 
-// durabilityLedger is the on-disk living-AI-line state: rootKey → path → spans.
+// durabilityLedger is the on-disk living-AI-line state: rootKey → path → spans,
+// plus the per-root default-branch cursor (rootKey → last-processed default-tip
+// SHA). Cursor and ranges live in ONE file under ONE lock so a poll advances
+// both atomically.
 type durabilityLedger struct {
-	V     int                                     `json:"v"`
-	Roots map[string]map[string][]durTrackedRange `json:"roots"`
+	V       int                                     `json:"v"`
+	Roots   map[string]map[string][]durTrackedRange `json:"roots"`
+	Cursors map[string]string                       `json:"cursors"`
 }
 
 func durabilityLedgerPath() string {
@@ -340,16 +344,24 @@ func durLineageID(sha, path string) string {
 func pollDurabilityCommit(root, rootKey string, session Session, sha string, nowMs int64) []event.Event {
 	diff, ok := gitCommitRawDiff(root, sha)
 	if !ok {
+		// Inconclusive (git failed): do NOT advance the cursor, so this commit is
+		// retried next poll rather than silently skipped.
 		return nil
 	}
 	hunks := parseUnifiedDiffHunks(diff)
-	if len(hunks) == 0 {
-		return nil
-	}
 	aiPaths := readAiTouchedPaths(rootKey)
 
 	var verdicts []event.Event
 	mutateDurabilityLedger(func(led *durabilityLedger) {
+		// Advance the cursor to this commit in the SAME transaction as its range
+		// changes. A separate advance could crash in between, leaving the ranges
+		// applied but the cursor behind — reprocessing would then remap the commit
+		// twice (remapTrackedRanges is not idempotent). A zero-hunk commit still
+		// advances: it is genuinely behind us and changed no tracked ranges.
+		if led.Cursors == nil {
+			led.Cursors = map[string]string{}
+		}
+		led.Cursors[rootKey] = sha
 		files := led.Roots[rootKey]
 		if files == nil {
 			files = map[string][]durTrackedRange{}

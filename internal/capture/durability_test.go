@@ -195,6 +195,50 @@ func TestDurabilityChurnBeforeWindow(t *testing.T) {
 	}
 }
 
+// TestDurabilityDefaultBranchScopeOnly: durability advances on the DEFAULT
+// branch only. A commit that rewrites an AI line on a FEATURE branch (never
+// merged to default) must NOT churn it — the line stays durable. Proves the
+// durability cursor tracks the default-branch ref, not working HEAD.
+func TestDurabilityDefaultBranchScopeOnly(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main") // deterministic default branch name
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	roots := []string{ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// Cold start: baseline the durability cursor to main's tip, no processing.
+	pollDurability(sess, roots, t0)
+
+	// AI adds ai.go ON main.
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	pollDurability(sess, roots, t0+dayMs) // main moved → seed ai.go 1..3
+
+	// Rewrite line 2 on a FEATURE branch that is never merged to main.
+	git("checkout", "-b", "feature")
+	writeCommitFile(t, ws, "ai.go", "l1\nCHANGED\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "feature rewrites line 2")
+	pollDurability(sess, roots, t0+2*dayMs) // main did NOT move → no processing
+
+	// At 30d, all of ai.go 1..3 is durable — the feature-branch churn was out of
+	// scope. (If durability had followed working HEAD, line 2 would be churned.)
+	v := harvestDurable(sess, ws, key, t0+31*dayMs)
+	data := durVerdictFor(t, v, "ai.go")
+	durable := rangeSet(t, data, "durableRanges")
+	if !durable["1..3"] {
+		t.Errorf("durableRanges = %+v, want 1..3 (feature-branch churn must be out of scope)", durable)
+	}
+}
+
 // TestDurabilityInsertionShiftsSurvivor: an unrelated insertion ABOVE an AI range
 // shifts the range's reported line numbers but keeps it durable — the interval
 // remap, done with no per-line git spawn.
@@ -307,5 +351,98 @@ func TestDurabilityLedgerConcurrentMutations(t *testing.T) {
 		if got[fmt.Sprintf("root-%d", i)]["f.go"][0].LineageID != fmt.Sprintf("lin-%d", i) {
 			t.Errorf("root-%d missing/wrong after concurrent mutation", i)
 		}
+	}
+}
+
+// TestDurabilityDefaultRefReprobesWhenUnresolved: when a root has no resolvable
+// default branch (detached HEAD, no main/master, no origin), the ref must NOT be
+// cached as "" — otherwise creating the default branch later would never take
+// effect and durability would stay disabled for that root until restart. The
+// second lookup, after main is created, must re-resolve to it.
+func TestDurabilityDefaultRefReprobesWhenUnresolved(t *testing.T) {
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "trunk") // no main/master
+	sha := gitOut("rev-parse", "HEAD")
+	git("checkout", "--detach", sha) // detached HEAD → symbolic-ref HEAD is empty
+
+	if ref := durabilityDefaultRef(ws); ref != "" {
+		t.Fatalf("with no resolvable default, ref = %q, want empty", ref)
+	}
+	// Create the conventional default; a cached "" would defeat this.
+	git("branch", "main", sha)
+	if ref := durabilityDefaultRef(ws); ref != "refs/heads/main" {
+		t.Errorf("after creating main, ref = %q, want refs/heads/main (re-probed, not cached empty)", ref)
+	}
+}
+
+// TestDurabilityDefaultRefEvictsDeletedRef: once a default ref is resolved and
+// cached, renaming/deleting that branch must evict the cache so the next poll
+// re-resolves. Without eviction the root keeps probing the dead ref via the cache
+// and stays disabled until the process restarts.
+func TestDurabilityDefaultRefEvictsDeletedRef(t *testing.T) {
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	// First resolve caches refs/heads/main.
+	if ref, _, ok := durabilityDefaultTip(ws); !ok || ref != "refs/heads/main" {
+		t.Fatalf("initial tip: ref=%q ok=%v, want refs/heads/main true", ref, ok)
+	}
+	// Rename the default out from under the cache. The cached refs/heads/main no
+	// longer resolves; this call must fail AND evict.
+	git("branch", "-M", "trunk")
+	if _, _, ok := durabilityDefaultTip(ws); ok {
+		t.Fatalf("tip resolved a deleted ref, want ok=false")
+	}
+	// After eviction, the next poll re-resolves to the renamed default (trunk via
+	// symbolic HEAD). A non-evicting cache would stay stuck on the dead main ref.
+	want := gitOut("rev-parse", "HEAD")
+	ref, tip, ok := durabilityDefaultTip(ws)
+	if !ok || ref != "refs/heads/trunk" || tip != want {
+		t.Errorf("re-resolved tip: ref=%q tip=%q ok=%v, want refs/heads/trunk %s true", ref, tip, ok, want)
+	}
+}
+
+// TestDurabilityCommitAdvancesCursorAtomically pins that pollDurabilityCommit
+// advances the cursor to the commit it processed, in the same ledger transaction
+// as that commit's range changes. If the cursor advanced separately, a crash in
+// between would reprocess the commit and remap its ranges twice (remapTrackedRanges
+// is not idempotent). A zero-hunk (empty) commit must still advance, or it would
+// be reprocessed forever.
+func TestDurabilityCommitAdvancesCursorAtomically(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// An AI commit: processing it must leave the cursor AT that commit.
+	recordAiTouchedPath("sess-cursor", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	aiSha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(ws, key, sess, aiSha, t0)
+	if got := durabilityCursor(key); got != aiSha {
+		t.Fatalf("cursor after AI commit = %q, want %q (advanced atomically with ranges)", got, aiSha)
+	}
+
+	// A zero-hunk (empty) commit still advances the cursor — otherwise it would be
+	// reprocessed every poll.
+	git("commit", "--allow-empty", "-m", "empty")
+	emptySha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(ws, key, sess, emptySha, t0+dayMs)
+	if got := durabilityCursor(key); got != emptySha {
+		t.Errorf("cursor after empty commit = %q, want %q (zero-hunk commit must advance)", got, emptySha)
 	}
 }
