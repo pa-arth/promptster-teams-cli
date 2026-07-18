@@ -372,6 +372,40 @@ func TestClaudeTranscriptEditToolResult(t *testing.T) {
 	}
 }
 
+func TestClaudeTranscriptEditLineRanges(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"id":"msg-lr","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_lr","name":"Edit","input":{"file_path":"/tmp/ws/limiter.go","old_string":"a","new_string":"b"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:01:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_lr","content":"edited"}]},"toolUseResult":{"filePath":"/tmp/ws/limiter.go","structuredPatch":[{"oldStart":10,"oldLines":1,"newStart":10,"newLines":2,"lines":["-old","+new1","+new2"]},{"oldStart":30,"oldLines":0,"newStart":31,"newLines":3,"lines":["+a","+b","+c"]}],"userModified":false},"timestamp":"2026-06-10T10:01:02Z"}`,
+	)
+	var diff *event.Event
+	for i := range events {
+		if events[i].Kind == "file_diff" {
+			diff = &events[i]
+		}
+	}
+	if diff == nil {
+		t.Fatalf("no file_diff in %+v", events)
+	}
+	raw, ok := dm(*diff)["lineRanges"].([]interface{})
+	if !ok {
+		t.Fatalf("lineRanges = %T, want []interface{}: %+v", dm(*diff)["lineRanges"], dm(*diff)["lineRanges"])
+	}
+	if len(raw) != 2 {
+		t.Fatalf("lineRanges len = %d, want 2: %+v", len(raw), raw)
+	}
+	want := []struct{ start, end int }{{10, 11}, {31, 33}}
+	for i, r := range raw {
+		m := r.(map[string]interface{})
+		if m["start"] != want[i].start || m["end"] != want[i].end {
+			t.Errorf("range[%d] = {start:%v,end:%v}, want {%d,%d}", i, m["start"], m["end"], want[i].start, want[i].end)
+		}
+		if m["attribution"] != "likely_ai" {
+			t.Errorf("range[%d] attribution = %v, want likely_ai", i, m["attribution"])
+		}
+	}
+}
+
 func TestClaudeTranscriptErrorToolResult(t *testing.T) {
 	p := NewClaudeTranscriptProcessor("sess-1")
 	events := processAll(t, p,

@@ -85,7 +85,10 @@ var projectFieldAllowlist = map[string][]string{
 	// Keep in lockstep with the backend's TEAMS_FIELD_ALLOWLIST.
 	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
-	"file_diff":    {"path", "linesAdded", "linesRemoved"},
+	// lineRanges carries WHICH lines were AI as content-free {start,end,
+	// attribution} triples (ints + one enum); its element allowlist below is
+	// what structurally guarantees no diff/text bytes ride along.
+	"file_diff":    {"path", "linesAdded", "linesRemoved", "lineRanges"},
 	"file_create":  {"path", "linesAdded", "sizeBytes"},
 	"file_read":    {"path"},
 	"file_search":  {"path", "query"},
@@ -164,6 +167,13 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 		"skills":     {"slug", "name", "descTokens"},
 		"plugins":    {"name", "listingTokens"},
 		"mcpServers": {"name", "deferred"},
+	},
+	// lineRanges elements are content-free by construction (ints + one enum), but
+	// this allowlist is the LOAD-BEARING privacy line: it strips every element to
+	// exactly these three scalar keys, so a nested `text`/content key (a code
+	// leak) can never survive projection.
+	"file_diff": {
+		"lineRanges": {"start", "end", "attribution"},
 	},
 }
 

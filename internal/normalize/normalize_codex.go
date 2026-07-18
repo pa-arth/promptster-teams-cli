@@ -242,6 +242,9 @@ func (p *CodexRolloutProcessor) patchApplyEnd(payload map[string]interface{}, ts
 			"attribution":  "likely_ai",
 			"changeType":   stringField(change, "type"),
 		}
+		if ranges := lineRangesFromUnifiedDiff(diff, e.Provenance.Attribution); len(ranges) > 0 {
+			data["lineRanges"] = ranges
+		}
 		if mv := stringField(change, "move_path"); mv != "" {
 			data["movePath"] = mv
 		}
@@ -442,6 +445,43 @@ func countDiffLines(diff string) (added, removed int) {
 		}
 	}
 	return
+}
+
+// unifiedHunkHeaderRe captures the new-file side of a `@@ -a,b +c,d @@` hunk
+// header: group 1 = new start (c), group 2 = new length (d, optional — a
+// missing count means 1 per the unified-diff spec).
+var unifiedHunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
+
+// lineRangesFromUnifiedDiff derives the new-file-side line span of each hunk in
+// a unified diff as content-free {start,end,attribution} triples. Codex has no
+// structured hunks, so this scans ONLY the `@@` header lines — never any
+// `+`/`-` body content — mirroring the Claude structuredPatch path.
+//
+// Shape/attribution and the pure-deletion (new length 0) skip match
+// lineRangesFromStructuredPatch; see its doc comment.
+func lineRangesFromUnifiedDiff(diff, attribution string) []interface{} {
+	var ranges []interface{}
+	for _, line := range strings.Split(diff, "\n") {
+		m := unifiedHunkHeaderRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		start := 0
+		_, _ = fmt.Sscanf(m[1], "%d", &start) // regex guarantees digits.
+		count := 1
+		if m[2] != "" {
+			_, _ = fmt.Sscanf(m[2], "%d", &count)
+		}
+		if count == 0 {
+			continue
+		}
+		ranges = append(ranges, map[string]interface{}{
+			"start":       start,
+			"end":         start + count - 1,
+			"attribution": attribution,
+		})
+	}
+	return ranges
 }
 
 // parseCodexTs normalizes a rollout timestamp ("2026-06-06T20:38:45.965Z") to

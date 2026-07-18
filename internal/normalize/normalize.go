@@ -139,6 +139,40 @@ func countLinesFromPatches(patches []interface{}) (added, removed int) {
 	return
 }
 
+// lineRangesFromStructuredPatch derives the new-file-side line span of each
+// structuredPatch hunk as content-free {start,end,attribution} triples. This is
+// the WHICH-lines counterpart to countLinesFromPatches' how-many: it carries
+// only integers + the event's provenance enum, never any diff bytes or file
+// content (the projector's element allowlist structurally enforces that).
+//
+// The result is []interface{} of map[string]interface{} — the ONLY array shape
+// redact.projectArrayElements can walk (a []map[string]any would be stripped to
+// empty because it does not assert to []interface{}, and this path never
+// round-trips through JSON before projection).
+//
+// A pure-deletion hunk (newLines == 0) has no new-file lines to attribute and
+// is skipped.
+func lineRangesFromStructuredPatch(patches []interface{}, attribution string) []interface{} {
+	ranges := make([]interface{}, 0, len(patches))
+	for _, p := range patches {
+		patch, ok := p.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		newStart := intFromJSON(patch["newStart"])
+		newLines := intFromJSON(patch["newLines"])
+		if newLines == 0 {
+			continue
+		}
+		ranges = append(ranges, map[string]interface{}{
+			"start":       newStart,
+			"end":         newStart + newLines - 1,
+			"attribution": attribution,
+		})
+	}
+	return ranges
+}
+
 // intFromJSON extracts an int from a JSON number (float64).
 func intFromJSON(v interface{}) int {
 	if f, ok := v.(float64); ok {
@@ -218,6 +252,9 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 				added, removed := countLinesFromPatches(patches)
 				data["linesAdded"] = added
 				data["linesRemoved"] = removed
+				if ranges := lineRangesFromStructuredPatch(patches, e.Provenance.Attribution); len(ranges) > 0 {
+					data["lineRanges"] = ranges
+				}
 			} else if oldStr != "" || newStr != "" {
 				// Fallback: compute from old/new strings
 				oldLines := strings.Count(oldStr, "\n")
