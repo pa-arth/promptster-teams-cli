@@ -164,6 +164,14 @@ var projectFieldAllowlist = map[string][]string{
 	// files[]/lineRanges[] element allowlists below are the load-bearing privacy
 	// line — they clamp both array levels to scalar keys only.
 	"commit_attribution": {"commitSha", "workspaceKey", "files"},
+	// durability_verdict reports WHICH AI line ranges survived (durableRanges) or
+	// were rewritten (churnedRanges) on a path over time — content-free metadata:
+	// integer line numbers, an age, and a lineage id (a `sha:path` handle, never
+	// content). commitSha/workspaceKey/path are the same public identities the
+	// other watcher events carry. The durableRanges[]/churnedRanges[] element
+	// allowlists below are the load-bearing privacy line. NEVER a diff, file body,
+	// old/new string, or content fingerprint (fingerprints stay on-device).
+	"durability_verdict": {"commitSha", "workspaceKey", "path", "durableRanges", "churnedRanges", "measuredTsMs"},
 }
 
 // projectArrayElementAllowlist — element-level allowlists for array-of-object
@@ -194,6 +202,14 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	"commit_attribution": {
 		"files":      {"path", "lineRanges"},
 		"lineRanges": {"start", "end", "attribution"},
+	},
+	// durability_verdict's two range arrays are content-free by construction
+	// (ints + one lineage handle), but this allowlist is the LOAD-BEARING privacy
+	// line: it strips every element to exactly these scalar keys, so a smuggled
+	// `text`/byte/fingerprint key can never survive projection.
+	"durability_verdict": {
+		"durableRanges": {"start", "end", "ageDays", "lineageId"},
+		"churnedRanges": {"start", "end", "ageDays", "lineageId"},
 	},
 }
 
