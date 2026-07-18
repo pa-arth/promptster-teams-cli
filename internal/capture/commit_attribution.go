@@ -79,8 +79,13 @@ var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // `--unified=0` makes the `@@` spans tight to the changed lines. Best-effort:
 // an error (bad sha, not a repo) yields an empty map, which suppresses emission.
 func gitCommitDiffRanges(root, sha string) map[string][]attrLineRange {
+	// core.quotePath=false keeps non-ASCII paths verbatim (UTF-8) instead of
+	// C-quoted (octal-escaped), so they match the ledger's relPath keys. Paths
+	// with literal tabs/quotes/backslashes are still double-quoted by git and
+	// remain a rare documented miss.
 	// #nosec G204 -- constant argv; root is a discovered workspace dir and sha comes from git rev-list output (the watcher), not user input. Read-only.
 	out, err := exec.Command("git", "-C", root,
+		"-c", "core.quotePath=false",
 		"show", "--root", "--no-color", "--unified=0", "--format=", sha).Output()
 	if err != nil {
 		return map[string][]attrLineRange{}
@@ -160,12 +165,18 @@ func reconcileCommitAttribution(fileRanges map[string][]attrLineRange, aiPaths m
 	files = make([]attrFile, 0, len(paths))
 	for _, path := range paths {
 		attribution := attributionUnknown
-		// PATH-SPACE CAVEAT: aiPaths keys are relativized against session.TaskRoot
-		// (RelativizeEventPaths), while `path` is relative to the git root being
-		// polled. They align for the primary workspace root; for a SIBLING git
-		// worktree (root != TaskRoot) they may not, so AI evidence there can read
-		// as `unknown` — a conservative under-attribution, never a misattribution.
-		// A later per-line refinement must normalize both to a common root first.
+		// PATH-SPACE NOTES (what's true after workspace scoping):
+		//   1. aiPaths is now scoped by workspace root key (the caller passes
+		//      gitWatchRootKey(root) into readAiTouchedPaths), so a same-named
+		//      path AI-touched in ANOTHER repo can no longer bleed in.
+		//   2. Remaining v1 limitation (temporal, SAME workspace): a file
+		//      AI-touched earlier and then edited by a HUMAN within the 7-day
+		//      ledger TTL still attributes `likely_ai` at path granularity. The
+		//      Phase-2 commit-joined ledger will resolve this per-line/per-commit.
+		//   3. Sibling-worktree note: aiPaths keys are relativized against
+		//      session.TaskRoot, while `path` is relative to the git root polled.
+		//      For a SIBLING worktree (root != TaskRoot) the keys differ, so AI
+		//      evidence there reads as `unknown` — a conservative under-attribution.
 		if sid, ok := aiPaths[path]; ok {
 			attribution = attributionLikelyAI
 			sessionFiles[sid]++
@@ -213,7 +224,10 @@ func buildCommitAttributionEvent(session Session, root, sha string) (event.Event
 	if len(fileRanges) == 0 {
 		return event.Event{}, false
 	}
-	files, primarySession := reconcileCommitAttribution(fileRanges, readAiTouchedPaths())
+	// Scope the AI-paths read to THIS workspace's root key so a same-named path
+	// AI-touched in a DIFFERENT repo can't bleed in (closes cross-workspace
+	// over-attribution). gitWatchRootKey is in this package.
+	files, primarySession := reconcileCommitAttribution(fileRanges, readAiTouchedPaths(gitWatchRootKey(root)))
 
 	sessionID := primarySession
 	if sessionID == "" {

@@ -55,8 +55,9 @@ func TestCommitAttributionHappyPath(t *testing.T) {
 	git("commit", "-m", "add foo")
 	sha := gitOut("rev-parse", "HEAD")
 
-	// The AI channel recorded foo.go for this session (repo-relative POSIX path).
-	recordAiTouchedPath("ai-sess-1", "foo.go")
+	// The AI channel recorded foo.go for this session (repo-relative POSIX path),
+	// scoped to this workspace's root key.
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(ws), "foo.go")
 
 	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
 	if !ok {
@@ -145,7 +146,7 @@ func TestCommitAttributionFormatterRobust(t *testing.T) {
 	// AI edits app.go; the ledger records the path. The "reflow": the change
 	// lands as two NEW lines appended at the end (new-side lines 4-5), which no
 	// pre-formatter transcript range for the middle of the file would predict.
-	recordAiTouchedPath("ai-sess-2", "app.go")
+	recordAiTouchedPath("ai-sess-2", gitWatchRootKey(ws), "app.go")
 	writeCommitFile(t, ws, "app.go", "line1\nline2\nline3\nnew4\nnew5\n")
 	git("add", "-A")
 	git("commit", "-m", "ai appends, reflowed")
@@ -215,7 +216,7 @@ func TestCommitAttributionSurvivesEmitPath(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "ai handler")
 	sha := gitOut("rev-parse", "HEAD")
-	recordAiTouchedPath("ai-sess-3", "svc/handler.go")
+	recordAiTouchedPath("ai-sess-3", gitWatchRootKey(ws), "svc/handler.go")
 
 	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-emit", TaskRoot: ws}, ws, sha)
 	if !ok {
@@ -276,6 +277,72 @@ func TestCommitAttributionSurvivesEmitPath(t *testing.T) {
 	// Only the three scalar keys survive the nested element allowlist.
 	if len(r) != 3 {
 		t.Errorf("lineRange has %d keys, want exactly {start,end,attribution}: %+v", len(r), r)
+	}
+}
+
+// TestCommitAttributionCrossWorkspaceNoBleed: an AI path recorded under
+// workspace A's root key must NOT attribute a same-named file committed in a
+// DIFFERENT repo B. The workspace scoping (readAiTouchedPaths(rootKey)) is what
+// prevents the cross-repo over-attribution.
+func TestCommitAttributionCrossWorkspaceNoBleed(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	// Workspace A: AI touched shared.go here.
+	wsA, _, _ := gitRepo(t)
+	recordAiTouchedPath("ai-sess-A", gitWatchRootKey(wsA), "shared.go")
+
+	// Workspace B: a DIFFERENT repo commits a same-named shared.go.
+	wsB, gitB, gitBOut := gitRepo(t)
+	writeCommitFile(t, wsB, "shared.go", "package main\n\nvar y = 2\n")
+	gitB("add", "-A")
+	gitB("commit", "-m", "human edit in repo B")
+	shaB := gitBOut("rev-parse", "HEAD")
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-b", TaskRoot: wsB}, wsB, shaB)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	shared := files["shared.go"]
+	for _, r := range shared["lineRanges"].([]interface{}) {
+		if r.(map[string]interface{})["attribution"] != attributionUnknown {
+			t.Errorf("cross-workspace shared.go must be unknown, not bled likely_ai: %+v", r)
+		}
+	}
+}
+
+// TestCommitAttributionNonASCIIPath: a committed file with a non-ASCII name that
+// IS in the ai-paths ledger must reconcile as likely_ai. Without
+// core.quotePath=false git would C-quote the path in the diff header, and it
+// would never match the ledger's UTF-8 key (falling to unknown).
+func TestCommitAttributionNonASCIIPath(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "café.go", "package main\n\nvar z = 3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai edit, non-ascii path")
+	sha := gitOut("rev-parse", "HEAD")
+
+	recordAiTouchedPath("ai-sess-utf8", gitWatchRootKey(ws), "café.go")
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	cafe, present := files["café.go"]
+	if !present {
+		t.Fatalf("café.go missing from files (path likely C-quoted): %+v", files)
+	}
+	ranges := cafe["lineRanges"].([]interface{})
+	if len(ranges) == 0 {
+		t.Fatal("café.go has no lineRanges")
+	}
+	for _, r := range ranges {
+		if r.(map[string]interface{})["attribution"] != attributionLikelyAI {
+			t.Errorf("non-ASCII AI-touched path must be likely_ai: %+v", r)
+		}
 	}
 }
 
