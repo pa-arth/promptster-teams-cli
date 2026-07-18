@@ -319,6 +319,38 @@ func TestCodexAiResponseCarriesReasoningTokens(t *testing.T) {
 	t.Fatal("no ai_response event")
 }
 
+// TestCodexReasoningTokensOmittedWhenUnreported (§10.2): a usage payload that
+// reports input/output tokens but NO reasoning_output_tokens must OMIT
+// reasoningTokens entirely rather than emit 0. Emitting 0 would conflate an
+// unreported count with a genuine zero — the same "never fabricate a value for
+// something we don't know" invariant the attribution buckets hold.
+func TestCodexReasoningTokensOmittedWhenUnreported(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-nr")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		data := e.Data.(map[string]interface{})
+		if _, present := data["reasoningTokens"]; present {
+			t.Fatalf("reasoningTokens present (%v) when the usage payload reported none; want omitted", data["reasoningTokens"])
+		}
+		// Ordinary counts still flow.
+		if got := data["outputTokens"]; got != int64(20) {
+			t.Fatalf("outputTokens = %v, want int64(20)", got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
 func TestParseCodexExecOutput(t *testing.T) {
 	code, stdout := parseCodexExecOutput("Chunk ID: a1\nProcess exited with code 3\nOutput:\nhello\nworld\n")
 	if code != 3 {
