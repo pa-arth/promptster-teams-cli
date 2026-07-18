@@ -68,10 +68,14 @@ type durTrackedRange struct {
 	BornTsMs  int64  `json:"bornTsMs"`
 }
 
-// durabilityLedger is the on-disk living-AI-line state: rootKey → path → spans.
+// durabilityLedger is the on-disk living-AI-line state: rootKey → path → spans,
+// plus the per-root default-branch cursor (rootKey → last-processed default-tip
+// SHA). Cursor and ranges live in ONE file under ONE lock so a poll advances
+// both atomically.
 type durabilityLedger struct {
-	V     int                                     `json:"v"`
-	Roots map[string]map[string][]durTrackedRange `json:"roots"`
+	V       int                                     `json:"v"`
+	Roots   map[string]map[string][]durTrackedRange `json:"roots"`
+	Cursors map[string]string                       `json:"cursors"`
 }
 
 func durabilityLedgerPath() string {
