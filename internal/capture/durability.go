@@ -349,7 +349,17 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 		return nil
 	}
 	hunks := parseUnifiedDiffHunks(diff)
+	diffNewLines := parseUnifiedDiffNewLines(diff)
 	aiPaths := readAiTouchedPaths(rootKey)
+
+	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
+	// ledger lock, so the ledger's read-modify-write never nests another lock.
+	fpsByPath := map[string]map[string]string{}
+	for path := range hunks {
+		if fps := fingerprintsForPath(rootKey, path, nowMs); fps != nil {
+			fpsByPath[path] = fps
+		}
+	}
 
 	var verdicts []event.Event
 	mutateDurabilityLedger(func(led *durabilityLedger) {
@@ -380,16 +390,24 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 				}
 				continue
 			}
-			// First touch: seed the path's new-side AI spans if the AI touched it.
-			if _, isAI := aiPaths[path]; !isAI {
-				continue
-			}
-			lineage := durLineageID(sha, path)
+			// First touch. Prefer fingerprint transfer (precise, and the ONLY thing
+			// that survives a squash-merge — it carries lineage across the new SHA).
+			// Fall back to path-level seeding only when there is NO fingerprint
+			// evidence for this path (e.g. a cold ledger), preserving the simpler
+			// same-branch behavior.
 			var seeded []durTrackedRange
-			for _, r := range newSideAiRanges(hs) {
-				r.LineageID = lineage
-				r.BornTsMs = nowMs
-				seeded = append(seeded, r)
+			if fps := fpsByPath[path]; fps != nil {
+				for _, r := range matchedAiRuns(diffNewLines[path], fps, durabilityMinTransferRun) {
+					r.BornTsMs = nowMs
+					seeded = append(seeded, r)
+				}
+			} else if _, isAI := aiPaths[path]; isAI {
+				lineage := durLineageID(sha, path)
+				for _, r := range newSideAiRanges(hs) {
+					r.LineageID = lineage
+					r.BornTsMs = nowMs
+					seeded = append(seeded, r)
+				}
 			}
 			if len(seeded) > 0 {
 				files[path] = seeded
