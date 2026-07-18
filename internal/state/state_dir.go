@@ -37,6 +37,24 @@ func HomeRelative(p string) string {
 	return p
 }
 
+// HomeRelativeStrict is HomeRelative for telemetry: it returns a value ONLY
+// when it can PROVE the path is under $HOME (result is "~" or begins "~/").
+// An outside-home path or a home-lookup failure returns "" — an absolute path
+// (which may carry the OS username) must never be emitted as workdir.
+//
+// This is the emit boundary for the allowlisted `workdir` field: HomeRelative
+// returns an outside-home path UNCHANGED (correct for user-facing display in
+// prettyHome), which would copy an absolute, username-bearing path onto the
+// wire. The normalizers guard `if wd != "" {...}`, so "" here omits the field
+// entirely — workdir is "~"-prefixed or ABSENT, never a raw absolute path.
+func HomeRelativeStrict(p string) string {
+	r := HomeRelative(p)
+	if r == "~" || strings.HasPrefix(r, "~/") {
+		return r
+	}
+	return ""
+}
+
 // activeWorkspacePath returns the path to the pointer file that tells hooks
 // which workspace is currently active.
 func activeWorkspacePath() string {

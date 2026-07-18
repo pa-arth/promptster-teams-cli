@@ -701,10 +701,11 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// workdir — WHERE this session ran, home-collapsed to "~/…" so it names the
 	// repo/worktree without leaking the OS username the absolute path carries. It
 	// rides on its own individually-allowlisted key (redact.projectFieldAllowlist
-	// "prompt" → "workdir"); the raw absolute `cwd` stays DROPPED. Set only when
-	// the transcript line actually carried a cwd (and HomeRelative returned
-	// non-empty).
-	if wd := state.HomeRelative(stringField(rec, "cwd")); wd != "" {
+	// "prompt" → "workdir"); the raw absolute `cwd` stays DROPPED. HomeRelativeStrict
+	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home cwd
+	// or a home-lookup failure returns "", so the field is omitted rather than
+	// leaking an absolute path that may carry the OS username.
+	if wd := state.HomeRelativeStrict(stringField(rec, "cwd")); wd != "" {
 		data["workdir"] = wd
 	}
 

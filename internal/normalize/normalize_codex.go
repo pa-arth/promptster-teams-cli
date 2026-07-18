@@ -138,8 +138,11 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 		p.sessionID = stringField(payload, "id")
 	}
 	// Stash the home-collapsed cwd for prompt events: session_meta is the only
-	// rollout line carrying cwd, and it precedes every prompt.
-	p.workdir = state.HomeRelative(stringField(payload, "cwd"))
+	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
+	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home
+	// cwd or a home-lookup failure yields "", so the prompt omits workdir rather
+	// than leaking an absolute path that may carry the OS username.
+	p.workdir = state.HomeRelativeStrict(stringField(payload, "cwd"))
 	e := p.newCodexEvent("session_start", ts, stringField(payload, "id"))
 	data := map[string]interface{}{
 		"ideSessionId": stringField(payload, "id"),

@@ -1,6 +1,7 @@
 package normalize
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -149,6 +150,53 @@ func TestCodexTranscriptDeterministicEventIDs(t *testing.T) {
 	other := idsByKindCodex(t, "sess-other")
 	if other["prompt"][0] == first["prompt"][0] {
 		t.Errorf("prompt id collided across sessions: %q", other["prompt"][0])
+	}
+}
+
+// codexPromptWorkdir feeds a session_meta (carrying cwd) followed by a
+// user_message and returns the workdir stamped on the prompt event (nil if
+// absent). session_meta is the only rollout line carrying cwd; it precedes
+// every prompt.
+func codexPromptWorkdir(t *testing.T, cwd string) interface{} {
+	t.Helper()
+	p := NewCodexRolloutProcessor("sess-wd")
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"019e9ea8-d5a7-7492-89ec-10c105ee33c3","cwd":"` + cwd + `","originator":"codex_exec","cli_version":"0.137.0","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing","images":[]}}`,
+	}
+	var prompt *event.Event
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatalf("no prompt event emitted for cwd %q", cwd)
+	}
+	return prompt.Data.(map[string]interface{})["workdir"]
+}
+
+// TestCodexPromptWorkdirHomeRelative pins the codex workdir emit: an under-home
+// cwd collapses to "~/…" on the prompt event.
+func TestCodexPromptWorkdirHomeRelative(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "user")
+	t.Setenv("HOME", home)
+	cwd := filepath.Join(home, "repos", "foo")
+	if got := codexPromptWorkdir(t, cwd); got != "~/repos/foo" {
+		t.Errorf("workdir = %v, want ~/repos/foo", got)
+	}
+}
+
+// TestCodexPromptWorkdirOutsideHome is the privacy guard: an outside-home cwd
+// (which may carry the OS username) must produce NO workdir on the prompt.
+func TestCodexPromptWorkdirOutsideHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "user")
+	t.Setenv("HOME", home)
+	if got := codexPromptWorkdir(t, "/mnt/users/alice/repo"); got != nil {
+		t.Errorf("workdir = %v, want absent for an outside-home cwd (would leak absolute path)", got)
 	}
 }
 

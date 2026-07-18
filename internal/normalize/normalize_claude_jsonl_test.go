@@ -87,6 +87,30 @@ func TestClaudeTranscriptPromptWorkdir(t *testing.T) {
 	}
 }
 
+// TestClaudeTranscriptPromptWorkdirOutsideHome is the privacy guard: a prompt
+// whose cwd is OUTSIDE $HOME (an absolute path that may carry the OS username)
+// must produce NO data.workdir — the field is "~"-prefixed or absent, never a
+// raw absolute path. HomeRelativeStrict returns "" and the emit guard omits it.
+func TestClaudeTranscriptPromptWorkdirOutsideHome(t *testing.T) {
+	home := filepath.Join(t.TempDir(), "user")
+	t.Setenv("HOME", home)
+
+	p := NewClaudeTranscriptProcessor("sess-wd-out")
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/mnt/users/alice/repo","sessionId":"ide-1","promptSource":"typed","uuid":"u-wd-out"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	e := events[0]
+	if got := dm(e)["workdir"]; got != nil {
+		t.Errorf("workdir = %v, want absent for an outside-home cwd (would leak absolute path)", got)
+	}
+	if dm(e)["cwd"] != nil {
+		t.Errorf("raw cwd stamped onto the event: %v", dm(e)["cwd"])
+	}
+}
+
 // A <task-notification> is harness-injected, and the CLI deliberately does NOT
 // drop it: a client-side drop is irreversible and bakes into every installed
 // CLI. It ships with promptSource:"system" so the backend can filter on read.
