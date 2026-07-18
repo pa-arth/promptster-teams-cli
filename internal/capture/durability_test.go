@@ -1,7 +1,9 @@
 package capture
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -224,5 +226,86 @@ func TestDurabilityInsertionShiftsSurvivor(t *testing.T) {
 	durable := rangeSet(t, data, "durableRanges")
 	if !durable["3..5"] {
 		t.Errorf("durableRanges = %+v, want shifted 3..5", durable)
+	}
+}
+
+// TestDurabilityMergeCommitSeedsFirstParent: AI lines that reach the default
+// branch through a real (non-squash) MERGE commit are still seen. A merge
+// commit's default `git show` is a combined `@@@` diff our `@@` parser cannot
+// read, so without `-m --first-parent` the merge yields zero hunks and the
+// landed AI lines are neither seeded nor churned. Here they must seed and mature.
+func TestDurabilityMergeCommitSeedsFirstParent(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// AI writes feature.go on a branch.
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-merge", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "m1\nm2\nm3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+
+	// Merge into main WITHOUT squashing and WITHOUT fast-forward, producing a
+	// real two-parent merge commit — the case a combined diff would hide.
+	git("checkout", "main")
+	git("merge", "--no-ff", "--no-edit", "feature")
+	mergeSha := gitOut("rev-parse", "HEAD")
+	if parents := strings.Fields(gitOut("rev-list", "--parents", "-n1", "HEAD")); len(parents) != 3 {
+		t.Fatalf("expected a 2-parent merge commit, got parents %v", parents)
+	}
+
+	// The merge commit's first-parent diff surfaces feature.go's AI lines → seed.
+	if churn := pollDurabilityCommit(ws, key, sess, mergeSha, t0); len(churn) != 0 {
+		t.Fatalf("seeding a merge commit must churn nothing, got %+v", churn)
+	}
+	// They mature to durable 30d after landing on the default branch.
+	v := harvestDurable(sess, ws, key, t0+31*dayMs)
+	data := durVerdictFor(t, v, "feature.go")
+	durable := rangeSet(t, data, "durableRanges")
+	if !durable["1..3"] {
+		t.Errorf("durableRanges = %+v, want 1..3 seeded via merge first-parent", durable)
+	}
+}
+
+// TestDurabilityLedgerConcurrentMutations pins the atomicity contract of
+// mutateDurabilityLedger: concurrent read-modify-writes (as several CLI sessions
+// sharing the state dir produce) must not lose updates. Load-then-save with two
+// separate locks would drop entries here; the single locked RMW keeps them all.
+func TestDurabilityLedgerConcurrentMutations(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const n = 40
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			mutateDurabilityLedger(func(led *durabilityLedger) {
+				if led.Roots == nil {
+					led.Roots = map[string]map[string][]durTrackedRange{}
+				}
+				led.Roots[fmt.Sprintf("root-%d", i)] = map[string][]durTrackedRange{
+					"f.go": {{Start: 1, End: 1, LineageID: fmt.Sprintf("lin-%d", i), BornTsMs: 1}},
+				}
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	got := loadDurabilityLedger().Roots
+	if len(got) != n {
+		t.Fatalf("roots = %d, want %d — a concurrent RMW lost updates", len(got), n)
+	}
+	for i := 0; i < n; i++ {
+		if got[fmt.Sprintf("root-%d", i)]["f.go"][0].LineageID != fmt.Sprintf("lin-%d", i) {
+			t.Errorf("root-%d missing/wrong after concurrent mutation", i)
+		}
 	}
 }

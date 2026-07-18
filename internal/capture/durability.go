@@ -78,38 +78,62 @@ func durabilityLedgerPath() string {
 	return filepath.Join(state.StateDir(), "durability.json")
 }
 
-// loadDurabilityLedger reads the ledger under the buffer lock; a missing or
-// version-mismatched file yields an empty ledger (never an error).
-func loadDurabilityLedger() durabilityLedger {
+// readDurabilityLedgerUnlocked reads the ledger WITHOUT taking the buffer lock —
+// the caller must already hold it. A missing or version-mismatched file yields
+// an empty ledger (never an error).
+func readDurabilityLedgerUnlocked() durabilityLedger {
 	led := durabilityLedger{V: durabilityLedgerVersion, Roots: map[string]map[string][]durTrackedRange{}}
+	data, err := os.ReadFile(durabilityLedgerPath())
+	if err != nil {
+		return led
+	}
+	var onDisk durabilityLedger
+	if json.Unmarshal(data, &onDisk) == nil && onDisk.V == durabilityLedgerVersion && onDisk.Roots != nil {
+		led = onDisk
+	}
+	return led
+}
+
+// writeDurabilityLedgerUnlocked writes the ledger atomically (tmp + rename)
+// WITHOUT taking the buffer lock — the caller must already hold it. Best-effort:
+// I/O failure never blocks the caller.
+func writeDurabilityLedgerUnlocked(led durabilityLedger) {
+	led.V = durabilityLedgerVersion
+	data, err := json.Marshal(led)
+	if err != nil {
+		return
+	}
+	tmp := durabilityLedgerPath() + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, durabilityLedgerPath())
+}
+
+// loadDurabilityLedger reads the ledger under the buffer lock. For read-only
+// callers; a mutating caller MUST use mutateDurabilityLedger so its
+// read-modify-write is a single locked section.
+func loadDurabilityLedger() durabilityLedger {
+	var led durabilityLedger
 	_ = sign.WithBufferLock(durabilityLedgerPath()+".lock", func() error {
-		data, err := os.ReadFile(durabilityLedgerPath())
-		if err != nil {
-			return nil
-		}
-		var onDisk durabilityLedger
-		if json.Unmarshal(data, &onDisk) == nil && onDisk.V == durabilityLedgerVersion && onDisk.Roots != nil {
-			led = onDisk
-		}
+		led = readDurabilityLedgerUnlocked()
 		return nil
 	})
 	return led
 }
 
-// saveDurabilityLedger writes the ledger atomically (tmp + rename) under the
-// lock. Best-effort: I/O failure never blocks the caller.
-func saveDurabilityLedger(led durabilityLedger) {
-	led.V = durabilityLedgerVersion
+// mutateDurabilityLedger runs load -> fn -> save as ONE locked read-modify-write.
+// Separately locking the load and the save (as load+save above do) is not atomic
+// across processes: with several CLI sessions sharing the state dir, a range
+// update written between another writer's load and save is silently lost while
+// its cursor still advances past the commit — permanently omitting that AI range.
+// Every mutating durability path funnels through here so the whole RMW is atomic.
+func mutateDurabilityLedger(fn func(led *durabilityLedger)) {
 	_ = sign.WithBufferLock(durabilityLedgerPath()+".lock", func() error {
-		data, err := json.Marshal(led)
-		if err != nil {
-			return err
-		}
-		tmp := durabilityLedgerPath() + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			return err
-		}
-		return os.Rename(tmp, durabilityLedgerPath())
+		led := readDurabilityLedgerUnlocked()
+		fn(&led)
+		writeDurabilityLedgerUnlocked(led)
+		return nil
 	})
 }
 
@@ -183,11 +207,19 @@ func parseUnifiedDiffHunks(diff string) map[string][]diffHunk {
 // gitCommitRawDiff returns the raw unified-diff text for one commit — the SAME
 // single spawn as gitCommitDiffRanges, kept as text so durability can parse
 // both sides of each hunk. Best-effort: an error yields ok=false.
+//
+// `-m --first-parent` makes a merge commit diff against its FIRST parent (the
+// previous default-branch tip) instead of emitting a combined `@@@` diff that
+// our `@@` hunk parser cannot read. Without it, a merge that lands AI lines on
+// the default branch produces no parseable hunks, so those lines are neither
+// seeded nor churned — a real miss for merge-based (non-squash) flows. For a
+// single-parent commit the flags are a verified no-op (byte-identical output).
 func gitCommitRawDiff(root, sha string) (string, bool) {
 	// #nosec G204 -- constant argv; root is a discovered workspace dir and sha comes from git rev-list output, not user input. Read-only.
 	out, err := exec.Command("git", "-C", root,
 		"-c", "core.quotePath=false",
-		"show", "--root", "--no-color", "--unified=0", "--format=", sha).Output()
+		"show", "--root", "--no-color", "--unified=0", "--format=",
+		"-m", "--first-parent", sha).Output()
 	if err != nil {
 		return "", false
 	}
@@ -316,52 +348,51 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	}
 	aiPaths := readAiTouchedPaths(rootKey)
 
-	led := loadDurabilityLedger()
-	files := led.Roots[rootKey]
-	if files == nil {
-		files = map[string][]durTrackedRange{}
-	}
-
 	var verdicts []event.Event
-	for path, hs := range hunks {
-		if existing := files[path]; len(existing) > 0 {
-			// Already tracked: remap only — never re-seed (header rationale).
-			surv, churned := remapTrackedRanges(existing, hs)
-			if len(surv) > 0 {
-				files[path] = surv
-			} else {
-				delete(files, path)
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		files := led.Roots[rootKey]
+		if files == nil {
+			files = map[string][]durTrackedRange{}
+		}
+		for path, hs := range hunks {
+			if existing := files[path]; len(existing) > 0 {
+				// Already tracked: remap only — never re-seed (header rationale).
+				surv, churned := remapTrackedRanges(existing, hs)
+				if len(surv) > 0 {
+					files[path] = surv
+				} else {
+					delete(files, path)
+				}
+				if len(churned) > 0 {
+					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nowMs))
+				}
+				continue
 			}
-			if len(churned) > 0 {
-				verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nowMs))
+			// First touch: seed the path's new-side AI spans if the AI touched it.
+			if _, isAI := aiPaths[path]; !isAI {
+				continue
 			}
-			continue
+			lineage := durLineageID(sha, path)
+			var seeded []durTrackedRange
+			for _, r := range newSideAiRanges(hs) {
+				r.LineageID = lineage
+				r.BornTsMs = nowMs
+				seeded = append(seeded, r)
+			}
+			if len(seeded) > 0 {
+				files[path] = seeded
+			}
 		}
-		// First touch: seed the path's new-side AI spans if the AI touched it.
-		if _, isAI := aiPaths[path]; !isAI {
-			continue
-		}
-		lineage := durLineageID(sha, path)
-		var seeded []durTrackedRange
-		for _, r := range newSideAiRanges(hs) {
-			r.LineageID = lineage
-			r.BornTsMs = nowMs
-			seeded = append(seeded, r)
-		}
-		if len(seeded) > 0 {
-			files[path] = seeded
-		}
-	}
 
-	if len(files) > 0 {
-		if led.Roots == nil {
-			led.Roots = map[string]map[string][]durTrackedRange{}
+		if len(files) > 0 {
+			if led.Roots == nil {
+				led.Roots = map[string]map[string][]durTrackedRange{}
+			}
+			led.Roots[rootKey] = files
+		} else {
+			delete(led.Roots, rootKey)
 		}
-		led.Roots[rootKey] = files
-	} else {
-		delete(led.Roots, rootKey)
-	}
-	saveDurabilityLedger(led)
+	})
 
 	for i := range verdicts {
 		emitDurabilityVerdict(verdicts[i])
@@ -374,40 +405,53 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 // reported exactly once. Returns (and emits) one verdict per path with matured
 // spans. No git spawn on the hot path — pure age check over the ledger.
 func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.Event {
-	led := loadDurabilityLedger()
-	files := led.Roots[rootKey]
-	if len(files) == 0 {
-		return nil
+	// Matured spans dropped from the ledger under the lock; the verdict (which
+	// needs a git HEAD read) is built afterwards so no git spawn runs while the
+	// ledger lock is held, and only when something actually matured.
+	type harvested struct {
+		path    string
+		durable []durTrackedRange
 	}
-	measureSha, _ := gitHead(root)
-
-	var verdicts []event.Event
-	for path, ranges := range files {
-		var durable, remaining []durTrackedRange
-		for _, r := range ranges {
-			if nowMs-r.BornTsMs >= durabilityWindowMs {
-				durable = append(durable, r)
+	var matured []harvested
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		files := led.Roots[rootKey]
+		if len(files) == 0 {
+			return
+		}
+		for path, ranges := range files {
+			var durable, remaining []durTrackedRange
+			for _, r := range ranges {
+				if nowMs-r.BornTsMs >= durabilityWindowMs {
+					durable = append(durable, r)
+				} else {
+					remaining = append(remaining, r)
+				}
+			}
+			if len(durable) == 0 {
+				continue
+			}
+			matured = append(matured, harvested{path: path, durable: durable})
+			if len(remaining) > 0 {
+				files[path] = remaining
 			} else {
-				remaining = append(remaining, r)
+				delete(files, path)
 			}
 		}
-		if len(durable) == 0 {
-			continue
-		}
-		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, path, durable, nil, nowMs))
-		if len(remaining) > 0 {
-			files[path] = remaining
+		if len(files) > 0 {
+			led.Roots[rootKey] = files
 		} else {
-			delete(files, path)
+			delete(led.Roots, rootKey)
 		}
+	})
+	if len(matured) == 0 {
+		return nil
 	}
-	if len(files) > 0 {
-		led.Roots[rootKey] = files
-	} else {
-		delete(led.Roots, rootKey)
-	}
-	saveDurabilityLedger(led)
 
+	measureSha, _ := gitHead(root)
+	var verdicts []event.Event
+	for _, h := range matured {
+		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, h.path, h.durable, nil, nowMs))
+	}
 	for i := range verdicts {
 		emitDurabilityVerdict(verdicts[i])
 	}
