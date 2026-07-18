@@ -25,10 +25,10 @@ func findBashWindow(windows []bashWindow, sessionID string) (bashWindow, bool) {
 func TestRecordAndReadBashWindows(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 
-	recordBashWindow("sess-A", 1000, 2000)
-	recordBashWindow("sess-B", 5000, 6000)
+	recordBashWindow("sess-A", "", 1000, 2000)
+	recordBashWindow("sess-B", "", 5000, 6000)
 
-	got := readBashWindows()
+	got := readBashWindows("")
 	a, ok := findBashWindow(got, "sess-A")
 	if !ok {
 		t.Fatalf("sess-A window missing: %+v", got)
@@ -51,8 +51,8 @@ func TestRecordAndReadBashWindows(t *testing.T) {
 func TestReadBashWindowsExpiresByTTL(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 
-	recordBashWindow("fresh", 1000, 2000)
-	recordBashWindow("stale", 3000, 4000)
+	recordBashWindow("fresh", "", 1000, 2000)
+	recordBashWindow("stale", "", 3000, 4000)
 
 	// Rewrite the "stale" session's timestamp to well beyond the TTL window.
 	data, err := os.ReadFile(bashWindowsLedgerPath())
@@ -74,12 +74,46 @@ func TestReadBashWindowsExpiresByTTL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := readBashWindows()
+	got := readBashWindows("")
 	if _, ok := findBashWindow(got, "stale"); ok {
 		t.Error("window from an expired session must be excluded by TTL")
 	}
 	if _, ok := findBashWindow(got, "fresh"); !ok {
 		t.Error("fresh session window must survive")
+	}
+}
+
+// TestReadBashWindowsWorkspaceScoping: windows recorded under different root keys
+// are separated by a scoped read, and an unscoped read returns all — mirrors the
+// ai-paths ledger scoping.
+func TestReadBashWindowsWorkspaceScoping(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	recordBashWindow("sess-A", "keyA", 1000, 2000)
+	recordBashWindow("sess-B", "keyB", 5000, 6000)
+
+	a := readBashWindows("keyA")
+	if _, ok := findBashWindow(a, "sess-A"); !ok {
+		t.Errorf("keyA scope must include sess-A: %+v", a)
+	}
+	if _, ok := findBashWindow(a, "sess-B"); ok {
+		t.Errorf("keyA scope must exclude sess-B (recorded under keyB): %+v", a)
+	}
+
+	b := readBashWindows("keyB")
+	if _, ok := findBashWindow(b, "sess-B"); !ok {
+		t.Errorf("keyB scope must include sess-B: %+v", b)
+	}
+	if _, ok := findBashWindow(b, "sess-A"); ok {
+		t.Errorf("keyB scope must exclude sess-A: %+v", b)
+	}
+
+	all := readBashWindows("")
+	if _, ok := findBashWindow(all, "sess-A"); !ok {
+		t.Errorf("unscoped read must include sess-A: %+v", all)
+	}
+	if _, ok := findBashWindow(all, "sess-B"); !ok {
+		t.Errorf("unscoped read must include sess-B: %+v", all)
 	}
 }
 
@@ -96,24 +130,24 @@ func TestRecordAiBashWindowOnlyAICommands(t *testing.T) {
 	ai := event.NewEvent("command", "ai-sess")
 	ai.Ts = ts
 	ai.Provenance = event.AIProvenance()
-	recordAiBashWindow(&ai)
+	recordAiBashWindow(&ai, "")
 
 	human := event.NewEvent("command", "human-sess")
 	human.Ts = ts
 	human.Provenance = event.HumanProvenance()
-	recordAiBashWindow(&human)
+	recordAiBashWindow(&human, "")
 
 	noProv := event.NewEvent("command", "noprov-sess")
 	noProv.Ts = ts
-	recordAiBashWindow(&noProv)
+	recordAiBashWindow(&noProv, "")
 
 	// A non-command AI event must never record a bash window.
 	fileDiff := event.NewEvent("file_diff", "ai-sess")
 	fileDiff.Ts = ts
 	fileDiff.Provenance = event.AIProvenance()
-	recordAiBashWindow(&fileDiff)
+	recordAiBashWindow(&fileDiff, "")
 
-	got := readBashWindows()
+	got := readBashWindows("")
 	if len(got) != 1 {
 		t.Fatalf("want exactly one recorded window (the AI command), got %d: %+v", len(got), got)
 	}

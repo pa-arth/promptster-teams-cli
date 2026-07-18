@@ -236,6 +236,7 @@ type bashWindowsLedger struct {
 type bashWindowsEntry struct {
 	Windows []bashWindowSpan `json:"windows"`
 	TsMs    int64            `json:"tsMs"`
+	RootKey string           `json:"rootKey"`
 }
 
 // bashWindowSpan is one AI bash command's execution window, in Unix ms.
@@ -253,17 +254,23 @@ type bashWindow struct {
 }
 
 const (
-	bashWindowsLedgerVersion = 1
+	bashWindowsLedgerVersion = 2
 	// bashWindowsMaxPerSession bounds a session that runs a very large number of
 	// bash commands. Oldest windows are dropped first — recovery cares about
 	// recent activity, and a commit's files were written recently.
 	bashWindowsMaxPerSession = 1024
 )
 
-// recordBashWindow appends one AI bash execution window to the session's ledger.
+// recordBashWindow appends one AI bash execution window to the session's ledger,
+// tagged with the workspace rootKey so a reader can scope reads to one workspace.
 // Best-effort: ledger I/O failures must never block event emission. Mirrors
 // recordAiTouchedPath's lock + version/TTL/prune discipline.
-func recordBashWindow(sessionID string, startMs, endMs int64) {
+//
+// RESIDUAL RISK (same-workspace, inherent to the mtime heuristic): a HUMAN file
+// save that happens to land inside an AI bash window is recovered as likely_ai.
+// The window scoping below removes only the CROSS-repo case; the temporal
+// same-workspace overlap is a documented tradeoff of the opt-in heuristic.
+func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 	if sessionID == "" {
 		return
 	}
@@ -286,6 +293,7 @@ func recordBashWindow(sessionID string, startMs, endMs int64) {
 			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
 		}
 		entry.TsMs = nowMs
+		entry.RootKey = rootKey
 		ledger.Sessions[sessionID] = entry
 		pruneBashWindows(&ledger, nowMs)
 
@@ -305,7 +313,12 @@ func recordBashWindow(sessionID string, startMs, endMs int64) {
 // aiPathsTTL, each tagged with its recording session. Read-only (never rewrites
 // the ledger), so a pure reader like the git watcher can't evict a live session
 // — same discipline as readAiTouchedPaths.
-func readBashWindows() []bashWindow {
+//
+// rootKey scopes the read to one workspace: a window recorded under a DIFFERENT
+// known rootKey is skipped, so a bash edit in another repo can't recover a
+// same-mtime file here. Conservative: excluded only when both sides are known
+// AND differ (an unknown on either side falls through as a match).
+func readBashWindows(rootKey string) []bashWindow {
 	var out []bashWindow
 	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(bashWindowsLedgerPath())
@@ -320,6 +333,9 @@ func readBashWindows() []bashWindow {
 		ttlMs := aiPathsTTL.Milliseconds()
 		for sid, entry := range ledger.Sessions {
 			if nowMs-entry.TsMs > ttlMs {
+				continue
+			}
+			if entry.RootKey != "" && rootKey != "" && entry.RootKey != rootKey {
 				continue
 			}
 			for _, w := range entry.Windows {
@@ -362,7 +378,7 @@ func pruneBashWindows(ledger *bashWindowsLedger, nowMs int64) {
 //
 // Only the command END time is observable (see the ledger header), so the stored
 // window is the point [endMs, endMs]; recovery widens it by ± the δ/ε tolerance.
-func recordAiBashWindow(e *event.Event) {
+func recordAiBashWindow(e *event.Event, taskRoot string) {
 	if e == nil || e.Kind != "command" {
 		return
 	}
@@ -373,7 +389,13 @@ func recordAiBashWindow(e *event.Event) {
 	if !ok {
 		return
 	}
-	recordBashWindow(e.SessionID, endMs, endMs)
+	// Derive the workspace root key AFTER the guards so the resolvePath syscall
+	// only runs for an AI command, not for every watcher event.
+	rootKey := ""
+	if taskRoot != "" {
+		rootKey = gitWatchRootKey(taskRoot)
+	}
+	recordBashWindow(e.SessionID, rootKey, endMs, endMs)
 }
 
 // eventTsMs parses an event's RFC3339Nano Ts into Unix ms.

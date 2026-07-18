@@ -879,7 +879,7 @@ func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
 	// (a `sed -i`/codegen edit produces no file_diff, so its paths never enter
 	// the ai-paths ledger — this is the only signal we keep for them). No-op for
 	// anything that is not an AI-attributed `command` event.
-	recordAiBashWindow(&ev)
+	recordAiBashWindow(&ev, session.TaskRoot)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.
 	if !dedupeFileDiff(session.TaskRoot, &ev) {
