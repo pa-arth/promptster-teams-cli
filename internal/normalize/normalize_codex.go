@@ -131,10 +131,13 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 		return p.responseItem(payload, ts, raw)
 	case "turn_context":
 		// turn_context carries the per-turn model (the only rollout line that does);
-		// stash it for the turn's ai_response. It emits no event of its own.
-		if m := stringField(payload, "model"); m != "" {
-			p.model = m
-		}
+		// stash it for the turn's ai_response. Assigned UNCONDITIONALLY: a
+		// turn_context that declares no model clears any prior value rather than
+		// carrying it forward, so the next ai_response omits model instead of pricing
+		// against a stale one (never attribute a model we do not currently know). A
+		// turn with no turn_context at all leaves the last value untouched — the model
+		// genuinely persists until the next turn_context changes it. Emits no event.
+		p.model = stringField(payload, "model")
 		return nil
 	default:
 		// Unknown wrappers carry no candidate-visible signal.

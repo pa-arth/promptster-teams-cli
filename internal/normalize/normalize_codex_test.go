@@ -265,6 +265,34 @@ func TestCodexAttachesModelFromTurnContext(t *testing.T) {
 	}
 }
 
+// TestCodexTurnContextWithoutModelClearsStale (§10.1, honesty guard): a later
+// turn_context that declares NO model must not leave the previous turn's model
+// attributed to the new turn's ai_response — we omit model rather than price
+// against a stale one. (A turn with no turn_context at all still retains the
+// last known model; this only covers a turn_context that is present but empty.)
+func TestCodexTurnContextWithoutModelClearsStale(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:46.000Z","type":"turn_context","payload":{"model":"gpt-5.5"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.000Z","type":"turn_context","payload":{"cwd":"/tmp/ws"}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-clear")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if got, present := e.Data.(map[string]interface{})["model"]; present {
+			t.Fatalf("ai_response model = %v, want omitted (later turn_context declared no model)", got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
 // TestCodexAiResponseCarriesReasoningTokens (§10.2): the ai_response usage payload
 // includes reasoningTokens (OpenAI's reasoning_output_tokens), a content-free
 // count the backend uses for reasoning-model pricing. The normalizer already
