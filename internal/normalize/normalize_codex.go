@@ -372,9 +372,14 @@ func (p *CodexRolloutProcessor) attachTokenUsage(data map[string]interface{}) {
 		data["inputTokens"] = input
 		data["outputTokens"] = output
 		data["cacheReadTokens"] = cacheRead
-		// Note: this is an OpenAI-priced estimate placeholder, not an
-		// authoritative cost.
-		data["reasoningTokens"] = intField(u, "reasoning_output_tokens")
+		// reasoning_output_tokens is OpenAI-only and absent on non-reasoning
+		// turns. Attach reasoningTokens ONLY when the provider actually reported
+		// it — emitting 0 for an unreported count would conflate "no reasoning
+		// data" with "reported zero," the same fabrication the attribution
+		// buckets refuse. Absent-by-omission is the honest signal.
+		if _, ok := u["reasoning_output_tokens"].(float64); ok {
+			data["reasoningTokens"] = intField(u, "reasoning_output_tokens")
+		}
 	}
 }
 
