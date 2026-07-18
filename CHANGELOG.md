@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-07-18
+
+### Fixed
+- **Stop the config census from walking your home folder (macOS permission
+  prompts).** The autostart daemon runs with its working directory set to your
+  home directory and no explicit workspace, so its workspace fell back to `~`.
+  The nested-CLAUDE.md scan added in 0.9.0 then walked that root five levels
+  deep — which on macOS enumerates `~/Documents`, `~/Downloads`, `~/Music`, and
+  the other protected folders, triggering "promptster-teams wants to access your
+  Downloads/Documents/Music" consent prompts from a tool that only ever *stat*s
+  file sizes (no contents are read or transmitted). The scan now descends only
+  into actual git repositories (gated on a `.git` at the root), so a non-repo
+  workspace like a home directory is never walked. A one-time stat per root;
+  legitimate watched repos are unaffected. If you granted any of those folder
+  permissions, you can revoke them under **System Settings → Privacy &
+  Security → Files and Folders** (and **Music**).
+
 ## [0.9.0] — 2026-07-18
 
 ### Added
