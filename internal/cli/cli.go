@@ -52,6 +52,14 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "codex watcher error: %v\n", err)
 			return 1
 		}
+	case "git-watch":
+		// Out-of-band git watcher: detect new commits per root on a ~60s timer
+		// and advance a persisted per-root HEAD cursor. Detection only — emits
+		// nothing. Runs foreground until interrupted.
+		if err := capture.RunGitWatcher(); err != nil {
+			fmt.Fprintf(os.Stderr, "git watcher error: %v\n", err)
+			return 1
+		}
 	case "autostart":
 		// Register/remove the per-user OS service that relaunches capture at
 		// login so it survives reboots (launchd / systemd --user / Task Scheduler).

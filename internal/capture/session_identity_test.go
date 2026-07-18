@@ -132,9 +132,9 @@ func TestCensusIsDeviceScoped(t *testing.T) {
 func TestAiPathsLedgerKeepsSessionsApart(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 
-	recordAiTouchedPath("sess-claude", "src/a.go")
-	recordAiTouchedPath("sess-codex", "src/b.go")
-	recordAiTouchedPath("sess-claude", "src/c.go")
+	recordAiTouchedPath("sess-claude", "", "src/a.go")
+	recordAiTouchedPath("sess-codex", "", "src/b.go")
+	recordAiTouchedPath("sess-claude", "", "src/c.go")
 
 	ledger := readAiPathsLedgerForTest(t)
 	claude := ledger.Sessions["sess-claude"]
