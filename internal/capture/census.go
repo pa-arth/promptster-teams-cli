@@ -204,6 +204,18 @@ func projectClaudeMdTokens(roots []string) int {
 	return maxNestedClaudeMdTokens(roots)
 }
 
+// isGitRepoRoot reports whether root is the top of a git working tree — a
+// primary checkout (.git is a directory) or a linked worktree (.git is a file
+// with a gitdir: pointer). One stat per root: constant-time and off the 24h
+// census path. Empty root → false.
+func isGitRepoRoot(root string) bool {
+	if root == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(root, ".git"))
+	return err == nil
+}
+
 // maxNestedClaudeMdTokens returns the token cost of the LARGEST CLAUDE.md nested
 // below any of the workspace roots, or 0 when none is found. Bounded by
 // claudeMdMaxDepth and projectClaudeMdSkipDirs (+ hidden dirs); every branch is
@@ -216,6 +228,17 @@ func maxNestedClaudeMdTokens(roots []string) int {
 			continue
 		}
 		seenRoots[root] = true
+		// Only ever descend into an actual git repository. The autostart daemon's
+		// workspace falls back to the user's HOME dir (launchd
+		// WorkingDirectory=home, no PROMPTSTER_TEAMS_WATCH_DIR set), and a 5-level
+		// WalkDir of home enumerates ~/Documents, ~/Downloads, ~/Music — every
+		// macOS TCC-protected folder — firing "wants to access your Downloads"
+		// consent prompts from a capture tool. A non-repo root has no project
+		// CLAUDE.md to find anyway, so gating the walk on .git presence both fixes
+		// the prompt storm and matches the census's per-repo intent.
+		if !isGitRepoRoot(root) {
+			continue
+		}
 		rootDepth := strings.Count(filepath.Clean(root), string(os.PathSeparator))
 		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {

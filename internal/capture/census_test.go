@@ -500,6 +500,41 @@ func TestProjectClaudeMdTokensNested(t *testing.T) {
 	}
 }
 
+// markGitRepo makes root look like the top of a git working tree so the
+// nested-CLAUDE.md scan (which gates on .git presence) will descend into it.
+func markGitRepo(t *testing.T, root string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProjectClaudeMdTokensSkipsNonRepoRoot is the v0.9.1 regression guard: the
+// nested-CLAUDE.md fallback must NEVER descend into a root that is not a git
+// repository. The autostart daemon's workspace falls back to the user's HOME
+// dir (launchd WorkingDirectory=home, no PROMPTSTER_TEAMS_WATCH_DIR), and a
+// 5-level WalkDir of home enumerates ~/Documents, ~/Downloads, ~/Music — every
+// macOS TCC-protected folder — firing "wants to access your Downloads" consent
+// prompts from a capture tool. A non-repo root contributes 0 and is never
+// walked; the SAME tree marked as a repo is walked normally.
+func TestProjectClaudeMdTokensSkipsNonRepoRoot(t *testing.T) {
+	// A home-like directory: protected-folder-shaped subdirs, each with a
+	// CLAUDE.md, but NO .git at the root.
+	home := t.TempDir()
+	writeClaudeFixture(t, home, "Documents/proj/CLAUDE.md", 400) // 100 tokens
+	writeClaudeFixture(t, home, "Downloads/CLAUDE.md", 400)      // 100 tokens
+
+	if got := projectClaudeMdTokens([]string{home}); got != 0 {
+		t.Fatalf("non-repo root walked: got %d, want 0 (must not descend into a dir with no .git)", got)
+	}
+
+	// Same tree, now a git repo → the walk runs and finds the nested file.
+	markGitRepo(t, home)
+	if got := projectClaudeMdTokens([]string{home}); got != 100 {
+		t.Fatalf("repo root: got %d, want 100 (max nested once .git present)", got)
+	}
+}
+
 // TestProjectClaudeMdTokensRootPreferred pins the always-loaded semantic: when a
 // root CLAUDE.md exists, it is the reported value and nested sibling packages are
 // ignored entirely (they aren't loaded on every request, so they must not inflate
@@ -523,6 +558,7 @@ func TestProjectClaudeMdTokensRootPreferred(t *testing.T) {
 func TestProjectClaudeMdTokensDepthBound(t *testing.T) {
 	// Depth 5 (l1/l2/l3/l4/l5/CLAUDE.md): dir l5 is 5 levels below root → included.
 	inRoot := t.TempDir()
+	markGitRepo(t, inRoot)
 	writeClaudeFixture(t, inRoot, "l1/l2/l3/l4/l5/CLAUDE.md", 200)
 	if got := projectClaudeMdTokens([]string{inRoot}); got != 50 {
 		t.Errorf("depth-5 file: got %d, want 50 (must be included)", got)
@@ -530,6 +566,7 @@ func TestProjectClaudeMdTokensDepthBound(t *testing.T) {
 
 	// Depth 6 (m1/.../m6/CLAUDE.md): dir m6 is 6 levels below root → excluded.
 	outRoot := t.TempDir()
+	markGitRepo(t, outRoot)
 	writeClaudeFixture(t, outRoot, "m1/m2/m3/m4/m5/m6/CLAUDE.md", 200)
 	if got := projectClaudeMdTokens([]string{outRoot}); got != 0 {
 		t.Errorf("depth-6 file: got %d, want 0 (must be excluded)", got)
