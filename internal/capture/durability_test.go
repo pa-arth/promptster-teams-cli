@@ -353,3 +353,27 @@ func TestDurabilityLedgerConcurrentMutations(t *testing.T) {
 		}
 	}
 }
+
+// TestDurabilityDefaultRefReprobesWhenUnresolved: when a root has no resolvable
+// default branch (detached HEAD, no main/master, no origin), the ref must NOT be
+// cached as "" — otherwise creating the default branch later would never take
+// effect and durability would stay disabled for that root until restart. The
+// second lookup, after main is created, must re-resolve to it.
+func TestDurabilityDefaultRefReprobesWhenUnresolved(t *testing.T) {
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "trunk") // no main/master
+	sha := gitOut("rev-parse", "HEAD")
+	git("checkout", "--detach", sha) // detached HEAD → symbolic-ref HEAD is empty
+
+	if ref := durabilityDefaultRef(ws); ref != "" {
+		t.Fatalf("with no resolvable default, ref = %q, want empty", ref)
+	}
+	// Create the conventional default; a cached "" would defeat this.
+	git("branch", "main", sha)
+	if ref := durabilityDefaultRef(ws); ref != "refs/heads/main" {
+		t.Errorf("after creating main, ref = %q, want refs/heads/main (re-probed, not cached empty)", ref)
+	}
+}
