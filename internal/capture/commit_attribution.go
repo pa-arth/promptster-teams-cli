@@ -160,6 +160,12 @@ func reconcileCommitAttribution(fileRanges map[string][]attrLineRange, aiPaths m
 	files = make([]attrFile, 0, len(paths))
 	for _, path := range paths {
 		attribution := attributionUnknown
+		// PATH-SPACE CAVEAT: aiPaths keys are relativized against session.TaskRoot
+		// (RelativizeEventPaths), while `path` is relative to the git root being
+		// polled. They align for the primary workspace root; for a SIBLING git
+		// worktree (root != TaskRoot) they may not, so AI evidence there can read
+		// as `unknown` — a conservative under-attribution, never a misattribution.
+		// A later per-line refinement must normalize both to a common root first.
 		if sid, ok := aiPaths[path]; ok {
 			attribution = attributionLikelyAI
 			sessionFiles[sid]++
