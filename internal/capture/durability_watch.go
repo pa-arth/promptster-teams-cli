@@ -71,8 +71,11 @@ func resolveDefaultRef(root string) string {
 }
 
 // durabilityDefaultRef returns the cached default-branch ref for a root,
-// resolving (and memoizing) it on first use. A resolved "" is also cached so a
-// remote-less/detached repo is not re-probed every poll.
+// resolving (and memoizing) it on first use. Only a NON-EMPTY resolution is
+// cached: an unborn/detached repo with no default yet (empty result) is re-probed
+// every poll so durability starts as soon as its default branch is created,
+// instead of staying disabled for that root until the process restarts. The
+// re-probe is a handful of constant-time read-only spawns off the critical path.
 func durabilityDefaultRef(root string) string {
 	key := gitWatchRootKey(root)
 	durDefaultRefMu.Lock()
@@ -83,6 +86,9 @@ func durabilityDefaultRef(root string) string {
 	durDefaultRefMu.Unlock()
 
 	ref := resolveDefaultRef(root)
+	if ref == "" {
+		return "" // not resolvable yet — re-probe next poll rather than cache it
+	}
 
 	durDefaultRefMu.Lock()
 	durDefaultRefCache[key] = ref
@@ -116,15 +122,16 @@ func durabilityCursor(rootKey string) string {
 	return loadDurabilityLedger().Cursors[rootKey]
 }
 
-// advanceDurabilityCursor persists the default-branch cursor for a root,
-// preserving the tracked ranges (re-read under the lock).
+// advanceDurabilityCursor persists the default-branch cursor for a root as a
+// single locked read-modify-write, preserving any tracked-range update written
+// by a concurrent session between this load and save.
 func advanceDurabilityCursor(rootKey, tip string) {
-	led := loadDurabilityLedger()
-	if led.Cursors == nil {
-		led.Cursors = map[string]string{}
-	}
-	led.Cursors[rootKey] = tip
-	saveDurabilityLedger(led)
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		if led.Cursors == nil {
+			led.Cursors = map[string]string{}
+		}
+		led.Cursors[rootKey] = tip
+	})
 }
 
 // pollDurability advances durability for every root over its DEFAULT branch
