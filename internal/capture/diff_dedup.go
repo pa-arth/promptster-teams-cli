@@ -56,12 +56,13 @@ type aiPathsLedger struct {
 }
 
 type aiPathsEntry struct {
-	Paths map[string]bool `json:"paths"`
-	TsMs  int64           `json:"tsMs"`
+	Paths   map[string]bool `json:"paths"`
+	TsMs    int64           `json:"tsMs"`
+	RootKey string          `json:"rootKey"`
 }
 
 const (
-	aiPathsLedgerVersion = 2
+	aiPathsLedgerVersion = 3
 	// aiPathsTTL bounds the ledger to recently-active sessions. It has no TTL
 	// per-entry semantics beyond eviction: the git watcher reads it long after
 	// the 5-minute dedup window, so this must outlive a working session by a lot.
@@ -75,9 +76,11 @@ type diffDedupEntry struct {
 	TsMs int64  `json:"tsMs"`
 }
 
-// recordAiTouchedPath adds relPath to the session's AI-paths ledger.
+// recordAiTouchedPath adds relPath to the session's AI-paths ledger, tagging
+// the entry with the workspace rootKey so a reader can scope reads to one
+// workspace and a same-named path in another repo can't bleed in.
 // Best-effort: ledger I/O failures must never block event emission.
-func recordAiTouchedPath(sessionID, relPath string) {
+func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 	if sessionID == "" || relPath == "" {
 		return
 	}
@@ -101,6 +104,7 @@ func recordAiTouchedPath(sessionID, relPath string) {
 		}
 		entry.Paths[relPath] = true
 		entry.TsMs = nowMs
+		entry.RootKey = rootKey
 		ledger.Sessions[sessionID] = entry
 		pruneAiPaths(&ledger, nowMs)
 
@@ -127,7 +131,12 @@ func recordAiTouchedPath(sessionID, relPath string) {
 // attribution consumer needs — given a path that changed in a new commit, it
 // asks "was this AI-touched, and by which session" in one lookup, with no
 // sessionId known in advance.
-func readAiTouchedPaths() map[string]string {
+// rootKey scopes the read to one workspace: an entry recorded under a DIFFERENT
+// known rootKey is skipped, so a same-named path in another repo cannot bleed
+// in. The scoping is conservative — an entry is excluded only when both its
+// rootKey and the requested rootKey are known AND differ; an unknown on either
+// side (empty rootKey) falls through as a match.
+func readAiTouchedPaths(rootKey string) map[string]string {
 	out := map[string]string{}
 	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(aiPathsLedgerPath())
@@ -145,8 +154,13 @@ func readAiTouchedPaths() map[string]string {
 			if nowMs-entry.TsMs > ttlMs {
 				continue
 			}
+			if entry.RootKey != "" && rootKey != "" && entry.RootKey != rootKey {
+				continue
+			}
 			for p := range entry.Paths {
-				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts {
+				// Newer session wins; on an exact-ts tie, the lexicographically
+				// smaller sessionId wins so repeated reads are deterministic.
+				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts || (entry.TsMs == ts && sid < out[p]) {
 					out[p] = sid
 					bestTs[p] = entry.TsMs
 				}
@@ -268,7 +282,11 @@ func dedupeFileDiff(taskRoot string, e *event.Event) bool {
 	// (ai_revised_by_human vs likely_human). Recorded regardless of claim
 	// outcome — a deduped re-observation is still an AI edit to this path.
 	if e.Provenance != nil && e.Provenance.Attribution == "likely_ai" {
-		recordAiTouchedPath(e.SessionID, rel)
+		rootKey := ""
+		if taskRoot != "" {
+			rootKey = gitWatchRootKey(taskRoot)
+		}
+		recordAiTouchedPath(e.SessionID, rootKey, rel)
 	}
 	return won
 }

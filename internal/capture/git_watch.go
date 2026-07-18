@@ -51,12 +51,13 @@ const gitWatchCursorsVersion = 1
 // state. Crucially it spawns NO git, keeping the per-poll budget at rev-parse +
 // rev-list. (workspaceKey/gitRemoteSlug would add a `git config` spawn per root
 // per poll for a human-readable slug we don't need in a local-only cursor file.)
+//
+// The path is canonicalized via resolvePath (symlink-resolved, with a cleaned
+// fallback) so the key is caller-independent: a writer and reader referring to
+// the same dir through different spellings (e.g. /tmp vs /private/tmp on macOS,
+// or a symlinked checkout) agree on the key.
 func gitWatchRootKey(root string) string {
-	abs := root
-	if a, err := filepath.Abs(root); err == nil {
-		abs = a
-	}
-	return ingest.Sha256Hex(abs)[:16]
+	return ingest.Sha256Hex(resolvePath(root))[:16]
 }
 
 // gitHead returns the root's current HEAD commit, or ok=false when there is no
