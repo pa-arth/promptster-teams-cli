@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"os/exec"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -178,6 +179,85 @@ func TestReworkScopedToPreMergeBranch(t *testing.T) {
 
 	if led := loadReworkLedger().Roots[key]; len(led) != 0 {
 		t.Fatalf("a commit on the default branch must not seed rework, got %+v", led)
+	}
+}
+
+// TestReworkLocalCommitOnDefaultBranchNotSeeded (regression, Greptile #85): a
+// LOCAL commit on the default branch that has not been pushed leaves the
+// remote-tracking default tip (origin/main) behind local HEAD. A sha comparison
+// (HEAD != default tip) would misclassify this ordinary default-branch work as
+// pre-merge and seed it into the rework ledger; the branch-NAME comparison must
+// not. Sets up a real bare remote so the default resolves to origin/HEAD.
+func TestReworkLocalCommitOnDefaultBranchNotSeeded(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	// Bare remote whose origin/HEAD names main as the default branch. Pushing main
+	// establishes origin/main; it then lags every LOCAL commit we make without
+	// pushing.
+	remote := t.TempDir()
+	if o, err := exec.Command("git", "init", "--bare", remote).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, o)
+	}
+	git("remote", "add", "origin", remote)
+	git("push", "origin", "main")
+	git("remote", "set-head", "origin", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	pollGitWatchWorkspace(sess) // baseline
+
+	// AI commits on local main WITHOUT pushing → origin/main stays behind HEAD.
+	recordAiTouchedPath("sess-rw", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go on local main")
+	pollGitWatchWorkspace(sess)
+
+	if led := loadReworkLedger().Roots[key]; len(led) != 0 {
+		t.Fatalf("a local unpushed commit on the default branch must not seed rework, got %+v", led)
+	}
+}
+
+// TestReworkClearedOnDefaultCheckoutWithoutNewCommits (regression, Greptile #85):
+// returning to the default branch clears stale rework tracking EVEN on a poll that
+// surfaces no new commits (a plain `git checkout main`). The clear must run before
+// the no-new-commits guard, or a later feature branch inherits the previous
+// branch's ranges.
+func TestReworkClearedOnDefaultCheckoutWithoutNewCommits(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	pollGitWatchWorkspace(sess) // baseline on main
+
+	// Feature branch: seed rework.
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-rw", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+	pollGitWatchWorkspace(sess)
+	if c := reworkCovered(key, "feature.go"); !c[1] {
+		t.Fatalf("expected feature.go seeded on the feature branch, got %+v", c)
+	}
+
+	// Return to main WITHOUT creating any new commit: the poll detects NO new
+	// commits, but must still clear the stale rework ledger.
+	git("checkout", "main")
+	pollGitWatchWorkspace(sess)
+
+	if led := loadReworkLedger().Roots[key]; len(led) != 0 {
+		t.Errorf("rework tracking must clear on returning to the default branch even with no new commits, got %+v", led)
 	}
 }
 

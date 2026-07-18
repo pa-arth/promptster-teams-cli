@@ -273,20 +273,26 @@ func pollGitWatchWorkspace(session Session) {
 
 	for _, root := range roots {
 		rootKey := gitWatchRootKey(root)
+		// Rework scope, resolved ONCE per root (never per commit). Resolved BEFORE the
+		// no-new-commits guard so that returning to the default branch clears stale
+		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
+		// `git checkout main` after a feature branch merged).
+		scope := reworkScope(root)
+		if scope == scopeDefault {
+			// On (or merged back to) the default branch: surviving AI lines are now the
+			// durability engine's and reworked ones already emitted, so drop the root's
+			// rework tracking before a future branch could remap against stale ranges.
+			// Guarded on presence to avoid a needless ledger write on every poll.
+			if _, tracked := loadReworkLedger().Roots[rootKey]; tracked {
+				clearReworkLedger(rootKey)
+			}
+		}
+
 		commits := detected[rootKey]
 		if len(commits) == 0 {
 			continue
 		}
-		// Pre-merge scope for rework, resolved ONCE per root (never per commit):
-		// the working branch is ahead of the default branch iff HEAD != default tip.
-		preMerge := isPreMergeBranch(root)
-		if !preMerge {
-			// On (or merged back to) the default branch: any branch rework tracking is
-			// resolved — surviving AI lines are now the durability engine's, reworked
-			// ones already emitted — so drop it before a future branch could remap
-			// against another branch's stale ranges.
-			clearReworkLedger(rootKey)
-		}
+		preMerge := scope == scopePreMerge
 		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v)", len(commits), rootKey, preMerge)
 		// Oldest-first: rework is STATEFUL (seed then churn across commits), so it
 		// must see commits in commit order. Attribution is per-commit independent, so
@@ -297,21 +303,59 @@ func pollGitWatchWorkspace(session Session) {
 	}
 }
 
-// isPreMergeBranch reports whether root's working HEAD is ahead of / diverged
-// from its default branch — i.e. commits here are pre-merge branch commits whose
-// AI-line churn is rework, not durability. Two constant-time read-only spawns per
-// root per poll (default tip [ref cached] + HEAD); false when there is no
-// resolvable default (nothing to be "ahead of") or HEAD is unresolvable.
-func isPreMergeBranch(root string) bool {
-	_, tip, ok := durabilityDefaultTip(root)
-	if !ok {
-		return false
+// branchScope classifies a root's current checkout for rework tracking.
+type branchScope int
+
+const (
+	// scopeUnknown: no resolvable default branch, or a detached/unborn HEAD. Neither
+	// seed rework (we cannot tell it is a feature branch) nor clear it (a transient
+	// detach mid-rebase must not wipe a real branch's tracking).
+	scopeUnknown branchScope = iota
+	// scopeDefault: checked out ON the default branch — durability territory. Any
+	// rework tracking for this root is stale and gets cleared.
+	scopeDefault
+	// scopePreMerge: checked out on a NON-default named branch — pre-merge feature
+	// work whose AI-line churn is rework.
+	scopePreMerge
+)
+
+// reworkScope classifies root's checkout by comparing BRANCH NAMES, not tip SHAs.
+// A sha comparison (HEAD vs the default tip) misreads a local, not-yet-pushed
+// commit on the default branch as pre-merge: the default ref resolves to the
+// remote-tracking tip (refs/remotes/origin/HEAD), which lags a local commit, so
+// ordinary default-branch work would be wrongly seeded as rework. Comparing the
+// checked-out branch name to the default branch name is push-state independent.
+// Two constant-time read-only spawns per root per poll (symbolic-ref HEAD + the
+// cached default ref).
+func reworkScope(root string) branchScope {
+	defRef := durabilityDefaultRef(root)
+	if defRef == "" {
+		return scopeUnknown
 	}
-	head, ok := gitHead(root)
-	if !ok {
-		return false
+	head := gitSymbolicRef(root, "HEAD")
+	if head == "" {
+		return scopeUnknown // detached or unborn — no branch name to compare
 	}
-	return head != tip
+	if shortBranchName(head) == shortBranchName(defRef) {
+		return scopeDefault
+	}
+	return scopePreMerge
+}
+
+// shortBranchName reduces a full ref name to its branch short name:
+// refs/heads/feat/x → feat/x, refs/remotes/origin/main → main. A name matching
+// neither prefix is returned unchanged.
+func shortBranchName(ref string) string {
+	if s, ok := strings.CutPrefix(ref, "refs/heads/"); ok {
+		return s
+	}
+	if s, ok := strings.CutPrefix(ref, "refs/remotes/"); ok {
+		if i := strings.IndexByte(s, '/'); i >= 0 {
+			return s[i+1:] // drop the remote name (first path component)
+		}
+		return s
+	}
+	return ref
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until
