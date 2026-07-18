@@ -1,9 +1,11 @@
 package capture
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 )
@@ -46,6 +48,62 @@ func TestDedupeFileDiffAcrossChannels(t *testing.T) {
 	human := fileDiffEvent("a.txt", "diff --git a/a.txt b/a.txt\n+EDITED")
 	if !dedupeFileDiff(ws, &human) {
 		t.Error("a new resulting content must be emitted, not deduped")
+	}
+}
+
+// TestReadAiTouchedPaths is the first unit test for the AI-paths ledger:
+// two sessions each record a path, and the reader must map each relPath back to
+// the session that touched it.
+func TestReadAiTouchedPaths(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	recordAiTouchedPath("sess-A", "src/foo.go")
+	recordAiTouchedPath("sess-B", "src/bar.go")
+
+	got := readAiTouchedPaths()
+	if got["src/foo.go"] != "sess-A" {
+		t.Errorf("foo.go => %q, want sess-A", got["src/foo.go"])
+	}
+	if got["src/bar.go"] != "sess-B" {
+		t.Errorf("bar.go => %q, want sess-B", got["src/bar.go"])
+	}
+}
+
+// TestReadAiTouchedPathsExpiresByTTL ages one session's timestamp past
+// aiPathsTTL on disk and asserts the reader drops its paths while keeping the
+// fresh session's.
+func TestReadAiTouchedPathsExpiresByTTL(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	recordAiTouchedPath("fresh", "keep.go")
+	recordAiTouchedPath("stale", "drop.go")
+
+	// Rewrite the "stale" session's timestamp to well beyond the TTL window.
+	data, err := os.ReadFile(aiPathsLedgerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ledger aiPathsLedger
+	if err := json.Unmarshal(data, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	e := ledger.Sessions["stale"]
+	e.TsMs = time.Now().Add(-aiPathsTTL - time.Hour).UnixMilli()
+	ledger.Sessions["stale"] = e
+	out, err := json.Marshal(ledger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aiPathsLedgerPath(), out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := readAiTouchedPaths()
+	if _, ok := got["drop.go"]; ok {
+		t.Error("path from an expired session must be excluded by TTL")
+	}
+	if got["keep.go"] != "fresh" {
+		t.Errorf("keep.go => %q, want fresh", got["keep.go"])
 	}
 }
 

@@ -174,6 +174,12 @@ func RunTeamsWatch(args []string) error {
 	stopUpdate := selfupdate.StartAutoUpdate(noAutoUpdate, updatePolicy)
 	defer stopUpdate()
 
+	// Out-of-band git watcher: on a ~60s timer, detect new commits per root and
+	// advance a persisted per-root HEAD cursor. Detection only — it emits nothing
+	// (a later PR computes attribution from the AI-paths ledger + these commits).
+	stopGitWatch := StartGitWatch(cfg.TaskRoot)
+	defer stopGitWatch()
+
 	errCh := make(chan error, 2)
 	go func() { errCh <- RunClaudeWatcher() }()
 	go func() { errCh <- RunCodexWatcher() }()

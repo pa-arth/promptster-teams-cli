@@ -116,6 +116,47 @@ func recordAiTouchedPath(sessionID, relPath string) {
 	})
 }
 
+// readAiTouchedPaths returns every workspace-relative path an AI channel has
+// recorded, mapped to the sessionId that touched it, across all sessions still
+// within aiPathsTTL. When more than one session touched the same path the most
+// recently active session wins. Mirrors the writer's lock + version/TTL
+// discipline and is read-only (it never rewrites the ledger, so a pure reader
+// like the git watcher can't evict a live session).
+//
+// Shape rationale: a relPath -> sessionId map is exactly what the later
+// attribution consumer needs — given a path that changed in a new commit, it
+// asks "was this AI-touched, and by which session" in one lookup, with no
+// sessionId known in advance.
+func readAiTouchedPaths() map[string]string {
+	out := map[string]string{}
+	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
+		data, err := os.ReadFile(aiPathsLedgerPath())
+		if err != nil {
+			return nil
+		}
+		var ledger aiPathsLedger
+		if json.Unmarshal(data, &ledger) != nil || ledger.V != aiPathsLedgerVersion || ledger.Sessions == nil {
+			return nil
+		}
+		nowMs := time.Now().UnixMilli()
+		ttlMs := aiPathsTTL.Milliseconds()
+		bestTs := map[string]int64{}
+		for sid, entry := range ledger.Sessions {
+			if nowMs-entry.TsMs > ttlMs {
+				continue
+			}
+			for p := range entry.Paths {
+				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts {
+					out[p] = sid
+					bestTs[p] = entry.TsMs
+				}
+			}
+		}
+		return nil
+	})
+	return out
+}
+
 // pruneAiPaths bounds the ledger by TTL, then by session count (oldest first).
 // Runs AFTER the active session's entry is stamped, so an actively-editing
 // session can never evict itself.
