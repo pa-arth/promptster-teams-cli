@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // Claude Code BYO-subscription capture works by tailing the per-session
@@ -695,6 +696,17 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// source-exclusion guarantee rather than a filtering preference.
 	if v := clampPromptSource(stringField(rec, "promptSource")); v != "" {
 		data["promptSource"] = v
+	}
+
+	// workdir — WHERE this session ran, home-collapsed to "~/…" so it names the
+	// repo/worktree without leaking the OS username the absolute path carries. It
+	// rides on its own individually-allowlisted key (redact.projectFieldAllowlist
+	// "prompt" → "workdir"); the raw absolute `cwd` stays DROPPED. HomeRelativeStrict
+	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home cwd
+	// or a home-lookup failure returns "", so the field is omitted rather than
+	// leaking an absolute path that may carry the OS username.
+	if wd := state.HomeRelativeStrict(stringField(rec, "cwd")); wd != "" {
+		data["workdir"] = wd
 	}
 
 	// Track the previous human-prompt time as lane state only. No timing,

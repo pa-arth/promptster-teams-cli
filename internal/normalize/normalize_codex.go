@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // Codex instrumentation works by tailing the per-session rollout JSONL that the
@@ -40,6 +41,11 @@ type CodexRolloutProcessor struct {
 	sessionID      string
 	pending        map[string]codexPendingCall
 	lastTokenUsage map[string]interface{}
+	// workdir is the session's cwd, home-collapsed to "~/…", captured from the
+	// session_meta header (the ONLY codex rollout line that carries cwd). It is
+	// stamped onto each prompt event so the teams dashboard can show where the
+	// session ran; the raw absolute cwd is never emitted on prompts.
+	workdir string
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -131,6 +137,12 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 	if p.sessionID == "" {
 		p.sessionID = stringField(payload, "id")
 	}
+	// Stash the home-collapsed cwd for prompt events: session_meta is the only
+	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
+	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home
+	// cwd or a home-lookup failure yields "", so the prompt omits workdir rather
+	// than leaking an absolute path that may carry the OS username.
+	p.workdir = state.HomeRelativeStrict(stringField(payload, "cwd"))
 	e := p.newCodexEvent("session_start", ts, stringField(payload, "id"))
 	data := map[string]interface{}{
 		"ideSessionId": stringField(payload, "id"),
@@ -153,6 +165,11 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		e := p.newCodexEvent("prompt", ts, ts)
 		e.Provenance = event.HumanProvenance()
 		data := map[string]interface{}{"text": text}
+		// workdir rides its own allowlisted key (never raw cwd); set only when the
+		// session_meta header supplied one.
+		if p.workdir != "" {
+			data["workdir"] = p.workdir
+		}
 		e.Data = data
 		e.RawPayload = raw
 		saveLastPromptTs()

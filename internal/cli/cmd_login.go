@@ -13,6 +13,7 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // cmdLogin onboards an individual contributor: it takes the per-engineer key
@@ -174,10 +175,9 @@ func hostOf(u string) string {
 	return u
 }
 
-// prettyHome abbreviates the user's home dir to ~ for display.
+// prettyHome abbreviates the user's home dir to ~ for display. Delegates to the
+// shared state.HomeRelative so the display collapse and the workdir emitted on
+// prompt events (normalize) stay one implementation.
 func prettyHome(p string) string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" && strings.HasPrefix(p, home) {
-		return "~" + p[len(home):]
-	}
-	return p
+	return state.HomeRelative(p)
 }
