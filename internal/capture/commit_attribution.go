@@ -2,7 +2,6 @@ package capture
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -73,26 +72,28 @@ const (
 // means a single line; d==0 is a pure deletion (no new-side lines).
 var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 
-// gitCommitDiffRanges runs ONE `git show` for the commit and returns the
-// new-file-side changed line ranges per repo-relative path (attribution unset —
-// reconcile fills it). One spawn per commit, never per file/line. `--root`
-// diffs the parentless first commit against the empty tree; `--format=`
-// suppresses the commit header (message/author never enter the buffer);
-// `--unified=0` makes the `@@` spans tight to the changed lines. Best-effort:
-// an error (bad sha, not a repo) yields an empty map, which suppresses emission.
-func gitCommitDiffRanges(root, sha string) map[string][]attrLineRange {
-	// core.quotePath=false keeps non-ASCII paths verbatim (UTF-8) instead of
-	// C-quoted (octal-escaped), so they match the ledger's relPath keys. Paths
-	// with literal tabs/quotes/backslashes are still double-quoted by git and
-	// remain a rare documented miss.
-	// #nosec G204 -- constant argv; root is a discovered workspace dir and sha comes from git rev-list output (the watcher), not user input. Read-only.
-	out, err := exec.Command("git", "-C", root,
-		"-c", "core.quotePath=false",
-		"show", "--root", "--no-color", "--unified=0", "--format=", sha).Output()
-	if err != nil {
-		return map[string][]attrLineRange{}
+// commitAttributionFromDiff runs ONE `git show` for the commit (via
+// gitCommitRawDiff) and returns the raw diff plus the reconciled per-file
+// attributions and representative AI session. One spawn per commit, never per
+// file/line. The raw diff is returned so the caller can ALSO capture on-device
+// AI-line fingerprints (for squash-merge transfer) from the same spawn. ok is
+// false when nothing changed (empty diff / no new-side ranges), which suppresses
+// emission. `--unified=0`/`--format=`/`--root` keep the diff tight and header-free
+// (message/author never enter the buffer).
+func commitAttributionFromDiff(root, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
+	diff, ok = gitCommitRawDiff(root, sha)
+	if !ok || diff == "" {
+		return "", nil, "", false
 	}
-	return parseUnifiedDiffNewRanges(string(out))
+	fileRanges := parseUnifiedDiffNewRanges(diff)
+	if len(fileRanges) == 0 {
+		return "", nil, "", false
+	}
+	// Scope BOTH ledger reads to THIS workspace's root key so a same-named path
+	// AI-touched (or bash-touched) in a DIFFERENT repo can't bleed in.
+	rootKey := gitWatchRootKey(root)
+	files, primarySession = reconcileCommitAttribution(root, fileRanges, readAiTouchedPaths(rootKey), readBashWindows(rootKey))
+	return diff, files, primarySession, true
 }
 
 // parseUnifiedDiffNewRanges extracts, per changed file, the NEW-side changed
@@ -305,16 +306,21 @@ func mostFrequentSession(counts map[string]int) string {
 // projector's element allowlist can walk. Assigning the struct straight to Data
 // would silently ship {} (see eventDataMap's header).
 func buildCommitAttributionEvent(session Session, root, sha string) (event.Event, bool) {
-	fileRanges := gitCommitDiffRanges(root, sha)
-	if len(fileRanges) == 0 {
+	_, files, primarySession, ok := commitAttributionFromDiff(root, sha)
+	if !ok {
 		return event.Event{}, false
 	}
-	// Scope BOTH ledger reads to THIS workspace's root key so a same-named path
-	// AI-touched (or bash-touched) in a DIFFERENT repo can't bleed in (closes
-	// cross-workspace over-attribution). gitWatchRootKey is in this package.
-	rootKey := gitWatchRootKey(root)
-	files, primarySession := reconcileCommitAttribution(root, fileRanges, readAiTouchedPaths(rootKey), readBashWindows(rootKey))
+	return assembleCommitAttributionEvent(session, root, sha, files, primarySession), true
+}
 
+// assembleCommitAttributionEvent wraps reconciled files into a ready-to-funnel
+// event. The sessionId is the most-active AI session touching the commit (so the
+// backend can key attribution to a real AI-tool session), falling back to the
+// device id for an all-unknown commit. Data goes through eventDataMap (a JSON
+// round-trip) so nested arrays-of-structs land as []interface{} of map — the
+// only shape the projector's element allowlist can walk (a straight struct
+// assignment would ship {}).
+func assembleCommitAttributionEvent(session Session, root, sha string, files []attrFile, primarySession string) event.Event {
 	sessionID := primarySession
 	if sessionID == "" {
 		sessionID = session.DeviceID
@@ -328,7 +334,7 @@ func buildCommitAttributionEvent(session Session, root, sha string) (event.Event
 		WorkspaceKey: workspaceKey(root),
 		Files:        files,
 	})
-	return e, true
+	return e
 }
 
 // emitCommitAttribution runs the event through the SAME buffer/sign/queue funnel
@@ -358,10 +364,14 @@ func emitCommitAttribution(ev event.Event) {
 // squashed commit's patch-id is the union diff of its sources and matches no
 // single source commit, so there is nothing to match against. Recovering it
 // would need an explicit merge/squash signal we do not collect out-of-band.
-func attributeCommit(session Session, root, sha string) {
-	ev, ok := buildCommitAttributionEvent(session, root, sha)
+func attributeCommit(session Session, root, sha string, nowMs int64) {
+	diff, files, primarySession, ok := commitAttributionFromDiff(root, sha)
 	if !ok {
 		return
 	}
-	emitCommitAttribution(ev)
+	emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession))
+	// From the SAME diff, capture on-device fingerprints of this commit's
+	// likely_ai lines so a later squash-merge onto the default branch can
+	// transfer attribution by content match. Fingerprints never leave the device.
+	recordAiFingerprints(gitWatchRootKey(root), sha, diff, files, nowMs)
 }

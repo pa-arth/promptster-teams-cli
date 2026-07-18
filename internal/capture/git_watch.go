@@ -259,6 +259,7 @@ func pollGitWatch(roots []string) map[string][]string {
 func pollGitWatchWorkspace(session Session) {
 	roots := workspaceMatchRoots(resolvePath(session.TaskRoot))
 	detected := pollGitWatch(roots)
+	nowMs := time.Now().UnixMilli() // one clock read, threaded to both passes
 	for _, root := range roots {
 		commits := detected[gitWatchRootKey(root)]
 		if len(commits) == 0 {
@@ -266,13 +267,13 @@ func pollGitWatchWorkspace(session Session) {
 		}
 		state.HookDebugf("git-watch: %d new commit(s) on %s", len(commits), gitWatchRootKey(root))
 		for _, sha := range commits {
-			attributeCommit(session, root, sha)
+			attributeCommit(session, root, sha, nowMs)
 		}
 	}
 	// Durability advances on the DEFAULT branch only (its own cursor), so it is
 	// driven separately from the working-HEAD attribution loop above. Same roots,
-	// same cadence; nowMs read here (top-level) and threaded down.
-	pollDurability(session, roots, time.Now().UnixMilli())
+	// same cadence.
+	pollDurability(session, roots, nowMs)
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until
