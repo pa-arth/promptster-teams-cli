@@ -61,9 +61,15 @@ var projectFieldAllowlist = map[string][]string{
 	// only be kept whole, so allowlisting it would leak the path. The emitter no
 	// longer builds one; `meta` stays pinned as dropped in project_test.go so a
 	// smuggled one still dies here.
+	// workdir is the session's cwd home-collapsed to "~/…" by the emitter
+	// (normalize → state.HomeRelative), so it names the repo/worktree WHERE the
+	// session ran without carrying the OS username an absolute path leaks. It is
+	// its own individually-allowlisted key precisely so the raw absolute `cwd`
+	// can stay dropped (pinned by the leak-canary case in project_test.go): a
+	// short home-relative token is allowlistable, an absolute path is not.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt", "promptSource"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so

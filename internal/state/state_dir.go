@@ -14,6 +14,29 @@ func GlobalPromptsterDir() string {
 	return filepath.Join(home, ".promptster-teams")
 }
 
+// HomeRelative collapses a $HOME prefix to "~" for display/transport, so a path
+// can name WHERE a session ran without leaking the OS username the absolute path
+// carries. Empty in → empty out; exact $HOME → "~"; a path under $HOME → "~/…";
+// anything else (an absolute path outside home, e.g. /tmp/ws — no username in it)
+// is returned unchanged. The boundary check requires a separator after $HOME so a
+// sibling like /Users/foobar is not mangled into ~bar.
+func HomeRelative(p string) string {
+	if p == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	if p == home {
+		return "~"
+	}
+	if strings.HasPrefix(p, home+string(os.PathSeparator)) {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
 // activeWorkspacePath returns the path to the pointer file that tells hooks
 // which workspace is currently active.
 func activeWorkspacePath() string {
