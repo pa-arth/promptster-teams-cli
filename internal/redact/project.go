@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -85,7 +86,10 @@ var projectFieldAllowlist = map[string][]string{
 	// Keep in lockstep with the backend's TEAMS_FIELD_ALLOWLIST.
 	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
-	"file_diff":    {"path", "linesAdded", "linesRemoved"},
+	// lineRanges carries WHICH lines were AI as content-free {start,end,
+	// attribution} triples (ints + one enum); its element allowlist below is
+	// what structurally guarantees no diff/text bytes ride along.
+	"file_diff":    {"path", "linesAdded", "linesRemoved", "lineRanges"},
 	"file_create":  {"path", "linesAdded", "sizeBytes"},
 	"file_read":    {"path"},
 	"file_search":  {"path", "query"},
@@ -164,6 +168,13 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 		"skills":     {"slug", "name", "descTokens"},
 		"plugins":    {"name", "listingTokens"},
 		"mcpServers": {"name", "deferred"},
+	},
+	// lineRanges elements are content-free by construction (ints + one enum), but
+	// this allowlist is the LOAD-BEARING privacy line: it strips every element to
+	// exactly these three scalar keys, so a nested `text`/content key (a code
+	// leak) can never survive projection.
+	"file_diff": {
+		"lineRanges": {"start", "end", "attribution"},
 	},
 }
 
@@ -553,10 +564,30 @@ func projectArrayElements(value interface{}, fields []string) []interface{} {
 		projected := make(map[string]interface{}, len(fields))
 		for _, field := range fields {
 			if v, present := obj[field]; present && v != nil {
-				projected[field] = v
+				// The allowlist limits key NAMES; without a type check a map or
+				// slice smuggled into a scalar key (start/end/attribution/path)
+				// would ride through verbatim. Clamp kept values to scalars.
+				if isScalar(v) {
+					projected[field] = v
+				}
 			}
 		}
 		out = append(out, projected)
 	}
 	return out
+}
+
+// isScalar reports whether v is a leaf JSON value safe to copy verbatim through
+// an element allowlist: nil, string, bool, or any numeric type. Maps and slices
+// (which could nest smuggled source) return false.
+func isScalar(v interface{}) bool {
+	switch v.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number:
+		return true
+	default:
+		return false
+	}
 }

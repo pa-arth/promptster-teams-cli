@@ -200,6 +200,42 @@ func TestCodexPromptWorkdirOutsideHome(t *testing.T) {
 	}
 }
 
+func TestCodexPatchLineRanges(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-1")
+	// A multi-hunk unified diff: an update hunk (+3,2), an insertion hunk
+	// (+10,3), and a pure-deletion hunk (+20,0 — must be skipped).
+	line := `{"timestamp":"2026-06-06T20:38:50.783Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_A","success":true,"changes":{"/tmp/ws/target.py":{"type":"update","unified_diff":"@@ -3,2 +3,2 @@\n-old\n+new\n line\n@@ -9,0 +10,3 @@\n+a\n+b\n+c\n@@ -20,2 +20,0 @@\n-x\n-y\n"}},"status":"completed"}}`
+	var events []event.Event
+	events = append(events, p.Process([]byte(line))...)
+
+	var diff *event.Event
+	for i := range events {
+		if events[i].Kind == "file_diff" {
+			diff = &events[i]
+		}
+	}
+	if diff == nil {
+		t.Fatalf("no file_diff in %+v", events)
+	}
+	raw, ok := diff.Data.(map[string]interface{})["lineRanges"].([]interface{})
+	if !ok {
+		t.Fatalf("lineRanges = %T, want []interface{}", diff.Data.(map[string]interface{})["lineRanges"])
+	}
+	if len(raw) != 2 {
+		t.Fatalf("lineRanges len = %d, want 2 (deletion-only hunk skipped): %+v", len(raw), raw)
+	}
+	want := []struct{ start, end int }{{3, 4}, {10, 12}}
+	for i, r := range raw {
+		m := r.(map[string]interface{})
+		if m["start"] != want[i].start || m["end"] != want[i].end {
+			t.Errorf("range[%d] = {start:%v,end:%v}, want {%d,%d}", i, m["start"], m["end"], want[i].start, want[i].end)
+		}
+		if m["attribution"] != "likely_ai" {
+			t.Errorf("range[%d] attribution = %v, want likely_ai", i, m["attribution"])
+		}
+	}
+}
+
 func TestParseCodexExecOutput(t *testing.T) {
 	code, stdout := parseCodexExecOutput("Chunk ID: a1\nProcess exited with code 3\nOutput:\nhello\nworld\n")
 	if code != 3 {

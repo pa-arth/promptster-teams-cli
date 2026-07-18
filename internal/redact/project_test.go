@@ -226,6 +226,72 @@ func TestProjectEventConfigCensusArrayElements(t *testing.T) {
 	}
 }
 
+func TestProjectEventFileDiffLineRanges(t *testing.T) {
+	// lineRanges survives projection, but each element must be stripped to
+	// exactly {start,end,attribution} — a smuggled `text`/content key on an
+	// element (a code leak) must not survive.
+	e := eventWithData("file_diff", map[string]interface{}{
+		"path": "src/app.ts", "linesAdded": 5, "linesRemoved": 2,
+		"diff": leakCanary,
+		"lineRanges": []interface{}{
+			map[string]interface{}{"start": 10, "end": 11, "attribution": "likely_ai", "text": leakCanary},
+			map[string]interface{}{"start": 31, "end": 33, "attribution": "likely_ai"},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived lineRanges projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	ranges, ok := data["lineRanges"].([]interface{})
+	if !ok {
+		t.Fatalf("lineRanges did not survive projection: %T %+v", data["lineRanges"], data["lineRanges"])
+	}
+	if len(ranges) != 2 {
+		t.Fatalf("lineRanges len = %d, want 2", len(ranges))
+	}
+	first := ranges[0].(map[string]interface{})
+	if _, present := first["text"]; present {
+		t.Errorf("smuggled text key survived element projection: %+v", first)
+	}
+	if len(first) != 3 || first["start"] != 10 || first["end"] != 11 || first["attribution"] != "likely_ai" {
+		t.Errorf("element not stripped to {start,end,attribution}: %+v", first)
+	}
+}
+
+func TestProjectEventLineRangeScalarClamp(t *testing.T) {
+	// The element allowlist limits key NAMES, not value TYPES. A map/slice
+	// smuggled into a scalar key (start/end/attribution) must be dropped, not
+	// copied verbatim — otherwise source could ride through a "scalar" field.
+	e := eventWithData("file_diff", map[string]interface{}{
+		"path": "src/app.ts", "linesAdded": 1, "linesRemoved": 0,
+		"lineRanges": []interface{}{
+			map[string]interface{}{
+				"start":       map[string]interface{}{"leak": "secret"},
+				"end":         11,
+				"attribution": "likely_ai",
+			},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), "secret") {
+		t.Fatalf("non-scalar smuggled into start survived projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	ranges := data["lineRanges"].([]interface{})
+	first := ranges[0].(map[string]interface{})
+	if _, present := first["start"]; present {
+		t.Errorf("non-scalar start should be dropped, got: %+v", first)
+	}
+	if first["end"] != 11 || first["attribution"] != "likely_ai" {
+		t.Errorf("scalar siblings should survive: %+v", first)
+	}
+}
+
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary
