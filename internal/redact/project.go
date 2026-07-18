@@ -156,6 +156,14 @@ var projectFieldAllowlist = map[string][]string{
 		// never a transcript path/filename/slug. Content-free by construction.
 		"claudeTranscriptsTotal", "claudeTranscriptsActive7d",
 	},
+	// Post-commit AI attribution: a PUBLIC commit hash + privacy-safe workspace
+	// id + a per-file list of content-free line-range attributions. workspaceKey
+	// is the same git-slug-or-hash identity config_census sends (never a path);
+	// commitSha is a public content hash the notes backend is keyed on. NEVER a
+	// diff, file body, commit message, author, or old/new string. The nested
+	// files[]/lineRanges[] element allowlists below are the load-bearing privacy
+	// line — they clamp both array levels to scalar keys only.
+	"commit_attribution": {"commitSha", "workspaceKey", "files"},
 }
 
 // projectArrayElementAllowlist — element-level allowlists for array-of-object
@@ -174,6 +182,17 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	// exactly these three scalar keys, so a nested `text`/content key (a code
 	// leak) can never survive projection.
 	"file_diff": {
+		"lineRanges": {"start", "end", "attribution"},
+	},
+	// commit_attribution nests TWO array levels: files[] each carrying a
+	// lineRanges[]. projectArrayElements recurses when a kept element field has
+	// its own entry here, so `files` keeps {path, lineRanges} and the nested
+	// `lineRanges` is itself clamped to {start,end,attribution} — a smuggled
+	// non-scalar (a `text`/content key) cannot survive either level. `lineRanges`
+	// is NOT a top-level allowlisted field for this kind (only commitSha/
+	// workspaceKey/files are), so this entry serves purely as the nested spec.
+	"commit_attribution": {
+		"files":      {"path", "lineRanges"},
 		"lineRanges": {"start", "end", "attribution"},
 	},
 }
@@ -528,7 +547,7 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 			continue
 		}
 		if elementFields, hasElementList := elementAllowlists[key]; hasElementList {
-			projected[key] = projectArrayElements(value, elementFields)
+			projected[key] = projectArrayElements(value, elementFields, elementAllowlists)
 			continue
 		}
 		projected[key] = value
@@ -550,7 +569,15 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 
 // projectArrayElements projects each element of an array field down to its
 // allowlisted keys. Non-array values and non-object elements yield nothing.
-func projectArrayElements(value interface{}, fields []string) []interface{} {
+//
+// A kept element field that is ITSELF an array-of-objects — it has its own entry
+// in the kind's element allowlist (elementAllowlists), e.g.
+// commit_attribution.files[].lineRanges — is projected RECURSIVELY against that
+// entry, so no non-scalar can ride through a deeper nesting level. A field with
+// no such entry is treated as a scalar and kept verbatim; the allowlist author
+// asserts (by listing it) that it carries no source. Recursion terminates on
+// the DATA's finite nesting depth, so a self-referential spec cannot loop.
+func projectArrayElements(value interface{}, fields []string, elementAllowlists map[string][]string) []interface{} {
 	arr, ok := value.([]interface{})
 	if !ok {
 		return []interface{}{}
@@ -563,13 +590,20 @@ func projectArrayElements(value interface{}, fields []string) []interface{} {
 		}
 		projected := make(map[string]interface{}, len(fields))
 		for _, field := range fields {
-			if v, present := obj[field]; present && v != nil {
-				// The allowlist limits key NAMES; without a type check a map or
-				// slice smuggled into a scalar key (start/end/attribution/path)
-				// would ride through verbatim. Clamp kept values to scalars.
-				if isScalar(v) {
-					projected[field] = v
-				}
+			v, present := obj[field]
+			if !present || v == nil {
+				continue
+			}
+			if nested, hasNested := elementAllowlists[field]; hasNested {
+				projected[field] = projectArrayElements(v, nested, elementAllowlists)
+				continue
+			}
+			// No nested allowlist entry: this field must be a scalar. The
+			// allowlist limits key NAMES; without this type check a map or
+			// slice smuggled into a scalar key (start/end/attribution/path)
+			// would ride through verbatim. Clamp kept values to scalars.
+			if isScalar(v) {
+				projected[field] = v
 			}
 		}
 		out = append(out, projected)

@@ -292,6 +292,71 @@ func TestProjectEventLineRangeScalarClamp(t *testing.T) {
 	}
 }
 
+// TestProjectEventCommitAttributionNestedElements is the load-bearing privacy
+// check for PR3: commit_attribution nests TWO array levels (files[] each with a
+// lineRanges[]), and the top-level element projection is shallow. Without the
+// recursive element-allowlist walk, a files[] element would carry its lineRanges
+// VERBATIM — so a smuggled non-scalar (`text`) inside a nested lineRange element
+// would ship. This pins that BOTH levels are clamped to their scalar keys.
+func TestProjectEventCommitAttributionNestedElements(t *testing.T) {
+	e := eventWithData("commit_attribution", map[string]interface{}{
+		"commitSha":    "deadbeefcafe",
+		"workspaceKey": "owner/name",
+		// A private absolute path smuggled at the top level must not be kept
+		// (only commitSha/workspaceKey/files are allowlisted).
+		"absPath": "/home/alice/secret",
+		"files": []interface{}{
+			map[string]interface{}{
+				"path": "src/app.ts",
+				// A smuggled diff body at the files-element level must be stripped.
+				"diff": leakCanary,
+				"lineRanges": []interface{}{
+					// A `text` canary NESTED inside a lineRange element is the leak
+					// the recursive strip must kill.
+					map[string]interface{}{"start": 10, "end": 12, "attribution": "likely_ai", "text": leakCanary},
+					map[string]interface{}{"start": 30, "end": 30, "attribution": "unknown"},
+				},
+			},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived nested commit_attribution projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	if data["commitSha"] != "deadbeefcafe" || data["workspaceKey"] != "owner/name" {
+		t.Errorf("commitSha/workspaceKey lost in projection: %+v", data)
+	}
+	if _, present := data["absPath"]; present {
+		t.Errorf("non-allowlisted top-level field survived: %+v", data)
+	}
+	files, ok := data["files"].([]interface{})
+	if !ok || len(files) != 1 {
+		t.Fatalf("files did not survive projection: %T %+v", data["files"], data["files"])
+	}
+	file := files[0].(map[string]interface{})
+	if _, present := file["diff"]; present {
+		t.Errorf("smuggled diff survived files-element projection: %+v", file)
+	}
+	// A files element must strip to exactly {path, lineRanges}.
+	if len(file) != 2 || file["path"] != "src/app.ts" {
+		t.Errorf("files element not stripped to {path, lineRanges}: %+v", file)
+	}
+	ranges, ok := file["lineRanges"].([]interface{})
+	if !ok || len(ranges) != 2 {
+		t.Fatalf("nested lineRanges did not survive: %T %+v", file["lineRanges"], file["lineRanges"])
+	}
+	first := ranges[0].(map[string]interface{})
+	if _, present := first["text"]; present {
+		t.Errorf("smuggled text key survived nested lineRanges projection: %+v", first)
+	}
+	if len(first) != 3 || first["start"] != 10 || first["end"] != 12 || first["attribution"] != "likely_ai" {
+		t.Errorf("nested lineRange not stripped to {start,end,attribution}: %+v", first)
+	}
+}
+
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary

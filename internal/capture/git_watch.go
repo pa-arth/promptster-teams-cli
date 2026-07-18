@@ -197,18 +197,29 @@ func pollGitWatch(roots []string) map[string][]string {
 }
 
 // pollGitWatchWorkspace enumerates the workspace's roots (workspace + its git
-// worktrees) and polls them, logging what it detected. Nothing is emitted.
-func pollGitWatchWorkspace(workspace string) {
-	detected := pollGitWatch(workspaceMatchRoots(workspace))
-	for key, commits := range detected {
-		state.HookDebugf("git-watch: %d new commit(s) on %s", len(commits), key)
+// worktrees), polls them, and computes+emits AI attribution for every newly
+// detected commit. pollGitWatch returns commits keyed by the opaque root key, so
+// we re-derive that key per root to recover the ROOT PATH the attribution engine
+// needs to run its one `git show` per commit.
+func pollGitWatchWorkspace(session Session) {
+	roots := workspaceMatchRoots(resolvePath(session.TaskRoot))
+	detected := pollGitWatch(roots)
+	for _, root := range roots {
+		commits := detected[gitWatchRootKey(root)]
+		if len(commits) == 0 {
+			continue
+		}
+		state.HookDebugf("git-watch: %d new commit(s) on %s", len(commits), gitWatchRootKey(root))
+		for _, sha := range commits {
+			attributeCommit(session, root, sha)
+		}
 	}
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until
 // stop is closed. Mirrors runConfigCensus's stop-channel loop.
-func runGitWatch(workspace string, stop <-chan struct{}) {
-	pollGitWatchWorkspace(workspace)
+func runGitWatch(session Session, stop <-chan struct{}) {
+	pollGitWatchWorkspace(session)
 	ticker := time.NewTicker(gitWatchInterval)
 	defer ticker.Stop()
 	for {
@@ -216,21 +227,21 @@ func runGitWatch(workspace string, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			pollGitWatchWorkspace(workspace)
+			pollGitWatchWorkspace(session)
 		}
 	}
 }
 
-// StartGitWatch launches the watcher goroutine for a workspace and returns a
-// stop func the caller defers. Mirrors StartConfigCensus / StartPresenceHeartbeat.
-func StartGitWatch(workspace string) (stop func()) {
+// StartGitWatch launches the watcher goroutine for a session and returns a stop
+// func the caller defers. Mirrors StartConfigCensus / StartPresenceHeartbeat.
+func StartGitWatch(session Session) (stop func()) {
 	done := make(chan struct{})
-	go runGitWatch(workspace, done)
+	go runGitWatch(session, done)
 	return func() { close(done) }
 }
 
-// RunGitWatcher is the foreground `git-watch` subcommand: resolve the session's
-// workspace and poll until the process is interrupted.
+// RunGitWatcher is the foreground `git-watch` subcommand: resolve the session
+// and poll until the process is interrupted.
 func RunGitWatcher() error {
 	session, err := loadSession()
 	if err != nil {
@@ -239,6 +250,6 @@ func RunGitWatcher() error {
 	if session.TaskRoot == "" {
 		return fmt.Errorf("session has no task root")
 	}
-	runGitWatch(resolvePath(session.TaskRoot), make(chan struct{}))
+	runGitWatch(session, make(chan struct{}))
 	return nil
 }
