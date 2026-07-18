@@ -269,6 +269,10 @@ func pollGitWatchWorkspace(session Session) {
 			attributeCommit(session, root, sha)
 		}
 	}
+	// Durability advances on the DEFAULT branch only (its own cursor), so it is
+	// driven separately from the working-HEAD attribution loop above. Same roots,
+	// same cadence; nowMs read here (top-level) and threaded down.
+	pollDurability(session, roots, time.Now().UnixMilli())
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until

@@ -195,6 +195,50 @@ func TestDurabilityChurnBeforeWindow(t *testing.T) {
 	}
 }
 
+// TestDurabilityDefaultBranchScopeOnly: durability advances on the DEFAULT
+// branch only. A commit that rewrites an AI line on a FEATURE branch (never
+// merged to default) must NOT churn it — the line stays durable. Proves the
+// durability cursor tracks the default-branch ref, not working HEAD.
+func TestDurabilityDefaultBranchScopeOnly(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main") // deterministic default branch name
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	roots := []string{ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// Cold start: baseline the durability cursor to main's tip, no processing.
+	pollDurability(sess, roots, t0)
+
+	// AI adds ai.go ON main.
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	pollDurability(sess, roots, t0+dayMs) // main moved → seed ai.go 1..3
+
+	// Rewrite line 2 on a FEATURE branch that is never merged to main.
+	git("checkout", "-b", "feature")
+	writeCommitFile(t, ws, "ai.go", "l1\nCHANGED\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "feature rewrites line 2")
+	pollDurability(sess, roots, t0+2*dayMs) // main did NOT move → no processing
+
+	// At 30d, all of ai.go 1..3 is durable — the feature-branch churn was out of
+	// scope. (If durability had followed working HEAD, line 2 would be churned.)
+	v := harvestDurable(sess, ws, key, t0+31*dayMs)
+	data := durVerdictFor(t, v, "ai.go")
+	durable := rangeSet(t, data, "durableRanges")
+	if !durable["1..3"] {
+		t.Errorf("durableRanges = %+v, want 1..3 (feature-branch churn must be out of scope)", durable)
+	}
+}
+
 // TestDurabilityInsertionShiftsSurvivor: an unrelated insertion ABOVE an AI range
 // shifts the range's reported line numbers but keeps it durable — the interval
 // remap, done with no per-line git spawn.
