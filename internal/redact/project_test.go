@@ -357,6 +357,55 @@ func TestProjectEventCommitAttributionNestedElements(t *testing.T) {
 	}
 }
 
+// Privacy gate for the durability engine: a durability_verdict carries two
+// range arrays (durableRanges/churnedRanges). The top-level projection is
+// shallow, so without the element-allowlist walk a range element would ship
+// VERBATIM — including a smuggled byte/text/fingerprint key. This pins that the
+// top level keeps only its allowlisted fields AND every range element strips to
+// exactly {start,end,ageDays,lineageId}. A fingerprint MUST NOT leave the device.
+func TestProjectEventDurabilityVerdictNestedElements(t *testing.T) {
+	e := eventWithData("durability_verdict", map[string]interface{}{
+		"commitSha":    "deadbeefcafe",
+		"workspaceKey": "owner/name",
+		"path":         "src/app.ts",
+		"measuredTsMs": 1000,
+		// A content fingerprint smuggled at the top level must not be kept.
+		"fingerprint": leakCanary,
+		"durableRanges": []interface{}{
+			// A `text` canary NESTED inside a range element is the leak the
+			// recursive strip must kill.
+			map[string]interface{}{"start": 3, "end": 5, "ageDays": 31, "lineageId": "abc:src/app.ts", "text": leakCanary},
+		},
+		"churnedRanges": []interface{}{
+			map[string]interface{}{"start": 9, "end": 9, "ageDays": 4, "lineageId": "abc:src/app.ts", "content": leakCanary},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived durability_verdict projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	if data["commitSha"] != "deadbeefcafe" || data["workspaceKey"] != "owner/name" || data["path"] != "src/app.ts" {
+		t.Errorf("allowlisted scalars lost in projection: %+v", data)
+	}
+	if _, present := data["fingerprint"]; present {
+		t.Errorf("smuggled top-level fingerprint survived: %+v", data)
+	}
+	durable, ok := data["durableRanges"].([]interface{})
+	if !ok || len(durable) != 1 {
+		t.Fatalf("durableRanges did not survive: %T %+v", data["durableRanges"], data["durableRanges"])
+	}
+	first := durable[0].(map[string]interface{})
+	if _, present := first["text"]; present {
+		t.Errorf("smuggled text key survived durableRanges projection: %+v", first)
+	}
+	if len(first) != 4 || first["start"] != 3 || first["end"] != 5 || first["ageDays"] != 31 || first["lineageId"] != "abc:src/app.ts" {
+		t.Errorf("durable range not stripped to {start,end,ageDays,lineageId}: %+v", first)
+	}
+}
+
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary
