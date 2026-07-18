@@ -365,6 +365,17 @@ func emitCommitAttribution(ev event.Event) {
 // single source commit, so there is nothing to match against. Recovering it
 // would need an explicit merge/squash signal we do not collect out-of-band.
 func attributeCommit(session Session, root, sha string, nowMs int64) {
+	attributeAndReworkCommit(session, root, sha, false, nowMs)
+}
+
+// attributeAndReworkCommit does attribution for one detected working-HEAD commit
+// and, when preMerge is true (the working branch is ahead of the default branch),
+// ALSO folds the commit into the pre-merge rework ledger — reusing the SAME
+// `git show` diff + reconciled files, so a pre-merge commit stays one spawn.
+// preMerge is resolved once per root by the caller (never per commit), keeping
+// the per-commit budget constant-time. attributeCommit is the preMerge=false
+// entry point for callers (and tests) that only want attribution.
+func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, sha)
 	if !ok {
 		return
@@ -374,4 +385,8 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 	// likely_ai lines so a later squash-merge onto the default branch can
 	// transfer attribution by content match. Fingerprints never leave the device.
 	recordAiFingerprints(gitWatchRootKey(root), sha, diff, files, nowMs)
+	if preMerge {
+		// Reuse the same diff + files — no extra spawn — to track pre-merge rework.
+		pollReworkCommit(session, root, sha, diff, files, nowMs)
+	}
 }

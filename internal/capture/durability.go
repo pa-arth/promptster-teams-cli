@@ -507,23 +507,27 @@ type durabilityVerdictData struct {
 	MeasuredTsMs  int64             `json:"measuredTsMs"`
 }
 
+// toVerdictRanges converts tracked spans into content-free verdict ranges,
+// stamping each with its age in days at nowMs. Shared by the durability and
+// rework verdict builders (both age a durTrackedRange the same way).
+func toVerdictRanges(rs []durTrackedRange, nowMs int64) []durVerdictRange {
+	var out []durVerdictRange
+	for _, r := range rs {
+		out = append(out, durVerdictRange{
+			Start:     r.Start,
+			End:       r.End,
+			AgeDays:   int((nowMs - r.BornTsMs) / (24 * 60 * 60 * 1000)),
+			LineageID: r.LineageID,
+		})
+	}
+	return out
+}
+
 // buildDurabilityVerdict assembles a durability_verdict for one path. Data goes
 // through eventDataMap (JSON round-trip) so nested arrays land as
 // []interface{} of map — the only shape the redaction projector's element
 // allowlist can walk (assigning the struct straight to Data ships {}).
 func buildDurabilityVerdict(session Session, root, sha, path string, durable, churned []durTrackedRange, nowMs int64) event.Event {
-	toVR := func(rs []durTrackedRange) []durVerdictRange {
-		var out []durVerdictRange
-		for _, r := range rs {
-			out = append(out, durVerdictRange{
-				Start:     r.Start,
-				End:       r.End,
-				AgeDays:   int((nowMs - r.BornTsMs) / (24 * 60 * 60 * 1000)),
-				LineageID: r.LineageID,
-			})
-		}
-		return out
-	}
 	e := event.NewEvent("durability_verdict", session.DeviceID)
 	e.Source = presenceSource
 	e.DeviceID = session.DeviceID
@@ -532,8 +536,8 @@ func buildDurabilityVerdict(session Session, root, sha, path string, durable, ch
 		CommitSha:     sha,
 		WorkspaceKey:  workspaceKey(root),
 		Path:          path,
-		DurableRanges: toVR(durable),
-		ChurnedRanges: toVR(churned),
+		DurableRanges: toVerdictRanges(durable, nowMs),
+		ChurnedRanges: toVerdictRanges(churned, nowMs),
 		MeasuredTsMs:  nowMs,
 	})
 	return e

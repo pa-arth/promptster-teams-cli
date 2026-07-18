@@ -272,15 +272,46 @@ func pollGitWatchWorkspace(session Session) {
 	pollDurability(session, roots, nowMs)
 
 	for _, root := range roots {
-		commits := detected[gitWatchRootKey(root)]
+		rootKey := gitWatchRootKey(root)
+		commits := detected[rootKey]
 		if len(commits) == 0 {
 			continue
 		}
-		state.HookDebugf("git-watch: %d new commit(s) on %s", len(commits), gitWatchRootKey(root))
-		for _, sha := range commits {
-			attributeCommit(session, root, sha, nowMs)
+		// Pre-merge scope for rework, resolved ONCE per root (never per commit):
+		// the working branch is ahead of the default branch iff HEAD != default tip.
+		preMerge := isPreMergeBranch(root)
+		if !preMerge {
+			// On (or merged back to) the default branch: any branch rework tracking is
+			// resolved — surviving AI lines are now the durability engine's, reworked
+			// ones already emitted — so drop it before a future branch could remap
+			// against another branch's stale ranges.
+			clearReworkLedger(rootKey)
+		}
+		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v)", len(commits), rootKey, preMerge)
+		// Oldest-first: rework is STATEFUL (seed then churn across commits), so it
+		// must see commits in commit order. Attribution is per-commit independent, so
+		// the reversed order is equally correct for it. commits is newest-first.
+		for i := len(commits) - 1; i >= 0; i-- {
+			attributeAndReworkCommit(session, root, commits[i], preMerge, nowMs)
 		}
 	}
+}
+
+// isPreMergeBranch reports whether root's working HEAD is ahead of / diverged
+// from its default branch — i.e. commits here are pre-merge branch commits whose
+// AI-line churn is rework, not durability. Two constant-time read-only spawns per
+// root per poll (default tip [ref cached] + HEAD); false when there is no
+// resolvable default (nothing to be "ahead of") or HEAD is unresolvable.
+func isPreMergeBranch(root string) bool {
+	_, tip, ok := durabilityDefaultTip(root)
+	if !ok {
+		return false
+	}
+	head, ok := gitHead(root)
+	if !ok {
+		return false
+	}
+	return head != tip
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until

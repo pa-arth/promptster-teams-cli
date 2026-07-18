@@ -172,6 +172,13 @@ var projectFieldAllowlist = map[string][]string{
 	// allowlists below are the load-bearing privacy line. NEVER a diff, file body,
 	// old/new string, or content fingerprint (fingerprints stay on-device).
 	"durability_verdict": {"commitSha", "workspaceKey", "path", "durableRanges", "churnedRanges", "measuredTsMs"},
+	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
+	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
+	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
+	// never content. commitSha/workspaceKey/path are the same public identities.
+	// The reworkedRanges[] element allowlist below is the load-bearing privacy
+	// line. NEVER a diff, file body, old/new string, or content fingerprint.
+	"rework_verdict": {"commitSha", "workspaceKey", "path", "reworkedRanges", "measuredTsMs"},
 }
 
 // projectArrayElementAllowlist — element-level allowlists for array-of-object
@@ -210,6 +217,13 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	"durability_verdict": {
 		"durableRanges": {"start", "end", "ageDays", "lineageId"},
 		"churnedRanges": {"start", "end", "ageDays", "lineageId"},
+	},
+	// rework_verdict's range array is content-free by construction (ints + a
+	// lineage handle), but this allowlist is the LOAD-BEARING privacy line: it
+	// strips every element to exactly these scalar keys, so a smuggled
+	// text/byte/fingerprint key can never survive projection.
+	"rework_verdict": {
+		"reworkedRanges": {"start", "end", "ageDays", "lineageId"},
 	},
 }
 
