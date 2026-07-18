@@ -28,12 +28,15 @@ import (
 
 // projectUsageFields — per-request token usage: numbers plus a model id, no
 // source. Shared between ai_response (main chain) and subagent_usage
-// (sidechains).
+// (sidechains). reasoningTokens is OpenAI's reasoning_output_tokens (Codex) — a
+// content-free integer the backend uses for reasoning-model pricing; absent on
+// providers that don't report it (dropped-by-omission, never leaked).
 var projectUsageFields = []string{
 	"model",
 	"usageScope",
 	"inputTokens",
 	"outputTokens",
+	"reasoningTokens",
 	"cacheReadTokens",
 	"cacheWriteTokens",
 	"cacheWrite5mTokens",

@@ -236,6 +236,89 @@ func TestCodexPatchLineRanges(t *testing.T) {
 	}
 }
 
+// TestCodexAttachesModelFromTurnContext (§10.1): the per-turn model id lives on
+// the turn_context rollout line — session_meta carries only model_provider (the
+// vendor, e.g. "openai"). Capture the latest turn_context model as processor
+// state and stamp it on the ai_response so the backend can price the turn against
+// the real model. turn_context precedes the turn's agent messages, so the state
+// capture is order-correct.
+func TestCodexAttachesModelFromTurnContext(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:46.000Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/tmp/ws"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.000Z","type":"event_msg","payload":{"type":"user_message","message":"go"}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-m")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	var got string
+	for _, e := range events {
+		if e.Kind == "ai_response" {
+			got, _ = e.Data.(map[string]interface{})["model"].(string)
+		}
+	}
+	if got != "gpt-5.5" {
+		t.Fatalf("ai_response model = %q, want gpt-5.5 (from turn_context)", got)
+	}
+}
+
+// TestCodexTurnContextWithoutModelClearsStale (§10.1, honesty guard): a later
+// turn_context that declares NO model must not leave the previous turn's model
+// attributed to the new turn's ai_response — we omit model rather than price
+// against a stale one. (A turn with no turn_context at all still retains the
+// last known model; this only covers a turn_context that is present but empty.)
+func TestCodexTurnContextWithoutModelClearsStale(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:46.000Z","type":"turn_context","payload":{"model":"gpt-5.5"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.000Z","type":"turn_context","payload":{"cwd":"/tmp/ws"}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-clear")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if got, present := e.Data.(map[string]interface{})["model"]; present {
+			t.Fatalf("ai_response model = %v, want omitted (later turn_context declared no model)", got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
+// TestCodexAiResponseCarriesReasoningTokens (§10.2): the ai_response usage payload
+// includes reasoningTokens (OpenAI's reasoning_output_tokens), a content-free
+// count the backend uses for reasoning-model pricing. The normalizer already
+// extracts it; this pins it onto the ai_response event.
+func TestCodexAiResponseCarriesReasoningTokens(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"reasoning_output_tokens":37,"total_tokens":157}}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-r")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if got := e.Data.(map[string]interface{})["reasoningTokens"]; got != int64(37) {
+			t.Fatalf("ai_response reasoningTokens = %v (%T), want int64(37)", got, got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
 func TestParseCodexExecOutput(t *testing.T) {
 	code, stdout := parseCodexExecOutput("Chunk ID: a1\nProcess exited with code 3\nOutput:\nhello\nworld\n")
 	if code != 3 {

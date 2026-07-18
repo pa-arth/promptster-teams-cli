@@ -56,13 +56,14 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			wantDropped: []string{"stdout", "stderr"},
 		},
 		{
-			name: "ai_response keeps usage metadata, drops text and lastAssistantMessage",
+			name: "ai_response keeps usage metadata (incl. reasoningTokens), drops text and lastAssistantMessage",
 			kind: "ai_response",
 			data: map[string]interface{}{
 				"text": leakCanary, "lastAssistantMessage": leakCanary,
 				"model": "claude-sonnet-5", "inputTokens": 1200, "outputTokens": 340,
+				"reasoningTokens": 37,
 			},
-			wantKept:    map[string]interface{}{"model": "claude-sonnet-5", "inputTokens": 1200, "outputTokens": 340},
+			wantKept:    map[string]interface{}{"model": "claude-sonnet-5", "inputTokens": 1200, "outputTokens": 340, "reasoningTokens": 37},
 			wantDropped: []string{"text", "lastAssistantMessage"},
 		},
 		{
