@@ -96,6 +96,18 @@ func durabilityDefaultRef(root string) string {
 	return ref
 }
 
+// invalidateDurabilityDefaultRef drops a root's cached default ref so the next
+// poll re-resolves it. Called when a previously-cached ref stops resolving
+// (renamed/deleted default branch): without eviction the root would keep probing
+// the dead ref and stay disabled until the process restarts. Re-resolution is
+// cheap and idempotent, so evicting on a transient failure is harmless too.
+func invalidateDurabilityDefaultRef(root string) {
+	key := gitWatchRootKey(root)
+	durDefaultRefMu.Lock()
+	delete(durDefaultRefCache, key)
+	durDefaultRefMu.Unlock()
+}
+
 // durabilityDefaultTip resolves the default branch's current tip SHA (one
 // rev-parse; the ref itself is cached). ok=false when there is no default scope
 // or the tip is unresolvable.
@@ -107,6 +119,9 @@ func durabilityDefaultTip(root string) (ref, tip string, ok bool) {
 	// #nosec G204 -- constant argv; root discovered, ref is a resolved ref name (not user input). Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "--quiet", ref).Output()
 	if err != nil {
+		// The cached ref no longer resolves (default branch renamed/deleted). Evict
+		// it so the next poll re-resolves instead of skipping this root forever.
+		invalidateDurabilityDefaultRef(root)
 		return "", "", false
 	}
 	tip = strings.TrimSpace(string(out))
@@ -159,11 +174,13 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 			if !ok {
 				continue // inconclusive — keep the cursor, retry next poll
 			}
-			for i := len(commits) - 1; i >= 0; i-- { // oldest-first
-				pollDurabilityCommit(root, rootKey, session, commits[i], nowMs)
-			}
 			if len(commits) > 0 {
-				advanceDurabilityCursor(rootKey, commits[0]) // newest returned (clamp-safe)
+				// Each pollDurabilityCommit advances the cursor to its own commit in
+				// the SAME ledger transaction as that commit's range changes, so a
+				// crash cannot leave ranges applied with the cursor behind them.
+				for i := len(commits) - 1; i >= 0; i-- { // oldest-first
+					pollDurabilityCommit(root, rootKey, session, commits[i], nowMs)
+				}
 			} else {
 				advanceDurabilityCursor(rootKey, tip) // backward move / nothing new
 			}

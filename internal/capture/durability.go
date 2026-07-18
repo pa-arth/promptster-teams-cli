@@ -344,16 +344,24 @@ func durLineageID(sha, path string) string {
 func pollDurabilityCommit(root, rootKey string, session Session, sha string, nowMs int64) []event.Event {
 	diff, ok := gitCommitRawDiff(root, sha)
 	if !ok {
+		// Inconclusive (git failed): do NOT advance the cursor, so this commit is
+		// retried next poll rather than silently skipped.
 		return nil
 	}
 	hunks := parseUnifiedDiffHunks(diff)
-	if len(hunks) == 0 {
-		return nil
-	}
 	aiPaths := readAiTouchedPaths(rootKey)
 
 	var verdicts []event.Event
 	mutateDurabilityLedger(func(led *durabilityLedger) {
+		// Advance the cursor to this commit in the SAME transaction as its range
+		// changes. A separate advance could crash in between, leaving the ranges
+		// applied but the cursor behind — reprocessing would then remap the commit
+		// twice (remapTrackedRanges is not idempotent). A zero-hunk commit still
+		// advances: it is genuinely behind us and changed no tracked ranges.
+		if led.Cursors == nil {
+			led.Cursors = map[string]string{}
+		}
+		led.Cursors[rootKey] = sha
 		files := led.Roots[rootKey]
 		if files == nil {
 			files = map[string][]durTrackedRange{}
