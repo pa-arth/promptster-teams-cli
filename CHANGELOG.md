@@ -6,6 +6,31 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-07-18
+
+### Added
+- **Per-commit AI line attribution.** A new periodic git watcher emits a
+  `commit_attribution` event per commit on the watched repos, recording which
+  committed line ranges were AI-authored. Ranges are reconciled against the
+  *real committed diff*, so a silent formatter hook that reflows AI lines
+  doesn't lose the attribution. Only integer line ranges, the commit SHA, and a
+  hashed workspace key leave the machine — never file contents, diff bytes, or
+  filenames. Runs on a 60s timer off any latency-sensitive path.
+- **AI-line durability.** AI-authored lines are followed forward on the default
+  branch; once a line survives 30 days it emits a `durability_verdict` — a
+  content-free measure of how much AI code actually persists rather than getting
+  reverted. Lineage follows through squash-merges, cherry-picks, and rebases via
+  on-device fingerprints (fingerprints never leave the machine).
+- **AI-line rework.** On a pre-merge branch, a `rework_verdict` emits the moment
+  AI-authored lines are churned or rewritten before they land, measuring
+  pre-merge iteration on AI output. No maturity window; content-free (line
+  ranges + SHA + hashed workspace key only). The ledger clears when the branch
+  merges back to the default branch.
+- **Codex per-turn model + reasoning tokens.** Codex rollout normalization now
+  attaches the exact per-turn model from `turn_context` and carries OpenAI's
+  reasoning-output token count through the privacy projector (absent-by-omission
+  on providers that don't report it).
+
 ### Fixed
 - **CLAUDE.md coverage no longer reads 0% for monorepos.** The config census
   looked for `CLAUDE.md` only at the workspace ROOT, but Claude Code discovers it
