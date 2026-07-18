@@ -406,6 +406,52 @@ func TestProjectEventDurabilityVerdictNestedElements(t *testing.T) {
 	}
 }
 
+// Privacy gate for the rework engine: a rework_verdict carries one range array
+// (reworkedRanges). The top-level projection is shallow, so without the
+// element-allowlist walk a range element would ship VERBATIM — including a
+// smuggled byte/text/fingerprint key. This pins that the top level keeps only its
+// allowlisted fields AND every range element strips to exactly
+// {start,end,ageDays,lineageId}. A fingerprint MUST NOT leave the device.
+func TestProjectEventReworkVerdictNestedElements(t *testing.T) {
+	e := eventWithData("rework_verdict", map[string]interface{}{
+		"commitSha":    "deadbeefcafe",
+		"workspaceKey": "owner/name",
+		"path":         "src/app.ts",
+		"measuredTsMs": 1000,
+		// A content fingerprint smuggled at the top level must not be kept.
+		"fingerprint": leakCanary,
+		"reworkedRanges": []interface{}{
+			// A `text` canary NESTED inside a range element is the leak the
+			// recursive strip must kill.
+			map[string]interface{}{"start": 2, "end": 2, "ageDays": 1, "lineageId": "abc:src/app.ts", "text": leakCanary},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived rework_verdict projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	if data["commitSha"] != "deadbeefcafe" || data["workspaceKey"] != "owner/name" || data["path"] != "src/app.ts" {
+		t.Errorf("allowlisted scalars lost in projection: %+v", data)
+	}
+	if _, present := data["fingerprint"]; present {
+		t.Errorf("smuggled top-level fingerprint survived: %+v", data)
+	}
+	reworked, ok := data["reworkedRanges"].([]interface{})
+	if !ok || len(reworked) != 1 {
+		t.Fatalf("reworkedRanges did not survive: %T %+v", data["reworkedRanges"], data["reworkedRanges"])
+	}
+	first := reworked[0].(map[string]interface{})
+	if _, present := first["text"]; present {
+		t.Errorf("smuggled text key survived reworkedRanges projection: %+v", first)
+	}
+	if len(first) != 4 || first["start"] != 2 || first["end"] != 2 || first["ageDays"] != 1 || first["lineageId"] != "abc:src/app.ts" {
+		t.Errorf("rework range not stripped to {start,end,ageDays,lineageId}: %+v", first)
+	}
+}
+
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary
