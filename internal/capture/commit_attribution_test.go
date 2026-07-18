@@ -6,11 +6,24 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
+
+// statMtimeMs returns a file's on-disk mtime in Unix ms — read back after any
+// os.Chtimes so windows are placed against the value the reconciler will actually
+// stat, immune to filesystem mtime-granularity truncation.
+func statMtimeMs(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.ModTime().UnixMilli()
+}
 
 // writeFile writes content to <dir>/<rel>, creating parents.
 func writeCommitFile(t *testing.T, dir, rel, content string) {
@@ -343,6 +356,158 @@ func TestCommitAttributionNonASCIIPath(t *testing.T) {
 		if r.(map[string]interface{})["attribution"] != attributionLikelyAI {
 			t.Errorf("non-ASCII AI-touched path must be likely_ai: %+v", r)
 		}
+	}
+}
+
+// TestBashRecoveryHappyPath: a committed file with NO ai-paths evidence
+// (simulating an AI `sed -i`/codegen edit that produced no file_diff) whose
+// working-tree mtime falls inside a recorded AI bash window is recovered from
+// unknown to likely_ai, tagged with that bash session.
+func TestBashRecoveryHappyPath(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "gen.go", "package main\n\nvar Gen = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "bash-generated file")
+	sha := gitOut("rev-parse", "HEAD")
+
+	// Deliberately record NOTHING in the ai-paths ledger for gen.go — a bash edit
+	// produces no file_diff, so its path never enters that ledger.
+	base := time.Now()
+	if err := os.Chtimes(filepath.Join(ws, "gen.go"), base, base); err != nil {
+		t.Fatal(err)
+	}
+	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
+	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-500, m+500) // window spans the file mtime
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	gen := files["gen.go"]
+	for _, r := range gen["lineRanges"].([]interface{}) {
+		if r.(map[string]interface{})["attribution"] != attributionLikelyAI {
+			t.Errorf("bash-recovered file must be likely_ai, got %+v", r)
+		}
+	}
+	// The recovered bash session is the commit's representative AI session.
+	if ev.SessionID != "bash-sess" {
+		t.Errorf("sessionId = %q, want recovered bash session bash-sess", ev.SessionID)
+	}
+}
+
+// TestBashRecoveryOutsideWindowStaysUnknown: same setup, but the recorded bash
+// window is far from the file mtime (beyond δ/ε) → the file stays unknown and
+// "human" appears nowhere.
+func TestBashRecoveryOutsideWindowStaysUnknown(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "gen.go", "package main\n\nvar Gen = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "not-AI file")
+	sha := gitOut("rev-parse", "HEAD")
+
+	base := time.Now()
+	if err := os.Chtimes(filepath.Join(ws, "gen.go"), base, base); err != nil {
+		t.Fatal(err)
+	}
+	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
+	// A window a full minute before the file mtime — well outside the 3s tolerance.
+	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-60000, m-59000)
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	for _, r := range files["gen.go"]["lineRanges"].([]interface{}) {
+		if r.(map[string]interface{})["attribution"] != attributionUnknown {
+			t.Errorf("file outside any bash window must stay unknown, got %+v", r)
+		}
+	}
+	if ev.SessionID != "dev-x" {
+		t.Errorf("sessionId = %q, want device fallback dev-x (no AI evidence)", ev.SessionID)
+	}
+	b, _ := json.Marshal(ev)
+	if strings.Contains(string(b), "human") {
+		t.Errorf(`"human" must never appear in a commit_attribution event: %s`, b)
+	}
+}
+
+// TestBashRecoveryNeverOverridesPrimaryAI: a file already likely_ai from the
+// ai-paths ledger is NOT re-tagged by the recovery pass even when a bash window
+// also matches — recovery fills holes only, and the primary session wins.
+func TestBashRecoveryNeverOverridesPrimaryAI(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "gen.go", "package main\n\nvar Gen = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "ai file with a matching bash window too")
+	sha := gitOut("rev-parse", "HEAD")
+
+	// Primary AI evidence for gen.go.
+	recordAiTouchedPath("ai-sess", gitWatchRootKey(ws), "gen.go")
+
+	base := time.Now()
+	if err := os.Chtimes(filepath.Join(ws, "gen.go"), base, base); err != nil {
+		t.Fatal(err)
+	}
+	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
+	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-500, m+500) // also matches, must be ignored
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	for _, r := range files["gen.go"]["lineRanges"].([]interface{}) {
+		if r.(map[string]interface{})["attribution"] != attributionLikelyAI {
+			t.Errorf("primary AI file must stay likely_ai, got %+v", r)
+		}
+	}
+	// The primary ai-paths session, not the bash session, represents the commit.
+	if ev.SessionID != "ai-sess" {
+		t.Errorf("sessionId = %q, want primary ai-sess (recovery must not seize it)", ev.SessionID)
+	}
+}
+
+// TestBashRecoveryNearestWindowChosen: two windows both within tolerance of the
+// file mtime; the nearer one's session must win the tie-break.
+func TestBashRecoveryNearestWindowChosen(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "gen.go", "package main\n\nvar Gen = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "bash file, two candidate windows")
+	sha := gitOut("rev-parse", "HEAD")
+
+	base := time.Now()
+	if err := os.Chtimes(filepath.Join(ws, "gen.go"), base, base); err != nil {
+		t.Fatal(err)
+	}
+	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
+	// near-sess ends 100ms before the mtime (distance 100); far-sess starts
+	// 2000ms after it (distance 2000). Both are within the 3s tolerance.
+	recordBashWindow("near-sess", gitWatchRootKey(ws), m-200, m-100)
+	recordBashWindow("far-sess", gitWatchRootKey(ws), m+2000, m+2500)
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	for _, r := range files["gen.go"]["lineRanges"].([]interface{}) {
+		if r.(map[string]interface{})["attribution"] != attributionLikelyAI {
+			t.Errorf("recovered file must be likely_ai, got %+v", r)
+		}
+	}
+	if ev.SessionID != "near-sess" {
+		t.Errorf("sessionId = %q, want nearest window session near-sess", ev.SessionID)
 	}
 }
 

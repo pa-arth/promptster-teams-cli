@@ -1,7 +1,9 @@
 package capture
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -154,7 +156,7 @@ func parseDiffNewPath(s string) string {
 // transcript ranges vs committed ranges is a later refinement — the transcript
 // ranges are pre-formatter and won't line up 1:1 with the committed lines
 // anyway, so path-level + committed-bytes is the defensible first cut.
-func reconcileCommitAttribution(fileRanges map[string][]attrLineRange, aiPaths map[string]string) (files []attrFile, primarySession string) {
+func reconcileCommitAttribution(root string, fileRanges map[string][]attrLineRange, aiPaths map[string]string, bashWindows []bashWindow) (files []attrFile, primarySession string) {
 	paths := make([]string, 0, len(fileRanges))
 	for p := range fileRanges {
 		paths = append(paths, p)
@@ -165,21 +167,35 @@ func reconcileCommitAttribution(fileRanges map[string][]attrLineRange, aiPaths m
 	files = make([]attrFile, 0, len(paths))
 	for _, path := range paths {
 		attribution := attributionUnknown
+		session := ""
 		// PATH-SPACE NOTES (what's true after workspace scoping):
-		//   1. aiPaths is now scoped by workspace root key (the caller passes
-		//      gitWatchRootKey(root) into readAiTouchedPaths), so a same-named
-		//      path AI-touched in ANOTHER repo can no longer bleed in.
+		//   1. aiPaths (and bashWindows) are now scoped by workspace root key (the
+		//      caller passes gitWatchRootKey(root) into the readers), so a
+		//      same-named path AI-touched in ANOTHER repo can no longer bleed in.
 		//   2. Remaining v1 limitation (temporal, SAME workspace): a file
 		//      AI-touched earlier and then edited by a HUMAN within the 7-day
 		//      ledger TTL still attributes `likely_ai` at path granularity. The
 		//      Phase-2 commit-joined ledger will resolve this per-line/per-commit.
+		//      The bash-mtime recovery pass below shares this residual: a human
+		//      save landing inside an AI bash window is recovered as likely_ai.
 		//   3. Sibling-worktree note: aiPaths keys are relativized against
 		//      session.TaskRoot, while `path` is relative to the git root polled.
 		//      For a SIBLING worktree (root != TaskRoot) the keys differ, so AI
 		//      evidence there reads as `unknown` — a conservative under-attribution.
 		if sid, ok := aiPaths[path]; ok {
 			attribution = attributionLikelyAI
-			sessionFiles[sid]++
+			session = sid
+		} else if sid, ok := recoverBashSession(root, path, bashWindows); ok {
+			// BASH-MTIME RECOVERY PASS (else-if is load-bearing): only reached for a
+			// file the primary pass left UNKNOWN — a file already likely_ai above is
+			// never re-examined, so recovery can only fill holes, never override AI
+			// or emit human. A file whose working-tree mtime falls in an AI bash
+			// window is recovered to likely_ai, tagged with that bash session.
+			attribution = attributionLikelyAI
+			session = sid
+		}
+		if session != "" {
+			sessionFiles[session]++
 		}
 		src := fileRanges[path]
 		tagged := make([]attrLineRange, 0, len(src))
@@ -190,6 +206,75 @@ func reconcileCommitAttribution(fileRanges map[string][]attrLineRange, aiPaths m
 		files = append(files, attrFile{Path: path, LineRanges: tagged})
 	}
 	return files, mostFrequentSession(sessionFiles)
+}
+
+// δ/ε mtime-correlation tolerance for bash recovery (git-ai's ±3s, in ms). A file
+// mtime up to δ BEFORE a window's start or ε AFTER its end still matches — δ
+// covers the command's execution duration plus clock skew before its observed
+// END time (the only timestamp we have), ε covers the mtime landing slightly
+// after that observed end. Package vars so a test can tighten them.
+var (
+	bashWindowPreToleranceMs  int64 = 3000 // δ
+	bashWindowPostToleranceMs int64 = 3000 // ε
+)
+
+// recoverBashSession returns the session of the AI bash window that best matches
+// the working-tree mtime of relPath, or ok=false when none is within tolerance.
+//
+// It stats the working-tree path (the committed content usually matches the
+// working tree at poll time); if the file is gone or unstattable it returns no
+// match — a conservative MISS, never a guess. Ties break to the NEAREST window,
+// then the newest, then the lexicographically smallest session for determinism.
+//
+// KNOWN LIMIT (deliberate, documented): a later `git checkout` / `reset --hard` /
+// `stash` rewrites working-tree mtimes to the checkout instant, breaking the
+// correlation → the file stays unknown (a miss). That is acceptable; do NOT try
+// to defeat it. The window persists under its TTL, so a rewrite re-attribution
+// that re-enters via rev-list can still catch a fast first-poll miss.
+func recoverBashSession(root, relPath string, windows []bashWindow) (string, bool) {
+	if root == "" || len(windows) == 0 {
+		return "", false
+	}
+	info, err := os.Stat(filepath.Join(root, relPath))
+	if err != nil {
+		return "", false
+	}
+	mtimeMs := info.ModTime().UnixMilli()
+
+	best := ""
+	bestDist := int64(-1)
+	bestEnd := int64(0)
+	for _, w := range windows {
+		dist, ok := windowDistanceMs(mtimeMs, w)
+		if !ok {
+			continue // outside tolerance
+		}
+		if bestDist < 0 || dist < bestDist ||
+			(dist == bestDist && (w.EndMs > bestEnd || (w.EndMs == bestEnd && w.SessionID < best))) {
+			best, bestDist, bestEnd = w.SessionID, dist, w.EndMs
+		}
+	}
+	if bestDist < 0 {
+		return "", false
+	}
+	return best, true
+}
+
+// windowDistanceMs reports how far mtimeMs sits from window w, and whether it is
+// within the δ/ε tolerance at all. 0 means the mtime is inside [StartMs, EndMs];
+// a positive value is the ms outside that span (but still within tolerance).
+func windowDistanceMs(mtimeMs int64, w bashWindow) (int64, bool) {
+	if mtimeMs < w.StartMs-bashWindowPreToleranceMs || mtimeMs > w.EndMs+bashWindowPostToleranceMs {
+		return 0, false
+	}
+	switch {
+	case mtimeMs < w.StartMs:
+		return w.StartMs - mtimeMs, true
+	case mtimeMs > w.EndMs:
+		return mtimeMs - w.EndMs, true
+	default:
+		return 0, true
+	}
 }
 
 // mostFrequentSession returns the sessionId that touched the most files in the
@@ -224,10 +309,11 @@ func buildCommitAttributionEvent(session Session, root, sha string) (event.Event
 	if len(fileRanges) == 0 {
 		return event.Event{}, false
 	}
-	// Scope the AI-paths read to THIS workspace's root key so a same-named path
-	// AI-touched in a DIFFERENT repo can't bleed in (closes cross-workspace
-	// over-attribution). gitWatchRootKey is in this package.
-	files, primarySession := reconcileCommitAttribution(fileRanges, readAiTouchedPaths(gitWatchRootKey(root)))
+	// Scope BOTH ledger reads to THIS workspace's root key so a same-named path
+	// AI-touched (or bash-touched) in a DIFFERENT repo can't bleed in (closes
+	// cross-workspace over-attribution). gitWatchRootKey is in this package.
+	rootKey := gitWatchRootKey(root)
+	files, primarySession := reconcileCommitAttribution(root, fileRanges, readAiTouchedPaths(rootKey), readBashWindows(rootKey))
 
 	sessionID := primarySession
 	if sessionID == "" {

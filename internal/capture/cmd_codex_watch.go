@@ -389,6 +389,10 @@ func tailCodexRollout(
 			// sourced separately is what stops them collapsing into one value.
 			ev.DeviceID = session.DeviceID
 			normalize.RelativizeEventPaths(&ev, session.TaskRoot)
+			// Record AI bash execution windows for later commit-attribution
+			// recovery — same as the Claude watcher. No-op unless this is an
+			// AI-attributed `command` event.
+			recordAiBashWindow(&ev)
 			// Idempotency: skip a file_diff whose resulting content the git
 			// watcher (or another channel) has already emitted, so an apply_patch
 			// edit isn't double-counted when the working-tree poll sees it later.
