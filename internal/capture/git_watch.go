@@ -260,6 +260,17 @@ func pollGitWatchWorkspace(session Session) {
 	roots := workspaceMatchRoots(resolvePath(session.TaskRoot))
 	detected := pollGitWatch(roots)
 	nowMs := time.Now().UnixMilli() // one clock read, threaded to both passes
+
+	// Durability advances on the DEFAULT branch only (its own cursor), so it is
+	// driven separately from the working-HEAD attribution loop. It MUST run BEFORE
+	// attributeCommit: attributeCommit records this cycle's AI fingerprints, and a
+	// squash landing on the default branch is BOTH the new working-HEAD commit and
+	// the new default-branch commit. Seeding first means the squash is matched only
+	// against fingerprints from EARLIER cycles (the real feature-branch lines) —
+	// never its own just-recorded ones, which path-level attribution would mark for
+	// the whole AI-touched file, wrongly transferring human lines in the squash as AI.
+	pollDurability(session, roots, nowMs)
+
 	for _, root := range roots {
 		commits := detected[gitWatchRootKey(root)]
 		if len(commits) == 0 {
@@ -270,10 +281,6 @@ func pollGitWatchWorkspace(session Session) {
 			attributeCommit(session, root, sha, nowMs)
 		}
 	}
-	// Durability advances on the DEFAULT branch only (its own cursor), so it is
-	// driven separately from the working-HEAD attribution loop above. Same roots,
-	// same cadence.
-	pollDurability(session, roots, nowMs)
 }
 
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until

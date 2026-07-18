@@ -199,3 +199,114 @@ func TestDurabilitySquashDoesNotTransferHumanLines(t *testing.T) {
 		t.Fatalf("runs = %+v, want only the 1..2 AI block (human 3..5 and stray 6 excluded)", runs)
 	}
 }
+
+// TestMatchedAiRunsSplitsOnLineage: two fingerprint-matched lines that are
+// adjacent but belong to DIFFERENT feature commits must NOT be merged into one
+// run under the first line's lineage — each keeps its own lineageId so the
+// backend attributes each line to the commit that actually wrote it.
+func TestMatchedAiRunsSplitsOnLineage(t *testing.T) {
+	fps := map[string]string{"h1": "lin-A", "h2": "lin-B"}
+	newLines := map[int]string{1: "h1", 2: "h2"} // adjacent, different lineages
+
+	// minRun=1 so each singleton survives and we can inspect the split directly.
+	runs := matchedAiRuns(newLines, fps, 1)
+	if len(runs) != 2 {
+		t.Fatalf("runs = %+v, want 2 (a lineage change must break the run)", runs)
+	}
+	byLineage := map[string]durTrackedRange{}
+	for _, r := range runs {
+		byLineage[r.LineageID] = r
+	}
+	if r, ok := byLineage["lin-A"]; !ok || r.Start != 1 || r.End != 1 {
+		t.Errorf("lin-A run = %+v, want 1..1", r)
+	}
+	if r, ok := byLineage["lin-B"]; !ok || r.Start != 2 || r.End != 2 {
+		t.Errorf("lin-B run = %+v, want 2..2", r)
+	}
+}
+
+// TestDurabilityFingerprintRecaptureRefreshesTTL: re-capturing identical AI
+// content must refresh its bornTs (dedup keeps the freshest, not the oldest),
+// so a later squash within the fresh capture's TTL still finds the evidence.
+func TestDurabilityFingerprintRecaptureRefreshesTTL(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const t0 int64 = 1_000_000_000_000
+	key := "rk-ttl"
+	diff := strings.Join([]string{
+		"diff --git a/app.go b/app.go",
+		"--- /dev/null",
+		"+++ b/app.go",
+		"@@ -0,0 +1,2 @@",
+		"+ai_line_one",
+		"+ai_line_two",
+	}, "\n")
+	files := []attrFile{{Path: "app.go", LineRanges: []attrLineRange{{Start: 1, End: 2, Attribution: attributionLikelyAI}}}}
+
+	recordAiFingerprints(key, "sha-old", diff, files, t0)
+	// Re-capture the SAME content 10 days later (well before the 14d TTL).
+	recordAiFingerprints(key, "sha-new", diff, files, t0+10*dayMs)
+
+	// 16 days after the FIRST capture: the old entry has expired, but the refresh
+	// (born at t0+10d, now 6d old) must keep the evidence live.
+	if fps := fingerprintsForPath(key, "app.go", t0+16*dayMs); fps == nil {
+		t.Fatal("recapture must refresh bornTs so evidence survives past the first entry's TTL")
+	}
+}
+
+// TestDurabilitySquashSeedsBeforeRecordingOwnFingerprints (ordering guard): the
+// squash landing on the default branch is BOTH the new working-HEAD commit and
+// the new default-branch commit. Durability seeding must run BEFORE
+// attributeCommit records the squash's own fingerprints — otherwise path-level
+// attribution marks every changed line of the AI-touched file as likely_ai,
+// fingerprints them, and the human lines in the squash transfer as AI. Driving
+// the real poll cycle, only the true AI block may land in the ledger.
+func TestDurabilitySquashSeedsBeforeRecordingOwnFingerprints(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	// Cycle 1: baseline both cursors on main.
+	pollGitWatchWorkspace(sess)
+
+	// Feature branch: the AI writes feature.go (3 AI lines only).
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-sq", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "ai_a\nai_b\nai_c\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+	// Cycle 2 (working HEAD = feature): attributeCommit records the 3 AI
+	// fingerprints; main has not moved, so nothing is seeded yet.
+	pollGitWatchWorkspace(sess)
+
+	// Squash-merge into main, and the landed file gains 2 HUMAN lines the branch
+	// never fingerprinted. feature.go is AI-touched, so path-level attribution on
+	// the squash would tag all 5 lines likely_ai if it ran before seeding.
+	git("checkout", "main")
+	git("merge", "--squash", "feature")
+	writeCommitFile(t, ws, "feature.go", "ai_a\nai_b\nai_c\nhuman_d\nhuman_e\n")
+	git("add", "-A")
+	git("commit", "-m", "squash: feature (+ human lines)")
+	// Cycle 3: pollDurability runs first, seeding the squash against the EARLIER
+	// feature fingerprints only.
+	pollGitWatchWorkspace(sess)
+
+	tracked := loadDurabilityLedger().Roots[key]["feature.go"]
+	covered := map[int]bool{}
+	for _, r := range tracked {
+		for ln := r.Start; ln <= r.End; ln++ {
+			covered[ln] = true
+		}
+	}
+	if !covered[1] || !covered[2] || !covered[3] {
+		t.Errorf("tracked = %+v, want the AI block 1..3 seeded", tracked)
+	}
+	if covered[4] || covered[5] {
+		t.Errorf("tracked = %+v, human lines 4..5 must NOT transfer (seed ran before recording own fps)", tracked)
+	}
+}

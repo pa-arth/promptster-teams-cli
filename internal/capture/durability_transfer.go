@@ -194,9 +194,11 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 	for path, entries := range captured {
 		seen := map[string]bool{}
 		var kept []durAiFingerprint
-		// Existing (TTL-pruned) first so the freshest bornTs of a duplicate wins
-		// on the append below (dedup keeps the first seen; existing are older).
-		for _, e := range append(append([]durAiFingerprint{}, paths[path]...), entries...) {
+		// New captures FIRST: dedup keeps the first occurrence of a fingerprint, so
+		// re-seeing identical AI content must refresh it to the latest bornTs (and
+		// lineage) rather than keep the older existing entry — otherwise the entry
+		// could TTL-expire and miss a later squash despite fresh re-capture.
+		for _, e := range append(append([]durAiFingerprint{}, entries...), paths[path]...) {
 			if nowMs-e.BornTsMs >= durabilityFingerprintTTLms {
 				continue
 			}
@@ -266,10 +268,13 @@ func matchedAiRuns(newLines map[int]string, fps map[string]string, minRun int) [
 			flush()
 			continue
 		}
-		if cur != nil && i > 0 && ln == nums[i-1]+1 {
+		if cur != nil && i > 0 && ln == nums[i-1]+1 && cur.LineageID == lineage {
 			cur.End = ln
 			continue
 		}
+		// Adjacent but a DIFFERENT lineage (two feature commits' lines meeting):
+		// start a fresh run so each keeps its own lineage instead of the whole
+		// span being mis-attributed to the first line's commit.
 		flush()
 		cur = &durTrackedRange{Start: ln, End: ln, LineageID: lineage}
 	}
