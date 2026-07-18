@@ -406,6 +406,37 @@ func TestClaudeTranscriptEditLineRanges(t *testing.T) {
 	}
 }
 
+func TestClaudeTranscriptWriteLineRanges(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		`{"type":"assistant","message":{"id":"msg-w","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_w","name":"Write","input":{"file_path":"/tmp/ws/new.go","content":"line one\nline two\nline three\n"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:01:00Z"}`,
+		`{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_w","content":"wrote"}]},"toolUseResult":{"filePath":"/tmp/ws/new.go"},"timestamp":"2026-06-10T10:01:02Z"}`,
+	)
+	var diff *event.Event
+	for i := range events {
+		if events[i].Kind == "file_diff" {
+			diff = &events[i]
+		}
+	}
+	if diff == nil {
+		t.Fatalf("no file_diff in %+v", events)
+	}
+	raw, ok := dm(*diff)["lineRanges"].([]interface{})
+	if !ok {
+		t.Fatalf("lineRanges = %T, want []interface{}: %+v", dm(*diff)["lineRanges"], dm(*diff)["lineRanges"])
+	}
+	if len(raw) != 1 {
+		t.Fatalf("lineRanges len = %d, want 1: %+v", len(raw), raw)
+	}
+	m := raw[0].(map[string]interface{})
+	if m["start"] != 1 || m["end"] != 3 {
+		t.Errorf("range = {start:%v,end:%v}, want {1,3}", m["start"], m["end"])
+	}
+	if m["attribution"] != "likely_ai" {
+		t.Errorf("range attribution = %v, want likely_ai", m["attribution"])
+	}
+}
+
 func TestClaudeTranscriptErrorToolResult(t *testing.T) {
 	p := NewClaudeTranscriptProcessor("sess-1")
 	events := processAll(t, p,

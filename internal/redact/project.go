@@ -1,6 +1,7 @@
 package redact
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -563,10 +564,30 @@ func projectArrayElements(value interface{}, fields []string) []interface{} {
 		projected := make(map[string]interface{}, len(fields))
 		for _, field := range fields {
 			if v, present := obj[field]; present && v != nil {
-				projected[field] = v
+				// The allowlist limits key NAMES; without a type check a map or
+				// slice smuggled into a scalar key (start/end/attribution/path)
+				// would ride through verbatim. Clamp kept values to scalars.
+				if isScalar(v) {
+					projected[field] = v
+				}
 			}
 		}
 		out = append(out, projected)
 	}
 	return out
+}
+
+// isScalar reports whether v is a leaf JSON value safe to copy verbatim through
+// an element allowlist: nil, string, bool, or any numeric type. Maps and slices
+// (which could nest smuggled source) return false.
+func isScalar(v interface{}) bool {
+	switch v.(type) {
+	case nil, string, bool,
+		int, int8, int16, int32, int64,
+		uint, uint8, uint16, uint32, uint64,
+		float32, float64, json.Number:
+		return true
+	default:
+		return false
+	}
 }

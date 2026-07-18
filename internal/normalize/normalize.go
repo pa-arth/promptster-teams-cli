@@ -280,6 +280,16 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 				}
 				data["linesAdded"] = lines
 				data["linesRemoved"] = 0
+				// A Write replaces the whole file, so every new line is AI.
+				// Mirror lineRangesFromStructuredPatch's exact shape:
+				// []interface{} of map[string]interface{}. This is the
+				// non-round-tripped normalizer path -- a []map[string]any would
+				// be silently stripped by the projector's .([]interface{}) assert.
+				if lines > 0 {
+					data["lineRanges"] = []interface{}{
+						map[string]interface{}{"start": 1, "end": lines, "attribution": e.Provenance.Attribution},
+					}
+				}
 				// Build synthetic diff for new file
 				data["diff"] = buildNewFileDiff(filePath, content)
 			}
