@@ -158,6 +158,128 @@ func TestDurabilitySquashMergeTransfersAttribution(t *testing.T) {
 	}
 }
 
+// TestDurabilityCherryPickFollowsLineage (§3.4): a cherry-pick replays a feature
+// commit onto the default branch under a BRAND-NEW sha (distinct from the feature
+// commit, unlike a squash it stays a single commit). The AI lines must still
+// transfer by content fingerprint AND carry the ORIGINAL feature commit's
+// lineage — not the cherry-pick's sha — so the backend follows the line to the
+// commit that actually authored it across the rewrite.
+func TestDurabilityCherryPickFollowsLineage(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	roots := []string{ws}
+	const t0 int64 = 1_000_000_000_000
+
+	pollDurability(sess, roots, t0) // baseline main
+
+	// Feature branch: the AI writes feature.go, then we capture fingerprints just
+	// as the attribution watcher would on the branch.
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-cp", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "func A() {\n\treturn 1\n}\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+	featureSha := gitOut("rev-parse", "HEAD")
+	attributeCommit(sess, ws, featureSha, t0+dayMs)
+
+	// main advances so the cherry-pick lands on a different parent — otherwise git
+	// recreates a byte-identical commit (same tree+parent) and reuses the sha.
+	git("checkout", "main")
+	writeCommitFile(t, ws, "other.txt", "unrelated\n")
+	git("add", "-A")
+	git("commit", "-m", "main advances")
+
+	// Cherry-pick feature's commit onto main: a NEW sha, single commit, no squash.
+	git("cherry-pick", "feature")
+	cherrySha := gitOut("rev-parse", "HEAD")
+	if cherrySha == featureSha {
+		t.Fatalf("cherry-pick must produce a new sha; got %q == featureSha", cherrySha)
+	}
+
+	// Durability polls main, sees the cherry-picked commit, transfers by fingerprint.
+	land := t0 + 2*dayMs
+	pollDurability(sess, roots, land)
+
+	// 30d after landing, feature.go's AI lines are durable and lineage points at
+	// the ORIGINAL feature commit, not the cherry-pick sha.
+	v := harvestDurable(sess, ws, key, land+31*dayMs)
+	data := durVerdictFor(t, v, "feature.go")
+	durable := rangeSet(t, data, "durableRanges")
+	if !durable["1..3"] {
+		t.Errorf("durableRanges = %+v, want 1..3 transferred through cherry-pick", durable)
+	}
+	if lin := firstLineage(t, data, "durableRanges"); lin != featureSha+":feature.go" {
+		t.Errorf("lineageId = %q, want %q (original feature commit, not cherry sha)", lin, featureSha+":feature.go")
+	}
+}
+
+// TestDurabilityRebaseFollowsLineage (§3.4): a rebase replays a feature commit
+// onto an ADVANCED default-branch tip under a new sha, then fast-forwards main
+// onto it. The AI lines transfer by fingerprint and keep the original feature
+// commit's lineage across the rebase rewrite (same mechanism as cherry-pick;
+// pinned separately because the spec enumerates rebase and cherry-pick).
+func TestDurabilityRebaseFollowsLineage(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	roots := []string{ws}
+	const t0 int64 = 1_000_000_000_000
+
+	pollDurability(sess, roots, t0) // baseline main
+
+	// Feature branch off base: the AI writes feature.go; capture fingerprints.
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-rb", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "func A() {\n\treturn 1\n}\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+	featureSha := gitOut("rev-parse", "HEAD")
+	attributeCommit(sess, ws, featureSha, t0+dayMs)
+
+	// main advances independently, so the feature commit cannot fast-forward as-is.
+	git("checkout", "main")
+	writeCommitFile(t, ws, "other.txt", "unrelated\n")
+	git("add", "-A")
+	git("commit", "-m", "main advances")
+
+	// Rebase feature onto the new main tip (new sha), then fast-forward main onto it.
+	git("checkout", "feature")
+	git("rebase", "main")
+	rebasedSha := gitOut("rev-parse", "HEAD")
+	if rebasedSha == featureSha {
+		t.Fatalf("rebase must produce a new sha; got %q == featureSha", rebasedSha)
+	}
+	git("checkout", "main")
+	git("merge", "--ff-only", "feature")
+
+	// Durability polls main, sees the rebased commit, transfers by fingerprint.
+	land := t0 + 2*dayMs
+	pollDurability(sess, roots, land)
+
+	v := harvestDurable(sess, ws, key, land+31*dayMs)
+	data := durVerdictFor(t, v, "feature.go")
+	durable := rangeSet(t, data, "durableRanges")
+	if !durable["1..3"] {
+		t.Errorf("durableRanges = %+v, want 1..3 transferred through rebase", durable)
+	}
+	if lin := firstLineage(t, data, "durableRanges"); lin != featureSha+":feature.go" {
+		t.Errorf("lineageId = %q, want %q (original feature commit, not rebased sha)", lin, featureSha+":feature.go")
+	}
+}
+
 // TestDurabilitySquashDoesNotTransferHumanLines: a squash whose file mixes the
 // AI block with human lines transfers ONLY the AI block — human lines the branch
 // never fingerprinted stay unknown (not durable).
