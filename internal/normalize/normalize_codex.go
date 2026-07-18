@@ -46,6 +46,12 @@ type CodexRolloutProcessor struct {
 	// stamped onto each prompt event so the teams dashboard can show where the
 	// session ran; the raw absolute cwd is never emitted on prompts.
 	workdir string
+	// model is the per-turn model id captured from the LATEST turn_context line
+	// (session_meta carries only model_provider — the vendor, e.g. "openai"). It is
+	// stamped onto each ai_response so the backend can price the turn against the
+	// real model. turn_context precedes the turn's agent messages, so the captured
+	// value is always the model in force for the response it lands on.
+	model string
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -123,8 +129,15 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 		return p.eventMsg(payload, ts, raw)
 	case "response_item":
 		return p.responseItem(payload, ts, raw)
+	case "turn_context":
+		// turn_context carries the per-turn model (the only rollout line that does);
+		// stash it for the turn's ai_response. It emits no event of its own.
+		if m := stringField(payload, "model"); m != "" {
+			p.model = m
+		}
+		return nil
 	default:
-		// turn_context and unknown wrappers carry no candidate-visible signal.
+		// Unknown wrappers carry no candidate-visible signal.
 		return nil
 	}
 }
@@ -187,6 +200,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		e := p.newCodexEvent("ai_response", ts, ts)
 		data := map[string]interface{}{
 			"lastAssistantMessage": stringField(payload, "message"),
+		}
+		if p.model != "" {
+			data["model"] = p.model
 		}
 		p.attachTokenUsage(data)
 		if last := loadLastPromptTs(); !last.IsZero() {
