@@ -198,6 +198,215 @@ func pruneAiPaths(ledger *aiPathsLedger, nowMs int64) {
 	}
 }
 
+// --- AI bash-command execution windows ledger --------------------------------
+//
+// PR5 (bash-attribution recovery): when an AI edits files via a Bash command
+// (`sed -i`, `>>`, a codegen/formatter) instead of Edit/Write, NO file_diff is
+// produced, so those paths never enter the ai-paths ledger and would commit as
+// unknown — an AI edit undercounted. Since this codebase has no daemon/checkpoint
+// and no pre/post stat diff, the only signal for "which files did an AI bash
+// command touch" is TIMESTAMP CORRELATION: a file changed in a commit whose
+// on-disk mtime falls within (± a small tolerance of) an AI bash command's
+// execution window was likely written by that command. This mirrors git-ai's ±3s
+// mtime solver (docs/bash-attribution-recovery-plan.md).
+//
+// TIMESTAMP MODEL (verified against the normalizers, not assumed): the `command`
+// event is built from the tool_result / function_call_output transcript line —
+// Claude's resolveToolResult and Codex's emitToolEvent both stamp the event's Ts
+// with that OUTPUT line's timestamp. The tool_use / function_call START line's
+// timestamp is NOT retained in the pending-call structs (claudePendingTool /
+// codexPendingCall carry name+input only). So only the command END time is
+// reliably available at the point a window is recorded. We therefore store the
+// window as the observed END point [end, end] and apply the δ/ε tolerance at
+// RECOVERY time (see commit_attribution.go) — modelling [end - δ, end + ε].
+//
+// This ledger is modelled EXACTLY on the ai-paths ledger above: session-keyed,
+// same WithBufferLock discipline, the same 7-day aiPathsTTL prune, same
+// max-sessions backstop. Windows carry only integers.
+
+func bashWindowsLedgerPath() string { return filepath.Join(state.StateDir(), "bash-windows.json") }
+
+// bashWindowsLedger is keyed by session, exactly like aiPathsLedger, so
+// concurrent Claude and Codex sessions never invalidate each other's windows.
+type bashWindowsLedger struct {
+	V        int                         `json:"v"`
+	Sessions map[string]bashWindowsEntry `json:"sessions"`
+}
+
+type bashWindowsEntry struct {
+	Windows []bashWindowSpan `json:"windows"`
+	TsMs    int64            `json:"tsMs"`
+	RootKey string           `json:"rootKey"`
+}
+
+// bashWindowSpan is one AI bash command's execution window, in Unix ms.
+type bashWindowSpan struct {
+	StartMs int64 `json:"startMs"`
+	EndMs   int64 `json:"endMs"`
+}
+
+// bashWindow is a span joined with the session that recorded it — the shape the
+// recovery consumer reads (it needs the session to tag a recovered file).
+type bashWindow struct {
+	SessionID string
+	StartMs   int64
+	EndMs     int64
+}
+
+const (
+	bashWindowsLedgerVersion = 2
+	// bashWindowsMaxPerSession bounds a session that runs a very large number of
+	// bash commands. Oldest windows are dropped first — recovery cares about
+	// recent activity, and a commit's files were written recently.
+	bashWindowsMaxPerSession = 1024
+)
+
+// recordBashWindow appends one AI bash execution window to the session's ledger,
+// tagged with the workspace rootKey so a reader can scope reads to one workspace.
+// Best-effort: ledger I/O failures must never block event emission. Mirrors
+// recordAiTouchedPath's lock + version/TTL/prune discipline.
+//
+// RESIDUAL RISK (same-workspace, inherent to the mtime heuristic): a HUMAN file
+// save that happens to land inside an AI bash window is recovered as likely_ai.
+// The window scoping below removes only the CROSS-repo case; the temporal
+// same-workspace overlap is a documented tradeoff of the opt-in heuristic.
+func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
+	if sessionID == "" {
+		return
+	}
+	if endMs < startMs {
+		startMs, endMs = endMs, startMs
+	}
+	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
+		ledger := bashWindowsLedger{V: bashWindowsLedgerVersion, Sessions: map[string]bashWindowsEntry{}}
+		if data, err := os.ReadFile(bashWindowsLedgerPath()); err == nil {
+			var onDisk bashWindowsLedger
+			if json.Unmarshal(data, &onDisk) == nil && onDisk.V == bashWindowsLedgerVersion && onDisk.Sessions != nil {
+				ledger = onDisk
+			}
+		}
+
+		nowMs := time.Now().UnixMilli()
+		entry := ledger.Sessions[sessionID]
+		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
+		if len(entry.Windows) > bashWindowsMaxPerSession {
+			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
+		}
+		entry.TsMs = nowMs
+		entry.RootKey = rootKey
+		ledger.Sessions[sessionID] = entry
+		pruneBashWindows(&ledger, nowMs)
+
+		data, err := json.Marshal(ledger)
+		if err != nil {
+			return err
+		}
+		tmp := bashWindowsLedgerPath() + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			return err
+		}
+		return os.Rename(tmp, bashWindowsLedgerPath())
+	})
+}
+
+// readBashWindows returns every AI bash window across all sessions still within
+// aiPathsTTL, each tagged with its recording session. Read-only (never rewrites
+// the ledger), so a pure reader like the git watcher can't evict a live session
+// — same discipline as readAiTouchedPaths.
+//
+// rootKey scopes the read to one workspace: a window recorded under a DIFFERENT
+// known rootKey is skipped, so a bash edit in another repo can't recover a
+// same-mtime file here. Conservative: excluded only when both sides are known
+// AND differ (an unknown on either side falls through as a match).
+func readBashWindows(rootKey string) []bashWindow {
+	var out []bashWindow
+	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
+		data, err := os.ReadFile(bashWindowsLedgerPath())
+		if err != nil {
+			return nil
+		}
+		var ledger bashWindowsLedger
+		if json.Unmarshal(data, &ledger) != nil || ledger.V != bashWindowsLedgerVersion || ledger.Sessions == nil {
+			return nil
+		}
+		nowMs := time.Now().UnixMilli()
+		ttlMs := aiPathsTTL.Milliseconds()
+		for sid, entry := range ledger.Sessions {
+			if nowMs-entry.TsMs > ttlMs {
+				continue
+			}
+			if entry.RootKey != "" && rootKey != "" && entry.RootKey != rootKey {
+				continue
+			}
+			for _, w := range entry.Windows {
+				out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs})
+			}
+		}
+		return nil
+	})
+	return out
+}
+
+// pruneBashWindows bounds the ledger by TTL, then by session count (oldest
+// first). Runs AFTER the active session's entry is stamped, so an actively-active
+// session can never evict itself. Mirrors pruneAiPaths.
+func pruneBashWindows(ledger *bashWindowsLedger, nowMs int64) {
+	ttlMs := aiPathsTTL.Milliseconds()
+	for sid, e := range ledger.Sessions {
+		if nowMs-e.TsMs > ttlMs {
+			delete(ledger.Sessions, sid)
+		}
+	}
+	for len(ledger.Sessions) > aiPathsMaxSessions {
+		oldest, oldestTs := "", int64(0)
+		for sid, e := range ledger.Sessions {
+			if oldest == "" || e.TsMs < oldestTs || (e.TsMs == oldestTs && sid < oldest) {
+				oldest, oldestTs = sid, e.TsMs
+			}
+		}
+		delete(ledger.Sessions, oldest)
+	}
+}
+
+// recordAiBashWindow records the execution window of an AI-attributed Bash
+// `command` event, so the commit reconciler can later recover unknown files
+// whose mtime falls in it. It is the bash-window counterpart to the
+// recordAiTouchedPath call in dedupeFileDiff, and is called from the SAME watcher
+// queue funnels (Claude + Codex). No-op for anything that is not an AI command:
+//   - non-command kinds (file edits already flow through the ai-paths ledger),
+//   - human/unknown provenance (ONLY AI bash is recorded — never misattribute).
+//
+// Only the command END time is observable (see the ledger header), so the stored
+// window is the point [endMs, endMs]; recovery widens it by ± the δ/ε tolerance.
+func recordAiBashWindow(e *event.Event, taskRoot string) {
+	if e == nil || e.Kind != "command" {
+		return
+	}
+	if e.Provenance == nil || e.Provenance.Attribution != "likely_ai" {
+		return
+	}
+	endMs, ok := eventTsMs(e.Ts)
+	if !ok {
+		return
+	}
+	// Derive the workspace root key AFTER the guards so the resolvePath syscall
+	// only runs for an AI command, not for every watcher event.
+	rootKey := ""
+	if taskRoot != "" {
+		rootKey = gitWatchRootKey(taskRoot)
+	}
+	recordBashWindow(e.SessionID, rootKey, endMs, endMs)
+}
+
+// eventTsMs parses an event's RFC3339Nano Ts into Unix ms.
+func eventTsMs(ts string) (int64, bool) {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return 0, false
+	}
+	return t.UnixMilli(), true
+}
+
 // fileContentSHA returns a hex sha256 of the file's current contents.
 func fileContentSHA(absPath string) (string, bool) {
 	// #nosec G304 -- absPath is a workspace file the capture session already touched (from a tool diff), hashed for dedup; not user input.
