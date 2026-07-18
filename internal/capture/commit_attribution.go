@@ -261,6 +261,17 @@ func emitCommitAttribution(ev event.Event) {
 
 // attributeCommit builds and emits attribution for one detected commit, or does
 // nothing when there is nothing attributable.
+//
+// KNOWN COLD-LEDGER HOLE (deliberate boundary of the out-of-band design, not a
+// bug): attribution here re-derives from the 7-day AI-paths ledger
+// (readAiTouchedPaths) every poll. A rewritten commit that RE-ENTERS via
+// rev-list (amend, rebase, squash, cherry-pick) is therefore re-attributed
+// correctly only while its files are still inside that 7-day window. Once the
+// TTL expires, the same commit attributes `unknown` — a conservative MISS, never
+// a misattribution. Cold SQUASH specifically cannot be recovered by patch-id: a
+// squashed commit's patch-id is the union diff of its sources and matches no
+// single source commit, so there is nothing to match against. Recovering it
+// would need an explicit merge/squash signal we do not collect out-of-band.
 func attributeCommit(session Session, root, sha string) {
 	ev, ok := buildCommitAttributionEvent(session, root, sha)
 	if !ok {

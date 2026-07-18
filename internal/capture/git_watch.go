@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,19 @@ import (
 // when HEAD moved). Never a spawn per commit, file, or line. The root key is
 // computed WITHOUT spawning git so the two above stay the whole budget.
 const gitWatchInterval = 60 * time.Second
+
+// gitWatchMaxCommitsPerPoll bounds how many commits a single poll of ONE root
+// surfaces — and therefore how many `git show` spawns attribution makes. A HEAD
+// that jumps far from the cursor (a `git checkout other-branch`, a large rebase)
+// would otherwise return the whole `lastSeen..head` range in one burst; we clamp
+// to the OLDEST N and advance the cursor only to the newest returned SHA, so the
+// remainder drains on subsequent polls in order rather than being dropped. It
+// doubles as the recovery-window size when the cursor is gc'd (see
+// gitNewCommits). A package var, not a const, so a test can lower it without
+// building hundreds of commits. Re-seeing a SHA on a clamp/overlap is idempotent
+// (the backend upserts by SHA and attribution re-derives from the current
+// ledger), so the bounded batching is never wrong.
+var gitWatchMaxCommitsPerPoll = 100
 
 func gitWatchCursorsPath() string {
 	return filepath.Join(state.StateDir(), "git-watch-cursors.json")
@@ -77,42 +91,77 @@ func gitHead(root string) (string, bool) {
 }
 
 // gitNewCommits lists commits reachable from head but not from lastSeen, newest
-// first, but ONLY on a fast-forward — lastSeen must be an ancestor of head. The
-// bool distinguishes a definitive answer from an inconclusive one:
+// first, bounded to gitWatchMaxCommitsPerPoll. The bool distinguishes a
+// definitive answer from an inconclusive one, and it closes the robustness holes
+// a bare `rev-list lastSeen..head` leaves open:
 //
-//   - Fast-forward (lastSeen is an ancestor of head): the new commits, ok=true.
-//     An empty slice means genuinely nothing new.
-//   - Divergence (lastSeen is valid but NOT an ancestor of head — a branch
-//     switch, rebase, or reset): no commits, ok=true. rev-list lastSeen..head
-//     would otherwise surface the new tip's PRE-EXISTING history as if freshly
-//     created, so the caller re-baselines instead of replaying it.
-//   - Failure (lastSeen unresolvable — pruned object, corrupt cursor — or git
-//     errored): ok=false, so the caller KEEPS the old cursor and retries next
-//     poll rather than advancing past an undetermined window forever.
+//   - Normal range (lastSeen resolves): the new commits, ok=true. This covers a
+//     plain fast-forward AND any surviving-object rewrite — amend, rebase,
+//     cherry-pick, squash — because the rewritten tip is reachable from head but
+//     not from lastSeen, so it re-enters through the same range. A burst larger
+//     than the cap keeps the OLDEST cap (rev-list is newest-first, so the tail);
+//     the caller advances the cursor only to the newest returned SHA, so the
+//     remainder drains on later polls in commit order rather than being dropped.
+//     An empty slice means genuinely nothing new (e.g. a backward reset, where
+//     the range is empty). Re-seeing a SHA after a branch switch or overlap is
+//     idempotent — the backend upserts by SHA and attribution re-derives from
+//     the current ledger — so we deliberately do NOT guard against it (a
+//     merge-base ancestor check would silently drop amend/rebase detection).
+//   - gc'd cursor (lastSeen is unresolvable — pruned after an aggressive
+//     rewrite): `rev-list lastSeen..head` ERRORS. We fall back to a bounded
+//     recovery window, `rev-list -n <cap> head`, so the tip region is still
+//     attributed instead of the commits being skipped forever, ok=true.
+//   - Failure (even the recovery rev-list errors — not a repo / bad head): ok=false,
+//     so the caller KEEPS the old cursor and retries next poll rather than
+//     advancing past an undetermined window.
+//
+// Spawn budget stays sane: the normal path is one `rev-list`; the fallback adds
+// at most one more, only in the rare gc'd case. No merge-base spawn.
 func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
-	switch err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", lastSeen, head).Run().(type) {
-	case nil:
-		// Fast-forward — fall through to rev-list.
-	case *exec.ExitError:
-		if err.ExitCode() == 1 {
-			return nil, true // valid but not an ancestor → divergence: re-baseline
-		}
-		return nil, false // bad object / other git error → keep cursor, retry
-	default:
-		return nil, false // spawn failure → keep cursor, retry
-	}
-	// #nosec G204 -- see above; read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", lastSeen+".."+head).Output()
-	if err != nil {
+	if err == nil {
+		return clampCommitBurst(parseRevListShas(out), root), true
+	}
+	// lastSeen is unreachable (gc'd/pruned, or a corrupt cursor): recover the tip
+	// region rather than skip it. If even that errors, keep the cursor and retry.
+	// #nosec G204 -- see above; read-only.
+	out, rerr := exec.Command("git", "-C", root, "rev-list",
+		"-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), head).Output()
+	if rerr != nil {
 		return nil, false
 	}
+	shas := parseRevListShas(out)
+	state.HookDebugf("git-watch: cursor %s unreachable on %s; recovered newest %d commit(s) from head",
+		lastSeen, gitWatchRootKey(root), len(shas))
+	return shas, true
+}
+
+// clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
+// keeping the OLDEST cap commits (rev-list is newest-first, so the tail). The
+// caller advances the cursor only to the newest returned SHA, so the remainder
+// drains on subsequent polls in commit order rather than being permanently
+// dropped.
+func clampCommitBurst(shas []string, root string) []string {
+	if len(shas) > gitWatchMaxCommitsPerPoll {
+		total := len(shas)
+		shas = shas[len(shas)-gitWatchMaxCommitsPerPoll:]
+		state.HookDebugf("git-watch: %d new commit(s) on %s exceed per-poll cap %d; processing oldest %d this poll, draining the remaining %d on subsequent polls",
+			total, gitWatchRootKey(root), gitWatchMaxCommitsPerPoll, gitWatchMaxCommitsPerPoll, total-gitWatchMaxCommitsPerPoll)
+	}
+	return shas
+}
+
+// parseRevListShas splits newest-first rev-list stdout into trimmed, non-empty
+// SHAs, preserving order.
+func parseRevListShas(out []byte) []string {
+	var shas []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
-			commits = append(commits, line)
+			shas = append(shas, line)
 		}
 	}
-	return commits, true
+	return shas
 }
 
 func loadGitWatchCursors() map[string]string {
@@ -186,10 +235,16 @@ func pollGitWatch(roots []string) map[string][]string {
 		if !ok {
 			continue // comparison inconclusive — keep the old cursor, retry next poll
 		}
-		if len(commits) > 0 {
-			detected[key] = commits
+		if len(commits) == 0 {
+			newHeads[key] = head // nothing new (e.g. a backward reset): just move to head
+			continue
 		}
-		newHeads[key] = head // advance only after a definitive comparison
+		detected[key] = commits
+		// Advance only to the newest commit we actually returned. commits[0] is
+		// newest-first: it equals head on a normal or gc'd-recovery poll, but on a
+		// clamped burst it is the newest of the OLDEST batch, so the next poll
+		// enumerates commits[0]..head and drains the remainder in order.
+		newHeads[key] = commits[0]
 	}
 
 	saveGitWatchCursors(newHeads)
