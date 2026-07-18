@@ -80,6 +80,12 @@ type diffDedupEntry struct {
 // the entry with the workspace rootKey so a reader can scope reads to one
 // workspace and a same-named path in another repo can't bleed in.
 // Best-effort: ledger I/O failures must never block event emission.
+//
+// The single rootKey per session entry is sound because rootKey is an invariant
+// of the session, not the edit: every caller derives it from the immutable
+// session.TaskRoot (see dedupeFileDiff), so a given sessionID is only ever
+// recorded under one rootKey. Restamping RootKey below therefore never retags a
+// prior root's paths — it re-writes the same value.
 func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 	if sessionID == "" || relPath == "" {
 		return

@@ -72,6 +72,60 @@ func TestGitWatchDetectsNewCommits(t *testing.T) {
 	}
 }
 
+// TestGitWatchDivergentHeadRebaselines: after a branch switch the new tip's
+// pre-existing history must NOT be replayed as freshly created. Baseline on
+// main (A→B), then check out a sibling branch (A→C); C already existed, so the
+// poll must re-baseline and report nothing rather than surface C as new.
+func TestGitWatchDivergentHeadRebaselines(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	git("commit", "--allow-empty", "-m", "A")
+	git("checkout", "-b", "side")
+	git("commit", "--allow-empty", "-m", "C")
+	sideHead := gitOut("rev-parse", "HEAD")
+	git("checkout", "-") // back to the default branch (only A)
+	git("commit", "--allow-empty", "-m", "B")
+
+	roots := []string{ws}
+	key := gitWatchRootKey(ws)
+
+	pollGitWatch(roots) // baseline at B
+
+	// Switch to the divergent sibling: its tip C is not a descendant of B, so
+	// it must re-baseline (report nothing), not replay C.
+	git("checkout", "side")
+	if d := pollGitWatch(roots); len(d) != 0 {
+		t.Fatalf("divergent head must re-baseline, not replay %s: got %v", sideHead, d)
+	}
+	// Cursor now sits at C: a fresh commit D on side is a clean fast-forward and
+	// IS reported (re-baseline didn't wedge detection).
+	git("commit", "--allow-empty", "-m", "D")
+	headD := gitOut("rev-parse", "HEAD")
+	if d := pollGitWatch(roots); len(d[key]) != 1 || d[key][0] != headD {
+		t.Fatalf("expected only D (%s) after re-baseline, got %v", headD, d[key])
+	}
+}
+
+// TestGitWatchKeepsCursorOnComparisonFailure: when the stored cursor can't be
+// resolved (pruned object / corrupt cursor), the poll must KEEP the old cursor
+// and retry, not silently advance to HEAD and skip the window forever.
+func TestGitWatchKeepsCursorOnComparisonFailure(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	git("commit", "--allow-empty", "-m", "A")
+
+	key := gitWatchRootKey(ws)
+	const bogus = "0000000000000000000000000000000000000000"
+	saveGitWatchCursors(map[string]string{key: bogus})
+
+	if d := pollGitWatch([]string{ws}); len(d) != 0 {
+		t.Fatalf("unresolvable cursor must report nothing, got %v", d)
+	}
+	if got := loadGitWatchCursors()[key]; got != bogus {
+		t.Fatalf("cursor must stay %s on comparison failure, advanced to %s", bogus, got)
+	}
+}
+
 // TestGitWatchHandlesDegenerateRoots asserts no panic and no false positives on
 // a repo with zero commits, a non-git directory, and a detached HEAD.
 func TestGitWatchHandlesDegenerateRoots(t *testing.T) {

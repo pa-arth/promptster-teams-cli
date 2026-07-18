@@ -77,20 +77,42 @@ func gitHead(root string) (string, bool) {
 }
 
 // gitNewCommits lists commits reachable from head but not from lastSeen, newest
-// first. One spawn; empty on error or when there is nothing new.
-func gitNewCommits(root, lastSeen, head string) []string {
+// first, but ONLY on a fast-forward — lastSeen must be an ancestor of head. The
+// bool distinguishes a definitive answer from an inconclusive one:
+//
+//   - Fast-forward (lastSeen is an ancestor of head): the new commits, ok=true.
+//     An empty slice means genuinely nothing new.
+//   - Divergence (lastSeen is valid but NOT an ancestor of head — a branch
+//     switch, rebase, or reset): no commits, ok=true. rev-list lastSeen..head
+//     would otherwise surface the new tip's PRE-EXISTING history as if freshly
+//     created, so the caller re-baselines instead of replaying it.
+//   - Failure (lastSeen unresolvable — pruned object, corrupt cursor — or git
+//     errored): ok=false, so the caller KEEPS the old cursor and retries next
+//     poll rather than advancing past an undetermined window forever.
+func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
+	switch err := exec.Command("git", "-C", root, "merge-base", "--is-ancestor", lastSeen, head).Run().(type) {
+	case nil:
+		// Fast-forward — fall through to rev-list.
+	case *exec.ExitError:
+		if err.ExitCode() == 1 {
+			return nil, true // valid but not an ancestor → divergence: re-baseline
+		}
+		return nil, false // bad object / other git error → keep cursor, retry
+	default:
+		return nil, false // spawn failure → keep cursor, retry
+	}
+	// #nosec G204 -- see above; read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", lastSeen+".."+head).Output()
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	var shas []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		if line = strings.TrimSpace(line); line != "" {
-			shas = append(shas, line)
+			commits = append(commits, line)
 		}
 	}
-	return shas
+	return commits, true
 }
 
 func loadGitWatchCursors() map[string]string {
@@ -154,15 +176,20 @@ func pollGitWatch(roots []string) map[string][]string {
 			continue // no commits / detached-before-first-commit / not a repo
 		}
 		key := gitWatchRootKey(root)
-		newHeads[key] = head
 
 		lastSeen, hadCursor := prior[key]
 		if !hadCursor || lastSeen == head {
-			continue // cold start (baseline only) or nothing moved
+			newHeads[key] = head // cold start (baseline only) or nothing moved
+			continue
 		}
-		if commits := gitNewCommits(root, lastSeen, head); len(commits) > 0 {
+		commits, ok := gitNewCommits(root, lastSeen, head)
+		if !ok {
+			continue // comparison inconclusive — keep the old cursor, retry next poll
+		}
+		if len(commits) > 0 {
 			detected[key] = commits
 		}
+		newHeads[key] = head // advance only after a definitive comparison
 	}
 
 	saveGitWatchCursors(newHeads)
