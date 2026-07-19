@@ -44,7 +44,7 @@ func reworkCovered(rootKey, path string) map[int]bool {
 // feeds them into rework.
 func commitDiffFiles(t *testing.T, root, sha string) (string, []attrFile) {
 	t.Helper()
-	diff, files, _, ok := commitAttributionFromDiff(root, sha)
+	diff, files, _, ok := commitAttributionFromDiff(root, root, sha)
 	if !ok {
 		t.Fatalf("commitAttributionFromDiff(%s) not ok", sha)
 	}

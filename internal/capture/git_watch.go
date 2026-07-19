@@ -74,6 +74,117 @@ func gitWatchRootKey(root string) string {
 	return ingest.Sha256Hex(resolvePath(root))[:16]
 }
 
+// ledgerScope maps a polled repo root onto capture's AI ledgers, which are
+// anchored to the daemon's single workspace (session.TaskRoot) rather than to
+// each repo. In the autostart daemon TaskRoot is the HOME dir and `root` is a
+// repo discovered under it, so a path that capture recorded workspace-relative as
+// "<rel(home,root)>/<p>" under gitWatchRootKey(home) must be looked up WITH that
+// prefix. When root == taskRoot (the explicit-repo / dev / `git-watch`
+// subcommand case) the prefix is "" and the key is gitWatchRootKey(root), so
+// reconciliation is byte-for-byte what it was before repo discovery existed.
+type ledgerScope struct {
+	aiKey  string // the root key the ai-paths / bash-windows ledgers are stored under
+	prefix string // POSIX rel(taskRoot, root); "" when root == taskRoot (or fallback)
+}
+
+// resolveLedgerScope computes the scope for reconciling `root`'s committed paths
+// against ledgers anchored to `taskRoot`. rel is taken in resolvePath-canonical
+// space so a symlinked home (macOS /var vs /private/var, or a symlinked checkout)
+// still yields the correct workspace-relative prefix — the symlinked absolute
+// prefix cancels on both sides, leaving exactly the sub-path capture stored. A
+// root that is NOT under taskRoot (a discovered repo outside home — rare) falls
+// back to the per-root key with no prefix: conservative, and identical to the
+// pre-discovery behavior.
+func resolveLedgerScope(root, taskRoot string) ledgerScope {
+	if taskRoot == "" {
+		return ledgerScope{aiKey: gitWatchRootKey(root)}
+	}
+	rel, err := filepath.Rel(resolvePath(taskRoot), resolvePath(root))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ledgerScope{aiKey: gitWatchRootKey(root)} // root not under taskRoot
+	}
+	if rel == "." {
+		rel = ""
+	}
+	return ledgerScope{aiKey: gitWatchRootKey(taskRoot), prefix: filepath.ToSlash(rel)}
+}
+
+// ledgerPath translates a repo-relative committed path into the workspace-relative
+// key the ai-paths ledger stored it under.
+func (s ledgerScope) ledgerPath(committedRel string) string {
+	if s.prefix == "" {
+		return committedRel
+	}
+	return s.prefix + "/" + committedRel
+}
+
+// gitRootOf walks up from dir to the nearest ancestor that is a git repo root
+// (its .git exists — reusing isGitRepoRoot), or ok=false at the filesystem root.
+// Stat-only per level, bounded by path depth: NO git spawn, so it stays off the
+// constant-time budget the poll loop guards.
+func gitRootOf(dir string) (string, bool) {
+	for {
+		if isGitRepoRoot(dir) {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // reached the filesystem root without finding .git
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+// discoverAiRepoRoots derives the repo roots to poll from capture's ai-paths
+// ledger, so the single autostart daemon (TaskRoot == HOME, not a repo) actually
+// polls the engineer's real repos instead of the un-pollable home dir. Every
+// AI-touched path is recorded workspace-relative under gitWatchRootKey(taskRoot),
+// so the repo that owns it is the nearest ancestor dir containing a .git — found
+// by a stat-only walk (gitRootOf), deduped. Bounded by the number of distinct
+// AI-touched files and each walk by path depth; runs on the 60s timer, never the
+// critical path, and spawns NO git.
+func discoverAiRepoRoots(taskRoot string) []string {
+	base := resolvePath(taskRoot)
+	seen := map[string]bool{}
+	dirRoot := map[string]string{} // memoize dir -> resolved repo root ("" = none)
+	var roots []string
+	for rel := range readAiTouchedPaths(gitWatchRootKey(taskRoot)) {
+		abs := rel
+		if !filepath.IsAbs(rel) {
+			abs = filepath.Join(base, rel)
+		}
+		dir := filepath.Dir(abs)
+		root, memoized := dirRoot[dir]
+		if !memoized {
+			if r, ok := gitRootOf(dir); ok {
+				root = r
+			}
+			dirRoot[dir] = root
+		}
+		if root != "" && !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}
+
+// dedupRootsByKey collapses roots that resolve to the same repo (workspace root
+// and a discovered root can be different spellings of one dir), keeping the first
+// spelling so each repo is polled — and cursored — exactly once per cycle.
+func dedupRootsByKey(roots []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range roots {
+		k := resolvePath(r)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // gitHead returns the root's current HEAD commit, or ok=false when there is no
 // commit yet (unborn branch) or the dir is not a git repo. A detached HEAD
 // still resolves — it is a real commit — so it is tracked normally.
@@ -257,7 +368,15 @@ func pollGitWatch(roots []string) map[string][]string {
 // we re-derive that key per root to recover the ROOT PATH the attribution engine
 // needs to run its one `git show` per commit.
 func pollGitWatchWorkspace(session Session) {
-	roots := workspaceMatchRoots(resolvePath(session.TaskRoot))
+	// The workspace roots (workspace + its worktrees) PLUS the repos discovered
+	// from the ai-paths ledger. The latter is what makes the autostart daemon work
+	// at all: its TaskRoot is the un-pollable HOME dir, so without discovery the
+	// root set is just [home] and nothing is ever detected. Deduped so a repo that
+	// appears in both sources is polled once.
+	roots := dedupRootsByKey(append(
+		workspaceMatchRoots(resolvePath(session.TaskRoot)),
+		discoverAiRepoRoots(session.TaskRoot)...,
+	))
 	detected := pollGitWatch(roots)
 	nowMs := time.Now().UnixMilli() // one clock read, threaded to both passes
 
