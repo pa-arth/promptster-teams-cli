@@ -31,6 +31,11 @@ func TestCensusIsQueuedAndPresenceIsNot(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
 	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
 	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	// Isolate the transcript store so repo discovery is deterministic: an empty
+	// projects dir yields no active repos, so emitConfigCensus queues exactly one
+	// device-only census. Without this the count would follow whatever real repos
+	// the running machine's ~/.claude/projects happens to hold.
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(tmp, "claude"))
 
 	// A backend that fails every request: whatever ships inline is LOST, and
 	// whatever is queued survives.

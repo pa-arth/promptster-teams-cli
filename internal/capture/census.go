@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -290,8 +291,14 @@ func primaryWorkspaceRoot(roots []string) string {
 // PREFERS the git remote slug (owner/name) so backend rollups can correlate
 // CLAUDE.md coverage with PR outcomes (outcome_events.repo uses the same
 // convention); when the workspace is not a git repo with an origin remote it
-// falls back to an opaque sha256(abspath) hash truncated to 16 hex chars. The
-// result never carries a filesystem path or file contents. Empty root → "".
+// falls back to an opaque sha256 hash truncated to 16 hex chars. The result
+// never carries a filesystem path or file contents. Empty root → "".
+//
+// The hash fallback keys off the REPO ROOT (gitRepoRoot), not the raw path, so
+// every subdir and linked worktree of one no-remote repo collapses to a single
+// key — matching how the slug path already yields one identity from any subdir
+// of a repo WITH an origin remote. Only a dir that is not inside any git repo at
+// all falls all the way back to hashing its own abspath.
 func workspaceKey(root string) string {
 	if root == "" {
 		return ""
@@ -299,11 +306,45 @@ func workspaceKey(root string) string {
 	if slug := gitRemoteSlug(root); slug != "" {
 		return slug
 	}
-	abs := root
-	if a, err := filepath.Abs(root); err == nil {
-		abs = a
+	target := gitRepoRoot(root)
+	if target == "" {
+		target = root
+		if a, err := filepath.Abs(root); err == nil {
+			target = a
+		}
 	}
-	return ingest.Sha256Hex(abs)[:16]
+	return ingest.Sha256Hex(target)[:16]
+}
+
+// gitRepoRoot canonicalizes dir to the root of its git repository — the SAME
+// path for a repo's primary checkout and all of its linked worktrees, and for
+// any subdirectory of either — so worktrees/subdirs of one repo collapse to a
+// single identity. It resolves the shared git dir (`--git-common-dir`, which
+// points at the one `.git` every worktree of a repo shares) and returns its
+// parent. Returns "" when dir is not inside a git repo. Timeout-bounded like
+// gitRemoteSlug so a network-mounted or corrupt .git can't stall the census.
+func gitRepoRoot(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// #nosec G204 -- constant argv; dir is a discovered workspace/transcript cwd, not user input. Reads only the local git layout, timeout-bounded.
+	out, err := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--git-common-dir").Output()
+	if err != nil {
+		return ""
+	}
+	common := strings.TrimSpace(string(out))
+	if common == "" {
+		return ""
+	}
+	// `--git-common-dir` is reported relative to dir for a primary checkout
+	// (".git") and absolute for a linked worktree; normalize both to an absolute
+	// path before taking the parent (the repo root).
+	if !filepath.IsAbs(common) {
+		common = filepath.Join(dir, common)
+	}
+	return resolvePath(filepath.Dir(common))
 }
 
 // gitRemoteSlug returns the workspace's origin remote as an owner/name slug, or
@@ -710,6 +751,151 @@ func readFrontmatter(path string) map[string]string {
 	return fm
 }
 
+// --- repo discovery -----------------------------------------------------------
+
+const (
+	// censusRepoActivityWindow bounds repo discovery to recently-active repos: a
+	// project directory whose newest transcript predates this window is treated as
+	// dormant and skipped, so the census reflects where the engineer is actually
+	// working, not every repo they ever opened.
+	censusRepoActivityWindow = 30 * 24 * time.Hour
+	// censusMaxRepos caps how many distinct repos a single census pass emits for,
+	// bounding the once-per-24h work (a git call per repo) and the event count.
+	// Repos beyond the cap are dropped newest-first-preserving and LOGGED — never
+	// silently truncated.
+	censusMaxRepos = 64
+)
+
+// discoverCensusRepoRoots returns the distinct git-repo roots this device is
+// actively capturing for. It is the fix for the "CLAUDE.md coverage = 0%" bug:
+// the autostart daemon runs with cwd=$HOME (launchd WorkingDirectory=home, no
+// PROMPTSTER_TEAMS_WATCH_DIR), so a census built from the watch root only ever
+// described $HOME — a non-repo whose workspaceKey is a bogus sha(HOME) and whose
+// projectClaudeMdTokens is structurally 0. Instead we recover the REAL repos the
+// same way the transcript watcher does: from the cwd recorded on Claude Code
+// transcripts under ~/.claude/projects.
+//
+// TCC-safe by construction: it reads ONLY files the watcher already sees (the
+// transcript store), never a blind WalkDir of $HOME that would fire "wants to
+// access your Downloads" consent prompts. Only the recorded cwd is read from
+// each transcript (see transcriptCwd) — never its body — and the cwd itself
+// never leaves the machine; it is reduced to a repo root and then to a
+// workspaceKey (slug or opaque hash).
+//
+// Bounded: one representative (newest) transcript per project directory, only
+// project dirs active within censusRepoActivityWindow, deduped by canonical repo
+// root, capped at censusMaxRepos (overflow logged). Returns nil when there is no
+// transcript store or no active repo — the caller then emits a single device-only
+// census with an empty workspaceKey rather than a fake pseudo-repo.
+func discoverCensusRepoRoots() []string {
+	entries, err := os.ReadDir(ClaudeProjectsDir())
+	if err != nil {
+		return nil
+	}
+	cutoff := time.Now().Add(-censusRepoActivityWindow)
+
+	// One candidate cwd per project directory (Claude Code buckets transcripts by
+	// munged cwd), taken from that dir's most-recent transcript. Newest-first so
+	// the repo cap keeps the most-recently-active repos.
+	type candidate struct {
+		cwd string
+		mod time.Time
+	}
+	cands := []candidate{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		path, mod := newestTranscript(filepath.Join(ClaudeProjectsDir(), e.Name()))
+		if path == "" || mod.Before(cutoff) {
+			continue
+		}
+		cwd := transcriptCwd(path)
+		if cwd == "" {
+			continue
+		}
+		cands = append(cands, candidate{cwd: cwd, mod: mod})
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].mod.After(cands[j].mod) })
+
+	seen := map[string]bool{}
+	dropped := map[string]bool{}
+	roots := []string{}
+	for _, c := range cands {
+		repo := gitRepoRoot(resolvePath(c.cwd))
+		if repo == "" || seen[repo] {
+			continue
+		}
+		if len(roots) >= censusMaxRepos {
+			dropped[repo] = true
+			continue
+		}
+		seen[repo] = true
+		roots = append(roots, repo)
+	}
+	if len(dropped) > 0 {
+		state.HookDebugf("config census: repo discovery capped at %d; dropped %d additional active repo(s)", censusMaxRepos, len(dropped))
+	}
+	return roots
+}
+
+// newestTranscript returns the path + mtime of the most recently modified
+// transcript JSONL under dir (recursively, so subagent sidechains count), or
+// ("", zero time) when dir holds none. Stat-only: no file is opened here.
+func newestTranscript(dir string) (string, time.Time) {
+	var newestPath string
+	var newestMod time.Time
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(filepath.Base(path), ".jsonl") {
+			return nil
+		}
+		if info.ModTime().After(newestMod) {
+			newestMod = info.ModTime()
+			newestPath = path
+		}
+		return nil
+	})
+	return newestPath, newestMod
+}
+
+// transcriptCwd returns the cwd recorded on the first cwd-bearing line of a
+// Claude Code transcript, or "" when none appears in the early lines. It mirrors
+// classifyClaudeTranscript's scan (first lines only, `cwd` field only) — the
+// transcript body is never retained, only the working directory, which the
+// caller reduces to a privacy-safe repo identity.
+func transcriptCwd(path string) string {
+	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects, not user input; opened read-only and only the cwd field is read.
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	const maxScanLines = 50
+	scanned := 0
+	for scanner.Scan() {
+		scanned++
+		if scanned > maxScanLines {
+			return ""
+		}
+		var rec struct {
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+			continue
+		}
+		if rec.Cwd != "" {
+			return rec.Cwd
+		}
+	}
+	return ""
+}
+
 // --- emission ----------------------------------------------------------------
 
 // lastCensusAtPath persists when the last census was emitted, so restarts and
@@ -737,25 +923,60 @@ func saveLastCensusAt(t time.Time) {
 	_ = os.WriteFile(p, []byte(t.UTC().Format(time.RFC3339)), 0o600)
 }
 
-// buildConfigCensusEvent wraps the census in the ordinary event envelope so it
-// is signed and chained exactly like every other event.
+// buildConfigCensusEventForWorkspace wraps the census for a single workspace in
+// the ordinary event envelope so it is signed and chained exactly like every
+// other event. workspace "" yields a device-only census (empty workspaceKey,
+// projectClaudeMdTokens 0) — the honest "no active repo" shape the backend
+// coverage fold skips.
 //
 // The census goes through eventDataMap rather than being assigned directly:
 // Data must hold a map[string]interface{} or the redaction projector
 // default-denies it and the whole census ships as {}. See eventDataMap.
 // Like presence, the census is DEVICE-scoped — it describes the machine's tool
 // configuration, not any one AI-tool session — so its envelope sessionId stays
-// the device id and the backend skips minting a session row for this kind.
-func buildConfigCensusEvent(session Session) event.Event {
+// the device id and the backend skips minting a session row for this kind. When
+// a device captures for several repos it emits several censuses, each with the
+// same device inventory but a distinct workspaceKey; the backend folds them by
+// workspaceKey (coverage), unions skills per key (idempotent), and reads only
+// the newest for MCP — so N censuses per device is correct with no schema change.
+func buildConfigCensusEventForWorkspace(session Session, workspace string) event.Event {
 	e := event.NewEvent("config_census", session.DeviceID)
 	e.Source = presenceSource
 	e.DeviceID = session.DeviceID
 	e.Actor = event.SystemActor()
-	e.Data = eventDataMap(buildConfigCensus(defaultCensusEnv(session.TaskRoot)))
+	e.Data = eventDataMap(buildConfigCensus(defaultCensusEnv(workspace)))
 	return e
 }
 
-// emitConfigCensus builds one census and runs it through the SAME
+// buildConfigCensusEvent builds the single census for the session's own workspace
+// (session.TaskRoot). Retained for the emit-path tests; the fleet emitter uses
+// the per-workspace builder directly over the discovered repos.
+func buildConfigCensusEvent(session Session) event.Event {
+	return buildConfigCensusEventForWorkspace(session, session.TaskRoot)
+}
+
+// buildConfigCensusEvents builds the census events this device should emit: one
+// per distinct real repo it is actively capturing for (each carrying the full
+// device inventory plus that repo's workspaceKey + projectClaudeMdTokens), or a
+// single device-only census with an EMPTY workspaceKey when no repo is active.
+//
+// Emitting the empty-workspaceKey census (rather than the old $HOME-rooted one)
+// is deliberate: the backend coverage fold skips empty keys, so a fresh device
+// with no sessions yet reports an honest "nothing to grade yet" instead of the
+// fake sha(HOME)/0 pseudo-repo that structurally pinned CLAUDE.md coverage to 0%.
+func buildConfigCensusEvents(session Session) []event.Event {
+	roots := discoverCensusRepoRoots()
+	if len(roots) == 0 {
+		return []event.Event{buildConfigCensusEventForWorkspace(session, "")}
+	}
+	events := make([]event.Event, 0, len(roots))
+	for _, root := range roots {
+		events = append(events, buildConfigCensusEventForWorkspace(session, root))
+	}
+	return events
+}
+
+// appendConfigCensus runs one prepared census event through the SAME
 // buffer/sign/queue funnel as captured events.
 //
 // The census is QUEUED rather than POSTed inline, unlike the presence heartbeat
@@ -770,8 +991,7 @@ func buildConfigCensusEvent(session Session) event.Event {
 // Still 400-tolerant: a backend that doesn't accept config_census yet rejects
 // it with a 4xx and the drain skips it (see outbox.deliver), so a rejecting
 // backend is still probed at most once per interval.
-func emitConfigCensus(session Session) {
-	ev := buildConfigCensusEvent(session)
+func appendConfigCensus(ev event.Event) {
 	// captureAssistantProse=false: a config_census event carries no ai_response
 	// text, so the prose gate is irrelevant — pass the fail-closed default.
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
@@ -779,6 +999,16 @@ func emitConfigCensus(session Session) {
 	}
 	if err := outbox.Append(ev); err != nil {
 		state.HookDebugf("config census queue error: %v", err)
+	}
+}
+
+// emitConfigCensus discovers the repos this device captures for and queues one
+// config_census per repo (or a single device-only census when none are active),
+// then advances the once-per-24h cursor. The cursor advances once for the whole
+// pass — a discovery that finds N repos is still one census "tick".
+func emitConfigCensus(session Session) {
+	for _, ev := range buildConfigCensusEvents(session) {
+		appendConfigCensus(ev)
 	}
 	saveLastCensusAt(time.Now())
 }
