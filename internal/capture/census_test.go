@@ -572,3 +572,169 @@ func TestProjectClaudeMdTokensDepthBound(t *testing.T) {
 		t.Errorf("depth-6 file: got %d, want 0 (must be excluded)", got)
 	}
 }
+
+// gitCmd runs git in dir, failing the test on error. Shared by the repo-discovery
+// and workspace-key tests below.
+func gitCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
+	}
+}
+
+// writeTranscriptCwd writes a minimal Claude Code transcript under
+// <CLAUDE_CONFIG_DIR>/projects/<slug>/session.jsonl whose first line records cwd
+// — the shape discoverCensusRepoRoots reads to recover a repo.
+func writeTranscriptCwd(t *testing.T, cfgDir, slug, cwd string) {
+	t.Helper()
+	p := filepath.Join(cfgDir, "projects", slug, "session.jsonl")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"cwd":` + jsonString(cwd) + `,"timestamp":"2026-07-20T00:00:00Z"}` + "\n"
+	if err := os.WriteFile(p, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBuildConfigCensusEventsPerRepo is the core fix for the "CLAUDE.md coverage
+// = 0%" bug: a device emits ONE config_census per real repo it captures for —
+// discovered from transcript cwds, not the $HOME watch root — each carrying that
+// repo's true workspaceKey (git slug when it has an origin remote, else the
+// collapsed repo-root hash) and a non-zero projectClaudeMdTokens when the repo
+// has a CLAUDE.md. The cwds point at SUBDIRS to prove canonicalization to root.
+func TestBuildConfigCensusEventsPerRepo(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	home := t.TempDir()
+	cfg := filepath.Join(home, ".claude")
+	t.Setenv("CLAUDE_CONFIG_DIR", cfg)
+
+	// repoA: origin remote → workspaceKey is the slug (matches outcome_events.repo).
+	repoA := t.TempDir()
+	gitCmd(t, repoA, "init")
+	gitCmd(t, repoA, "remote", "add", "origin", "git@github.com:acme/repo-a.git")
+	writeClaudeFixture(t, repoA, "CLAUDE.md", 400) // 100 tokens
+	repoASub := filepath.Join(repoA, "src")
+	if err := os.MkdirAll(repoASub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// repoB: no remote → workspaceKey is the collapsed repo-root hash.
+	repoB := t.TempDir()
+	gitCmd(t, repoB, "init")
+	writeClaudeFixture(t, repoB, "CLAUDE.md", 80) // 20 tokens
+
+	writeTranscriptCwd(t, cfg, "-repo-a-src", repoASub) // subdir cwd → must canonicalize to repoA root
+	writeTranscriptCwd(t, cfg, "-repo-b", repoB)
+
+	events := buildConfigCensusEvents(Session{DeviceID: "dev-fleet", TaskRoot: home})
+	if len(events) != 2 {
+		t.Fatalf("expected one census per discovered repo (2), got %d", len(events))
+	}
+
+	byKey := map[string]map[string]interface{}{}
+	for _, ev := range events {
+		data, ok := ev.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("event Data is not a map: %T", ev.Data)
+		}
+		key, _ := data["workspaceKey"].(string)
+		byKey[key] = data
+		// Every emitted census must carry the full device inventory, not a husk.
+		if _, ok := data["skills"]; !ok {
+			t.Errorf("census for %q missing device inventory (skills)", key)
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for k := range byKey {
+		keys = append(keys, k)
+	}
+
+	// repoA → slug, projectClaudeMdTokens from its root CLAUDE.md.
+	a, ok := byKey["acme/repo-a"]
+	if !ok {
+		t.Fatalf("no census keyed by repoA slug acme/repo-a; keys=%v", keys)
+	}
+	if tok, _ := a["projectClaudeMdTokens"].(float64); tok != 100 {
+		t.Errorf("repoA projectClaudeMdTokens = %v, want 100", a["projectClaudeMdTokens"])
+	}
+
+	// repoB → opaque 16-hex repo-root hash (not a slug, not sha(HOME)).
+	wantB := workspaceKey(gitRepoRoot(resolvePath(repoB)))
+	b, ok := byKey[wantB]
+	if !ok {
+		t.Fatalf("no census keyed by repoB hash %q; keys=%v", wantB, keys)
+	}
+	if len(wantB) != 16 || strings.Contains(wantB, "/") {
+		t.Errorf("repoB key must be a 16-hex non-slug hash, got %q", wantB)
+	}
+	if tok, _ := b["projectClaudeMdTokens"].(float64); tok != 20 {
+		t.Errorf("repoB projectClaudeMdTokens = %v, want 20", b["projectClaudeMdTokens"])
+	}
+}
+
+// TestBuildConfigCensusEventsNoActiveReposEmptyKey pins the fresh-device shape:
+// with no transcript store (no repos to discover), the device emits exactly ONE
+// census with an EMPTY workspaceKey — the honest "nothing to report yet" the
+// backend coverage fold skips — NOT the old sha(HOME) pseudo-repo that pinned
+// coverage to 0% fleet-wide.
+func TestBuildConfigCensusEventsNoActiveReposEmptyKey(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude")) // no projects/ store
+
+	events := buildConfigCensusEvents(Session{DeviceID: "dev-empty", TaskRoot: home})
+	if len(events) != 1 {
+		t.Fatalf("no active repos must yield exactly one device-only census, got %d", len(events))
+	}
+	data, ok := events[0].Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("event Data is not a map: %T", events[0].Data)
+	}
+	key, _ := data["workspaceKey"].(string)
+	if key != "" {
+		t.Errorf("no-active-repos census must carry an EMPTY workspaceKey, got %q", key)
+	}
+	// It must specifically NOT be the sha(HOME) pseudo-workspace of the old bug.
+	if bogus := workspaceKey(home); bogus != "" && key == bogus {
+		t.Errorf("census must not fall back to the sha(HOME) pseudo-workspace %q", bogus)
+	}
+}
+
+// TestWorkspaceKeyCollapsesNoRemoteWorktrees pins Part A.2: for a git repo with
+// NO origin remote, subdirs and linked worktrees must collapse to a single
+// workspaceKey (the repo-root hash) — the raw-abspath fallback gave each a
+// different key. A repo WITH a remote already collapses via its slug (covered by
+// TestWorkspaceKeyPrefersGitRemoteSlug).
+func TestWorkspaceKeyCollapsesNoRemoteWorktrees(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	main := t.TempDir()
+	gitCmd(t, main, "init")
+	gitCmd(t, main, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init")
+
+	// A subdir of the same no-remote repo → same key as the root.
+	sub := filepath.Join(main, "pkg", "x")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := workspaceKey(sub), workspaceKey(main); got != want {
+		t.Errorf("subdir key %q != root key %q (no-remote repo must collapse)", got, want)
+	}
+
+	// A linked worktree of the same no-remote repo → same key. This is the exact
+	// case the abspath fallback got wrong.
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitCmd(t, main, "worktree", "add", wt)
+	if got, want := workspaceKey(wt), workspaceKey(main); got != want {
+		t.Errorf("worktree key %q != root key %q (no-remote worktrees must collapse)", got, want)
+	}
+
+	// Still an opaque 16-hex hash, never a path.
+	if k := workspaceKey(main); len(k) != 16 || strings.ContainsRune(k, filepath.Separator) {
+		t.Errorf("no-remote workspaceKey must be a 16-hex hash, got %q", k)
+	}
+}
