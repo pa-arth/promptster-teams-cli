@@ -71,9 +71,14 @@ var projectFieldAllowlist = map[string][]string{
 	// its own individually-allowlisted key precisely so the raw absolute `cwd`
 	// can stay dropped (pinned by the leak-canary case in project_test.go): a
 	// short home-relative token is allowlistable, an absolute path is not.
+	// repoRoot is the canonical per-session repo identity — a git remote slug
+	// (owner/name, the same public value stored in outcome_events.repo) or an opaque
+	// sha256 hash, resolved on-device in capture. It is canary-safe (never a raw
+	// path) and its own individually-allowlisted key, so the backend can key repo
+	// rollups + the PR-count join on it; it survives projection exactly like workdir.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so

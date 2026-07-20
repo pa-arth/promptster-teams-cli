@@ -52,6 +52,15 @@ type CodexRolloutProcessor struct {
 	// real model. turn_context precedes the turn's agent messages, so the captured
 	// value is always the model in force for the response it lands on.
 	model string
+	// RepoRoot is the canonical per-session repository identity (a git remote slug
+	// owner/name, or a stable opaque hash for a no-remote/non-git dir). Unlike
+	// workdir — which normalize derives itself from the payload cwd via
+	// HomeRelativeStrict — repoRoot needs `git config` (fs/exec) and so CANNOT be
+	// derived here; it is resolved ONCE per session in internal/capture
+	// (capture.sessionRepoRoot) and threaded in as session state, then stamped onto
+	// each prompt event beside workdir when non-empty. Empty (omitted) when the cwd
+	// was gone/unresolvable, mirroring workdir's empty-on-failure.
+	RepoRoot string
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -185,6 +194,12 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		// session_meta header supplied one.
 		if p.workdir != "" {
 			data["workdir"] = p.workdir
+		}
+		// repoRoot — the canonical repo identity resolved in capture and threaded in;
+		// stamped only when non-empty (mirrors workdir). It de-fragments the repo
+		// across subdirs/worktrees and joins exactly to outcome_events.repo.
+		if p.RepoRoot != "" {
+			data["repoRoot"] = p.RepoRoot
 		}
 		e.Data = data
 		e.RawPayload = raw

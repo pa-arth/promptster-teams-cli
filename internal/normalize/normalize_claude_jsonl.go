@@ -69,7 +69,17 @@ type ClaudeTranscriptProcessor struct {
 	// files): every line is agent-authored, so only per-request token usage is
 	// extracted — prompts, responses, and tool events must never enter the
 	// candidate's timeline from a sidechain.
-	UsageOnly     bool
+	UsageOnly bool
+	// RepoRoot is the canonical per-session repository identity (a git remote slug
+	// owner/name, or a stable opaque hash for a no-remote/non-git dir). Unlike
+	// workdir — which this processor derives itself from each line's payload cwd via
+	// HomeRelativeStrict — repoRoot needs `git config` (fs/exec) and so CANNOT be
+	// derived here; it is resolved ONCE per session in internal/capture
+	// (capture.sessionRepoRoot) and threaded in as session state, then stamped onto
+	// each prompt event beside workdir when non-empty. Empty (omitted) when the cwd
+	// was gone/unresolvable, mirroring workdir's empty-on-failure. Only set on
+	// main-chain processors — sidechains (UsageOnly) emit no prompts.
+	RepoRoot      string
 	pendingTools  map[string]claudePendingTool
 	emittedMsgIDs map[string]bool
 	accum         *claudeMsgAccum
@@ -707,6 +717,14 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// leaking an absolute path that may carry the OS username.
 	if wd := state.HomeRelativeStrict(stringField(rec, "cwd")); wd != "" {
 		data["workdir"] = wd
+	}
+
+	// repoRoot — the canonical repo identity resolved in capture (needs git, so it
+	// can't be derived here like workdir) and threaded in as session state; stamped
+	// only when non-empty (mirrors workdir). It de-fragments the repo across
+	// subdirs/worktrees and joins exactly to outcome_events.repo.
+	if p.RepoRoot != "" {
+		data["repoRoot"] = p.RepoRoot
 	}
 
 	// Track the previous human-prompt time as lane state only. No timing,
