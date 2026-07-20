@@ -87,6 +87,40 @@ func TestClaudeTranscriptPromptWorkdir(t *testing.T) {
 	}
 }
 
+// TestClaudeTranscriptPromptStampsRepoRoot pins the repoRoot stamp: when capture
+// has threaded a resolved RepoRoot in as session state, every prompt event carries
+// it beside workdir. repoRoot is NOT derived from the payload (it needs git) — the
+// processor only stamps the pre-resolved value.
+func TestClaudeTranscriptPromptStampsRepoRoot(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-rr")
+	p.RepoRoot = "acme/foo"
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-1","promptSource":"typed","uuid":"u-rr"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if got := dm(events[0])["repoRoot"]; got != "acme/foo" {
+		t.Errorf("repoRoot = %v, want acme/foo", got)
+	}
+}
+
+// TestClaudeTranscriptPromptOmitsRepoRootWhenUnresolved pins the omit path: with
+// no RepoRoot threaded in (a gone/unresolvable cwd resolved to ""), the prompt
+// carries NO repoRoot key rather than an empty string — mirroring workdir.
+func TestClaudeTranscriptPromptOmitsRepoRootWhenUnresolved(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-rr-none")
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-1","promptSource":"typed","uuid":"u-rr-none"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if _, present := dm(events[0])["repoRoot"]; present {
+		t.Errorf("repoRoot must be absent when unresolved, got %v", dm(events[0])["repoRoot"])
+	}
+}
+
 // TestClaudeTranscriptPromptWorkdirOutsideHome is the privacy guard: a prompt
 // whose cwd is OUTSIDE $HOME (an absolute path that may carry the OS username)
 // must produce NO data.workdir — the field is "~"-prefixed or absent, never a

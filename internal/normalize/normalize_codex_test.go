@@ -200,6 +200,59 @@ func TestCodexPromptWorkdirOutsideHome(t *testing.T) {
 	}
 }
 
+// TestCodexPromptStampsRepoRoot pins the repoRoot stamp: a resolved RepoRoot
+// threaded in from capture rides on every prompt event beside workdir. repoRoot
+// is not derived from the rollout payload (it needs git) — the processor stamps
+// only the pre-resolved value.
+func TestCodexPromptStampsRepoRoot(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-rr")
+	p.RepoRoot = "acme/foo"
+	var prompt *event.Event
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}`,
+	}
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatal("no prompt event emitted")
+	}
+	if got := prompt.Data.(map[string]interface{})["repoRoot"]; got != "acme/foo" {
+		t.Errorf("repoRoot = %v, want acme/foo", got)
+	}
+}
+
+// TestCodexPromptOmitsRepoRootWhenUnresolved: with no RepoRoot threaded in, the
+// prompt carries NO repoRoot key (mirrors workdir's omit-when-empty).
+func TestCodexPromptOmitsRepoRootWhenUnresolved(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-rr-none")
+	var prompt *event.Event
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}`,
+	}
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatal("no prompt event emitted")
+	}
+	if _, present := prompt.Data.(map[string]interface{})["repoRoot"]; present {
+		t.Errorf("repoRoot must be absent when unresolved")
+	}
+}
+
 func TestCodexPatchLineRanges(t *testing.T) {
 	p := NewCodexRolloutProcessor("sess-1")
 	// A multi-hunk unified diff: an update hunk (+3,2), an insertion hunk
