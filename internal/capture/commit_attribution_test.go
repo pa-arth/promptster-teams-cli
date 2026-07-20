@@ -108,6 +108,58 @@ func TestCommitAttributionHappyPath(t *testing.T) {
 	}
 }
 
+// TestCommitAttributionAiTokensCounted: an AI-touched file committed → the event
+// carries aiTokens equal to the o200k tiktoken count of that file's likely_ai
+// added lines, and it is > 0.
+func TestCommitAttributionAiTokensCounted(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	const body = "package main\n\nfunc main() {}\n"
+	writeCommitFile(t, ws, "foo.go", body)
+	git("add", "-A")
+	git("commit", "-m", "add foo")
+	sha := gitOut("rev-parse", "HEAD")
+
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(ws), "foo.go")
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	// The three committed lines (no trailing empty line in the diff) are the
+	// likely_ai payload; newline-joined they are the tokenizer input.
+	want := countTiktokenTokens("package main\n\nfunc main() {}")
+	if want <= 0 {
+		t.Fatalf("fixture want count = %d, expected > 0", want)
+	}
+	if got := aiTokensOf(t, ev); got != want {
+		t.Errorf("aiTokens = %d, want %d", got, want)
+	}
+}
+
+// TestCommitAttributionAiTokensZeroWhenNoAI: a commit with only unknown lines
+// (no AI evidence) carries aiTokens == 0.
+func TestCommitAttributionAiTokensZeroWhenNoAI(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "hand.go", "package main\n\nvar x = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "human edit, no AI evidence")
+	sha := gitOut("rev-parse", "HEAD")
+
+	// Record NOTHING in the AI-paths ledger.
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	if got := aiTokensOf(t, ev); got != 0 {
+		t.Errorf("aiTokens = %d, want 0 for an all-unknown commit", got)
+	}
+}
+
 // TestCommitAttributionUnknownNeverHuman: a file with NO AI evidence is marked
 // unknown, and the string "human" appears NOWHERE in the emitted event.
 func TestCommitAttributionUnknownNeverHuman(t *testing.T) {

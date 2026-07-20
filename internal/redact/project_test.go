@@ -358,6 +358,33 @@ func TestProjectEventCommitAttributionNestedElements(t *testing.T) {
 	}
 }
 
+// TestProjectEventCommitAttributionAiTokens pins the aiTokens denominator: a
+// scalar integer allowlisted on commit_attribution survives projection intact,
+// while a smuggled content-bearing key on the same payload is dropped.
+func TestProjectEventCommitAttributionAiTokens(t *testing.T) {
+	e := eventWithData("commit_attribution", map[string]interface{}{
+		"commitSha":    "deadbeefcafe",
+		"workspaceKey": "owner/name",
+		"aiTokens":     1234,
+		// A content key smuggled alongside the scalar must not survive.
+		"aiLineText": leakCanary,
+		"files":      []interface{}{},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived commit_attribution projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	if data["aiTokens"] != 1234 {
+		t.Errorf("aiTokens lost or altered in projection: %+v", data["aiTokens"])
+	}
+	if _, present := data["aiLineText"]; present {
+		t.Errorf("smuggled content key survived: %+v", data)
+	}
+}
+
 // Privacy gate for the durability engine: a durability_verdict carries two
 // range arrays (durableRanges/churnedRanges). The top-level projection is
 // shallow, so without the element-allowlist walk a range element would ship
