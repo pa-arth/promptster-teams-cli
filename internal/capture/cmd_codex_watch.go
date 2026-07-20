@@ -291,6 +291,10 @@ func pollCodexRollouts(
 		proc := processors[path]
 		if proc == nil {
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
+			// Resolve the canonical repo identity ONCE per session (this processor is
+			// created once per rollout file) from the session_meta cwd, and thread it
+			// in as session state so each prompt event carries repoRoot.
+			proc.RepoRoot = sessionRepoRoot(codexRolloutCwd(path))
 			processors[path] = proc
 		}
 		n := tailCodexRollout(path, progress, proc, session, captureProse)
@@ -334,6 +338,37 @@ func codexRolloutMatchesWorkspace(path, workspace string, startCutoff time.Time)
 		return false
 	}
 	return pathWithin(resolvePath(rec.Payload.Cwd), workspace)
+}
+
+// codexRolloutCwd returns the absolute cwd recorded in a rollout file's
+// session_meta header (the only rollout line carrying cwd), or "" when the first
+// line is not a readable session_meta. Read-only, first line only — the body is
+// never retained; the caller reduces the cwd to a privacy-safe repo identity.
+func codexRolloutCwd(path string) string {
+	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only and only the cwd field is read.
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	if !scanner.Scan() {
+		return ""
+	}
+	var rec struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Cwd string `json:"cwd"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+		return ""
+	}
+	if rec.Type != "session_meta" {
+		return ""
+	}
+	return rec.Payload.Cwd
 }
 
 // tailCodexRollout reads new complete lines from path (starting at the stored

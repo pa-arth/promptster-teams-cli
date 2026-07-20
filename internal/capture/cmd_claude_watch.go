@@ -557,6 +557,13 @@ func pollClaudeTranscripts(
 				// usually repeat it (plus skill/agent names), but agentId must
 				// survive even if they don't.
 				proc.AgentID = claudeAgentIDFromPath(path)
+			} else {
+				// Resolve the canonical repo identity ONCE per session (this
+				// processor is created once per transcript) from the transcript's
+				// recorded cwd, and thread it in as session state so each prompt
+				// event carries repoRoot. Sidechains emit no prompts, so they skip
+				// it. transcriptCwd reads only the cwd field, never the body.
+				proc.RepoRoot = sessionRepoRoot(transcriptCwd(path))
 			}
 			processors[key] = proc
 		}
