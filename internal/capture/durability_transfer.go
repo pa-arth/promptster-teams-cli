@@ -113,6 +113,17 @@ func lineFingerprint(content string) string {
 // advances the new-side counter from the hunk's NewStart; `-` lines are old-side
 // and ignored.
 func parseUnifiedDiffNewLines(diff string) map[string]map[int]string {
+	return mapUnifiedDiffNewLines(diff, lineFingerprint)
+}
+
+// mapUnifiedDiffNewLines is the shared new-side parser: per changed file, each
+// NEW-side line number mapped to transform(content). parseUnifiedDiffNewLines
+// passes lineFingerprint (content hashed immediately, never retained); the
+// aiTokens counter passes identity to recover the added-line TEXT for on-device
+// tokenization. ONE parser so the fingerprint mask and the token text are read
+// from exactly the same `+` lines. transform receives the raw added-line content
+// (line[1:]); what it retains is the caller's choice.
+func mapUnifiedDiffNewLines(diff string, transform func(string) string) map[string]map[int]string {
 	out := map[string]map[int]string{}
 	oldPath, newPath := "", ""
 	inBody := false
@@ -142,7 +153,7 @@ func parseUnifiedDiffNewLines(diff string) map[string]map[int]string {
 			if out[path] == nil {
 				out[path] = map[int]string{}
 			}
-			out[path][newLine] = lineFingerprint(line[1:])
+			out[path][newLine] = transform(line[1:])
 			newLine++
 			// `-` (old-side) lines match no case above and are skipped: they do
 			// not advance the new-side counter.

@@ -6,6 +6,8 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/jedisct1/go-minisign v0.0.0-20260527172527-a09352b57a22
+	github.com/pkoukk/tiktoken-go v0.1.8
+	github.com/pkoukk/tiktoken-go-loader v0.0.2
 	github.com/praetorian-inc/titus v1.2.6
 	golang.org/x/sys v0.47.0
 )

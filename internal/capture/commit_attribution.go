@@ -56,10 +56,14 @@ type attrFile struct {
 }
 
 // commitAttributionData is the CLOSED payload of a commit_attribution event.
+// AiTokens is the o200k tiktoken count of this commit's likely_ai ADDED lines
+// (a scalar, content-free denominator for the backend's token-efficiency ratio);
+// 0 when no likely_ai line landed. See ai_tokens.go.
 type commitAttributionData struct {
 	CommitSha    string     `json:"commitSha"`
 	WorkspaceKey string     `json:"workspaceKey"`
 	Files        []attrFile `json:"files"`
+	AiTokens     int        `json:"aiTokens"`
 }
 
 const (
@@ -311,11 +315,11 @@ func mostFrequentSession(counts map[string]int) string {
 // projector's element allowlist can walk. Assigning the struct straight to Data
 // would silently ship {} (see eventDataMap's header).
 func buildCommitAttributionEvent(session Session, root, sha string) (event.Event, bool) {
-	_, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
+	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
 		return event.Event{}, false
 	}
-	return assembleCommitAttributionEvent(session, root, sha, files, primarySession), true
+	return assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files)), true
 }
 
 // assembleCommitAttributionEvent wraps reconciled files into a ready-to-funnel
@@ -325,7 +329,7 @@ func buildCommitAttributionEvent(session Session, root, sha string) (event.Event
 // round-trip) so nested arrays-of-structs land as []interface{} of map — the
 // only shape the projector's element allowlist can walk (a straight struct
 // assignment would ship {}).
-func assembleCommitAttributionEvent(session Session, root, sha string, files []attrFile, primarySession string) event.Event {
+func assembleCommitAttributionEvent(session Session, root, sha string, files []attrFile, primarySession string, aiTokens int) event.Event {
 	sessionID := primarySession
 	if sessionID == "" {
 		sessionID = session.DeviceID
@@ -338,6 +342,7 @@ func assembleCommitAttributionEvent(session Session, root, sha string, files []a
 		CommitSha:    sha,
 		WorkspaceKey: workspaceKey(root),
 		Files:        files,
+		AiTokens:     aiTokens,
 	})
 	return e
 }
@@ -385,7 +390,7 @@ func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, 
 	if !ok {
 		return
 	}
-	emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession))
+	emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files)))
 	// From the SAME diff, capture on-device fingerprints of this commit's
 	// likely_ai lines so a later squash-merge onto the default branch can
 	// transfer attribution by content match. Fingerprints never leave the device.

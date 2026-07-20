@@ -165,8 +165,11 @@ var projectFieldAllowlist = map[string][]string{
 	// commitSha is a public content hash the notes backend is keyed on. NEVER a
 	// diff, file body, commit message, author, or old/new string. The nested
 	// files[]/lineRanges[] element allowlists below are the load-bearing privacy
-	// line — they clamp both array levels to scalar keys only.
-	"commit_attribution": {"commitSha", "workspaceKey", "files"},
+	// line — they clamp both array levels to scalar keys only. aiTokens is a
+	// content-free scalar: the o200k tiktoken count of this commit's likely_ai
+	// added lines (the denominator for the backend's token-efficiency ratio),
+	// never the line text or bytes.
+	"commit_attribution": {"commitSha", "workspaceKey", "files", "aiTokens"},
 	// durability_verdict reports WHICH AI line ranges survived (durableRanges) or
 	// were rewritten (churnedRanges) on a path over time — content-free metadata:
 	// integer line numbers, an age, and a lineage id (a `sha:path` handle, never
