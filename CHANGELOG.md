@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Commit attribution now works in the autostart daemon.** The 0.9.0 git
+  watcher (`commit_attribution`, `durability_verdict`, `rework_verdict`) assumed
+  its workspace *was* a single git repo. The installed daemon's workspace is your
+  home directory, which is not a repo — so the watcher polled only `~`, detected
+  no commits, and the durability track never fired outside the standalone
+  `git-watch` subcommand. The watcher now discovers the repos you actually work
+  in from the AI-touched-paths ledger (a stat-only walk to each path's `.git`
+  root — no git spawns, off the 60s-timer's constant-time budget) and reconciles
+  each commit's attribution against that ledger through a workspace→repo path
+  translation. AI evidence recorded home-relative now matches commits in the
+  sub-repo that produced them; a file with no AI evidence stays `unknown` as
+  before. No change to what leaves the device (repo-relative paths, line ranges,
+  SHAs, workspace key — never contents).
+
 ## [0.9.1] — 2026-07-18
 
 ### Fixed

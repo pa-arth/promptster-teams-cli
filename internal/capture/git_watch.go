@@ -74,6 +74,236 @@ func gitWatchRootKey(root string) string {
 	return ingest.Sha256Hex(resolvePath(root))[:16]
 }
 
+// ledgerScope maps a polled repo root onto capture's AI ledgers, which are
+// anchored to the daemon's single workspace (session.TaskRoot) rather than to
+// each repo. In the autostart daemon TaskRoot is the HOME dir and `root` is a
+// repo discovered under it, so a path that capture recorded workspace-relative as
+// "<rel(home,root)>/<p>" under gitWatchRootKey(home) must be looked up WITH that
+// prefix. When root == taskRoot (the explicit-repo / dev / `git-watch`
+// subcommand case) the prefix is "" and the key is gitWatchRootKey(root), so
+// reconciliation is byte-for-byte what it was before repo discovery existed.
+type ledgerScope struct {
+	aiKey   string // the root key the ai-paths / bash-windows ledgers are stored under
+	prefix  string // POSIX rel(taskRoot, root) when root is UNDER taskRoot ("" == taskRoot)
+	absRoot string // resolved root, set when root is OUTSIDE taskRoot (evidence stored absolute)
+}
+
+// resolveLedgerScope computes the scope for reconciling `root`'s committed paths
+// against the ledgers, which capture ALWAYS anchors to the workspace
+// (session.TaskRoot) — every event is stamped with gitWatchRootKey(taskRoot) —
+// never to each polled repo. So the key is always the workspace key; only the
+// PATH form differs, matching exactly what RelativizeEventPaths stored:
+//
+//   - root UNDER taskRoot (the common daemon case: TaskRoot=home, repo under it):
+//     the path was rewritten workspace-relative, so look it up with the
+//     rel(taskRoot, root) prefix. rel is taken in resolvePath-canonical space so a
+//     symlinked home (macOS /var vs /private/var) cancels on both sides. When
+//     root == taskRoot the prefix is "" — byte-for-byte the pre-discovery behavior.
+//   - root OUTSIDE taskRoot (a discovered repo/worktree not under home — rare):
+//     RelativizeEventPaths leaves an out-of-workspace path UNREWRITTEN (absolute),
+//     so match by the absolute path under the same workspace key. Reading under
+//     the repo key here would miss the evidence entirely (it was never stored
+//     there) and silently attribute unknown.
+//
+// taskRoot == "" (no workspace, e.g. a malformed session) falls back to the
+// per-root key.
+func resolveLedgerScope(root, taskRoot string) ledgerScope {
+	if taskRoot == "" {
+		return ledgerScope{aiKey: gitWatchRootKey(root)}
+	}
+	rRoot := resolvePath(root)
+	rel, err := filepath.Rel(resolvePath(taskRoot), rRoot)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return ledgerScope{aiKey: gitWatchRootKey(taskRoot), absRoot: rRoot} // outside workspace
+	}
+	if rel == "." {
+		rel = ""
+	}
+	return ledgerScope{aiKey: gitWatchRootKey(taskRoot), prefix: filepath.ToSlash(rel)}
+}
+
+// ledgerPath translates a repo-relative committed path into the key the ai-paths
+// ledger stored it under: workspace-relative when the repo is under the workspace,
+// absolute when it is outside (see resolveLedgerScope).
+func (s ledgerScope) ledgerPath(committedRel string) string {
+	if s.absRoot != "" {
+		return filepath.ToSlash(filepath.Join(s.absRoot, committedRel))
+	}
+	if s.prefix == "" {
+		return committedRel
+	}
+	return s.prefix + "/" + committedRel
+}
+
+// gitRootOf walks up from dir to the nearest ancestor that is a git repo root
+// (its .git exists — reusing isGitRepoRoot), or ok=false at the filesystem root.
+// Stat-only per level, bounded by path depth: NO git spawn, so it stays off the
+// constant-time budget the poll loop guards.
+func gitRootOf(dir string) (string, bool) {
+	for {
+		if isGitRepoRoot(dir) {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // reached the filesystem root without finding .git
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+// discoverAiRepoRoots derives the repo roots to poll from capture's ai-paths
+// ledger, so the single autostart daemon (TaskRoot == HOME, not a repo) actually
+// polls the engineer's real repos instead of the un-pollable home dir. Every
+// AI-touched path is recorded workspace-relative under gitWatchRootKey(taskRoot),
+// so the repo that owns it is the nearest ancestor dir containing a .git — found
+// by a stat-only walk (gitRootOf), deduped. Bounded by the number of distinct
+// AI-touched files and each walk by path depth; runs on the 60s timer, never the
+// critical path, and spawns NO git.
+func discoverAiRepoRoots(taskRoot string) []string {
+	base := resolvePath(taskRoot)
+	seen := map[string]bool{}
+	dirRoot := map[string]string{} // memoize dir -> resolved repo root ("" = none)
+	var roots []string
+	for rel := range readAiTouchedPaths(gitWatchRootKey(taskRoot)) {
+		abs := rel
+		if !filepath.IsAbs(rel) {
+			abs = filepath.Join(base, rel)
+		}
+		dir := filepath.Dir(abs)
+		root, memoized := dirRoot[dir]
+		if !memoized {
+			if r, ok := gitRootOf(dir); ok {
+				root = r
+			}
+			dirRoot[dir] = root
+		}
+		if root != "" && !seen[root] {
+			seen[root] = true
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}
+
+// discoveredReposPath persists the repos git-watch has discovered so polling
+// SURVIVES the ai-paths ledger's 7-day expiry. Discovery from ai-paths alone
+// would stop polling a repo the moment its AI edits age out — but a durability
+// span matures at 30 days and is harvested only while its repo is still polled,
+// so a repo left AI-idle for a week would silently drop its pending durability /
+// rework verdicts. This file re-anchors polling to a durability-scale horizon.
+func discoveredReposPath() string {
+	return filepath.Join(state.StateDir(), "git-watch-repos.json")
+}
+
+// discoveredRepoTTL keeps a repo polled long enough after its last AI touch (or
+// last commit) to still observe a durability span maturing there even if the
+// engineer stops using AI in it. Comfortably above durabilityWindowMs (30d) so a
+// verdict is never missed to discovery expiry; the set stays bounded by the
+// number of repos the engineer actually works in regardless.
+var discoveredRepoTTLMs = durabilityWindowMs + 15*24*60*60*1000 // 30d + 15d slack
+
+const discoveredReposVersion = 1
+
+// discoveredRepos maps the opaque root key to the repo's on-disk path (a
+// LOCAL-only state file, never transmitted — the daemon plainly knows its own
+// repo paths) and the last time it had a reason to stay polled.
+type discoveredRepos struct {
+	V     int                          `json:"v"`
+	Repos map[string]discoveredRepoRow `json:"repos"`
+}
+
+type discoveredRepoRow struct {
+	Path string `json:"path"`
+	TsMs int64  `json:"tsMs"`
+}
+
+// loadDiscoveredRepos returns the paths of every persisted repo still within the
+// TTL. Expired rows are ignored (and compacted on the next refresh write).
+func loadDiscoveredRepos(nowMs int64) []string {
+	var paths []string
+	_ = sign.WithBufferLock(discoveredReposPath()+".lock", func() error {
+		data, err := os.ReadFile(discoveredReposPath())
+		if err != nil {
+			return nil
+		}
+		var onDisk discoveredRepos
+		if json.Unmarshal(data, &onDisk) != nil || onDisk.V != discoveredReposVersion {
+			return nil
+		}
+		for _, row := range onDisk.Repos {
+			if row.Path != "" && nowMs-row.TsMs <= discoveredRepoTTLMs {
+				paths = append(paths, row.Path)
+			}
+		}
+		return nil
+	})
+	return paths
+}
+
+// refreshDiscoveredRepos stamps nowMs onto every root that has a REASON to keep
+// being polled — fresh AI activity or a commit detected this poll — and prunes
+// rows past the TTL. A root that is merely idle (no AI, no commits) is NOT
+// refreshed, so it ages out after the durability horizon rather than being polled
+// forever. Best-effort: I/O failure never blocks a poll.
+func refreshDiscoveredRepos(roots []string, nowMs int64) {
+	if len(roots) == 0 {
+		return
+	}
+	_ = sign.WithBufferLock(discoveredReposPath()+".lock", func() error {
+		merged := discoveredRepos{V: discoveredReposVersion, Repos: map[string]discoveredRepoRow{}}
+		if data, err := os.ReadFile(discoveredReposPath()); err == nil {
+			var onDisk discoveredRepos
+			if json.Unmarshal(data, &onDisk) == nil && onDisk.Repos != nil {
+				merged.Repos = onDisk.Repos
+			}
+		}
+		for _, root := range roots {
+			merged.Repos[gitWatchRootKey(root)] = discoveredRepoRow{Path: root, TsMs: nowMs}
+		}
+		for key, row := range merged.Repos {
+			if nowMs-row.TsMs > discoveredRepoTTLMs {
+				delete(merged.Repos, key)
+			}
+		}
+		data, err := json.Marshal(merged)
+		if err != nil {
+			return err
+		}
+		tmp := discoveredReposPath() + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			return err
+		}
+		return os.Rename(tmp, discoveredReposPath())
+	})
+}
+
+// concatRoots flattens root slices into one, allocating fresh so no input slice
+// is aliased/mutated by a later append (the classic append-to-shared-backing bug).
+func concatRoots(lists ...[]string) []string {
+	var out []string
+	for _, l := range lists {
+		out = append(out, l...)
+	}
+	return out
+}
+
+// dedupRootsByKey collapses roots that resolve to the same repo (workspace root
+// and a discovered root can be different spellings of one dir), keeping the first
+// spelling so each repo is polled — and cursored — exactly once per cycle.
+func dedupRootsByKey(roots []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range roots {
+		k := resolvePath(r)
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // gitHead returns the root's current HEAD commit, or ok=false when there is no
 // commit yet (unborn branch) or the dir is not a git repo. A detached HEAD
 // still resolves — it is a real commit — so it is tracked normally.
@@ -257,9 +487,33 @@ func pollGitWatch(roots []string) map[string][]string {
 // we re-derive that key per root to recover the ROOT PATH the attribution engine
 // needs to run its one `git show` per commit.
 func pollGitWatchWorkspace(session Session) {
-	roots := workspaceMatchRoots(resolvePath(session.TaskRoot))
+	nowMs := time.Now().UnixMilli() // one clock read, threaded to every pass
+
+	// The poll set is three sources unioned and deduped:
+	//   1. workspace roots (workspace + its worktrees) — the explicit case;
+	//   2. repos discovered from the ai-paths ledger — what makes the autostart
+	//      daemon work at all (its TaskRoot is the un-pollable HOME dir, so without
+	//      discovery the set is just [home] and nothing is ever detected);
+	//   3. repos persisted from earlier polls — so a repo keeps being polled across
+	//      the 30-day durability horizon even after its AI edits age out of the
+	//      7-day ai-paths ledger (else its maturing verdicts would be silently lost).
+	aiRoots := discoverAiRepoRoots(session.TaskRoot)
+	roots := dedupRootsByKey(concatRoots(
+		workspaceMatchRoots(resolvePath(session.TaskRoot)),
+		aiRoots,
+		loadDiscoveredRepos(nowMs),
+	))
 	detected := pollGitWatch(roots)
-	nowMs := time.Now().UnixMilli() // one clock read, threaded to both passes
+
+	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
+	// detected this poll. A merely-idle repo is left to age out after the horizon.
+	keep := append([]string{}, aiRoots...)
+	for _, root := range roots {
+		if len(detected[gitWatchRootKey(root)]) > 0 {
+			keep = append(keep, root)
+		}
+	}
+	refreshDiscoveredRepos(keep, nowMs)
 
 	// Durability advances on the DEFAULT branch only (its own cursor), so it is
 	// driven separately from the working-HEAD attribution loop. It MUST run BEFORE

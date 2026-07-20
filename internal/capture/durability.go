@@ -350,7 +350,14 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	}
 	hunks := parseUnifiedDiffHunks(diff)
 	diffNewLines := parseUnifiedDiffNewLines(diff)
-	aiPaths := readAiTouchedPaths(rootKey)
+	// The ai-paths ledger is anchored to the workspace (session.TaskRoot), not this
+	// polled repo — in the daemon a discovered sub-repo's paths are stored
+	// HOME-relative under the HOME key. Read/look up through the scope so seeding
+	// sees the AI evidence; when root == taskRoot the scope is the identity. (The
+	// per-root rootKey still keys fingerprints and the durability cursor below —
+	// those are git-watch's own on-device state, correctly per-repo.)
+	scope := resolveLedgerScope(root, session.TaskRoot)
+	aiPaths := readAiTouchedPaths(scope.aiKey)
 
 	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
 	// ledger lock, so the ledger's read-modify-write never nests another lock.
@@ -401,7 +408,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 					r.BornTsMs = nowMs
 					seeded = append(seeded, r)
 				}
-			} else if _, isAI := aiPaths[path]; isAI {
+			} else if _, isAI := aiPaths[scope.ledgerPath(path)]; isAI {
 				lineage := durLineageID(sha, path)
 				for _, r := range newSideAiRanges(hs) {
 					r.LineageID = lineage

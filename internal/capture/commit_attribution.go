@@ -80,7 +80,7 @@ var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // false when nothing changed (empty diff / no new-side ranges), which suppresses
 // emission. `--unified=0`/`--format=`/`--root` keep the diff tight and header-free
 // (message/author never enter the buffer).
-func commitAttributionFromDiff(root, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
+func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
 	diff, ok = gitCommitRawDiff(root, sha)
 	if !ok || diff == "" {
 		return "", nil, "", false
@@ -89,10 +89,14 @@ func commitAttributionFromDiff(root, sha string) (diff string, files []attrFile,
 	if len(fileRanges) == 0 {
 		return "", nil, "", false
 	}
-	// Scope BOTH ledger reads to THIS workspace's root key so a same-named path
-	// AI-touched (or bash-touched) in a DIFFERENT repo can't bleed in.
-	rootKey := gitWatchRootKey(root)
-	files, primarySession = reconcileCommitAttribution(root, fileRanges, readAiTouchedPaths(rootKey), readBashWindows(rootKey))
+	// The ledgers are anchored to the workspace (taskRoot), not to each polled
+	// repo — in the daemon taskRoot is HOME and root is a repo discovered under it.
+	// The scope reads under the workspace key and translates each committed,
+	// repo-relative path into the workspace-relative key it was stored under. When
+	// root == taskRoot (explicit repo) the scope is the identity. Scoping to one
+	// key also keeps a same-named path AI-touched in a DIFFERENT repo from bleeding in.
+	scope := resolveLedgerScope(root, taskRoot)
+	files, primarySession = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
 	return diff, files, primarySession, true
 }
 
@@ -157,7 +161,7 @@ func parseDiffNewPath(s string) string {
 // transcript ranges vs committed ranges is a later refinement — the transcript
 // ranges are pre-formatter and won't line up 1:1 with the committed lines
 // anyway, so path-level + committed-bytes is the defensible first cut.
-func reconcileCommitAttribution(root string, fileRanges map[string][]attrLineRange, aiPaths map[string]string, bashWindows []bashWindow) (files []attrFile, primarySession string) {
+func reconcileCommitAttribution(root string, scope ledgerScope, fileRanges map[string][]attrLineRange, aiPaths map[string]string, bashWindows []bashWindow) (files []attrFile, primarySession string) {
 	paths := make([]string, 0, len(fileRanges))
 	for p := range fileRanges {
 		paths = append(paths, p)
@@ -179,11 +183,12 @@ func reconcileCommitAttribution(root string, fileRanges map[string][]attrLineRan
 		//      Phase-2 commit-joined ledger will resolve this per-line/per-commit.
 		//      The bash-mtime recovery pass below shares this residual: a human
 		//      save landing inside an AI bash window is recovered as likely_ai.
-		//   3. Sibling-worktree note: aiPaths keys are relativized against
-		//      session.TaskRoot, while `path` is relative to the git root polled.
-		//      For a SIBLING worktree (root != TaskRoot) the keys differ, so AI
-		//      evidence there reads as `unknown` — a conservative under-attribution.
-		if sid, ok := aiPaths[path]; ok {
+		//   3. aiPaths keys are relativized against the workspace (session.TaskRoot),
+		//      while `path` is relative to the git root polled. scope.ledgerPath
+		//      bridges them: it prepends rel(taskRoot, root) so a commit in a repo
+		//      DISCOVERED under the daemon's HOME workspace matches its home-relative
+		//      ledger key. When root == taskRoot the translation is the identity.
+		if sid, ok := aiPaths[scope.ledgerPath(path)]; ok {
 			attribution = attributionLikelyAI
 			session = sid
 		} else if sid, ok := recoverBashSession(root, path, bashWindows); ok {
@@ -306,7 +311,7 @@ func mostFrequentSession(counts map[string]int) string {
 // projector's element allowlist can walk. Assigning the struct straight to Data
 // would silently ship {} (see eventDataMap's header).
 func buildCommitAttributionEvent(session Session, root, sha string) (event.Event, bool) {
-	_, files, primarySession, ok := commitAttributionFromDiff(root, sha)
+	_, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
 		return event.Event{}, false
 	}
@@ -376,7 +381,7 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 // the per-commit budget constant-time. attributeCommit is the preMerge=false
 // entry point for callers (and tests) that only want attribution.
 func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) {
-	diff, files, primarySession, ok := commitAttributionFromDiff(root, sha)
+	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
 		return
 	}
