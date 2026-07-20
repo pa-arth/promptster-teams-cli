@@ -83,12 +83,19 @@ func TestResolveLedgerScope(t *testing.T) {
 		t.Fatalf("translated ledgerPath = %q, want repos/proj/foo.go", got)
 	}
 
-	// 3. root NOT under taskRoot (a discovered repo outside home — rare): fall back
-	//    to the per-root key with no prefix (conservative, prior behavior).
+	// 3. root OUTSIDE taskRoot (a repo not under home — rare): capture stored its
+	//    evidence UNDER the workspace key as an ABSOLUTE path (RelativizeEventPaths
+	//    leaves out-of-workspace paths unrewritten), so the scope must still read
+	//    under the HOME key and look the path up by its absolute form. Reading under
+	//    the repo key would miss the evidence entirely.
 	other := t.TempDir()
 	s = resolveLedgerScope(other, home)
-	if s.aiKey != gitWatchRootKey(other) || s.prefix != "" {
-		t.Fatalf("not-under-home: got key=%q prefix=%q, want per-root key %q, no prefix", s.aiKey, s.prefix, gitWatchRootKey(other))
+	if s.aiKey != gitWatchRootKey(home) {
+		t.Fatalf("outside-home: key=%q, want home key %q (evidence was stored under it)", s.aiKey, gitWatchRootKey(home))
+	}
+	wantAbs := filepath.ToSlash(filepath.Join(resolvePath(other), "x.go"))
+	if got := s.ledgerPath("x.go"); got != wantAbs {
+		t.Fatalf("outside-home ledgerPath = %q, want absolute %q", got, wantAbs)
 	}
 }
 
@@ -160,6 +167,41 @@ func TestCommitAttributionTranslatesHomeAnchoredLedger(t *testing.T) {
 	}
 }
 
+// TestCommitAttributionOutsideWorkspace: a repo OUTSIDE the workspace (e.g. code
+// kept in /work while home is the workspace). RelativizeEventPaths leaves such a
+// path ABSOLUTE under the workspace key, so attribution must match by absolute
+// path — reading under the repo key would miss it and attribute unknown.
+func TestCommitAttributionOutsideWorkspace(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	repo := t.TempDir() // a sibling of home, NOT under it
+	git, gitOut := gitRepoAt(t, repo)
+
+	writeCommitFile(t, repo, "foo.go", "package main\n\nfunc main() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "add foo")
+	sha := gitOut("rev-parse", "HEAD")
+
+	// Capture stored the out-of-workspace evidence ABSOLUTE, under the HOME key
+	// (mirrors RelativizeEventPaths leaving a `..`-relative path unrewritten).
+	absFoo := filepath.ToSlash(filepath.Join(resolvePath(repo), "foo.go"))
+	recordAiTouchedPath("ai-sess-ext", gitWatchRootKey(home), absFoo)
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: home}, repo, sha)
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	if ev.SessionID != "ai-sess-ext" {
+		t.Errorf("sessionId = %q, want ai-sess-ext (absolute-path match failed)", ev.SessionID)
+	}
+	f := filesByPath(t, ev)["foo.go"]
+	for _, r := range f["lineRanges"].([]interface{}) {
+		if rm := r.(map[string]interface{}); rm["attribution"] != attributionLikelyAI {
+			t.Errorf("attribution = %v, want likely_ai", rm["attribution"])
+		}
+	}
+}
+
 // TestPollGitWatchWorkspaceDaemonMode is the end-to-end proof that the durability
 // track actually fires in the installed daemon: TaskRoot is a non-repo HOME, the
 // engineer's real repo lives under it, and a new AI-authored commit there produces
@@ -213,6 +255,42 @@ func TestPollGitWatchWorkspaceDaemonMode(t *testing.T) {
 		if rm := r.(map[string]interface{}); rm["attribution"] != attributionLikelyAI {
 			t.Errorf("attribution = %v, want likely_ai", rm["attribution"])
 		}
+	}
+}
+
+// TestDiscoveredReposSurviveAiPathsExpiry: a repo persisted from an earlier poll
+// keeps being polled even when the ai-paths ledger no longer references it — so a
+// durability span maturing in a repo the engineer stopped AI-editing is still
+// harvested. The persisted horizon is durability-scale (>30d), well past the
+// 7-day ai-paths TTL that would otherwise drop the repo.
+func TestDiscoveredReposSurviveAiPathsExpiry(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	gitRepoAt(t, repo)
+
+	nowMs := int64(1_000_000_000_000)
+
+	// The repo was discovered on an earlier poll and persisted, but its AI paths
+	// have since aged out of the ai-paths ledger (nothing recorded there now).
+	refreshDiscoveredRepos([]string{repo}, nowMs)
+
+	// discoverAiRepoRoots (ai-paths only) finds nothing…
+	if roots := discoverAiRepoRoots(home); len(roots) != 0 {
+		t.Fatalf("ai-paths discovery should be empty, got %v", roots)
+	}
+	// …but the persisted ledger still yields the repo, both now and 20 days later
+	// (past the 7-day ai-paths TTL, inside the durability horizon).
+	if got := loadDiscoveredRepos(nowMs); len(got) != 1 || resolvePath(got[0]) != resolvePath(repo) {
+		t.Fatalf("persisted repo not returned now: %v", got)
+	}
+	twentyDaysLater := nowMs + 20*24*60*60*1000
+	if got := loadDiscoveredRepos(twentyDaysLater); len(got) != 1 {
+		t.Fatalf("persisted repo dropped after 20d (inside horizon): %v", got)
+	}
+	// Well past the horizon, an idle repo ages out.
+	if got := loadDiscoveredRepos(nowMs + discoveredRepoTTLMs + 1); len(got) != 0 {
+		t.Fatalf("repo should have aged out past the horizon: %v", got)
 	}
 }
 
