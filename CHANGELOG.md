@@ -6,7 +6,29 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-07-20
+
+### Added
+- **Canonical per-session repository identity (`repoRoot`).** Each session now
+  emits the repository it ran in as a stable `owner/name` git-remote slug (or, for
+  a repo with no remote / a non-git directory, a non-reversible opaque hash),
+  independent of how deep in the tree you were — repo root, a subdirectory, or a
+  worktree all resolve to the **same** identity. This lets the dashboard attribute
+  a session to the right repo and join it to merged pull requests exactly, instead
+  of guessing from a directory name (which split one repo into several rows and
+  missed the PR count when you worked from a subdirectory). Only the public
+  `owner/name` slug or a non-reversible hash leaves the device — never a
+  filesystem path. `workdir` is unchanged (it still identifies the specific
+  checkout/worktree).
+
 ### Fixed
+- **Config census now reports one entry per repository, not one for your home
+  folder.** The autostart daemon runs with its working directory set to `~`, so a
+  single `config_census` was emitted keyed to your home directory — which is not a
+  repo — leaving per-repo CLAUDE.md/skills/MCP coverage reading empty (0%). The
+  daemon now discovers the repositories you actually work in and emits one census
+  per repo, each keyed to its canonical identity; a home directory with no repo
+  yields a device-only census rather than a fake pseudo-repo.
 - **Commit attribution now works in the autostart daemon.** The 0.9.0 git
   watcher (`commit_attribution`, `durability_verdict`, `rework_verdict`) assumed
   its workspace *was* a single git repo. The installed daemon's workspace is your
