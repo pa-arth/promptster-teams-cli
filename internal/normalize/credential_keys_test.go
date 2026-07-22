@@ -42,6 +42,12 @@ func TestHarvestReturnsNilForNonCredentialFiles(t *testing.T) {
 		"package.json",
 		"src/config.ts",
 		"~/.ssh/id_ed25519",
+		// Credential files whose key syntax cannot survive the identifier
+		// filter. Classifying them as harvestable and then dropping every key
+		// would read downstream as "we looked and found none" — see the scope
+		// note in isCredentialKeyValueFile.
+		"~/.npmrc",
+		"~/.pypirc",
 	} {
 		if got := HarvestCredentialKeyNames(path, "KEY="+valueCanary); got != nil {
 			t.Fatalf("%s: expected nil, got %v", path, got)

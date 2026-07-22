@@ -83,10 +83,25 @@ func isCredentialKeyValueFile(path string) bool {
 		return true
 	}
 
-	// Package-registry auth files — both are `key=value`.
-	if base == ".npmrc" || base == ".pypirc" {
-		return true
-	}
+	// NOT harvested, though they are `key=value` files and the backend DOES
+	// classify them as credential findings:
+	//
+	//   .npmrc   — the only key that matters is `//registry.npmjs.org/:_authToken`
+	//              (verified against a real file). Slashes, dots and a colon: it
+	//              cannot pass isIdentifierName, and it never will.
+	//   .pypirc  — INI whose keys are `username` / `password`. Identifier-shaped,
+	//              but "this file contains a password" is what the PATH already
+	//              said; the name adds nothing to a rotation list.
+	//
+	// Listing them here would classify the file as harvestable and then drop
+	// every key from it, which reads downstream as "we looked inside and found
+	// no keys" — the exact ABSENT-vs-EMPTY lie this feature is built to avoid.
+	// Better to leave the field absent and let the path speak for itself.
+	//
+	// The alternative — widening isIdentifierName to admit `.`, `-`, `/` and `:` —
+	// is the wrong trade. Those characters are near-universal in secret VALUES,
+	// and the charset is the second of only two filters standing between a
+	// malformed parse and an arbitrary string on the wire.
 
 	return false
 }
