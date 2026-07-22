@@ -534,10 +534,19 @@ func TestProjectEventCredentialKeysClamp(t *testing.T) {
 			in:   []interface{}{"A_KEY", "A_KEY", "B_KEY"},
 			want: []interface{}{"A_KEY", "B_KEY"},
 		},
+		// A rejected harvest must leave the field ABSENT, not `[]`. An empty
+		// array reads downstream as "we looked inside the file and it had no
+		// keys" — a fabricated all-clear on the one surface whose job is naming
+		// what to rotate. Absence reads as "no harvest", which is the truth.
 		{
-			name: "a non-array value cannot ride through as itself",
+			name: "a non-array value cannot ride through as itself — and leaves NO field",
 			in:   leakCanary,
-			want: []interface{}{},
+			want: nil,
+		},
+		{
+			name: "every element rejected leaves NO field, never an empty array",
+			in:   []interface{}{"has space", "9leading", "postgres://u:p@h/db", 42, nil},
+			want: nil,
 		},
 	}
 
@@ -549,6 +558,22 @@ func TestProjectEventCredentialKeysClamp(t *testing.T) {
 			})
 			ProjectEvent(&e, false)
 			data := e.Data.(map[string]interface{})
+			if tc.want == nil {
+				if raw, present := data["credentialKeys"]; present {
+					t.Fatalf("credentialKeys must be ABSENT when nothing survives, got %#v", raw)
+				}
+				encoded, err := json.Marshal(data)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				if strings.Contains(string(encoded), "credentialKeys") {
+					t.Fatalf("credentialKeys reached the wire: %s", encoded)
+				}
+				if strings.Contains(string(encoded), leakCanary) {
+					t.Fatalf("canary survived projection: %s", encoded)
+				}
+				return
+			}
 			got, isArray := data["credentialKeys"].([]interface{})
 			if !isArray {
 				t.Fatalf("credentialKeys must project to an array, got %#v", data["credentialKeys"])

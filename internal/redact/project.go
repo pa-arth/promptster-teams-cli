@@ -719,7 +719,14 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 			continue
 		}
 		if clamp, hasClamp := stringClamps[key]; hasClamp {
-			projected[key] = projectStringArray(value, clamp)
+			// Drop to ABSENT, never to `[]`. If the field arrived malformed, or
+			// every element failed the shape/length test, an empty array on the
+			// wire reads downstream as "we harvested this file and it had no
+			// keys" — a fabricated all-clear on a security surface. Absence
+			// says "no harvest", which is the truth.
+			if clamped := projectStringArray(value, clamp); len(clamped) > 0 {
+				projected[key] = clamped
+			}
 			continue
 		}
 		projected[key] = value

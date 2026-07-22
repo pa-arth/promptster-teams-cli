@@ -124,10 +124,15 @@ func HarvestCredentialKeyNames(path, content string) []string {
 	var names []string
 	seen := make(map[string]struct{})
 
-	for i, line := range strings.Split(content, "\n") {
-		if i >= maxScanLines || len(names) >= maxKeyNames {
-			break
-		}
+	// Cut one line at a time rather than strings.Split: Split materializes a
+	// slice header for EVERY line in the body up front, so a pathological file
+	// with millions of short lines would allocate proportional to the whole blob
+	// before maxScanLines ever got a chance to stop us. The bound is meant to cap
+	// work, and this is what actually makes it do that.
+	rest := content
+	for i := 0; i < maxScanLines && len(names) < maxKeyNames && rest != ""; i++ {
+		var line string
+		line, rest, _ = strings.Cut(rest, "\n")
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
