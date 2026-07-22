@@ -85,11 +85,9 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 			buf.WriteString("false")
 		}
 	case string:
-		b, err := json.Marshal(x)
-		if err != nil {
+		if err := writeJSONString(buf, x); err != nil {
 			return err
 		}
-		buf.Write(b)
 	case float64:
 		// json.Unmarshal decodes all numbers as float64. Emit integer form when
 		// the value has no fractional component — matches TS JSON.stringify.
@@ -131,11 +129,9 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 				buf.WriteByte(',')
 			}
 			first = false
-			kb, err := json.Marshal(k)
-			if err != nil {
+			if err := writeJSONString(buf, k); err != nil {
 				return err
 			}
-			buf.Write(kb)
 			buf.WriteByte(':')
 			if err := writeCanonical(buf, val); err != nil {
 				return err
@@ -155,6 +151,23 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 		}
 		return writeCanonical(buf, reparsed)
 	}
+	return nil
+}
+
+// writeJSONString mirrors JSON.stringify's string escaping. encoding/json's
+// default HTML-safe mode rewrites &, < and > as \u0026/\u003c/\u003e. Those are
+// semantically equivalent JSON but NOT byte-equivalent inside the SHA-256 data
+// hash, so shell commands such as `a && b > out` signed in Go failed verification
+// in the TypeScript backend. Disable HTML escaping for both values and object
+// keys; trim Encoder's one framing newline.
+func writeJSONString(buf *strings.Builder, s string) error {
+	var encoded strings.Builder
+	enc := json.NewEncoder(&encoded)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return err
+	}
+	buf.WriteString(strings.TrimSuffix(encoded.String(), "\n"))
 	return nil
 }
 

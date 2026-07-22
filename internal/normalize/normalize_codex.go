@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +34,11 @@ type codexPendingCall struct {
 	args map[string]interface{}
 }
 
+type codexRunningCall struct {
+	call   codexPendingCall
+	callID string
+}
+
 // codexRolloutProcessor converts codex rollout JSONL lines into canonical
 // Events. It is stateful: function-call lines are correlated with their
 // *_output lines by call_id, and the latest token usage is attached to the next
@@ -40,6 +46,7 @@ type codexPendingCall struct {
 type CodexRolloutProcessor struct {
 	sessionID      string
 	pending        map[string]codexPendingCall
+	running        map[string]codexRunningCall
 	lastTokenUsage map[string]interface{}
 	// workdir is the session's cwd, home-collapsed to "~/…", captured from the
 	// session_meta header (the ONLY codex rollout line that carries cwd). It is
@@ -74,6 +81,7 @@ func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
 	return &CodexRolloutProcessor{
 		sessionID: sessionID,
 		pending:   map[string]codexPendingCall{},
+		running:   map[string]codexRunningCall{},
 	}
 }
 
@@ -306,13 +314,22 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 	switch stringField(payload, "type") {
 	case "function_call", "custom_tool_call":
 		name := stringField(payload, "name")
+		args := parseCodexArgs(payload)
+		// Newer Codex hosts expose one generic custom tool named `exec`. Its input
+		// is a small JavaScript orchestration program which calls the real tool
+		// (`tools.exec_command`, `tools.update_plan`, `tools.apply_patch`, ...).
+		// Unwrap the tool identity here so shell/planning/edit telemetry does not
+		// collapse into an empty generic tool_use event. Direct codex-cli calls are
+		// left unchanged for backwards compatibility.
+		if name == "exec" {
+			name, args = unwrapCodexExec(args)
+		}
 		// apply_patch is reported via the richer event_msg/patch_apply_end; skip
 		// the call line so we don't double-count file edits.
 		if name == "apply_patch" {
 			return nil
 		}
 		callID := stringField(payload, "call_id")
-		args := parseCodexArgs(payload)
 		if callID != "" {
 			p.pending[callID] = codexPendingCall{name: name, args: args}
 		}
@@ -325,7 +342,31 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 			return nil
 		}
 		delete(p.pending, callID)
-		output := stringField(payload, "output")
+		output := codexOutputText(payload["output"])
+		// Current hosts detach long-running exec_command calls and complete them
+		// through one or more write_stdin calls. Hold the original command until
+		// completion so we never report the handoff as a false exitCode=0, and use
+		// the original call id so replay remains deterministic.
+		if isCodexShellTool(call.name) {
+			if cellID := codexRunningCellID(output); cellID != "" {
+				p.running[cellID] = codexRunningCall{call: call, callID: callID}
+				return nil
+			}
+		}
+		if call.name == "write_stdin" {
+			cellID := stringField(call.args, "session_id")
+			if running, ok := p.running[cellID]; ok {
+				if nextID := codexRunningCellID(output); nextID != "" {
+					if nextID != cellID {
+						delete(p.running, cellID)
+						p.running[nextID] = running
+					}
+					return nil
+				}
+				delete(p.running, cellID)
+				return p.emitToolEvent(running.call, running.callID, output, ts, raw)
+			}
+		}
 		return p.emitToolEvent(call, callID, output, ts, raw)
 
 	default:
@@ -341,8 +382,25 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 // tool_use_id.
 func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, output, ts, raw string) []event.Event {
 	switch {
+	case call.name == "wrapped_apply_patch":
+		return p.emitWrappedPatch(call, callID, ts, raw)
+
 	case isCodexShellTool(call.name):
 		cmd := codexCommandString(call.args)
+		// The backend's canonical command schema requires a non-empty invocation.
+		// Current exec wrappers occasionally build arguments indirectly, where the
+		// narrow non-evaluating extractor cannot recover cmd safely. Preserve the
+		// tool occurrence without fabricating an empty command or retaining wrapper
+		// source; a future parser can widen this only with a pinned safe shape.
+		if strings.TrimSpace(cmd) == "" {
+			e := p.newCodexEvent("tool_use", ts, callID)
+			e.Data = map[string]interface{}{
+				"tool":   call.name,
+				"status": codexToolStatus(output),
+			}
+			e.RawPayload = raw
+			return []event.Event{e}
+		}
 		exitCode, stdout := parseCodexExecOutput(output)
 		e := p.newCodexEvent("command", ts, callID)
 		e.Provenance = event.AIProvenance()
@@ -379,9 +437,8 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, out
 	default:
 		e := p.newCodexEvent("tool_use", ts, callID)
 		e.Data = map[string]interface{}{
-			"toolName":     call.name,
-			"inputPreview": jsonPreview(call.args, 100),
-			"ok":           true,
+			"tool":   call.name,
+			"status": codexToolStatus(output),
 		}
 		e.RawPayload = raw
 		return []event.Event{e}
@@ -419,6 +476,221 @@ func isCodexShellTool(name string) bool {
 		return true
 	}
 	return false
+}
+
+// unwrapCodexExec recovers the real tool identity from the JavaScript wrapper
+// used by current Codex hosts. Only narrowly-recognized tool calls are lifted;
+// unknown programs remain generic `exec` tool_use events. The wrapper source is
+// never emitted. For shell commands we recover only the cmd string (which the
+// source-exclusion projector subsequently applies its inline-code scrub to).
+func unwrapCodexExec(args map[string]interface{}) (string, map[string]interface{}) {
+	input := stringField(args, "input")
+	switch {
+	case strings.Contains(input, "tools.exec_command("):
+		out := map[string]interface{}{}
+		if cmd := extractJSObjectStringField(input, "cmd"); cmd != "" {
+			out["cmd"] = cmd
+		}
+		return "exec_command", out
+	case strings.Contains(input, "tools.update_plan("):
+		return "update_plan", map[string]interface{}{}
+	case strings.Contains(input, "tools.apply_patch("):
+		out := map[string]interface{}{}
+		if patch := extractJSCallStringArg(input, "tools.apply_patch"); patch != "" {
+			out["patch"] = patch
+		}
+		// Keep this distinct from a direct apply_patch call: direct codex-cli also
+		// emits patch_apply_end and is skipped above, while the wrapper has no such
+		// companion record and must derive content-free file metadata itself.
+		return "wrapped_apply_patch", out
+	case strings.Contains(input, "tools.write_stdin("):
+		out := map[string]interface{}{}
+		if id := extractJSNumericField(input, "session_id"); id != "" {
+			out["session_id"] = id
+		}
+		return "write_stdin", out
+	default:
+		return "exec", map[string]interface{}{}
+	}
+}
+
+var jsCmdFieldRe = regexp.MustCompile(`(?s)\bcmd\s*:\s*("(?:\\.|[^"\\])*")`)
+
+func extractJSNumericField(input, field string) string {
+	re := regexp.MustCompile(`\b` + regexp.QuoteMeta(field) + `\s*:\s*(\d+)`)
+	m := re.FindStringSubmatch(input)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+func extractJSObjectStringField(input, field string) string {
+	if field != "cmd" { // keep the parser deliberately narrow
+		return ""
+	}
+	m := jsCmdFieldRe.FindStringSubmatch(input)
+	if m == nil {
+		return ""
+	}
+	s, err := strconv.Unquote(m[1])
+	if err != nil {
+		return ""
+	}
+	return s
+}
+
+// extractJSCallStringArg extracts a JSON-style double-quoted first argument.
+// Codex serializes the wrapper this way today. Refuse other JavaScript syntax
+// rather than attempting to evaluate it or accidentally retaining source.
+func extractJSCallStringArg(input, callee string) string {
+	start := strings.Index(input, callee+"(")
+	if start < 0 {
+		return ""
+	}
+	rest := strings.TrimSpace(input[start+len(callee)+1:])
+	if rest == "" {
+		return ""
+	}
+	if rest[0] != '"' {
+		// functions.exec commonly assigns a large patch to a local first:
+		//   const patch = "..."; await tools.apply_patch(patch)
+		// Resolve only a plain identifier bound to a double-quoted literal. Never
+		// evaluate expressions or template strings.
+		end := 0
+		for end < len(rest) && ((rest[end] >= 'a' && rest[end] <= 'z') ||
+			(rest[end] >= 'A' && rest[end] <= 'Z') ||
+			(rest[end] >= '0' && rest[end] <= '9') || rest[end] == '_') {
+			end++
+		}
+		if end == 0 {
+			return ""
+		}
+		name := rest[:end]
+		for _, decl := range []string{"const ", "let ", "var "} {
+			assign := decl + name
+			idx := strings.Index(input, assign)
+			if idx < 0 {
+				continue
+			}
+			value := strings.TrimSpace(input[idx+len(assign):])
+			if !strings.HasPrefix(value, "=") {
+				continue
+			}
+			rest = strings.TrimSpace(strings.TrimPrefix(value, "="))
+			break
+		}
+	}
+	if rest == "" || rest[0] != '"' {
+		return ""
+	}
+	for i := 1; i < len(rest); i++ {
+		if rest[i] != '"' {
+			continue
+		}
+		backslashes := 0
+		for j := i - 1; j >= 0 && rest[j] == '\\'; j-- {
+			backslashes++
+		}
+		if backslashes%2 != 0 {
+			continue
+		}
+		s, err := strconv.Unquote(rest[:i+1])
+		if err == nil {
+			return s
+		}
+		return ""
+	}
+	return ""
+}
+
+// codexOutputText accepts both the legacy scalar output and the current
+// Responses-style content array: [{type:"input_text", text:"..."}, ...].
+func codexOutputText(v interface{}) string {
+	switch out := v.(type) {
+	case string:
+		return out
+	case []interface{}:
+		parts := make([]string, 0, len(out))
+		for _, item := range out {
+			m, _ := item.(map[string]interface{})
+			if text := stringField(m, "text"); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}
+
+func codexToolStatus(output string) string {
+	if strings.Contains(strings.ToLower(output), "script failed") {
+		return "failed"
+	}
+	return "completed"
+}
+
+var codexRunningCellRe = regexp.MustCompile(`(?m)^Script running with cell ID ([0-9]+)\s*$`)
+
+func codexRunningCellID(output string) string {
+	m := codexRunningCellRe.FindStringSubmatch(output)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
+// emitWrappedPatch reduces an apply_patch envelope to paths and line counts.
+// Patch bodies stay only in transient normalizer memory and are never attached
+// to the event; the normal source-exclusion pass remains a second backstop.
+func (p *CodexRolloutProcessor) emitWrappedPatch(call codexPendingCall, callID, ts, raw string) []event.Event {
+	patch := stringField(call.args, "patch")
+	if patch == "" {
+		return nil
+	}
+	type change struct {
+		path           string
+		added, removed int
+	}
+	var changes []change
+	current := -1
+	for _, line := range strings.Split(patch, "\n") {
+		var path string
+		for _, prefix := range []string{"*** Add File: ", "*** Update File: ", "*** Delete File: "} {
+			if strings.HasPrefix(line, prefix) {
+				path = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				break
+			}
+		}
+		if path != "" {
+			changes = append(changes, change{path: path})
+			current = len(changes) - 1
+			continue
+		}
+		if current < 0 || strings.HasPrefix(line, "*** ") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if strings.HasPrefix(line, "+") {
+			changes[current].added++
+		} else if strings.HasPrefix(line, "-") {
+			changes[current].removed++
+		}
+	}
+	events := make([]event.Event, 0, len(changes))
+	for _, c := range changes {
+		e := p.newCodexEvent("file_diff", ts, callID+"\x1f"+c.path)
+		e.Provenance = event.AIProvenance()
+		e.Data = map[string]interface{}{
+			"path":         c.path,
+			"linesAdded":   c.added,
+			"linesRemoved": c.removed,
+		}
+		// RawPayload deliberately excludes the wrapper/patch source.
+		e.RawPayload = "wrapped apply_patch"
+		events = append(events, e)
+	}
+	return events
 }
 
 func isCodexMCPTool(name string) bool {
