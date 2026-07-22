@@ -539,8 +539,16 @@ func inventoryLiving(session Session, root, rootKey string, nowMs int64) []event
 	}
 	var due []snapshot
 	mutateDurabilityLedger(func(led *durabilityLedger) {
-		if nowMs-led.Inventoried[rootKey] < durabilityInventoryIntervalMs {
-			return // throttled; a zero/missing entry means "never" and always fires
+		last := led.Inventoried[rootKey]
+		// A zero/missing entry means "never inventoried" and always fires. A FUTURE
+		// entry means the host clock moved BACKWARDS (an NTP correction, a laptop
+		// resumed from suspend, a VM snapshot): nowMs-last goes negative, which is
+		// trivially < the interval, so a naive check would suppress every inventory
+		// until wall time caught back up — a multi-day hole in the survival series
+		// caused by a clock, not by the code. Treat a future stamp as due; the emit
+		// below overwrites it with a sane one.
+		if last != 0 && nowMs >= last && nowMs-last < durabilityInventoryIntervalMs {
+			return // throttled
 		}
 		files := led.Roots[rootKey]
 		if len(files) == 0 {
@@ -556,13 +564,6 @@ func inventoryLiving(session Session, root, rootKey string, nowMs int64) []event
 			copy(cp, ranges)
 			due = append(due, snapshot{path: path, living: cp})
 		}
-		if len(due) == 0 {
-			return
-		}
-		if led.Inventoried == nil {
-			led.Inventoried = map[string]int64{}
-		}
-		led.Inventoried[rootKey] = nowMs
 	})
 	if len(due) == 0 {
 		return nil
@@ -575,9 +576,28 @@ func inventoryLiving(session Session, root, rootKey string, nowMs int64) []event
 	for _, s := range due {
 		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, s.path, nil, nil, s.living, nowMs))
 	}
+	delivered := false
 	for i := range verdicts {
-		emitDurabilityVerdict(verdicts[i])
+		if err := emitDurabilityVerdict(verdicts[i]); err == nil {
+			delivered = true
+		}
 	}
+	// The throttle is stamped AFTER delivery, deliberately. Stamping it in the read
+	// pass above would burn the daily slot even when the outbox was unwritable
+	// (disk full, permissions, a half-migrated state dir) — the inventory would be
+	// silently skipped for 24h and that day would be missing from survival forever.
+	// Re-emitting instead is cheap and safe: living verdicts are PROVISIONAL, and
+	// the backend folds a lineage's living entries by max measuredTsMs, so a
+	// duplicate inventory of the same spans collapses to one.
+	if !delivered {
+		return verdicts
+	}
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		if led.Inventoried == nil {
+			led.Inventoried = map[string]int64{}
+		}
+		led.Inventoried[rootKey] = nowMs
+	})
 	return verdicts
 }
 
@@ -645,12 +665,18 @@ func buildDurabilityVerdict(session Session, root, sha, path string, durable, ch
 
 // emitDurabilityVerdict funnels a verdict through the SAME sign/redact/queue
 // path as every captured event, reusing the shared outbox drain singleton (it
-// never starts its own). Best-effort — matches emitCommitAttribution.
-func emitDurabilityVerdict(ev event.Event) {
+// never starts its own). Best-effort — matches emitCommitAttribution — but it
+// RETURNS the outbox error so a caller that gates state on delivery can see it.
+// The outbox is the leg that reaches the backend; the local buffer is the signed
+// audit copy, so a buffer-only failure is not a lost verdict. Callers that don't
+// care (churn at commit time, the durable harvest) discard the return.
+func emitDurabilityVerdict(ev event.Event) error {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("durability verdict buffer error: %v", err)
 	}
 	if err := outbox.Append(ev); err != nil {
 		state.HookDebugf("durability verdict queue error: %v", err)
+		return err
 	}
+	return nil
 }

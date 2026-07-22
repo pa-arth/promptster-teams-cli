@@ -3,6 +3,7 @@ package capture
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -615,6 +616,99 @@ func TestLivingInventoryEmptyRootDoesNotBurnThrottle(t *testing.T) {
 	// otherwise have started.
 	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) == 0 {
 		t.Error("an empty poll burned the throttle; the first AI span went unreported")
+	}
+}
+
+// TestLivingInventoryClockRollbackDoesNotWedgeTheThrottle: the throttle compares
+// nowMs against a persisted stamp. When the host clock moves BACKWARDS — NTP
+// correction, a laptop resumed from suspend, a restored VM snapshot — nowMs-last
+// goes negative, which is trivially less than the 24h interval, so a naive check
+// suppresses every inventory until wall time catches back up. That is a multi-day
+// hole in the survival series caused by a clock, not by the code.
+func TestLivingInventoryClockRollbackDoesNotWedgeTheThrottle(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// A first inventory stamps the ledger at a clock that is 3 days FAST.
+	future := t0 + 3*dayMs
+	if v := inventoryLiving(sess, ws, key, future); len(v) == 0 {
+		t.Fatal("first inventory must emit")
+	}
+	// The clock is then corrected backwards to the true time. Under the naive
+	// check this root is silenced for the next three days.
+	if v := inventoryLiving(sess, ws, key, t0); len(v) == 0 {
+		t.Error("a backwards clock correction wedged the inventory throttle")
+	}
+	// And the bogus future stamp is gone: the corrected clock now throttles
+	// normally from t0 rather than from t0+3d.
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) != 0 {
+		t.Errorf("expected the post-correction stamp to throttle, got %d verdicts", len(v))
+	}
+}
+
+// TestLivingInventoryFailedDeliveryDoesNotBurnTheDailySlot: the daily slot must
+// be consumed by a DELIVERED inventory, not an attempted one. Stamping the ledger
+// before the emit means an unwritable outbox (disk full, bad permissions, a
+// half-migrated state dir) silently skips the day AND throttles the retry for 24h
+// — that day is then missing from survival forever. Re-emitting is cheap: living
+// verdicts are provisional and the backend folds them by max measuredTsMs.
+func TestLivingInventoryFailedDeliveryDoesNotBurnTheDailySlot(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// Make the outbox undeliverable: point it at a DIRECTORY, so the append open
+	// fails with EISDIR. (A merely missing parent dir would not do it —
+	// sign.WithBufferLock MkdirAll's the outbox's parent before the write.) The
+	// ledger lives under the state dir, untouched, so the inventory can still READ
+	// what is tracked.
+	blocked := filepath.Join(stateDir, "outbox-is-a-dir")
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatalf("blocking the outbox: %v", err)
+	}
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", blocked)
+	inventoryLiving(sess, ws, key, t0)
+
+	// Restore delivery and poll again a minute later — the real cadence. If the
+	// failed attempt had stamped the throttle, this returns nothing and the day
+	// is lost.
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", stateDir+"/outbox.jsonl")
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) == 0 {
+		t.Error("a failed delivery burned the daily slot; the retry was throttled out")
+	}
+	// A DELIVERED inventory does still consume the slot.
+	if v := inventoryLiving(sess, ws, key, t0+120_000); len(v) != 0 {
+		t.Errorf("a delivered inventory must throttle the next poll, got %d verdicts", len(v))
 	}
 }
 
