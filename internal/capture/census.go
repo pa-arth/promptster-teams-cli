@@ -432,10 +432,14 @@ func normalizeRemote(raw string) (host, slug string) {
 		}
 		host = normalizeRemoteHost(rest[:j])
 		raw = rest[j+1:]
-	} else if i := strings.LastIndex(raw, ":"); i >= 0 {
-		// scp-style [user@]host:owner/name — everything after the colon. Reject
-		// forms that are actually filesystem paths: a host with a slash, or a
-		// path after the colon (C:/Users/alice/repo, git@host:/abs/path).
+	} else if i := strings.Index(raw, ":"); i >= 0 {
+		// scp-style [user@]host:owner/name — everything after the FIRST colon. The
+		// scp form has no port syntax, so the authority cannot itself contain a
+		// colon; the first one is always the separator. (Splitting on the LAST colon
+		// instead would hand a path that contains one, `git@host:a:b/c`, a truncated
+		// host and the wrong slug.) Reject forms that are actually filesystem paths:
+		// a host with a slash, or a path after the colon (C:/Users/alice/repo,
+		// git@host:/abs/path).
 		rawHost, rest := raw[:i], raw[i+1:]
 		if rawHost == "" || strings.ContainsAny(rawHost, "/\\") || strings.HasPrefix(rest, "/") {
 			return "", ""

@@ -385,6 +385,16 @@ func TestNormalizeRemoteHostAndSlug(t *testing.T) {
 		"ssh://git@[2001:db8::1]:22/owner/name":  {"[2001:db8::1]", "owner/name"},
 		"https://github.com:443/owner/name.git":  {"github.com", "owner/name"},
 
+		// scp-style splits on the FIRST colon, not the last. The scp form has no port
+		// syntax, so any later colon belongs to the PATH. Splitting late would take
+		// "git@host:a" as the authority — yielding a host truncated at its own port
+		// separator and "b/c" as the slug, an identity for a repo that does not
+		// exist (Greptile, #98). The path is still reduced to its last two segments,
+		// so a colon inside one rides along instead of re-cutting the URL.
+		"git@host:a:b/c":                {"host", "a:b/c"},
+		"git@github.com:owner/na:me":    {"github.com", "owner/na:me"},
+		"git@host:group/repo:arch/name": {"host", "repo:arch/name"},
+
 		// Every rejected form yields BOTH empty. There must be no state where a
 		// host survives from a URL we refused to turn into an identity — a host
 		// with no slug would be a fact about the machine attached to nothing.
