@@ -6,6 +6,128 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-07-22
+
+### Security
+
+- **Secret names with a prefix reached the wire in plaintext.** The generic
+  `KEY=value` and `"key": "value"` redaction rules were anchored with `\b`, and
+  `_` is a word character — so the anchor could never match inside a prefixed
+  name. `API_KEY=…` was masked; `STRIPE_API_KEY=…`, `ACME_DB_PASSWORD=…`,
+  `MY_CLIENT_SECRET=…` and `"STRIPE_API_KEY":"…"` were **stored in the clear**
+  unless the value happened to carry a vendor shape the scanner recognizes on
+  its own (`ghp_`, `sk-ant-`, `AKIA`). An org-internal secret with an opaque
+  value — the common case in a customer `.env` — matched nothing. Both rules now
+  accept a name prefix. Deliberately no trailing wildcard: `TOKEN` is a prefix of
+  `TOKENS`, and `*TOKEN*` would redact `MAX_TOKENS`/`INPUT_TOKENS` and destroy
+  your spend telemetry to mask a number. Redaction also now runs in three ordered
+  stages (precise vendor shapes → the wide scanner → the shape-blind generic
+  fallbacks), because the marker is the only provenance left once a value is gone
+  and the old order destroyed it in both directions — a partial vendor match left
+  a bare `sk-` on the wire, and the generic rules rewrote an already-attributed
+  `[REDACTED_ANTHROPIC_KEY]` back down to `[REDACTED]`. `[REDACTED_LLM_KEY]` is
+  now split into `[REDACTED_ANTHROPIC_KEY]` / `[REDACTED_OPENAI_KEY]` so a
+  dashboard can say *whose* key was pasted; consumers accept both spellings, so
+  older CLIs in the fleet are unaffected.
+- **Secrets pasted mid-sentence were not caught.** A webhook secret in prose —
+  "use this webhook secret to check my db: `whsec_…`" — went through the
+  redactor untouched. The bug was invisible from the rule list, because every one
+  of these shapes *is* caught the moment it appears as `NAME=value`: the
+  assignment rules mask on the name alone, so testing the way a config file looks
+  showed full coverage. Prose is the form a human actually pastes. A 31-shape
+  probe across the real pipeline found 7 bare leaks; four are now caught by
+  value-shape alone — `whsec_` (Svix/Supabase/Stripe webhook signing), `hf_`
+  (Hugging Face), `sntrys_` (Sentry), `secret_` (Notion). All four collapse to a
+  single `[REDACTED_SECRET_KEY]` marker, which grades **critical** downstream
+  (unlike the generic `[REDACTED]`, which fires on a *name* with an unverified
+  value — these fire on a value shape only one thing produces). The remaining
+  prefixless shapes (AWS secret access key, Datadog, Twilio API key secret) are
+  left uncaught **on purpose** and pinned by a test that fails if someone
+  "fixes" them: catching a shape with no prefix needs a bare-entropy pass that
+  collapses `msg_`/`toolu_`/`call_` provider ids and breaks turn dedup.
+
+### Added
+
+- **Credential-file reads now name the keys, not just the file.** "`acme-api/.env`
+  was opened" is a notification; "…and it holds `STRIPE_SECRET_KEY` and
+  `DATABASE_URL`" is a rotation list. Reads of the dotenv family and
+  `~/.aws/{credentials,config}` now emit the credential **key names** found in
+  the body. **Values can never be harvested** — every parse discards the
+  right-hand side at the call site, so it is a structural property of the code
+  rather than a careful one, and the outbound projection additionally bounds the
+  count, length and character shape of every name (a name that fails is dropped
+  whole, never truncated — a truncated secret is still a secret prefix).
+  Placeholder dotenvs (`.example`, `.sample`, `.template`, `.dist`) are skipped.
+  A file that yields no usable names reports **nothing at all** rather than an
+  empty list, so "this CLI did not harvest" never reads as a fabricated
+  all-clear. `.npmrc` and `.pypirc` are deliberately not harvested: npm's only
+  key that matters (`//registry.npmjs.org/:_authToken`) cannot pass the name
+  filter, and `.pypirc`'s keys are `username`/`password`, which the file path
+  already told you.
+- **Sessions now report the git host beside the repository slug (`repoHost`).**
+  The canonical slug added in 0.9.2 discards scheme and host by design, so
+  `gitlab.com/acme/api` and `github.com/acme/api` both reduce to the identical
+  string `acme/api`. Without a host, deciding whether a repo belongs to your
+  connected GitHub org has to treat a colliding owner name as a match — which at
+  a GitLab or Bitbucket shop misclassifies repos for every engineer at once. Two
+  invariants hold: a host is never reported without a slug, and it is non-empty
+  **only** when the repo has a real remote (the opaque-hash cases report `""`
+  rather than guessing). Resolved in the same single `git config` spawn as the
+  slug, so there is no added cost. What leaves the device is a provider name and
+  structurally cannot be a path, a URL, or your OS username.
+- **The config census now reports *where* project memory sits, not just how big
+  it is.** Claude Code loads `CLAUDE.md` at or above the working directory **at
+  launch**; a file nested in a sub-package loads lazily — only once the agent
+  first reads something in that directory — and is not re-injected after
+  `/compact`. One token count was being read by two dashboard metrics that need
+  opposite answers for that repo: coverage ("does this repo have project
+  memory?" — yes) and the context tax ("what standing per-turn cost?" — close to
+  none). Each census entry now carries `root` / `nested` / `absent` alongside the
+  count, so covered-but-latent memory stops being billed at always-on rates and
+  can be called out for what it is. Position tracks what was counted, not how
+  deep the path looks: a sub-package that is itself a watched root reports
+  `root`, because a session started there really does load it. Derived from paths
+  already walked — no file contents are read or transmitted.
+- **Durability is now measurable before day 30.** `durablePct` was 0% by
+  construction on every install and would have stayed there for a month: a
+  durable verdict only emits after a line has survived 30 days, while churn
+  emits at commit time, and the 30-day clock starts when the CLI first *sees* a
+  line — i.e. at install — not when the line was authored. A healthy team read
+  "0% durable / 100% churned". The watcher now emits a throttled (24h) inventory
+  of the AI-authored ranges still alive and undecided, as a third range array on
+  the existing durability event. This is purely additive: inventorying does not
+  consume a span, so the real 30-day verdict is untouched, and the ledger format
+  gained a field without a version bump (bumping it would make the reader discard
+  the file and wipe every in-flight lineage's birth timestamp on fleet upgrade —
+  re-inflicting this exact bug on purpose). The first AI line on a fresh install
+  reports immediately rather than up to 24h later.
+
+### Fixed
+
+- **Subagent delegations stopped being captured when Claude Code renamed its
+  delegation tool `Task` → `Agent`.** The normalizer branched on the old name, so
+  the rename did not throw — it stopped matching, and every spawn fell through to
+  a generic tool-use record. Measured in the live database on 2026-07-22:
+  **zero** delegation events for all time, against 658 `Agent` tool-use rows
+  across 104 sessions. Any dashboard counting subagent usage read 0 for every
+  session. `Task` is still matched for older clients in the field. The same case
+  also emitted its payload under a field name that has never been carried by
+  either the on-device or the server-side allowlist, so fixing only the tool name
+  would have shipped delegation events with an **empty** body, stripped silently
+  with no error. It now emits the task description preview and the subagent type
+  under already-sanctioned names; the full delegated instruction is never
+  emitted.
+- **Modern Codex rollouts are captured again.** Current Codex versions wrap tool
+  calls in generic `custom_tool_call` / `exec` envelopes that differ from the
+  older transcript shapes. Local normalization now understands those envelopes,
+  correlates a detached command with its later completion, and preserves safe
+  metadata for unknown tools without emitting any content-bearing field. Also
+  aligns Go's canonical-JSON signing with JavaScript `JSON.stringify` for
+  HTML-sensitive punctuation, so events containing `<`, `>` or `&` verify
+  correctly server-side. Validated end to end by replaying a real local rollout:
+  104 events through normalization, redaction, projection, signing, ingest and
+  worker analysis, all accepted and verified.
+
 ## [0.9.2] — 2026-07-20
 
 ### Added
@@ -508,7 +630,12 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.2...v0.10.0
+[0.9.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.5.6...v0.6.0
