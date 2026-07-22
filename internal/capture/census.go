@@ -81,17 +81,35 @@ type configCensusData struct {
 	// outcome_events.repo convention so coverage can correlate with PR outcomes
 	// — else an opaque sha256(abspath) hash. It NEVER carries a filesystem path
 	// or file contents. Empty only when there is no workspace.
-	WorkspaceKey          string            `json:"workspaceKey"`
-	GlobalClaudeMdTokens  int               `json:"globalClaudeMdTokens"`
-	ProjectClaudeMdTokens int               `json:"projectClaudeMdTokens"`
-	Skills                []censusSkill     `json:"skills"`
-	SkillListingTokens    int               `json:"skillListingTokens"`
-	SkillCount            int               `json:"skillCount"`
-	Plugins               []censusPlugin    `json:"plugins"`
-	PluginListingTokens   int               `json:"pluginListingTokens"`
-	PluginCount           int               `json:"pluginCount"`
-	MCPServers            []censusMCPServer `json:"mcpServers"`
-	MCPDeferred           bool              `json:"mcpDeferred"`
+	WorkspaceKey         string `json:"workspaceKey"`
+	GlobalClaudeMdTokens int    `json:"globalClaudeMdTokens"`
+	// ProjectClaudeMdTokens is the token cost; ProjectClaudeMdPosition says WHERE
+	// it came from, which decides whether those tokens are actually loaded.
+	//
+	// Magnitude alone cannot answer both questions asked of this field. Claude
+	// Code loads CLAUDE.md at or above the working directory AT LAUNCH; a file in
+	// a sub-package loads only when the agent first reads something in that
+	// directory, and is NOT re-injected after /compact. So for a nested file,
+	// "does this repo have project memory?" is YES while "what standing per-turn
+	// cost does it carry?" is ~NOTHING — opposite answers, one integer.
+	//
+	// "root"   — a watched root carries CLAUDE.md: always-loaded, bill it.
+	// "nested" — only a sub-package does: real memory, LATENT. Counts as covered,
+	//            must not be priced as standing context.
+	// "absent" — no project memory tokens found at all.
+	//
+	// omitempty: an older CLI omits it, and the backend must read that as
+	// "position unknown", never as the "absent" value.
+	ProjectClaudeMdTokens   int               `json:"projectClaudeMdTokens"`
+	ProjectClaudeMdPosition string            `json:"projectClaudeMdPosition,omitempty"`
+	Skills                  []censusSkill     `json:"skills"`
+	SkillListingTokens      int               `json:"skillListingTokens"`
+	SkillCount              int               `json:"skillCount"`
+	Plugins                 []censusPlugin    `json:"plugins"`
+	PluginListingTokens     int               `json:"pluginListingTokens"`
+	PluginCount             int               `json:"pluginCount"`
+	MCPServers              []censusMCPServer `json:"mcpServers"`
+	MCPDeferred             bool              `json:"mcpDeferred"`
 	// ClaudeTranscriptsTotal / ClaudeTranscriptsActive7d are content-free
 	// capture-health counts: how many Claude Code transcript JSONL files exist
 	// under ~/.claude/projects, and how many were modified in the last 7 days.
@@ -155,6 +173,15 @@ func fileTokens(path string) int {
 // below the root is included; deeper is skipped.
 const claudeMdMaxDepth = 5
 
+// projectClaudeMdPosition values. Mirrored by a zod enum in the backend contract
+// (packages/contracts/src/configCensus.ts) — changing a string here without
+// changing it there strips the field at ingest validation, silently.
+const (
+	claudeMdPositionRoot   = "root"
+	claudeMdPositionNested = "nested"
+	claudeMdPositionAbsent = "absent"
+)
+
 // projectClaudeMdSkipDirs are directory names the nested scan never descends
 // into: a CLAUDE.md inside a dependency/build/vendor tree is either a third
 // party's or a build-time COPY of the repo's own memory, not authored project
@@ -189,7 +216,13 @@ var projectClaudeMdSkipDirs = map[string]bool{
 // reports exactly what it did before — this change only lifts the false 0 for
 // repos whose memory lives in a sub-directory. Content is never read —
 // fileTokens stats size only, preserving the no-file-contents guarantee.
-func projectClaudeMdTokens(roots []string) int {
+//
+// The second return is WHICH branch supplied the count. The fallback made this
+// function answer two questions with one number, and for a nested file the right
+// answers are opposite: covered (yes, memory exists) but not always-loaded (no,
+// it isn't standing context). Reporting position lets each consumer read the one
+// it actually asked about instead of both reading the same integer wrong.
+func projectClaudeMdTokens(roots []string) (int, string) {
 	seenRoots := map[string]bool{}
 	rootTokens := 0
 	for _, root := range roots {
@@ -200,9 +233,17 @@ func projectClaudeMdTokens(roots []string) int {
 		rootTokens += fileTokens(filepath.Join(root, "CLAUDE.md"))
 	}
 	if rootTokens > 0 {
-		return rootTokens
+		return rootTokens, claudeMdPositionRoot
 	}
-	return maxNestedClaudeMdTokens(roots)
+	if nested := maxNestedClaudeMdTokens(roots); nested > 0 {
+		return nested, claudeMdPositionNested
+	}
+	// Position describes where the reported TOKENS came from, not what exists on
+	// disk: a root CLAUDE.md that is empty (or too small to round to a token)
+	// yields 0 here and reports "absent". That is the honest reading for every
+	// consumer — a zero-token file is zero always-loaded context and zero
+	// coverage, so there is no question the distinction would answer.
+	return 0, claudeMdPositionAbsent
 }
 
 // isGitRepoRoot reports whether root is the top of a git working tree — a
@@ -498,7 +539,9 @@ func buildConfigCensus(env censusEnv) configCensusData {
 
 	// Project CLAUDE.md: the always-loaded root file, or the largest nested one
 	// when the repo keeps its memory in a sub-package (see projectClaudeMdTokens).
-	data.ProjectClaudeMdTokens = projectClaudeMdTokens(env.workspaceRoots)
+	// Position rides along so the backend can tell those two apart — a nested file
+	// is covered but latent, and pricing it as always-on overstates the config tax.
+	data.ProjectClaudeMdTokens, data.ProjectClaudeMdPosition = projectClaudeMdTokens(env.workspaceRoots)
 
 	data.Skills = censusSkills(filepath.Join(env.claudeDir, "skills"))
 	for _, s := range data.Skills {

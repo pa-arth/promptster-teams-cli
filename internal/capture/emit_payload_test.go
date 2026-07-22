@@ -157,6 +157,19 @@ func TestConfigCensusEventSurvivesEmitPath(t *testing.T) {
 		t.Errorf("workspaceKey leaks a filesystem path: %q", key)
 	}
 
+	// Same failure class as workspaceKey above, one field later: the census struct
+	// can carry a correct position while the on-device allowlist drops it, and a
+	// unit test over projectClaudeMdTokens() would stay green through that. The
+	// backend cannot distinguish a stripped position from an older CLI, so the
+	// strip reads as "position unknown" and every consumer silently falls back to
+	// pre-feature behaviour — no error, no empty state, no telemetry.
+	//
+	// The fixture writes CLAUDE.md at the watched root itself, so the only correct
+	// answer here is "root": it loads at launch and the config tax prices it.
+	if got, _ := data["projectClaudeMdPosition"].(string); got != "root" {
+		t.Errorf("projectClaudeMdPosition = %#v, want \"root\" — it must be allowlisted for config_census", data["projectClaudeMdPosition"])
+	}
+
 	// The privacy rule still holds on the real emit path: counts and names only.
 	full, err := json.Marshal(ev)
 	if err != nil {
