@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -43,10 +44,27 @@ func loadLastPromptTs() time.Time {
 	return time.UnixMilli(ms)
 }
 
-// strPreview returns the first n chars of s (appending "..." if truncated).
+// strPreview returns the first n BYTES of s (appending "..." if truncated),
+// backing off to the nearest rune boundary so the result is always valid UTF-8.
+//
+// Without that back-off, `s[:n]` can land mid-rune and leave dangling
+// continuation bytes. Nothing errors: Go's json encoder silently substitutes
+// U+FFFD, so the preview just ends in a visible corruption artifact — and only
+// for non-ASCII text, which is exactly the input least likely to appear in a
+// test and most likely to appear in the field. Every caller here previews
+// human-authored free text (task descriptions, prompts, commands, search
+// queries), so this is not hypothetical.
+//
+// The unit is bytes, not characters, and deliberately so — these previews exist
+// to bound payload size. A rune-counted cap would let a CJK or emoji string
+// carry 3-4x the bytes of the same nominal length.
 func strPreview(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Walk back off any continuation byte (0b10xxxxxx) to the rune's first byte.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
@@ -549,8 +567,13 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		// WHICH agent was spun up ("Explore", "general-purpose", ...). A type name
 		// chosen from a registry, not free text, and the dimension any
 		// "what does this team delegate" surface is actually asking about.
-		if st, _ := toolInput["subagent_type"].(string); st != "" {
-			data["name"] = strings.TrimSpace(st)
+		// Test AFTER trimming, not before: a whitespace-only subagent_type passes
+		// `st != ""` and then emits `name: ""`, which is the exact ABSENT-vs-EMPTY
+		// collapse this branch exists to avoid — and downstream it opens a nameless
+		// agent-type bucket rather than being skipped.
+		raw, _ := toolInput["subagent_type"].(string)
+		if st := strings.TrimSpace(raw); st != "" {
+			data["name"] = st
 		}
 		e.Data = data
 		e.RawPayload = raw

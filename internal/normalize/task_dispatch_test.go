@@ -1,7 +1,9 @@
 package normalize
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
@@ -111,6 +113,47 @@ func TestTaskDispatchOmitsMissingSubagentType(t *testing.T) {
 	}
 	if _, present := dm(e)["name"]; present {
 		t.Errorf("name present on a spawn with no subagent_type: %v", dm(e)["name"])
+	}
+}
+
+// A whitespace-only subagent_type must be treated as ABSENT, not as an empty
+// name. Testing `!= ""` before trimming lets "   " through and emits `name: ""`,
+// which collapses the very distinction the case above exists to preserve and
+// opens a nameless agent-type bucket downstream.
+func TestTaskDispatchTreatsWhitespaceSubagentTypeAsAbsent(t *testing.T) {
+	call := `{"type":"assistant","message":{"id":"msg-ws","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_ws","name":"Agent","input":{"description":"do the thing","subagent_type":"   "}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:01:00Z"}`
+	res := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_ws","content":"done"}]},"toolUseResult":{"content":"done"},"timestamp":"2026-06-10T10:01:30Z"}`
+	e := taskDispatchOf(t, call, res)
+	if v, present := dm(e)["name"]; present {
+		t.Errorf("whitespace-only subagent_type emitted name=%q; want the key absent", v)
+	}
+}
+
+// strPreview slices BYTES. Landing mid-rune leaves dangling continuation bytes,
+// and Go's json encoder silently swaps them for U+FFFD — so the failure is a
+// corrupted preview, never an error. Descriptions are human free text, so
+// non-ASCII is a live case, not a hypothetical.
+func TestTaskDispatchSummaryStaysValidUTF8(t *testing.T) {
+	// 60 CJK runes = 180 bytes, so the 100-byte cap lands inside rune 34.
+	desc := strings.Repeat("設", 60)
+	call := `{"type":"assistant","message":{"id":"msg-u","model":"claude-sonnet-4-6","content":[{"type":"tool_use","id":"toolu_u","name":"Agent","input":{"description":"` + desc + `","subagent_type":"Explore"}}],"usage":{"input_tokens":10,"output_tokens":5}},"timestamp":"2026-06-10T10:01:00Z"}`
+	res := `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_u","content":"done"}]},"toolUseResult":{"content":"done"},"timestamp":"2026-06-10T10:01:30Z"}`
+	e := taskDispatchOf(t, call, res)
+
+	summary, _ := dm(e)["summary"].(string)
+	if !utf8.ValidString(summary) {
+		t.Errorf("summary is not valid UTF-8: %q", summary)
+	}
+	if strings.ContainsRune(summary, utf8.RuneError) {
+		t.Errorf("summary carries U+FFFD, i.e. a rune was sliced apart: %q", summary)
+	}
+	// The cap must still bind — a fix that stopped truncating would pass the two
+	// assertions above while defeating the point of a preview.
+	if !strings.HasSuffix(summary, "...") {
+		t.Errorf("summary was not truncated: %q", summary)
+	}
+	if len(summary) > 100+len("...") {
+		t.Errorf("summary is %d bytes, over the 100-byte cap: %q", len(summary), summary)
 	}
 }
 
