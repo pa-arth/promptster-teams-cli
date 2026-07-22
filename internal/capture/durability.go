@@ -72,10 +72,22 @@ type durTrackedRange struct {
 // plus the per-root default-branch cursor (rootKey → last-processed default-tip
 // SHA). Cursor and ranges live in ONE file under ONE lock so a poll advances
 // both atomically.
+//
+// ⚠️ DO NOT BUMP durabilityLedgerVersion TO ADD A FIELD. A version mismatch makes
+// readDurabilityLedgerUnlocked discard the whole file, which would wipe every
+// tracked AI span on the fleet the moment the new build rolls out — every
+// in-flight lineage loses its birth timestamp and restarts its 30-day clock, i.e.
+// exactly the "durability is always 0%" failure this change exists to fix,
+// inflicted deliberately. New fields must be ADDITIVE: an older ledger reads them as
+// nil/zero, which every reader below already tolerates.
 type durabilityLedger struct {
 	V       int                                     `json:"v"`
 	Roots   map[string]map[string][]durTrackedRange `json:"roots"`
 	Cursors map[string]string                       `json:"cursors"`
+	// Inventoried is rootKey → the last time a living inventory was emitted for
+	// that root (ms). Absent/zero means "never" and emits on the next poll, so a
+	// fresh install reports survival immediately rather than a day later.
+	Inventoried map[string]int64 `json:"inventoried,omitempty"`
 }
 
 func durabilityLedgerPath() string {
@@ -393,7 +405,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 					delete(files, path)
 				}
 				if len(churned) > 0 {
-					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nowMs))
+					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nil, nowMs))
 				}
 				continue
 			}
@@ -487,11 +499,105 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	measureSha, _ := gitHead(root)
 	var verdicts []event.Event
 	for _, h := range matured {
-		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, h.path, h.durable, nil, nowMs))
+		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, h.path, h.durable, nil, nil, nowMs))
 	}
 	for i := range verdicts {
 		emitDurabilityVerdict(verdicts[i])
 	}
+	return verdicts
+}
+
+// durabilityInventoryIntervalMs is how often a root re-reports its living spans.
+// A var (not const) so tests can drive it. Daily: the payload is a few integers
+// per tracked span and ageDays only changes at day granularity anyway, so a
+// tighter cadence would multiply event volume for no extra signal.
+var durabilityInventoryIntervalMs int64 = 24 * 60 * 60 * 1000
+
+// inventoryLiving emits, at most once per root per day, the AI spans still
+// tracked and NOT yet decided — each stamped with its current ageDays. It does
+// NOT mutate the spans: they stay in the ledger and are still churned or
+// harvested normally.
+//
+// WHY THIS EXISTS. Durable verdicts are terminal and gated on surviving the full
+// 30-day window, while churn is emitted the moment a commit rewrites a line. So
+// before an install is 30 days old the ONLY verdict that can exist is churn, and
+// every org reads "0% durable / 100% churned" — a statement about how long we
+// have been watching, dressed up as a statement about the AI. Worse, BornTsMs is
+// stamped when the ledger first SAW a span, not when it was authored, so the
+// 30-day clock restarts at install for the whole repo. This inventory is what
+// makes survival measurable in the meantime: the backend can compute survival at
+// any horizon up to the oldest age observed.
+//
+// The tempting alternative — shrinking durabilityWindowMs so spans harvest early
+// — is a TRAP: harvestDurable DROPS a span when it emits, so an early harvest
+// permanently forfeits that lineage's real 30-day verdict. Reporting alongside
+// costs nothing and destroys nothing.
+func inventoryLiving(session Session, root, rootKey string, nowMs int64) []event.Event {
+	type snapshot struct {
+		path   string
+		living []durTrackedRange
+	}
+	var due []snapshot
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		last := led.Inventoried[rootKey]
+		// A zero/missing entry means "never inventoried" and always fires. A FUTURE
+		// entry means the host clock moved BACKWARDS (an NTP correction, a laptop
+		// resumed from suspend, a VM snapshot): nowMs-last goes negative, which is
+		// trivially < the interval, so a naive check would suppress every inventory
+		// until wall time caught back up — a multi-day hole in the survival series
+		// caused by a clock, not by the code. Treat a future stamp as due; the emit
+		// below overwrites it with a sane one.
+		if last != 0 && nowMs >= last && nowMs-last < durabilityInventoryIntervalMs {
+			return // throttled
+		}
+		files := led.Roots[rootKey]
+		if len(files) == 0 {
+			return // nothing tracked — don't burn the throttle on an empty root
+		}
+		for path, ranges := range files {
+			if len(ranges) == 0 {
+				continue
+			}
+			// Copy: the slice stays owned by the ledger, and the verdict is built
+			// after the lock is released.
+			cp := make([]durTrackedRange, len(ranges))
+			copy(cp, ranges)
+			due = append(due, snapshot{path: path, living: cp})
+		}
+	})
+	if len(due) == 0 {
+		return nil
+	}
+
+	// gitHead is deliberately outside the ledger lock (matches harvestDurable):
+	// no git spawn ever runs while the lock is held.
+	measureSha, _ := gitHead(root)
+	var verdicts []event.Event
+	for _, s := range due {
+		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, s.path, nil, nil, s.living, nowMs))
+	}
+	delivered := false
+	for i := range verdicts {
+		if err := emitDurabilityVerdict(verdicts[i]); err == nil {
+			delivered = true
+		}
+	}
+	// The throttle is stamped AFTER delivery, deliberately. Stamping it in the read
+	// pass above would burn the daily slot even when the outbox was unwritable
+	// (disk full, permissions, a half-migrated state dir) — the inventory would be
+	// silently skipped for 24h and that day would be missing from survival forever.
+	// Re-emitting instead is cheap and safe: living verdicts are PROVISIONAL, and
+	// the backend folds a lineage's living entries by max measuredTsMs, so a
+	// duplicate inventory of the same spans collapses to one.
+	if !delivered {
+		return verdicts
+	}
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		if led.Inventoried == nil {
+			led.Inventoried = map[string]int64{}
+		}
+		led.Inventoried[rootKey] = nowMs
+	})
 	return verdicts
 }
 
@@ -505,12 +611,18 @@ type durVerdictRange struct {
 }
 
 // durabilityVerdictData is the CLOSED payload of a durability_verdict event.
+//
+// The three range arrays are mutually exclusive per event: churn is emitted at
+// commit time, durable at harvest, living on the daily inventory. LivingRanges is
+// the PROVISIONAL one — those spans are still tracked and can still churn or
+// mature; the other two are terminal.
 type durabilityVerdictData struct {
 	CommitSha     string            `json:"commitSha"`
 	WorkspaceKey  string            `json:"workspaceKey"`
 	Path          string            `json:"path"`
 	DurableRanges []durVerdictRange `json:"durableRanges,omitempty"`
 	ChurnedRanges []durVerdictRange `json:"churnedRanges,omitempty"`
+	LivingRanges  []durVerdictRange `json:"livingRanges,omitempty"`
 	MeasuredTsMs  int64             `json:"measuredTsMs"`
 }
 
@@ -534,7 +646,7 @@ func toVerdictRanges(rs []durTrackedRange, nowMs int64) []durVerdictRange {
 // through eventDataMap (JSON round-trip) so nested arrays land as
 // []interface{} of map — the only shape the redaction projector's element
 // allowlist can walk (assigning the struct straight to Data ships {}).
-func buildDurabilityVerdict(session Session, root, sha, path string, durable, churned []durTrackedRange, nowMs int64) event.Event {
+func buildDurabilityVerdict(session Session, root, sha, path string, durable, churned, living []durTrackedRange, nowMs int64) event.Event {
 	e := event.NewEvent("durability_verdict", session.DeviceID)
 	e.Source = presenceSource
 	e.DeviceID = session.DeviceID
@@ -545,6 +657,7 @@ func buildDurabilityVerdict(session Session, root, sha, path string, durable, ch
 		Path:          path,
 		DurableRanges: toVerdictRanges(durable, nowMs),
 		ChurnedRanges: toVerdictRanges(churned, nowMs),
+		LivingRanges:  toVerdictRanges(living, nowMs),
 		MeasuredTsMs:  nowMs,
 	})
 	return e
@@ -552,12 +665,18 @@ func buildDurabilityVerdict(session Session, root, sha, path string, durable, ch
 
 // emitDurabilityVerdict funnels a verdict through the SAME sign/redact/queue
 // path as every captured event, reusing the shared outbox drain singleton (it
-// never starts its own). Best-effort — matches emitCommitAttribution.
-func emitDurabilityVerdict(ev event.Event) {
+// never starts its own). Best-effort — matches emitCommitAttribution — but it
+// RETURNS the outbox error so a caller that gates state on delivery can see it.
+// The outbox is the leg that reaches the backend; the local buffer is the signed
+// audit copy, so a buffer-only failure is not a lost verdict. Callers that don't
+// care (churn at commit time, the durable harvest) discard the return.
+func emitDurabilityVerdict(ev event.Event) error {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("durability verdict buffer error: %v", err)
 	}
 	if err := outbox.Append(ev); err != nil {
 		state.HookDebugf("durability verdict queue error: %v", err)
+		return err
 	}
+	return nil
 }

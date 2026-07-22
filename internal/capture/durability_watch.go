@@ -150,8 +150,9 @@ func advanceDurabilityCursor(rootKey, tip string) {
 }
 
 // pollDurability advances durability for every root over its DEFAULT branch
-// only, then harvests matured spans. nowMs is injected by the caller (top-level
-// reads the clock) so tests drive time directly.
+// only, then harvests matured spans and inventories the ones still in flight.
+// nowMs is injected by the caller (top-level reads the clock) so tests drive time
+// directly.
 //
 // Cold start baselines the cursor to the current default tip WITHOUT processing
 // pre-existing history — durability tracks AI lines forward from first sight,
@@ -186,5 +187,9 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 			}
 		}
 		harvestDurable(session, root, rootKey, nowMs)
+		// AFTER the harvest, deliberately: harvestDurable DROPS matured spans, so
+		// inventorying second guarantees a span is never reported both durable
+		// (terminal) and living (provisional) in the same poll.
+		inventoryLiving(session, root, rootKey, nowMs)
 	}
 }

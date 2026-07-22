@@ -2,6 +2,8 @@ package capture
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -444,5 +446,295 @@ func TestDurabilityCommitAdvancesCursorAtomically(t *testing.T) {
 	pollDurabilityCommit(ws, key, sess, emptySha, t0+dayMs)
 	if got := durabilityCursor(key); got != emptySha {
 		t.Errorf("cursor after empty commit = %q, want %q (zero-hunk commit must advance)", got, emptySha)
+	}
+}
+
+// ── Living inventory (survival before the 30-day harvest can produce anything) ──
+//
+// The bug these lock down: durable verdicts are terminal and gated on 30 days of
+// survival, while churn is emitted at commit time. So for the first 30 days of
+// ANY install the only verdict that can exist is churn, and the dashboard reads
+// "0% durable / 100% churned" for a perfectly healthy team. Worse, BornTsMs is
+// stamped when the ledger first SAW a span, not when the line was authored, so
+// the 30-day clock restarts at install for the entire repo.
+
+// TestLivingInventoryReportsUndecidedSpans: 4 days in, nothing can be durable,
+// but the tracked AI span must still be reported — with its real age — so the
+// backend can measure survival at a 4-day horizon.
+func TestLivingInventoryReportsUndecidedSpans(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// Day 4: harvest yields nothing (correct — 30d not reached).
+	if v := harvestDurable(sess, ws, key, t0+4*dayMs); len(v) != 0 {
+		t.Fatalf("nothing can be durable at 4d, got %+v", v)
+	}
+	// ...but the inventory reports the span as living, aged 4 days.
+	v := inventoryLiving(sess, ws, key, t0+4*dayMs)
+	if len(v) == 0 {
+		t.Fatal("inventoryLiving emitted nothing; survival would be unmeasurable for 30d")
+	}
+	data := durVerdictFor(t, v, "ai.go")
+	living := rangeSet(t, data, "livingRanges")
+	if !living["1..3"] {
+		t.Errorf("livingRanges = %+v, want 1..3", living)
+	}
+	if data["durableRanges"] != nil || data["churnedRanges"] != nil {
+		t.Errorf("an inventory verdict must carry ONLY livingRanges, got %+v", data)
+	}
+}
+
+// TestLivingInventoryDoesNotConsumeTheSpan: the whole point of inventorying
+// instead of harvesting early — reporting must not drop the span, or the real
+// 30-day verdict is permanently forfeited.
+func TestLivingInventoryDoesNotConsumeTheSpan(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// Inventory on several days...
+	for _, d := range []int64{1, 2, 3} {
+		if v := inventoryLiving(sess, ws, key, t0+d*dayMs); len(v) == 0 {
+			t.Fatalf("day %d: expected a living inventory", d)
+		}
+	}
+	// ...and the span STILL matures into a real durable verdict at 30d.
+	v := harvestDurable(sess, ws, key, t0+31*dayMs)
+	data := durVerdictFor(t, v, "ai.go")
+	if durable := rangeSet(t, data, "durableRanges"); !durable["1..3"] {
+		t.Errorf("inventorying destroyed the 30d verdict: durableRanges = %+v, want 1..3", durable)
+	}
+}
+
+// TestLivingInventoryThrottledToOncePerDay: the poll loop runs every 60s. Without
+// a throttle this would emit one event per tracked path per minute.
+func TestLivingInventoryThrottledToOncePerDay(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// A never-inventoried root fires immediately — a fresh install must report
+	// survival on its first poll, not a day later.
+	if v := inventoryLiving(sess, ws, key, t0); len(v) == 0 {
+		t.Fatal("a never-inventoried root must emit on the first poll")
+	}
+	// 60s later (the real poll cadence): throttled.
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) != 0 {
+		t.Errorf("expected throttle at +60s, got %d verdicts", len(v))
+	}
+	// 23h later: still throttled.
+	if v := inventoryLiving(sess, ws, key, t0+23*60*60*1000); len(v) != 0 {
+		t.Errorf("expected throttle at +23h, got %d verdicts", len(v))
+	}
+	// 24h later: fires again, with the aged span.
+	v := inventoryLiving(sess, ws, key, t0+dayMs)
+	if len(v) == 0 {
+		t.Fatal("expected a fresh inventory at +24h")
+	}
+	data := durVerdictFor(t, v, "ai.go")
+	ranges, _ := data["livingRanges"].([]any)
+	if len(ranges) == 0 {
+		t.Fatal("expected livingRanges on the +24h inventory")
+	}
+	first, _ := ranges[0].(map[string]any)
+	if age := first["ageDays"]; age != float64(1) && age != 1 {
+		t.Errorf("ageDays = %v, want 1 (age must be current, not frozen at seed)", age)
+	}
+}
+
+// TestLivingInventoryEmptyRootDoesNotBurnThrottle: a root with nothing tracked
+// must not consume its daily slot, or the first real AI span would go unreported
+// for up to 24h.
+func TestLivingInventoryEmptyRootDoesNotBurnThrottle(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	const t0 int64 = 1_000_000_000_000
+	// Nothing tracked yet.
+	if v := inventoryLiving(sess, ws, key, t0); len(v) != 0 {
+		t.Fatalf("an empty root must emit nothing, got %+v", v)
+	}
+
+	// Now an AI span lands one minute later.
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(ws, key, sess, sha, t0+60_000)
+
+	// It must be reportable NOW, not after the throttle the empty poll would
+	// otherwise have started.
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) == 0 {
+		t.Error("an empty poll burned the throttle; the first AI span went unreported")
+	}
+}
+
+// TestLivingInventoryClockRollbackDoesNotWedgeTheThrottle: the throttle compares
+// nowMs against a persisted stamp. When the host clock moves BACKWARDS — NTP
+// correction, a laptop resumed from suspend, a restored VM snapshot — nowMs-last
+// goes negative, which is trivially less than the 24h interval, so a naive check
+// suppresses every inventory until wall time catches back up. That is a multi-day
+// hole in the survival series caused by a clock, not by the code.
+func TestLivingInventoryClockRollbackDoesNotWedgeTheThrottle(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// A first inventory stamps the ledger at a clock that is 3 days FAST.
+	future := t0 + 3*dayMs
+	if v := inventoryLiving(sess, ws, key, future); len(v) == 0 {
+		t.Fatal("first inventory must emit")
+	}
+	// The clock is then corrected backwards to the true time. Under the naive
+	// check this root is silenced for the next three days.
+	if v := inventoryLiving(sess, ws, key, t0); len(v) == 0 {
+		t.Error("a backwards clock correction wedged the inventory throttle")
+	}
+	// And the bogus future stamp is gone: the corrected clock now throttles
+	// normally from t0 rather than from t0+3d.
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) != 0 {
+		t.Errorf("expected the post-correction stamp to throttle, got %d verdicts", len(v))
+	}
+}
+
+// TestLivingInventoryFailedDeliveryDoesNotBurnTheDailySlot: the daily slot must
+// be consumed by a DELIVERED inventory, not an attempted one. Stamping the ledger
+// before the emit means an unwritable outbox (disk full, bad permissions, a
+// half-migrated state dir) silently skips the day AND throttles the retry for 24h
+// — that day is then missing from survival forever. Re-emitting is cheap: living
+// verdicts are provisional and the backend folds them by max measuredTsMs.
+func TestLivingInventoryFailedDeliveryDoesNotBurnTheDailySlot(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+
+	recordAiTouchedPath("sess-dur", key, "ai.go")
+	writeCommitFile(t, ws, "ai.go", "l1\nl2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds ai.go")
+	sha := gitOut("rev-parse", "HEAD")
+
+	const t0 int64 = 1_000_000_000_000
+	pollDurabilityCommit(ws, key, sess, sha, t0)
+
+	// Make the outbox undeliverable: point it at a DIRECTORY, so the append open
+	// fails with EISDIR. (A merely missing parent dir would not do it —
+	// sign.WithBufferLock MkdirAll's the outbox's parent before the write.) The
+	// ledger lives under the state dir, untouched, so the inventory can still READ
+	// what is tracked.
+	blocked := filepath.Join(stateDir, "outbox-is-a-dir")
+	if err := os.MkdirAll(blocked, 0o700); err != nil {
+		t.Fatalf("blocking the outbox: %v", err)
+	}
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", blocked)
+	inventoryLiving(sess, ws, key, t0)
+
+	// Restore delivery and poll again a minute later — the real cadence. If the
+	// failed attempt had stamped the throttle, this returns nothing and the day
+	// is lost.
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", stateDir+"/outbox.jsonl")
+	if v := inventoryLiving(sess, ws, key, t0+60_000); len(v) == 0 {
+		t.Error("a failed delivery burned the daily slot; the retry was throttled out")
+	}
+	// A DELIVERED inventory does still consume the slot.
+	if v := inventoryLiving(sess, ws, key, t0+120_000); len(v) != 0 {
+		t.Errorf("a delivered inventory must throttle the next poll, got %d verdicts", len(v))
+	}
+}
+
+// TestDurabilityLedgerVersionNotBumped: adding `inventoried` must NOT invalidate
+// existing on-disk ledgers. A version bump makes readDurabilityLedgerUnlocked
+// discard the file, wiping every tracked span's BornTsMs on fleet upgrade — which
+// restarts the 30-day clock for everyone and re-inflicts the exact bug this
+// change fixes.
+func TestDurabilityLedgerVersionNotBumped(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	if durabilityLedgerVersion != 1 {
+		t.Fatalf("durabilityLedgerVersion = %d, want 1 — bumping it wipes every fleet ledger", durabilityLedgerVersion)
+	}
+	// A pre-upgrade ledger (no `inventoried` key) must load its Roots intact.
+	old := `{"v":1,"roots":{"rk":{"ai.go":[{"start":1,"end":3,"lineageId":"L","bornTsMs":123}]}},"cursors":{"rk":"abc"}}`
+	if err := os.WriteFile(durabilityLedgerPath(), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	led := loadDurabilityLedger()
+	if got := len(led.Roots["rk"]["ai.go"]); got != 1 {
+		t.Fatalf("pre-upgrade ledger lost its spans: %d ranges, want 1", got)
+	}
+	if led.Roots["rk"]["ai.go"][0].BornTsMs != 123 {
+		t.Error("BornTsMs did not survive the upgrade — the 30d clock would restart")
+	}
+	if led.Cursors["rk"] != "abc" {
+		t.Error("cursor did not survive the upgrade")
 	}
 }
