@@ -228,6 +228,62 @@ func TestCodexPromptStampsRepoRoot(t *testing.T) {
 	}
 }
 
+// TestCodexPromptStampsRepoHost: the codex lane carries the host on the same
+// terms as the claude lane — pre-resolved in capture, stamped beside repoRoot,
+// omitted when empty. Pinned per-lane because the two processors build their
+// prompt data maps independently, so one can silently drift from the other.
+func TestCodexPromptStampsRepoHost(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-rh")
+	p.RepoRoot = "acme/foo"
+	p.RepoHost = "gitlab.com"
+	var prompt *event.Event
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}`,
+	}
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatal("no prompt event emitted")
+	}
+	if got := prompt.Data.(map[string]interface{})["repoHost"]; got != "gitlab.com" {
+		t.Errorf("repoHost = %v, want gitlab.com", got)
+	}
+}
+
+// TestCodexPromptOmitsRepoHostWhenUnresolved: a no-remote repo has no host, so
+// the key is absent rather than "" — the backend must be able to tell "no host
+// known" from a host it can compare against the org's provider.
+func TestCodexPromptOmitsRepoHostWhenUnresolved(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-rh-none")
+	p.RepoRoot = "d98ef209c46c9dd9"
+	var prompt *event.Event
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}`,
+	}
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatal("no prompt event emitted")
+	}
+	if _, present := prompt.Data.(map[string]interface{})["repoHost"]; present {
+		t.Errorf("repoHost must be absent when unresolved")
+	}
+}
+
 // TestCodexPromptOmitsRepoRootWhenUnresolved: with no RepoRoot threaded in, the
 // prompt carries NO repoRoot key (mirrors workdir's omit-when-empty).
 func TestCodexPromptOmitsRepoRootWhenUnresolved(t *testing.T) {

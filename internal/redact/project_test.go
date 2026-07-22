@@ -72,7 +72,7 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			// line if a meta map is ever smuggled back onto a prompt. Its cwd is the
 			// canary — an absolute path is exactly what allowlisting the map whole
 			// would have leaked.
-			name: "prompt keeps text (the product) + command name + promptSource + workdir + repoRoot, drops smuggled fields",
+			name: "prompt keeps text (the product) + command name + promptSource + workdir + repoRoot + repoHost, drops smuggled fields",
 			kind: "prompt",
 			data: map[string]interface{}{
 				"text": "fix the failing test", "command": "commit", "promptSource": "system",
@@ -82,12 +82,17 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 				// repoRoot is the canonical repo identity (git slug / opaque hash) —
 				// kept, like workdir, on its own allowlisted key.
 				"repoRoot": "acme/foo",
+				// repoHost is the bare provider hostname the slug was parsed from.
+				// Kept for the same reason and on the same terms: the normalizer
+				// strips scheme/userinfo/port/path on-device, so what survives is a
+				// provider name, not a URL and not a path.
+				"repoHost": "github.com",
 				"meta":     map[string]interface{}{"raw": leakCanary},
 				"cwd":      leakCanary,
 			},
 			wantKept: map[string]interface{}{
 				"text": "fix the failing test", "command": "commit", "promptSource": "system",
-				"workdir": "~/repos/foo/bar", "repoRoot": "acme/foo",
+				"workdir": "~/repos/foo/bar", "repoRoot": "acme/foo", "repoHost": "github.com",
 			},
 			wantDropped: []string{"meta", "cwd"},
 		},

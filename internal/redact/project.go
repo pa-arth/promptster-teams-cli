@@ -76,9 +76,16 @@ var projectFieldAllowlist = map[string][]string{
 	// sha256 hash, resolved on-device in capture. It is canary-safe (never a raw
 	// path) and its own individually-allowlisted key, so the backend can key repo
 	// rollups + the PR-count join on it; it survives projection exactly like workdir.
+	// repoHost is the bare hostname the slug was parsed from ("github.com",
+	// "gitlab.com") — scheme, userinfo, port and path all discarded on-device by
+	// normalizeRemoteHost, so it is a provider name and structurally cannot carry
+	// a path, a URL, or the OS username. It gets its own allowlisted key for the
+	// same reason repoRoot does: the slug alone is ambiguous across providers
+	// (both hosts' acme/api reduce to "acme/api"), and the backend must be able to
+	// require a provider match rather than treat a colliding owner name as one.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot", "repoHost"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so

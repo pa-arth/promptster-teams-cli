@@ -121,6 +121,47 @@ func TestClaudeTranscriptPromptOmitsRepoRootWhenUnresolved(t *testing.T) {
 	}
 }
 
+// TestClaudeTranscriptPromptStampsRepoHost: the host rides beside repoRoot on
+// the same terms — pre-resolved in capture, stamped here, never derived from the
+// payload. It exists so the backend can tell gitlab.com/acme/api apart from
+// github.com/acme/api, which normalizeRemoteSlug reduces to the same string.
+func TestClaudeTranscriptPromptStampsRepoHost(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-rh")
+	p.RepoRoot = "acme/foo"
+	p.RepoHost = "github.com"
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-1","promptSource":"typed","uuid":"u-rh"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if got := dm(events[0])["repoHost"]; got != "github.com" {
+		t.Errorf("repoHost = %v, want github.com", got)
+	}
+}
+
+// TestClaudeTranscriptPromptOmitsRepoHostWhenUnresolved pins the omit path. A
+// repo with no origin remote resolves to an opaque hash and NO host, so the key
+// must be absent rather than an empty string — the backend distinguishes "no
+// host known" from a host it can compare, and "" would be neither.
+func TestClaudeTranscriptPromptOmitsRepoHostWhenUnresolved(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-rh-none")
+	p.RepoRoot = "d98ef209c46c9dd9" // hash key: no remote, so no host
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-1","promptSource":"typed","uuid":"u-rh-none"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if _, present := dm(events[0])["repoHost"]; present {
+		t.Errorf("repoHost must be absent when unresolved, got %v", dm(events[0])["repoHost"])
+	}
+	// …and repoRoot still ships, so the omit is scoped to the host alone.
+	if got := dm(events[0])["repoRoot"]; got != "d98ef209c46c9dd9" {
+		t.Errorf("repoRoot = %v, want the hash key to survive", got)
+	}
+}
+
 // TestClaudeTranscriptPromptWorkdirOutsideHome is the privacy guard: a prompt
 // whose cwd is OUTSIDE $HOME (an absolute path that may carry the OS username)
 // must produce NO data.workdir — the field is "~"-prefixed or absent, never a

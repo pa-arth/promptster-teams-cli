@@ -358,6 +358,84 @@ func TestNormalizeRemoteSlug(t *testing.T) {
 	}
 }
 
+// TestNormalizeRemoteHostAndSlug covers the host half of the split. The slug
+// column repeats TestNormalizeRemoteSlug's expectations ON PURPOSE: the whole
+// safety argument for splitting normalizeRemoteSlug is that its output did not
+// move, so every case asserts both halves together.
+func TestNormalizeRemoteHostAndSlug(t *testing.T) {
+	cases := map[string]struct{ host, slug string }{
+		// The three mainstream forms, across three providers. Same slug shape,
+		// different hosts — this is the ambiguity the host exists to resolve.
+		"git@github.com:owner/name.git":         {"github.com", "owner/name"},
+		"https://github.com/owner/name.git":     {"github.com", "owner/name"},
+		"ssh://git@github.com/owner/name.git":   {"github.com", "owner/name"},
+		"https://gitlab.com/owner/name.git":     {"gitlab.com", "owner/name"},
+		"git@bitbucket.org:owner/name.git":      {"bitbucket.org", "owner/name"},
+		"https://gitlab.com/group/sub/name.git": {"gitlab.com", "sub/name"},
+		// Self-hosted: a bare host with no dot is still a host.
+		"git@internal-host:owner/name":         {"internal-host", "owner/name"},
+		"https://git.acme.internal/owner/name": {"git.acme.internal", "owner/name"},
+
+		// Host normalization. A host is only useful if it compares equal to the
+		// backend's provider string, so case, userinfo and port must not survive.
+		"https://GitHub.COM/owner/name":          {"github.com", "owner/name"},
+		"ssh://git@github.com:22/owner/name.git": {"github.com", "owner/name"},
+		"https://user:pw@github.com/owner/name":  {"github.com", "owner/name"},
+		"https://tok@n@github.com/owner/name":    {"github.com", "owner/name"},
+		"ssh://git@[2001:db8::1]:22/owner/name":  {"[2001:db8::1]", "owner/name"},
+		"https://github.com:443/owner/name.git":  {"github.com", "owner/name"},
+
+		// scp-style splits on the FIRST colon, not the last. The scp form has no port
+		// syntax, so any later colon belongs to the PATH. Splitting late would take
+		// "git@host:a" as the authority — yielding a host truncated at its own port
+		// separator and "b/c" as the slug, an identity for a repo that does not
+		// exist (Greptile, #98). The path is still reduced to its last two segments,
+		// so a colon inside one rides along instead of re-cutting the URL.
+		"git@host:a:b/c":                {"host", "a:b/c"},
+		"git@github.com:owner/na:me":    {"github.com", "owner/na:me"},
+		"git@host:group/repo:arch/name": {"host", "repo:arch/name"},
+
+		// Every rejected form yields BOTH empty. There must be no state where a
+		// host survives from a URL we refused to turn into an identity — a host
+		// with no slug would be a fact about the machine attached to nothing.
+		"":                             {"", ""},
+		"not-a-url":                    {"", ""},
+		"/home/alice/repos/myproject":  {"", ""},
+		"./myproject":                  {"", ""},
+		"file:///home/alice/myproject": {"", ""},
+		"C:/Users/alice/repo":          {"", ""},
+	}
+	for in, want := range cases {
+		host, slug := normalizeRemote(in)
+		if host != want.host || slug != want.slug {
+			t.Errorf("normalizeRemote(%q) = (%q, %q), want (%q, %q)", in, host, slug, want.host, want.slug)
+		}
+		// The wrapper must stay exactly the slug half — this is what makes the
+		// split a no-op for every existing caller.
+		if got := normalizeRemoteSlug(in); got != slug {
+			t.Errorf("normalizeRemoteSlug(%q) = %q, but normalizeRemote returned slug %q", in, got, slug)
+		}
+	}
+}
+
+// A host is never reported without a slug. Stated as its own invariant because
+// it is the property the redact allowlist depends on: repoHost is safe to ship
+// only while it is a provider name attached to a real repo identity.
+func TestNormalizeRemoteNeverHostWithoutSlug(t *testing.T) {
+	inputs := []string{
+		"", "not-a-url", "https://github.com", "https://github.com/",
+		"https://github.com/onlyowner", "git@github.com:", "git@github.com:name",
+		"file:///home/alice/myproject", "/home/alice/repo", "C:/Users/alice/repo",
+		"ssh://git@github.com/name",
+	}
+	for _, in := range inputs {
+		host, slug := normalizeRemote(in)
+		if slug == "" && host != "" {
+			t.Errorf("normalizeRemote(%q) = host %q with an empty slug — a host must never outlive the identity it came from", in, host)
+		}
+	}
+}
+
 func TestBuildConfigCensusMissingEverything(t *testing.T) {
 	tmp := t.TempDir()
 	data := buildConfigCensus(censusEnv{
