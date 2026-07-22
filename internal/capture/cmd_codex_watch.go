@@ -293,8 +293,10 @@ func pollCodexRollouts(
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
 			// Resolve the canonical repo identity ONCE per session (this processor is
 			// created once per rollout file) from the session_meta cwd, and thread it
-			// in as session state so each prompt event carries repoRoot.
-			proc.RepoRoot = sessionRepoRoot(codexRolloutCwd(path))
+			// in as session state so each prompt event carries repoRoot + repoHost.
+			// Both halves come from ONE call so the host can never be stamped from a
+			// different resolution pass than the slug.
+			proc.RepoRoot, proc.RepoHost = sessionRepoIdentity(codexRolloutCwd(path))
 			processors[path] = proc
 		}
 		n := tailCodexRollout(path, progress, proc, session, captureProse)

@@ -79,7 +79,15 @@ type ClaudeTranscriptProcessor struct {
 	// each prompt event beside workdir when non-empty. Empty (omitted) when the cwd
 	// was gone/unresolvable, mirroring workdir's empty-on-failure. Only set on
 	// main-chain processors — sidechains (UsageOnly) emit no prompts.
-	RepoRoot      string
+	RepoRoot string
+	// RepoHost is the remote's bare hostname (e.g. "github.com"), resolved in the
+	// same capture-side pass as RepoRoot and threaded in the same way. It exists
+	// because the slug alone cannot tell providers apart — gitlab.com/acme/api and
+	// github.com/acme/api both reduce to "acme/api" — so the backend needs it to
+	// require a real provider match rather than treating a colliding owner name as
+	// one. Non-empty ONLY when RepoRoot is a remote slug; the opaque-hash cases
+	// have no remote and report "" rather than a guess. Omitted when empty.
+	RepoHost      string
 	pendingTools  map[string]claudePendingTool
 	emittedMsgIDs map[string]bool
 	accum         *claudeMsgAccum
@@ -725,6 +733,13 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// subdirs/worktrees and joins exactly to outcome_events.repo.
 	if p.RepoRoot != "" {
 		data["repoRoot"] = p.RepoRoot
+	}
+
+	// repoHost — the provider the slug came from, so the backend can tell
+	// gitlab.com/acme/api apart from github.com/acme/api. Same omit-when-empty
+	// rule; empty is the honest answer for a repo with no remote.
+	if p.RepoHost != "" {
+		data["repoHost"] = p.RepoHost
 	}
 
 	// Track the previous human-prompt time as lane state only. No timing,

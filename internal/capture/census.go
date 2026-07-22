@@ -306,6 +306,15 @@ func workspaceKey(root string) string {
 	if slug := gitRemoteSlug(root); slug != "" {
 		return slug
 	}
+	return workspaceHashKey(root)
+}
+
+// workspaceHashKey is workspaceKey's opaque fallback, split out so a caller that
+// has ALREADY resolved the remote (sessionRepoIdentity) can reach the fallback
+// without paying for a second `git config` spawn. Never call it in place of
+// workspaceKey — on a repo that HAS an origin remote it would discard the
+// joinable slug and hash the root instead.
+func workspaceHashKey(root string) string {
 	target := gitRepoRoot(root)
 	if target == "" {
 		target = root
@@ -351,6 +360,15 @@ func gitRepoRoot(dir string) string {
 // "" when the dir is not a git repo, has no origin remote, or the URL can't be
 // reduced to owner/name. Only the slug leaves the machine — never the URL.
 func gitRemoteSlug(root string) string {
+	_, slug := gitRemote(root)
+	return slug
+}
+
+// gitRemote returns the workspace's origin remote as a (host, owner/name) pair.
+// Both are "" together when the dir is not a git repo, has no origin remote, or
+// the URL can't be reduced to owner/name. Only these two reduced fields ever
+// leave the machine — never the URL, and never a filesystem path.
+func gitRemote(root string) (host, slug string) {
 	// A local `git config` read is normally milliseconds, but on a
 	// network-mounted workspace or a corrupt .git it can hang indefinitely —
 	// bound it so census never stalls the watch process.
@@ -359,61 +377,108 @@ func gitRemoteSlug(root string) string {
 	// #nosec G204 -- constant argv; root is a discovered workspace dir, not user input. Reads only the local origin URL, timeout-bounded.
 	out, err := exec.CommandContext(ctx, "git", "-C", root, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
-		return ""
+		return "", ""
 	}
-	return normalizeRemoteSlug(string(out))
+	return normalizeRemote(string(out))
 }
 
-// normalizeRemoteSlug reduces a git remote URL to its trailing owner/name,
-// stripping scheme, host, userinfo, and a trailing ".git". Handles the common
-// forms: https://host/owner/name(.git), ssh://git@host/owner/name(.git), and
-// the scp-style git@host:owner/name(.git). Returns "" when it can't isolate an
-// owner and name. Taking only the last two path segments guarantees no full
-// filesystem path can survive into the identity.
+// normalizeRemoteSlug reduces a git remote URL to its trailing owner/name.
+// Thin wrapper over normalizeRemote — kept so existing callers and their tests
+// are unchanged, and so the slug can never drift from the host it was parsed
+// alongside.
 func normalizeRemoteSlug(raw string) string {
+	_, slug := normalizeRemote(raw)
+	return slug
+}
+
+// normalizeRemote reduces a git remote URL to a (host, owner/name) pair,
+// stripping scheme, userinfo, port, and a trailing ".git". Handles the common
+// forms: https://host/owner/name(.git), ssh://git@host/owner/name(.git), and
+// the scp-style git@host:owner/name(.git). Returns ("", "") when it can't
+// isolate an owner and name. Taking only the last two path segments guarantees
+// no full filesystem path can survive into the identity.
+//
+// WHY THE HOST IS CAPTURED SEPARATELY. The slug alone is ambiguous across
+// providers: gitlab.com/acme/api and github.com/acme/api both reduce to the
+// identical string "acme/api". The backend uses the slug to decide whether a
+// repo belongs to the company's connected GitHub org — without a host, an owner
+// name that merely collides reads as a match, which at a GitLab shop would
+// misclassify repos for every engineer. The host is emitted so the backend can
+// require a provider match instead of guessing, and abstain when it has none.
+//
+// The host is lowercased and port-stripped for stable comparison; userinfo
+// ("git@") is discarded rather than reduced, since a username is personal data
+// with no bearing on which provider hosts the repo. The two returns are always
+// produced together or not at all: a URL the parser rejects yields ("", ""), so
+// there is no state where a host survives from an identity we refused to form.
+func normalizeRemote(raw string) (host, slug string) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return ""
+		return "", ""
 	}
 	raw = strings.TrimSuffix(raw, ".git")
 	if i := strings.Index(raw, "://"); i >= 0 {
-		// scheme://[user@]host/owner/name — drop scheme + host. A non-empty host
-		// must sit between the "://" and the first "/"; an empty host (as in
+		// scheme://[user@]host/owner/name — drop scheme, keep host. A non-empty
+		// host must sit between the "://" and the first "/"; an empty host (as in
 		// file:///home/alice/repo) means a local path, not a hosted remote —
 		// reject so no filesystem segment can survive into the identity.
 		if strings.EqualFold(raw[:i], "file") {
-			return ""
+			return "", ""
 		}
 		rest := raw[i+3:]
 		j := strings.Index(rest, "/")
 		if j <= 0 {
-			return ""
+			return "", ""
 		}
+		host = normalizeRemoteHost(rest[:j])
 		raw = rest[j+1:]
 	} else if i := strings.LastIndex(raw, ":"); i >= 0 {
 		// scp-style [user@]host:owner/name — everything after the colon. Reject
 		// forms that are actually filesystem paths: a host with a slash, or a
 		// path after the colon (C:/Users/alice/repo, git@host:/abs/path).
-		host, rest := raw[:i], raw[i+1:]
-		if host == "" || strings.ContainsAny(host, "/\\") || strings.HasPrefix(rest, "/") {
-			return ""
+		rawHost, rest := raw[:i], raw[i+1:]
+		if rawHost == "" || strings.ContainsAny(rawHost, "/\\") || strings.HasPrefix(rest, "/") {
+			return "", ""
 		}
+		host = normalizeRemoteHost(rawHost)
 		raw = rest
 	} else {
 		// No scheme and no colon → a bare local path (/home/alice/repo, ./repo)
 		// or junk, never a hosted remote. Reject so the WorkspaceKey never
 		// encodes a filesystem path (it falls back to the hashed root instead).
-		return ""
+		return "", ""
 	}
 	parts := strings.Split(strings.Trim(raw, "/"), "/")
 	if len(parts) < 2 {
-		return ""
+		return "", ""
 	}
 	owner, name := parts[len(parts)-2], parts[len(parts)-1]
 	if owner == "" || name == "" {
-		return ""
+		return "", ""
 	}
-	return owner + "/" + name
+	return host, owner + "/" + name
+}
+
+// normalizeRemoteHost reduces a URL authority to a bare comparable hostname:
+// userinfo and port dropped, lowercased. Returns "" if nothing is left, so a
+// malformed authority degrades to "no host known" rather than to junk the
+// backend would compare against a real provider host.
+func normalizeRemoteHost(authority string) string {
+	// Userinfo may itself contain "@" in a password, so split on the LAST one.
+	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		authority = authority[i+1:]
+	}
+	// Strip a :port. An IPv6 literal is bracketed ("[::1]:22"), so only cut at a
+	// colon that follows the closing bracket; a bare colon in an unbracketed host
+	// is a port separator.
+	if strings.HasPrefix(authority, "[") {
+		if j := strings.Index(authority, "]"); j >= 0 {
+			authority = authority[:j+1]
+		}
+	} else if i := strings.LastIndex(authority, ":"); i >= 0 {
+		authority = authority[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(authority))
 }
 
 // buildConfigCensus inventories the config surfaces under env. Every branch is

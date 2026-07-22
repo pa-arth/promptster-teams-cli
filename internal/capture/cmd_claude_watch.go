@@ -561,9 +561,11 @@ func pollClaudeTranscripts(
 				// Resolve the canonical repo identity ONCE per session (this
 				// processor is created once per transcript) from the transcript's
 				// recorded cwd, and thread it in as session state so each prompt
-				// event carries repoRoot. Sidechains emit no prompts, so they skip
-				// it. transcriptCwd reads only the cwd field, never the body.
-				proc.RepoRoot = sessionRepoRoot(transcriptCwd(path))
+				// event carries repoRoot + repoHost. Sidechains emit no prompts, so
+				// they skip it. transcriptCwd reads only the cwd field, never the
+				// body. Both halves come from ONE call so the host can never be
+				// stamped from a different resolution pass than the slug.
+				proc.RepoRoot, proc.RepoHost = sessionRepoIdentity(transcriptCwd(path))
 			}
 			processors[key] = proc
 		}
