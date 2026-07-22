@@ -164,6 +164,14 @@ var projectFieldAllowlist = map[string][]string{
 	"config_census": {
 		"workspaceKey",
 		"globalClaudeMdTokens", "projectClaudeMdTokens",
+		// WHERE the counted project memory sits: the bare enum root|nested|absent,
+		// never a path. It says whether those tokens actually load at launch or
+		// only lazily, which coverage and the config tax read in OPPOSITE
+		// directions — so a strip here doesn't degrade the signal, it inverts it.
+		// LOCKSTEP with the backend's own default-deny allowlist in
+		// packages/shared/src/eventFieldProjection.ts: a field missing from
+		// EITHER side is dropped silently, with no error and no telemetry.
+		"projectClaudeMdPosition",
 		"skillListingTokens", "skillCount", "skills",
 		"pluginListingTokens", "pluginCount", "plugins",
 		"mcpServers", "mcpDeferred",
