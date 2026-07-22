@@ -140,11 +140,22 @@ var vendorPatterns = []redactRule{
 	// IDs and broke turn dedup. Shapes with no prefix — an AWS SECRET access key
 	// (40 bare base64) or a Datadog key (32 bare hex) — are indistinguishable
 	// from a hash or an ID and are intentionally left to the KEY=value rules.
+	//
+	// A rule here must match the CREDENTIAL, not the identifier that names it.
+	// Twilio is the worked example and the reason this paragraph exists: its API
+	// Key SID (`SK` + 32 hex) has a beautifully precise shape, and it is not a
+	// secret — it grants nothing on its own, ships in logs, URLs and API
+	// responses, and the thing that actually authenticates is a separately issued
+	// 32-char alphanumeric secret with NO prefix. A rule on the SID is the worst
+	// of both: it fires `critical` — "rotate this now" — on a value with nothing
+	// to rotate, while the real credential still walks past, and false criticals
+	// are what turn a rotation list back into noise. The precise shape is bait.
+	// Same trap in AWS (`AKIA…` key id vs the 40-char secret), Twilio account
+	// SIDs (`AC…`), and every other id/secret pair. Check which half you matched.
 	{regexp.MustCompile(`\bwhsec_[A-Za-z0-9+/=_-]{16,}`), "[REDACTED_SECRET_KEY]"},  // Svix / Supabase / Stripe webhook signing
 	{regexp.MustCompile(`\bhf_[A-Za-z0-9]{34}\b`), "[REDACTED_SECRET_KEY]"},         // Hugging Face
 	{regexp.MustCompile(`\bsntrys_[A-Za-z0-9+/=_-]{40,}`), "[REDACTED_SECRET_KEY]"}, // Sentry
 	{regexp.MustCompile(`\bsecret_[A-Za-z0-9]{43}\b`), "[REDACTED_SECRET_KEY]"},     // Notion internal integration
-	{regexp.MustCompile(`\bSK[0-9a-f]{32}\b`), "[REDACTED_SECRET_KEY]"},             // Twilio API key sid
 }
 
 // Stage 3 — shape-blind fallbacks, applied AFTER Titus. Every value pattern here

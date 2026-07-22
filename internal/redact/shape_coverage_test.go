@@ -66,16 +66,21 @@ func shapeCases() []shapeCase {
 		{vendor: "xAI", val: "xai-" + rep(b62, 80)},
 		{vendor: "JWT", val: "eyJhbGciOiJIUzI1NiJ9." + rep(b62, 40) + "." + rep(b62, 43)},
 
-		// The five added alongside this test — each leaked in prose before.
+		// The four added alongside this test — each leaked in prose before.
 		{vendor: "Svix/Supabase webhook", val: "whsec_" + rep(b62, 32)},
 		{vendor: "Hugging Face", val: "hf_" + rep(b62, 34)},
 		{vendor: "Sentry", val: "sntrys_" + rep(b62, 60)},
 		{vendor: "Notion integration", val: "secret_" + rep(b62, 43)},
-		{vendor: "Twilio API key sid", val: "SK" + rep(hx, 32)},
 
 		// Deliberately uncatchable by shape — see the dedicated test below.
 		{vendor: "AWS SECRET access key", val: "wJalrXUtnFEMI" + rep(b62, 27), bareLeakOK: true},
 		{vendor: "Datadog", val: rep(hx, 32), bareLeakOK: true},
+		// Twilio's API Key SECRET, the half that actually authenticates: 32 bare
+		// alphanumerics, no prefix. Its SID (`SK` + 32 hex) IS matchable and is
+		// deliberately not matched — see the identifier-vs-credential note in
+		// redact.go. Listing the secret here rather than the SID keeps the table
+		// honest about which half we can and cannot see.
+		{vendor: "Twilio API key SECRET", val: rep(b62, 32), bareLeakOK: true},
 	}
 }
 
@@ -131,7 +136,28 @@ func TestShapeCoverage_UncatchableAreDeliberate(t *testing.T) {
 	}
 }
 
-// The five new rules collapse to ONE marker on purpose, and that marker must be
+// A Twilio API Key SID (`SK` + 32 hex) is an IDENTIFIER, not a credential. It
+// grants nothing alone, appears in logs, URLs and API responses, and the half
+// that authenticates is a separately issued 32-char alphanumeric with no prefix.
+//
+// It shipped as a rule in the first draft of this PR precisely because the shape
+// is so clean, and that is the trap: `[REDACTED_SECRET_KEY]` grades `critical`
+// downstream, so the rule would have fired "rotate this now" on a value with
+// nothing to rotate — while the real secret walked past untouched. False
+// criticals are what turn a rotation list back into noise, which is the same
+// argument that keeps name-only evidence at `high`, pointed the other way.
+//
+// Pinned as a decision, not a comment. If this ever fails, the new rule is
+// matching the wrong half of an id/secret pair.
+func TestShapeCoverage_TwilioSidIsNotACredential(t *testing.T) {
+	sid := "SK" + rep(hx, 32)
+	out := string(RedactBytes([]byte("the api key sid is " + sid + " per the docs")))
+	if strings.Contains(out, "[REDACTED_SECRET_KEY]") {
+		t.Errorf("Twilio API Key SID graded as a verified key shape — that is a false critical: %s", out)
+	}
+}
+
+// The four new rules collapse to ONE marker on purpose, and that marker must be
 // distinguishable from the name-only generic. `[REDACTED]` means "a secret-ish
 // NAME had some value"; `[REDACTED_SECRET_KEY]` means "a value only a real key
 // produces". Downstream grades the second critical and the first high, so
