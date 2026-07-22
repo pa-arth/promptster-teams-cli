@@ -8,3 +8,15 @@
 # (fetch-depth 0) still flags via generic-api-key. This fingerprint suppresses
 # that one historical finding.
 8c89ed4f60b777a5f2ecef0a1b960f2c802573f3:internal/redact/project_test.go:generic-api-key:252
+
+# TestRedactLLMKeyVendorSplit asserts sk-proj- keys are attributed to OpenAI
+# rather than collapsing into the generic LLM marker, so the fixture must carry a
+# real sk-proj- SHAPE — that shape is the thing under test. The value itself is
+# synthetic (`A1b2C3d4…`, never issued), but as a single `OPENAI_API_KEY=<token>`
+# literal it reads to generic-api-key as an assignment with 4.75 entropy.
+#
+# HEAD splits the literal so the rule no longer fires, matching the convention
+# already used a few lines above it. This fingerprint covers the one historical
+# commit (fac85c9) that introduced it unsplit, which the PR-range scan still
+# walks. Same pattern as the entry above.
+fac85c9d32a682e00c13092304669d3fac130522:internal/redact/redact_test.go:generic-api-key:281

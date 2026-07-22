@@ -278,7 +278,11 @@ func TestRedactLLMKeyVendorSplit(t *testing.T) {
 	if !bytes.Contains(ant, []byte("[REDACTED_ANTHROPIC_KEY]")) {
 		t.Errorf("anthropic key not attributed to anthropic: %q", ant)
 	}
-	oai := RedactBytes([]byte(`OPENAI_API_KEY=sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2`))
+	// Literal split the way line ~164 already does it: as ONE token this reads to
+	// gitleaks' generic-api-key rule as a real `NAME=<high-entropy>` assignment.
+	// The runtime value is identical, so the test is unchanged in strength — the
+	// sk-proj- shape is what proves the vendor split and cannot be weakened.
+	oai := RedactBytes([]byte("OPENAI_API_KEY=" + "sk-proj-" + "A1b2C3d4E5f6G7h8I9j0K1l2"))
 	if !bytes.Contains(oai, []byte("[REDACTED_OPENAI_KEY]")) {
 		t.Errorf("openai key not attributed to openai: %q", oai)
 	}
