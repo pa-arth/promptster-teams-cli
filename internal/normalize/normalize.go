@@ -321,10 +321,16 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		}
 		contentLen := 0
 		numLines := 0
+		// The file body, held only for the length count and the credential
+		// key-NAME harvest below. It is never assigned into e.Data — the
+		// no-source contract means a file_read carries a path and counts, and
+		// `content` is not in the field allowlist at either end of the wire.
+		body := ""
 		// Claude Code sends tool_response as {type: "text", file: {filePath, content, numLines, ...}}
 		if fileObj, ok := toolResponse["file"].(map[string]interface{}); ok {
 			if content, ok := fileObj["content"].(string); ok {
 				contentLen = len(content)
+				body = content
 			}
 			if n, ok := fileObj["numLines"].(float64); ok {
 				numLines = int(n)
@@ -336,12 +342,25 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		} else if content, ok := toolResponse["content"].(string); ok {
 			// Fallback: direct content field
 			contentLen = len(content)
+			body = content
 		}
 		e := event.NewEvent("file_read", sessionID)
 		e.Data = map[string]interface{}{
 			"path":          path,
 			"contentLength": contentLen,
 			"numLines":      numLines,
+		}
+		// Credential KEY NAMES (never values) for dotenv-class files. Harvested
+		// here rather than by re-reading the file: the body is already in hand,
+		// so there is no second read and no window for it to change underneath
+		// us. Runs AFTER the filePath fixup above, because the response's path is
+		// the authoritative one and the classifier keys on it.
+		//
+		// Set only when non-empty. An absent field means "this CLI did not
+		// harvest"; an empty array would mean "we looked inside and the file held
+		// no keys", which is a different and much more dangerous claim.
+		if keys := HarvestCredentialKeyNames(path, body); len(keys) > 0 {
+			e.Data.(map[string]interface{})["credentialKeys"] = keys
 		}
 		e.RawPayload = raw
 		return e, true

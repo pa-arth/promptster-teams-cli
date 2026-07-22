@@ -104,9 +104,17 @@ var projectFieldAllowlist = map[string][]string{
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
 	// what structurally guarantees no diff/text bytes ride along.
-	"file_diff":    {"path", "linesAdded", "linesRemoved", "lineRanges"},
-	"file_create":  {"path", "linesAdded", "sizeBytes"},
-	"file_read":    {"path"},
+	"file_diff":   {"path", "linesAdded", "linesRemoved", "lineRanges"},
+	"file_create": {"path", "linesAdded", "sizeBytes"},
+	// credentialKeys is the KEY NAMES harvested on-device from a dotenv-class
+	// file the agent read — {"STRIPE_SECRET_KEY", "DATABASE_URL"}, never a value.
+	// normalize.HarvestCredentialKeyNames splits each line with strings.Cut and
+	// discards the right-hand side, so a value has no path into this field at
+	// all; the clamp below is a second, independent filter on shape and volume.
+	// ABSENT (not empty) when nothing was harvested — the backend reads absent as
+	// "this CLI does not harvest" and empty as "the file held no keys".
+	// Lockstep with the backend's TEAMS_FIELD_ALLOWLIST + TEAMS_STRING_ARRAY_CLAMPS.
+	"file_read":    {"path", "credentialKeys"},
 	"file_search":  {"path", "query"},
 	"file_delete":  {"path"},
 	"dir_list":     {"path"},
@@ -256,6 +264,104 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	"rework_verdict": {
 		"reworkedRanges": {"start", "end", "ageDays", "lineageId"},
 	},
+}
+
+// stringArrayClamp — shape + volume bounds for an allowlisted array-of-STRING
+// field.
+type stringArrayClamp struct {
+	maxItems  int
+	maxLength int
+	// allow reports whether an element's shape is acceptable. A false verdict
+	// DROPS the element; nothing is ever truncated, because a truncated secret is
+	// still a secret prefix and a truncated name is a lie.
+	allow func(string) bool
+}
+
+// projectStringArrayClamp — element-level clamps for array-of-STRING fields.
+//
+// projectArrayElements handles arrays of OBJECTS and skips every scalar, so
+// WITHOUT this an allowlisted string array would be copied VERBATIM by the
+// shallow projection — the whole array trusted because its key was allowlisted.
+// That is exactly the trust this file exists not to extend, and it is the same
+// hole the backend's TEAMS_STRING_ARRAY_CLAMPS closes. Keep the two in lockstep.
+//
+// HONEST LIMIT: this cannot prove an element is a NAME rather than a VALUE —
+// `AKIAIOSFODNN7EXAMPLE` is a real AWS key id and passes any identifier charset.
+// What it buys is volume (a bug can't turn one file_read into a string dump),
+// shape (whitespace, quotes, `=`, `/`, `+`, a redaction marker: all dropped) and
+// length. The guarantee that no value is ever a candidate comes from the
+// producer — normalize.HarvestCredentialKeyNames discards every right-hand side.
+var projectStringArrayClamp = map[string]map[string]stringArrayClamp{
+	"file_read": {
+		"credentialKeys": {maxItems: 40, maxLength: 64, allow: isIdentifierName},
+	},
+}
+
+// isIdentifierName — leading letter/underscore, then word characters. Mirrors
+// normalize.isIdentifierName and the backend's `/^[A-Za-z_][A-Za-z0-9_]*$/`.
+// Duplicated rather than imported so the redaction package depends on nothing:
+// a projection that could be weakened by an unrelated package's refactor is not
+// a default-deny boundary.
+func isIdentifierName(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c == '_':
+			continue
+		case c >= '0' && c <= '9':
+			if i == 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// projectStringArray clamps an array-of-string field: drop non-strings, drop
+// anything failing the shape or length test, de-duplicate, cap the count.
+// Order-preserving, so the result is deterministic for a given input. A
+// non-array yields an empty slice — the same default-deny posture as
+// projectArrayElements.
+func projectStringArray(value interface{}, clamp stringArrayClamp) []interface{} {
+	arr, isArray := value.([]interface{})
+	if !isArray {
+		// A []string never reaches here from the normalizer (Data is
+		// map[string]interface{} built from JSON), but handle it rather than
+		// silently dropping a field a future emitter might set natively.
+		if typed, isTyped := value.([]string); isTyped {
+			arr = make([]interface{}, 0, len(typed))
+			for _, s := range typed {
+				arr = append(arr, s)
+			}
+		} else {
+			return []interface{}{}
+		}
+	}
+	out := make([]interface{}, 0, len(arr))
+	seen := make(map[string]struct{}, len(arr))
+	for _, el := range arr {
+		if len(out) >= clamp.maxItems {
+			break
+		}
+		s, isString := el.(string)
+		if !isString || s == "" || len(s) > clamp.maxLength {
+			continue
+		}
+		if clamp.allow != nil && !clamp.allow(s) {
+			continue
+		}
+		if _, dup := seen[s]; dup {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 // shellCommandKinds — kinds whose kept `command` field is a SHELL INVOCATION
@@ -601,6 +707,7 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		return
 	}
 	elementAllowlists := projectArrayElementAllowlist[e.Kind]
+	stringClamps := projectStringArrayClamp[e.Kind]
 	projected := make(map[string]interface{}, len(allowed))
 	for _, key := range allowed {
 		value, present := data[key]
@@ -609,6 +716,17 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		}
 		if elementFields, hasElementList := elementAllowlists[key]; hasElementList {
 			projected[key] = projectArrayElements(value, elementFields, elementAllowlists)
+			continue
+		}
+		if clamp, hasClamp := stringClamps[key]; hasClamp {
+			// Drop to ABSENT, never to `[]`. If the field arrived malformed, or
+			// every element failed the shape/length test, an empty array on the
+			// wire reads downstream as "we harvested this file and it had no
+			// keys" — a fabricated all-clear on a security surface. Absence
+			// says "no harvest", which is the truth.
+			if clamped := projectStringArray(value, clamp); len(clamped) > 0 {
+				projected[key] = clamped
+			}
 			continue
 		}
 		projected[key] = value

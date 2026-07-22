@@ -488,6 +488,147 @@ func TestProjectEventReworkVerdictNestedElements(t *testing.T) {
 	}
 }
 
+// ── file_read.credentialKeys — the array-of-STRING clamp ───────────────────
+//
+// The hole this closes: projectArrayElements handles arrays of OBJECTS and
+// `continue`s past every scalar, so before the clamp an allowlisted string array
+// was copied VERBATIM — the whole array trusted because its key was allowlisted.
+
+func TestProjectEventCredentialKeysClamp(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want []interface{}
+	}{
+		{
+			name: "identifier-shaped names survive, in order",
+			in:   []interface{}{"STRIPE_SECRET_KEY", "DATABASE_URL", "_privateKey", "aws_access_key_id"},
+			want: []interface{}{"STRIPE_SECRET_KEY", "DATABASE_URL", "_privateKey", "aws_access_key_id"},
+		},
+		{
+			name: "value-shaped elements are DROPPED, not truncated",
+			in: []interface{}{
+				"GOOD_KEY",
+				"sk_live_51H/abc+def=",     // `/`, `+`, `=` — a real key charset
+				"ghp_" + leakCanary + "!!", // punctuation
+				"has space",
+				"9leading",
+				"DASHED-KEY",
+				"[REDACTED_ANTHROPIC_KEY]", // a marker is not a name
+				"postgres://u:p@host/db",
+			},
+			want: []interface{}{"GOOD_KEY"},
+		},
+		{
+			name: "an over-long element is dropped whole — a truncated secret is still a secret prefix",
+			in:   []interface{}{"OK_KEY", strings.Repeat("A", 65)},
+			want: []interface{}{"OK_KEY"},
+		},
+		{
+			name: "non-string elements are dropped",
+			in:   []interface{}{"OK_KEY", 42, nil, map[string]interface{}{"content": leakCanary}, []interface{}{leakCanary}},
+			want: []interface{}{"OK_KEY"},
+		},
+		{
+			name: "duplicates fold",
+			in:   []interface{}{"A_KEY", "A_KEY", "B_KEY"},
+			want: []interface{}{"A_KEY", "B_KEY"},
+		},
+		// A rejected harvest must leave the field ABSENT, not `[]`. An empty
+		// array reads downstream as "we looked inside the file and it had no
+		// keys" — a fabricated all-clear on the one surface whose job is naming
+		// what to rotate. Absence reads as "no harvest", which is the truth.
+		{
+			name: "a non-array value cannot ride through as itself — and leaves NO field",
+			in:   leakCanary,
+			want: nil,
+		},
+		{
+			name: "every element rejected leaves NO field, never an empty array",
+			in:   []interface{}{"has space", "9leading", "postgres://u:p@h/db", 42, nil},
+			want: nil,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := eventWithData("file_read", map[string]interface{}{
+				"path":           "acme-api/.env",
+				"credentialKeys": tc.in,
+			})
+			ProjectEvent(&e, false)
+			data := e.Data.(map[string]interface{})
+			if tc.want == nil {
+				if raw, present := data["credentialKeys"]; present {
+					t.Fatalf("credentialKeys must be ABSENT when nothing survives, got %#v", raw)
+				}
+				encoded, err := json.Marshal(data)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				if strings.Contains(string(encoded), "credentialKeys") {
+					t.Fatalf("credentialKeys reached the wire: %s", encoded)
+				}
+				if strings.Contains(string(encoded), leakCanary) {
+					t.Fatalf("canary survived projection: %s", encoded)
+				}
+				return
+			}
+			got, isArray := data["credentialKeys"].([]interface{})
+			if !isArray {
+				t.Fatalf("credentialKeys must project to an array, got %#v", data["credentialKeys"])
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %#v, want %#v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %#v, want %#v", got, tc.want)
+				}
+			}
+			encoded, err := json.Marshal(data)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if strings.Contains(string(encoded), leakCanary) {
+				t.Fatalf("canary survived projection: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestProjectEventCredentialKeysCap(t *testing.T) {
+	in := make([]interface{}, 0, 60)
+	for i := 0; i < 60; i++ {
+		in = append(in, "KEY_"+string(rune('a'+i%26))+string(rune('a'+i/26)))
+	}
+	e := eventWithData("file_read", map[string]interface{}{"path": ".env", "credentialKeys": in})
+	ProjectEvent(&e, false)
+	got := e.Data.(map[string]interface{})["credentialKeys"].([]interface{})
+	if len(got) != 40 {
+		t.Fatalf("expected the 40-item cap, got %d", len(got))
+	}
+}
+
+// ABSENT ≠ EMPTY at the projection boundary too: an older CLI (or an ordinary
+// read) emits no credentialKeys, and projection must NOT manufacture an empty
+// array — downstream, `[]` claims "we looked inside and there were no keys".
+func TestProjectEventLeavesCredentialKeysAbsent(t *testing.T) {
+	e := eventWithData("file_read", map[string]interface{}{
+		"path":          "src/app.ts",
+		"contentLength": 512,
+		"content":       leakCanary,
+	})
+	ProjectEvent(&e, false)
+	data := e.Data.(map[string]interface{})
+	if _, present := data["credentialKeys"]; present {
+		t.Fatalf("projection must not invent credentialKeys, got %#v", data)
+	}
+	if _, present := data["content"]; present {
+		t.Fatalf("file_read must never keep content, got %#v", data)
+	}
+}
+
 func TestProjectEventNonMapDataKeepsNothing(t *testing.T) {
 	e := event.NewEvent("command", "sess-project-test")
 	e.Data = "raw string payload " + leakCanary
