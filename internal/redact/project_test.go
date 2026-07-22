@@ -706,3 +706,39 @@ func TestProjectEventAssistantProseGate(t *testing.T) {
 
 // j2 joins lines with '\n' (helper local to the prose-gate test).
 func j2(lines ...string) string { return strings.Join(lines, "\n") }
+
+// livingRanges is the third range array (derivationV 2): a daily inventory of AI
+// spans still tracked and undecided, so survival is measurable before the 30-day
+// harvest can emit its first durable verdict. It is subject to the SAME two-level
+// allowlist as durable/churned — and, being new, is the one most likely to be
+// forgotten in the element walk and ship a range VERBATIM.
+//
+// LOCKSTEP: the backend's TEAMS_FIELD_ALLOWLIST must also name `livingRanges`
+// (packages/shared/src/eventFieldProjection.ts) or it is stripped again at ingest
+// and this whole array silently never arrives.
+func TestProjectEventDurabilityVerdictLivingRanges(t *testing.T) {
+	e := eventWithData("durability_verdict", map[string]interface{}{
+		"commitSha":    "deadbeefcafe",
+		"workspaceKey": "owner/name",
+		"path":         "src/app.ts",
+		"measuredTsMs": 1000,
+		"livingRanges": []interface{}{
+			map[string]interface{}{"start": 1, "end": 3, "ageDays": 4, "lineageId": "abc:src/app.ts", "text": leakCanary},
+		},
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived livingRanges projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	living, ok := data["livingRanges"].([]interface{})
+	if !ok || len(living) != 1 {
+		t.Fatalf("livingRanges did not survive projection (survival would be unmeasurable): %T %+v", data["livingRanges"], data["livingRanges"])
+	}
+	first := living[0].(map[string]interface{})
+	if len(first) != 4 || first["start"] != 1 || first["end"] != 3 || first["ageDays"] != 4 || first["lineageId"] != "abc:src/app.ts" {
+		t.Errorf("living range not stripped to {start,end,ageDays,lineageId}: %+v", first)
+	}
+}

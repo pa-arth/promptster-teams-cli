@@ -175,14 +175,18 @@ var projectFieldAllowlist = map[string][]string{
 	// added lines (the denominator for the backend's token-efficiency ratio),
 	// never the line text or bytes.
 	"commit_attribution": {"commitSha", "workspaceKey", "files", "aiTokens"},
-	// durability_verdict reports WHICH AI line ranges survived (durableRanges) or
-	// were rewritten (churnedRanges) on a path over time — content-free metadata:
-	// integer line numbers, an age, and a lineage id (a `sha:path` handle, never
-	// content). commitSha/workspaceKey/path are the same public identities the
-	// other watcher events carry. The durableRanges[]/churnedRanges[] element
-	// allowlists below are the load-bearing privacy line. NEVER a diff, file body,
-	// old/new string, or content fingerprint (fingerprints stay on-device).
-	"durability_verdict": {"commitSha", "workspaceKey", "path", "durableRanges", "churnedRanges", "measuredTsMs"},
+	// durability_verdict reports WHICH AI line ranges survived (durableRanges),
+	// were rewritten (churnedRanges), or are still tracked and undecided
+	// (livingRanges) on a path over time — content-free metadata: integer line
+	// numbers, an age, and a lineage id (a `sha:path` handle, never content).
+	// commitSha/workspaceKey/path are the same public identities the other watcher
+	// events carry. The three range element allowlists below are the load-bearing
+	// privacy line. NEVER a diff, file body, old/new string, or content
+	// fingerprint (fingerprints stay on-device). livingRanges introduces no new
+	// class of data — it is the SAME scalar shape as the other two.
+	// LOCKSTEP with promptster-backend packages/shared/src/eventFieldProjection.ts:
+	// a field allowed here but not there is silently dropped at ingest.
+	"durability_verdict": {"commitSha", "workspaceKey", "path", "durableRanges", "churnedRanges", "livingRanges", "measuredTsMs"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
@@ -228,6 +232,7 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	"durability_verdict": {
 		"durableRanges": {"start", "end", "ageDays", "lineageId"},
 		"churnedRanges": {"start", "end", "ageDays", "lineageId"},
+		"livingRanges":  {"start", "end", "ageDays", "lineageId"},
 	},
 	// rework_verdict's range array is content-free by construction (ints + a
 	// lineage handle), but this allowlist is the LOAD-BEARING privacy line: it
