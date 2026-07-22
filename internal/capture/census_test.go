@@ -188,7 +188,7 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 	}
 	want := []string{
 		"workspaceKey",
-		"globalClaudeMdTokens", "projectClaudeMdTokens",
+		"globalClaudeMdTokens", "projectClaudeMdTokens", "projectClaudeMdPosition",
 		"skills", "skillListingTokens", "skillCount",
 		"plugins", "pluginListingTokens", "pluginCount",
 		"mcpServers", "mcpDeferred",
@@ -447,6 +447,12 @@ func TestBuildConfigCensusMissingEverything(t *testing.T) {
 		data.SkillCount != 0 || data.PluginCount != 0 || len(data.MCPServers) != 0 {
 		t.Errorf("empty env must produce zeros: %+v", data)
 	}
+	// Position is "absent", NOT omitted. Omitted means "older CLI, position
+	// unknown" — a claim this census can disprove. It walked the roots and found
+	// nothing, so it says so; the backend must not have to guess which it meant.
+	if data.ProjectClaudeMdPosition != claudeMdPositionAbsent {
+		t.Errorf("position = %q, want %q", data.ProjectClaudeMdPosition, claudeMdPositionAbsent)
+	}
 	// Arrays must be present (not null) so the payload shape is stable.
 	raw, _ := json.Marshal(data)
 	if strings.Contains(string(raw), "null") {
@@ -562,19 +568,32 @@ func TestProjectClaudeMdTokensNested(t *testing.T) {
 	writeClaudeFixture(t, root, "d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // dir d6 is 6 levels down → past bound
 
 	const want = 50 // max(app=50, packages/x/y=10), NOT the 60 sum
-	if got := projectClaudeMdTokens([]string{root}); got != want {
+	got, pos := projectClaudeMdTokens([]string{root})
+	if got != want {
 		t.Errorf("projectClaudeMdTokens = %d, want %d (largest nested, not summed)", got, want)
+	}
+	// The whole point of position: this repo IS covered, but the memory is
+	// LATENT — it loads only once the agent reads a file under app/, and never
+	// again after /compact. Magnitude alone cannot say that.
+	if pos != claudeMdPositionNested {
+		t.Errorf("position = %q, want %q (fallback supplied the count)", pos, claudeMdPositionNested)
 	}
 
 	// Overlapping roots (a workspace + a sub-root resolving into the same tree)
 	// must not inflate — max is idempotent.
-	if got := projectClaudeMdTokens([]string{root, root, filepath.Join(root, "app")}); got != want {
-		t.Errorf("overlapping roots inflated: got %d, want %d", got, want)
+	//
+	// Position legitimately FLIPS to "root" here, and that is not a bug: once
+	// app/ is itself a watched root, app/CLAUDE.md sits AT a root, and a session
+	// started there loads it at launch. Position describes the file's relation to
+	// the watched root set, not how deep its path looks. Same 50 tokens — but now
+	// they really are always-on, and the config tax should bill them.
+	if got, pos := projectClaudeMdTokens([]string{root, root, filepath.Join(root, "app")}); got != want || pos != claudeMdPositionRoot {
+		t.Errorf("overlapping roots: got %d/%q, want %d/%q", got, pos, want, claudeMdPositionRoot)
 	}
 
 	// Empty / missing roots contribute nothing and never error.
-	if got := projectClaudeMdTokens([]string{"", filepath.Join(root, "does-not-exist")}); got != 0 {
-		t.Errorf("empty/missing roots = %d, want 0", got)
+	if got, pos := projectClaudeMdTokens([]string{"", filepath.Join(root, "does-not-exist")}); got != 0 || pos != claudeMdPositionAbsent {
+		t.Errorf("empty/missing roots = %d/%q, want 0/%q", got, pos, claudeMdPositionAbsent)
 	}
 }
 
@@ -602,14 +621,16 @@ func TestProjectClaudeMdTokensSkipsNonRepoRoot(t *testing.T) {
 	writeClaudeFixture(t, home, "Documents/proj/CLAUDE.md", 400) // 100 tokens
 	writeClaudeFixture(t, home, "Downloads/CLAUDE.md", 400)      // 100 tokens
 
-	if got := projectClaudeMdTokens([]string{home}); got != 0 {
-		t.Fatalf("non-repo root walked: got %d, want 0 (must not descend into a dir with no .git)", got)
+	// Position must report "absent" here, not "nested": nothing was found because
+	// nothing was walked. A non-repo root has no project memory to be latent.
+	if got, pos := projectClaudeMdTokens([]string{home}); got != 0 || pos != claudeMdPositionAbsent {
+		t.Fatalf("non-repo root walked: got %d/%q, want 0/%q (must not descend into a dir with no .git)", got, pos, claudeMdPositionAbsent)
 	}
 
 	// Same tree, now a git repo → the walk runs and finds the nested file.
 	markGitRepo(t, home)
-	if got := projectClaudeMdTokens([]string{home}); got != 100 {
-		t.Fatalf("repo root: got %d, want 100 (max nested once .git present)", got)
+	if got, pos := projectClaudeMdTokens([]string{home}); got != 100 || pos != claudeMdPositionNested {
+		t.Fatalf("repo root: got %d/%q, want 100/%q (max nested once .git present)", got, pos, claudeMdPositionNested)
 	}
 }
 
@@ -624,8 +645,14 @@ func TestProjectClaudeMdTokensRootPreferred(t *testing.T) {
 	writeClaudeFixture(t, root, "packages/a/CLAUDE.md", 4000) // huge nested sibling, must be ignored
 
 	const want = 20
-	if got := projectClaudeMdTokens([]string{root}); got != want {
+	got, pos := projectClaudeMdTokens([]string{root})
+	if got != want {
 		t.Errorf("projectClaudeMdTokens = %d, want %d (root only, nested ignored)", got, want)
+	}
+	// Root file present ⇒ always-loaded ⇒ the config tax may bill it. The huge
+	// nested sibling must not flip this to "nested" and get the tokens excused.
+	if pos != claudeMdPositionRoot {
+		t.Errorf("position = %q, want %q", pos, claudeMdPositionRoot)
 	}
 }
 
@@ -638,16 +665,18 @@ func TestProjectClaudeMdTokensDepthBound(t *testing.T) {
 	inRoot := t.TempDir()
 	markGitRepo(t, inRoot)
 	writeClaudeFixture(t, inRoot, "l1/l2/l3/l4/l5/CLAUDE.md", 200)
-	if got := projectClaudeMdTokens([]string{inRoot}); got != 50 {
-		t.Errorf("depth-5 file: got %d, want 50 (must be included)", got)
+	if got, pos := projectClaudeMdTokens([]string{inRoot}); got != 50 || pos != claudeMdPositionNested {
+		t.Errorf("depth-5 file: got %d/%q, want 50/%q (must be included)", got, pos, claudeMdPositionNested)
 	}
 
 	// Depth 6 (m1/.../m6/CLAUDE.md): dir m6 is 6 levels below root → excluded.
 	outRoot := t.TempDir()
 	markGitRepo(t, outRoot)
 	writeClaudeFixture(t, outRoot, "m1/m2/m3/m4/m5/m6/CLAUDE.md", 200)
-	if got := projectClaudeMdTokens([]string{outRoot}); got != 0 {
-		t.Errorf("depth-6 file: got %d, want 0 (must be excluded)", got)
+	// Excluded by the depth bound ⇒ no tokens ⇒ "absent". Position tracks what was
+	// COUNTED, so a file the scan deliberately skipped must not read as latent.
+	if got, pos := projectClaudeMdTokens([]string{outRoot}); got != 0 || pos != claudeMdPositionAbsent {
+		t.Errorf("depth-6 file: got %d/%q, want 0/%q (must be excluded)", got, pos, claudeMdPositionAbsent)
 	}
 }
 
