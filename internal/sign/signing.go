@@ -154,20 +154,37 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 	return nil
 }
 
-// writeJSONString mirrors JSON.stringify's string escaping. encoding/json's
-// default HTML-safe mode rewrites &, < and > as \u0026/\u003c/\u003e. Those are
-// semantically equivalent JSON but NOT byte-equivalent inside the SHA-256 data
-// hash, so shell commands such as `a && b > out` signed in Go failed verification
-// in the TypeScript backend. Disable HTML escaping for both values and object
-// keys; trim Encoder's one framing newline.
+// writeJSONString mirrors JSON.stringify's string escaping. encoding/json
+// differs even with HTML escaping disabled: it always escapes U+2028/U+2029,
+// while JavaScript emits both separators literally. Those spellings are valid
+// JSON but not byte-equivalent inside the SHA-256 data hash, so encode strings
+// directly for both values and object keys.
 func writeJSONString(buf *strings.Builder, s string) error {
-	var encoded strings.Builder
-	enc := json.NewEncoder(&encoded)
-	enc.SetEscapeHTML(false)
-	if err := enc.Encode(s); err != nil {
-		return err
+	buf.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"', '\\':
+			buf.WriteByte('\\')
+			buf.WriteRune(r)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				_, _ = fmt.Fprintf(buf, `\u%04x`, r)
+			} else {
+				buf.WriteRune(r)
+			}
+		}
 	}
-	buf.WriteString(strings.TrimSuffix(encoded.String(), "\n"))
+	buf.WriteByte('"')
 	return nil
 }
 

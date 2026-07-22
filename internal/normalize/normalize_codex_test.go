@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -172,6 +173,35 @@ func TestCodexExecWrapperCorrelatesDetachedCommandCompletion(t *testing.T) {
 	}
 	if events[0].Ts != "2026-07-22T17:30:03Z" {
 		t.Errorf("command timestamp = %q, want actual completion time", events[0].Ts)
+	}
+}
+
+func TestCodexExecWrapperDoesNotTreatCommandStdoutAsHandoff(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	call := `{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_echo","input":"const r = await tools.exec_command({cmd:\"printf handoff\"}); text(r.output);"}}`
+	out := `{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_echo","output":[{"type":"input_text","text":"Script completed\nOutput:\nScript running with cell ID 123\n"}]}}`
+	_ = p.Process([]byte(call))
+	events := p.Process([]byte(out))
+	if len(events) != 1 || events[0].Kind != "command" {
+		t.Fatalf("control-like stdout = %#v, want completed command", events)
+	}
+}
+
+func TestCodexExecWrapperDecodesJavaScriptStringEscapes(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"a\v\q\x41\u0042\
+c"}); text(r.output);`
+	name, args := unwrapCodexExec(map[string]interface{}{"input": input})
+	if name != "exec_command" {
+		t.Fatalf("tool = %q", name)
+	}
+	if got, want := args["cmd"], "a\vqABc"; got != want {
+		t.Errorf("decoded JS command = %q, want %q", got, want)
+	}
+
+	patchInput := `const patch = "*** Begin Patch\n*** Add File: a.txt\n+one\vline\n*** End Patch"; await tools.apply_patch(patch);`
+	patch := extractJSCallStringArg(patchInput, "tools.apply_patch")
+	if !strings.Contains(patch, "one\vline") {
+		t.Errorf("wrapped patch lost JavaScript escape: %q", patch)
 	}
 }
 

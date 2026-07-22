@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -533,8 +534,8 @@ func extractJSObjectStringField(input, field string) string {
 	if m == nil {
 		return ""
 	}
-	s, err := strconv.Unquote(m[1])
-	if err != nil {
+	s, ok := decodeJSDoubleQuoted(m[1])
+	if !ok {
 		return ""
 	}
 	return s
@@ -595,13 +596,153 @@ func extractJSCallStringArg(input, callee string) string {
 		if backslashes%2 != 0 {
 			continue
 		}
-		s, err := strconv.Unquote(rest[:i+1])
-		if err == nil {
+		s, ok := decodeJSDoubleQuoted(rest[:i+1])
+		if ok {
 			return s
 		}
 		return ""
 	}
 	return ""
+}
+
+// decodeJSDoubleQuoted decodes one JavaScript double-quoted string literal
+// without evaluating JavaScript. Codex's wrapper is JavaScript source, not a Go
+// string: in addition to JSON escapes it may legally contain \v, \xNN, identity
+// escapes, or escaped line continuations, all of which strconv.Unquote rejects.
+func decodeJSDoubleQuoted(lit string) (string, bool) {
+	if len(lit) < 2 || lit[0] != '"' || lit[len(lit)-1] != '"' {
+		return "", false
+	}
+	var out strings.Builder
+	for i := 1; i < len(lit)-1; {
+		if lit[i] != '\\' {
+			r, size := utf8.DecodeRuneInString(lit[i : len(lit)-1])
+			if r == utf8.RuneError && size == 1 {
+				return "", false
+			}
+			out.WriteRune(r)
+			i += size
+			continue
+		}
+		i++
+		if i >= len(lit)-1 {
+			return "", false
+		}
+		switch lit[i] {
+		case '"', '\\', '/':
+			out.WriteByte(lit[i])
+			i++
+		case 'b':
+			out.WriteByte('\b')
+			i++
+		case 'f':
+			out.WriteByte('\f')
+			i++
+		case 'n':
+			out.WriteByte('\n')
+			i++
+		case 'r':
+			out.WriteByte('\r')
+			i++
+		case 't':
+			out.WriteByte('\t')
+			i++
+		case 'v':
+			out.WriteByte('\v')
+			i++
+		case '0':
+			// Numeric escapes are deliberately unsupported, except JavaScript's
+			// unambiguous NUL escape (a following decimal digit makes it legacy
+			// octal syntax).
+			if i+1 < len(lit)-1 && lit[i+1] >= '0' && lit[i+1] <= '9' {
+				return "", false
+			}
+			out.WriteByte(0)
+			i++
+		case '\n':
+			i++ // JavaScript line continuation contributes no character.
+		case '\r':
+			i++
+			if i < len(lit)-1 && lit[i] == '\n' {
+				i++
+			}
+		case 'x':
+			v, next, ok := decodeJSHexEscape(lit, i+1, 2)
+			if !ok {
+				return "", false
+			}
+			out.WriteRune(rune(v))
+			i = next
+		case 'u':
+			v, next, ok := decodeJSUnicodeEscape(lit, i)
+			if !ok {
+				return "", false
+			}
+			i = next
+			if v >= 0xD800 && v <= 0xDBFF && i+2 < len(lit)-1 && lit[i] == '\\' && lit[i+1] == 'u' {
+				if low, after, lowOK := decodeJSUnicodeEscape(lit, i+1); lowOK && low >= 0xDC00 && low <= 0xDFFF {
+					out.WriteRune(utf16.DecodeRune(rune(v), rune(low)))
+					i = after
+					continue
+				}
+			}
+			if v >= 0xD800 && v <= 0xDFFF {
+				out.WriteRune(utf8.RuneError)
+			} else {
+				out.WriteRune(rune(v))
+			}
+		default:
+			// JavaScript identity escape: \q is the character q. Decode a full
+			// UTF-8 rune so non-ASCII identity escapes are preserved as well.
+			r, size := utf8.DecodeRuneInString(lit[i : len(lit)-1])
+			if r == utf8.RuneError && size == 1 {
+				return "", false
+			}
+			out.WriteRune(r)
+			i += size
+		}
+	}
+	return out.String(), true
+}
+
+func decodeJSUnicodeEscape(lit string, u int) (int, int, bool) {
+	if u >= len(lit)-1 || lit[u] != 'u' {
+		return 0, u, false
+	}
+	if u+1 < len(lit)-1 && lit[u+1] == '{' {
+		end := strings.IndexByte(lit[u+2:len(lit)-1], '}')
+		if end < 0 || end == 0 || end > 6 {
+			return 0, u, false
+		}
+		end += u + 2
+		v, _, ok := decodeJSHexEscape(lit, u+2, end-(u+2))
+		if !ok || v > utf8.MaxRune {
+			return 0, u, false
+		}
+		return v, end + 1, true
+	}
+	return decodeJSHexEscape(lit, u+1, 4)
+}
+
+func decodeJSHexEscape(lit string, start, count int) (int, int, bool) {
+	if count <= 0 || start+count > len(lit)-1 {
+		return 0, start, false
+	}
+	v := 0
+	for _, c := range []byte(lit[start : start+count]) {
+		v *= 16
+		switch {
+		case c >= '0' && c <= '9':
+			v += int(c - '0')
+		case c >= 'a' && c <= 'f':
+			v += int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			v += int(c-'A') + 10
+		default:
+			return 0, start, false
+		}
+	}
+	return v, start + count, true
 }
 
 // codexOutputText accepts both the legacy scalar output and the current
@@ -631,10 +772,13 @@ func codexToolStatus(output string) string {
 	return "completed"
 }
 
-var codexRunningCellRe = regexp.MustCompile(`(?m)^Script running with cell ID ([0-9]+)\s*$`)
+var codexRunningCellRe = regexp.MustCompile(`^Script running with cell ID ([0-9]+)$`)
 
 func codexRunningCellID(output string) string {
-	m := codexRunningCellRe.FindStringSubmatch(output)
+	// A handoff is a host control response containing only this line. Searching
+	// multiline stdout would misclassify a completed command that happened to
+	// print the same text and suppress its event forever.
+	m := codexRunningCellRe.FindStringSubmatch(strings.TrimSpace(output))
 	if m == nil {
 		return ""
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -291,6 +292,13 @@ func pollCodexRollouts(
 		proc := processors[path]
 		if proc == nil {
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
+			// Progress offsets survive daemon restarts, while the processor's
+			// call/output correlation maps do not. Replay the consumed prefix only
+			// to rebuild that transient state; deterministic events are discarded
+			// and tailing still begins at the persisted offset below.
+			if offset := progress.Offsets[path]; offset > 0 {
+				replayCodexRolloutPrefix(path, offset, proc)
+			}
 			// Resolve the canonical repo identity ONCE per session (this processor is
 			// created once per rollout file) from the session_meta cwd, and thread it
 			// in as session state so each prompt event carries repoRoot + repoHost.
@@ -306,6 +314,33 @@ func pollCodexRollouts(
 
 	saveCodexWatchProgress(progress)
 	return sent
+}
+
+// replayCodexRolloutPrefix reconstructs a fresh processor's transient state
+// after a watcher restart. It applies the same pre-parse redaction as live
+// tailing and intentionally discards every event, so already-consumed records
+// are never queued twice.
+func replayCodexRolloutPrefix(path string, offset int64, proc *normalize.CodexRolloutProcessor) {
+	// #nosec G304 -- path is a Codex rollout discovered under the sessions dir and is opened read-only.
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	reader := bufio.NewReader(io.LimitReader(f, offset))
+	for {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 && line[len(line)-1] == '\n' {
+			trimmed := strings.TrimSpace(string(line))
+			if trimmed != "" {
+				_ = proc.Process(redact.RedactBytes([]byte(trimmed)))
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // codexRolloutMatchesWorkspace reads a rollout file's session_meta header and

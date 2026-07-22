@@ -490,3 +490,18 @@ func TestCanonicalJSONMatchesJavaScriptForShellPunctuation(t *testing.T) {
 		t.Fatalf("canonical JSON = %s, want %s (must match JSON.stringify bytes)", got, want)
 	}
 }
+
+func TestCanonicalJSONMatchesJavaScriptForUnicodeSeparators(t *testing.T) {
+	got, err := canonicalJSON(map[string]interface{}{
+		"line\u2028key": "line\u2028separator",
+		"paragraph":     "paragraph\u2029separator",
+		"escaped":       `literal \u2028 text`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "{\"escaped\":\"literal \\\\u2028 text\",\"line\u2028key\":\"line\u2028separator\",\"paragraph\":\"paragraph\u2029separator\"}"
+	if string(got) != want {
+		t.Fatalf("canonical JSON = %q, want %q (must match JSON.stringify bytes)", got, want)
+	}
+}
