@@ -61,6 +61,30 @@ type redactRule struct {
 	replacement string
 }
 
+// alreadyRedactedValue matches an assignment, JSON pair, or URL credential whose
+// VALUE is already a redaction marker — `KEY=[REDACTED…]`, `"key": "[REDACTED…]"`,
+// `scheme://user:[REDACTED]@`.
+//
+// Stage 3 skips any match that satisfies this. Those rules run after the vendor
+// and Titus stages, so a value they see may already read `[REDACTED_AWS_KEY]`,
+// and rewriting it to a bare `[REDACTED]` would destroy the attribution the
+// stage ordering exists to produce.
+//
+// This is a POST-MATCH test rather than a character class inside each pattern.
+// RE2 has no lookahead, and the obvious approximation — excluding `[` from the
+// value's first byte — silently stops redacting any real secret that happens to
+// start with `[`, e.g. `API_KEY=[customer-secret]`. Narrowing a redaction rule to
+// protect a marker is exactly the trade that must not be made silently, so the
+// test is written against the marker itself. Mirrors scrubSecrets.ts, which
+// expresses the same guard as `val.startsWith('[REDACTED')`.
+// The trailing class is what makes this a MARKER test rather than a prefix
+// test: a real marker is `[REDACTED]`, `[REDACTED_AWS_KEY]` or
+// `[REDACTED:np.stripe.1]`, so the token must end right after REDACTED or
+// continue with `_` / `:`. Without it, a genuine secret whose value merely
+// begins with the letters REDACTED — `TOKEN=[REDACTEDish-not-a-marker]` — would
+// be mistaken for a marker and left in plaintext.
+var alreadyRedactedValue = regexp.MustCompile(`[=:]\s*"?\[REDACTED[\]_:]`)
+
 // Stage 1 — precise vendor shapes. Within this block sk-ant- precedes the
 // generic sk- rule, or the latter would consume it.
 var vendorPatterns = []redactRule{
@@ -124,21 +148,19 @@ var genericPatterns = []redactRule{
 	// makes the paste board actionable ("a Stripe key was pasted"), where a bare
 	// `[REDACTED]` is not. Only the value is ever cut.
 	//
-	// The value's FIRST byte excludes `[` so this rule cannot re-wrap a marker an
-	// attributed vendor rule above already wrote — that would silently downgrade
-	// [REDACTED_ANTHROPIC_KEY] back to [REDACTED] and undo the ordering. RE2 has
-	// no lookahead, so the guard is a first-character class; scrubSecrets.ts
-	// expresses the same guard as an explicit `val.startsWith('[REDACTED_')` check
-	// because JS regex callbacks allow it.
-	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY))\s*=\s*[^\s"'\[][^\s"']*`), "$1=[REDACTED]"},
+	// The value matches ANY non-space run, including one starting with `[`, so a
+	// real secret like `API_KEY=[customer-secret]` is still masked. Markers
+	// written by an earlier stage are protected by skipIfMarked, not by narrowing
+	// the value class — see the field's comment for why that distinction matters.
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY))\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
 	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
 	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
 	// inside the value and mis-bound the JSON. Value is rebuilt quoted. Carries
 	// the same prefix widening (and the same no-trailing-wildcard rule) as the
 	// assignment form above — `"STRIPE_API_KEY": "…"` was equally unmasked — and
-	// the same leading-`[` guard against re-wrapping an attributed marker. The
+	// the same skipIfMarked guard against re-wrapping an attributed marker. The
 	// whole value is optional so an empty `""` still matches harmlessly.
-	{regexp.MustCompile(`(?i)("[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:(?:\\.|[^"\\\[])(?:[^"\\]|\\.)*)?"`), `${1}"[REDACTED]"`},
+	{regexp.MustCompile(`(?i)("[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"`), `${1}"[REDACTED]"`},
 	// Credentials embedded in a connection string / URL (scheme://user:pass@).
 	// Username is optional so userless DSNs (redis://:pass@, amqp://:pass@) are
 	// caught too. Keep scheme + user, drop the password up to the @.
@@ -187,7 +209,17 @@ func RedactBytes(input []byte) []byte {
 	}
 	out = titusRedact(out)
 	for _, p := range genericPatterns {
-		out = p.re.ReplaceAll(out, []byte(p.replacement))
+		// Stage 3 is shape-blind, so it must not touch a value the attributed
+		// stages above already marked — see alreadyRedactedValue. Rules whose
+		// match can never contain a `KEY=` / `"key":` pair (email, SSN, phone, IP)
+		// are unaffected by the test; it simply never fires for them.
+		rule := p
+		out = rule.re.ReplaceAllFunc(out, func(m []byte) []byte {
+			if alreadyRedactedValue.Match(m) {
+				return m
+			}
+			return rule.re.Expand(nil, []byte(rule.replacement), m, rule.re.FindSubmatchIndex(m))
+		})
 	}
 	return out
 }

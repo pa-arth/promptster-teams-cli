@@ -286,3 +286,48 @@ func TestRedactLLMKeyVendorSplit(t *testing.T) {
 		t.Errorf("vendor split leaked a key value: %q %q", ant, oai)
 	}
 }
+
+// A value wrapped in square brackets is still a secret. An earlier revision of
+// this fix guarded against re-wrapping attributed markers by excluding `[` from
+// the value's first byte, which also stopped redacting every real secret that
+// happens to start with `[` — narrowing a redaction rule to protect a marker.
+// The guard is now a post-match test against the marker itself.
+func TestRedactBracketedValues(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		leak  string
+	}{
+		{"assignment", `API_KEY=[customer-secret]`, "customer-secret"},
+		{"prefixed assignment", `STRIPE_API_KEY=[zzzopaque123]`, "zzzopaque123"},
+		{"json", `{"STRIPE_API_KEY":"[customer-secret]","keep":"me"}`, "customer-secret"},
+		{"bracketed but not a marker", `TOKEN=[REDACTEDish-not-a-marker]`, "REDACTEDish"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RedactBytes([]byte(tc.input))
+			if bytes.Contains(out, []byte(tc.leak)) {
+				t.Errorf("bracketed secret survived redaction: %q", out)
+			}
+		})
+	}
+}
+
+// ...and the reason the guard exists at all: stage 3 must never overwrite an
+// attributed marker written by the vendor or Titus stages. Losing the vendor
+// name costs the paste board its provenance — "an Anthropic key was pasted"
+// degrades to "something was pasted".
+func TestRedactDoesNotDowngradeAttributedMarkers(t *testing.T) {
+	cases := []struct{ input, keep string }{
+		{`ANTHROPIC_API_KEY=sk-ant-aaaaaaaaaaaaaaaaaaaa`, "[REDACTED_ANTHROPIC_KEY]"},
+		{`OPENAI_API_KEY=sk-proj-aaaaaaaaaaaaaaaaaaaaaaaa`, "[REDACTED_OPENAI_KEY]"},
+		{`AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE`, "[REDACTED_AWS_KEY]"},
+		{`{"ANTHROPIC_API_KEY":"sk-ant-aaaaaaaaaaaaaaaaaaaa"}`, "[REDACTED_ANTHROPIC_KEY]"},
+	}
+	for _, tc := range cases {
+		out := RedactBytes([]byte(tc.input))
+		if !bytes.Contains(out, []byte(tc.keep)) {
+			t.Errorf("attributed marker lost for %q -> %q (want %s)", tc.input, out, tc.keep)
+		}
+	}
+}
