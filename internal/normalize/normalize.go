@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -43,10 +44,27 @@ func loadLastPromptTs() time.Time {
 	return time.UnixMilli(ms)
 }
 
-// strPreview returns the first n chars of s (appending "..." if truncated).
+// strPreview returns the first n BYTES of s (appending "..." if truncated),
+// backing off to the nearest rune boundary so the result is always valid UTF-8.
+//
+// Without that back-off, `s[:n]` can land mid-rune and leave dangling
+// continuation bytes. Nothing errors: Go's json encoder silently substitutes
+// U+FFFD, so the preview just ends in a visible corruption artifact — and only
+// for non-ASCII text, which is exactly the input least likely to appear in a
+// test and most likely to appear in the field. Every caller here previews
+// human-authored free text (task descriptions, prompts, commands, search
+// queries), so this is not hypothetical.
+//
+// The unit is bytes, not characters, and deliberately so — these previews exist
+// to bound payload size. A rune-counted cap would let a CJK or emoji string
+// carry 3-4x the bytes of the same nominal length.
 func strPreview(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	// Walk back off any continuation byte (0b10xxxxxx) to the rune's first byte.
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }
@@ -519,12 +537,45 @@ func normalizePostToolUseByTool(toolName string, toolInput, toolResponse map[str
 		e.RawPayload = raw
 		return e, true
 
-	case toolName == "Task":
+	// Claude Code renamed the delegation tool: `Task` became `Agent`. Same rename
+	// class as TodoWrite -> TaskCreate above, and it cost the same thing — a rename
+	// doesn't throw, it just stops matching, so every spawn fell to `default` and
+	// shipped as a generic tool_use. `task_dispatch` went to ZERO rows product-wide
+	// and stayed there (verified in prod 2026-07-22: 0 for all time, against 658
+	// tool_use rows named `Agent` across 104 sessions). The backend's
+	// subagentDispatchCount maxed three channels and this was the only one of the
+	// three anything had ever emitted, so team_harness_v1 reported a fleet that
+	// never delegates. `Task` is kept for older clients still in the field.
+	//
+	// The DATA half was independently broken, and would have bitten the moment the
+	// name was fixed: this emitted `taskPreview`, which has never been in either
+	// default-deny allowlist (on-device internal/redact/project.go OR the backend's
+	// eventFieldProjection.ts — both say {name, status, summary}). So the event
+	// would have arrived with an EMPTY data object and the description — the whole
+	// reason to prefer task_dispatch over the bare Agent tool_use — would have been
+	// stripped on-device with no error and no telemetry. Emit under the keys the
+	// allowlists actually pass. This widens nothing: `summary` was already
+	// sanctioned, it just had no producer.
+	case toolName == "Task" || toolName == "Agent":
 		taskDesc, _ := toolInput["description"].(string)
 		e := event.NewEvent("task_dispatch", sessionID)
-		e.Data = map[string]interface{}{
-			"taskPreview": strPreview(taskDesc, 100),
+		data := map[string]interface{}{
+			// Description only — never `prompt`, which is the full delegated
+			// instruction and can carry anything the human typed.
+			"summary": strPreview(taskDesc, 100),
 		}
+		// WHICH agent was spun up ("Explore", "general-purpose", ...). A type name
+		// chosen from a registry, not free text, and the dimension any
+		// "what does this team delegate" surface is actually asking about.
+		// Test AFTER trimming, not before: a whitespace-only subagent_type passes
+		// `st != ""` and then emits `name: ""`, which is the exact ABSENT-vs-EMPTY
+		// collapse this branch exists to avoid — and downstream it opens a nameless
+		// agent-type bucket rather than being skipped.
+		raw, _ := toolInput["subagent_type"].(string)
+		if st := strings.TrimSpace(raw); st != "" {
+			data["name"] = st
+		}
+		e.Data = data
 		e.RawPayload = raw
 		return e, true
 
