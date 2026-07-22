@@ -12,18 +12,40 @@ import (
 	"github.com/praetorian-inc/titus/pkg/scanner"
 )
 
-// Secret redaction runs in two layers, both behind redactBytes:
+// Secret redaction runs in THREE ordered stages, all behind RedactBytes:
 //
-//  1. Titus (praetorian-inc/titus, Apache-2.0) — ~490 entropy-aware provider
-//     rules (AWS, GitHub, Anthropic, OpenAI, Slack, PEM, JWT, ...). Engine
-//     init is once per process; if it ever fails the supplemental layer below
-//     still runs, so capture is never blocked and never unscrubbed.
-//  2. Supplemental regex patterns — Promptster's own credentials, generic
-//     credential shapes (KEY=value / JSON key:value, bearer headers, URL-
-//     embedded passwords) and PII / business data (email, SSN, phone, private
-//     IPs) that a provider-rule secret scanner doesn't cover.
+//  1. vendorPatterns — precise, high-confidence provider shapes we own (AWS
+//     AKIA, GitHub ghp_/ghs_, Anthropic sk-ant-, OpenAI sk-/sk-proj-, Slack
+//     xox*, JWT, PEM blocks, Promptster's own PST-/PSE-/psk_live_ keys). These
+//     leave an ATTRIBUTED marker naming the vendor.
+//  2. Titus (praetorian-inc/titus, Apache-2.0) — ~490 entropy-aware provider
+//     rules. The wide net for everything stage 1 doesn't enumerate. Engine
+//     init is once per process; if it ever fails the other stages still run,
+//     so capture is never blocked and never unscrubbed.
+//  3. genericPatterns — shape-blind fallbacks: KEY=value / JSON key:value with
+//     a secret-ish NAME, URL-embedded passwords, and PII / business data
+//     (email, SSN, phone, private IPs) that a provider-rule scanner misses.
 //
-// Both layers operate on raw JSON bytes (the hook + codex paths), so every
+// WHY VENDOR RUNS BEFORE TITUS (this ordering is load-bearing, not cosmetic).
+// The marker left behind is the ONLY provenance anything downstream has once
+// the value is gone — it is what lets the credential paste board say "an
+// Anthropic key was pasted" instead of "a secret was pasted". Titus narrows its
+// replacement span to the rule's captured group, and its generic rules capture
+// only PART of a key: `sk-ant-api03-…` came back as `sk-[REDACTED:np.generic.2]`,
+// leaving a bare `sk-` behind AND destroying vendor attribution, because our
+// precise `\bsk-ant-` rule then had nothing left to match. Running our own
+// precise rules first means Titus only ever sees what we could not name.
+//
+// WHY GENERIC RUNS LAST, AND WHY IT REFUSES TO TOUCH AN EXISTING MARKER. The
+// generic rules match on the NAME, not the value, so they would happily rewrite
+// `ANTHROPIC_API_KEY=[REDACTED_ANTHROPIC_KEY]` down to a bare `[REDACTED]` and
+// undo both stages above — the common case, since a pasted key usually arrives
+// as an assignment. Their value patterns therefore exclude a leading `[`. RE2
+// has no lookahead, so that guard is a first-character class; scrubSecrets.ts
+// expresses the same rule as an explicit `val.startsWith('[REDACTED_')` check
+// because JS regex callbacks allow one.
+//
+// Every stage operates on raw JSON bytes (the hook + codex paths), so every
 // replacement must be JSON-safe: markers contain no quotes or backslashes,
 // spans are narrowed to the secret token, and value matches stop at quotes —
 // so a match can never consume surrounding JSON structure.
@@ -34,29 +56,25 @@ import (
 // broke turn dedup, and an unquoted [REDACTED_CC] marker corrupted bare numeric
 // JSON values. Any future org-internal-secret heuristic must run JSON-aware over
 // string values only, skipping structural ID fields.
-var redactPatterns = []struct {
+type redactRule struct {
 	re          *regexp.Regexp
 	replacement string
-}{
-	// --- Credentials & secrets -------------------------------------------
-	// KEY=value assignments. Value match stops at whitespace OR a quote so
-	// redacting raw JSON bytes never eats a closing quote and corrupts the JSON.
-	// PWD is intentionally excluded — it's the working-directory env var far
-	// more often than a password, and clobbering it destroys replay context.
-	{regexp.MustCompile(`(?i)\b(API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY)\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
-	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
-	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
-	// inside the value and mis-bound the JSON. Value is rebuilt quoted.
-	{regexp.MustCompile(`(?i)("(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:[^"\\]|\\.)*"`), `${1}"[REDACTED]"`},
-	// Credentials embedded in a connection string / URL (scheme://user:pass@).
-	// Username is optional so userless DSNs (redis://:pass@, amqp://:pass@) are
-	// caught too. Keep scheme + user, drop the password up to the @.
-	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']*):[^\s@/"']+@`), "$1:[REDACTED]@"},
+}
+
+// Stage 1 — precise vendor shapes. Within this block sk-ant- precedes the
+// generic sk- rule, or the latter would consume it.
+var vendorPatterns = []redactRule{
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`), "[REDACTED_AWS_KEY]"},
 	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
 	{regexp.MustCompile(`\bghs_[A-Za-z0-9]{36}\b`), "[REDACTED_GITHUB_TOKEN]"},
-	// OpenAI / Anthropic-style keys (sk-, sk-proj-, sk-ant-, ...).
-	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{20,}`), "[REDACTED_LLM_KEY]"},
+	// OpenAI / Anthropic-style keys (sk-, sk-proj-, sk-ant-, ...), SPLIT by vendor
+	// so the board can answer "whose key did an engineer paste into the agent?".
+	// The Anthropic body is `{16,}` because it is measured AFTER a longer literal
+	// prefix — not a weaker match than the generic `{20,}`. Older CLIs still emit
+	// [REDACTED_LLM_KEY]; the backend classifier keeps accepting that marker and
+	// degrades it to an unattributed LLM-key finding.
+	{regexp.MustCompile(`\bsk-ant-[A-Za-z0-9_-]{16,}`), "[REDACTED_ANTHROPIC_KEY]"},
+	{regexp.MustCompile(`\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}`), "[REDACTED_OPENAI_KEY]"},
 	// Slack tokens (bot/user/app/refresh).
 	{regexp.MustCompile(`\bxox[baprs]-[A-Za-z0-9-]{10,}`), "[REDACTED_SLACK_TOKEN]"},
 	// HTTP bearer credentials.
@@ -74,6 +92,57 @@ var redactPatterns = []struct {
 	// is redacted (it currently mints six; older keys had two).
 	{regexp.MustCompile(`\bPSE-(?:[A-HJ-NP-Z2-9]{4}-)+[A-HJ-NP-Z2-9]{4}\b`), "[REDACTED_PROMPTSTER_ENGINEER_KEY]"},
 	{regexp.MustCompile(`\bpsk_live_[A-Za-z0-9_-]{20,}`), "[REDACTED_PROMPTSTER_ORG_KEY]"},
+}
+
+// Stage 3 — shape-blind fallbacks, applied AFTER Titus. Every value pattern here
+// refuses a leading `[` so it can never rewrite a marker stage 1 or 2 produced.
+var genericPatterns = []redactRule{
+	// KEY=value assignments. Value match stops at whitespace OR a quote so
+	// redacting raw JSON bytes never eats a closing quote and corrupts the JSON.
+	// PWD is intentionally excluded — it's the working-directory env var far
+	// more often than a password, and clobbering it destroys replay context.
+	//
+	// NAME_PREFIX is why these rules are not simply `\b(API[_-]?KEY|...)`. `_` is
+	// a word character, so a leading `\b` can never match inside a prefixed name:
+	// `STRIPE_API_KEY=…`, `ACME_DB_PASSWORD=…` and `MY_CLIENT_SECRET=…` all sailed
+	// through this layer unredacted, and only landed masked when their VALUE
+	// happened to carry a known provider shape Titus recognizes (`ghp_`, `sk-ant-`,
+	// `AKIA`). An org-internal secret with an opaque value matched nothing and was
+	// stored in plaintext — verified against the live teams DB, where the only key
+	// names this rule ever masked were the bare ones (API_KEY, TOKEN, SECRET,
+	// PASSWORD). Prefixed names are the common case in real .env files, so this was
+	// the majority of the space.
+	//
+	// The widening is a PREFIX ONLY — deliberately no trailing `[A-Za-z0-9_.-]*`.
+	// A trailing wildcard would swallow `MAX_TOKENS=4096`, `INPUT_TOKENS=…`,
+	// `OUTPUT_TOKENS=…` (TOKEN is a prefix of TOKENS), destroying live spend
+	// telemetry to redact a number. Requiring the name to END on a secret word
+	// keeps `AWS_SECRET_ACCESS_KEY` (ends on ACCESS_KEY) while dropping
+	// `AWS_ACCESS_KEY_ID` — which is the public half and not a secret anyway.
+	//
+	// The key NAME is preserved on purpose: `STRIPE_API_KEY=[REDACTED]` is what
+	// makes the paste board actionable ("a Stripe key was pasted"), where a bare
+	// `[REDACTED]` is not. Only the value is ever cut.
+	//
+	// The value's FIRST byte excludes `[` so this rule cannot re-wrap a marker an
+	// attributed vendor rule above already wrote — that would silently downgrade
+	// [REDACTED_ANTHROPIC_KEY] back to [REDACTED] and undo the ordering. RE2 has
+	// no lookahead, so the guard is a first-character class; scrubSecrets.ts
+	// expresses the same guard as an explicit `val.startsWith('[REDACTED_')` check
+	// because JS regex callbacks allow it.
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY))\s*=\s*[^\s"'\[][^\s"']*`), "$1=[REDACTED]"},
+	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
+	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
+	// inside the value and mis-bound the JSON. Value is rebuilt quoted. Carries
+	// the same prefix widening (and the same no-trailing-wildcard rule) as the
+	// assignment form above — `"STRIPE_API_KEY": "…"` was equally unmasked — and
+	// the same leading-`[` guard against re-wrapping an attributed marker. The
+	// whole value is optional so an empty `""` still matches harmlessly.
+	{regexp.MustCompile(`(?i)("[A-Za-z0-9_.-]*(?:api[_-]?key|apikey|access[_-]?key|secret[_-]?key|client[_-]?secret|secret|password|passwd|private[_-]?key|auth[_-]?token|token|credentials?|session[_-]?key)"\s*:\s*)"(?:(?:\\.|[^"\\\[])(?:[^"\\]|\\.)*)?"`), `${1}"[REDACTED]"`},
+	// Credentials embedded in a connection string / URL (scheme://user:pass@).
+	// Username is optional so userless DSNs (redis://:pass@, amqp://:pass@) are
+	// caught too. Keep scheme + user, drop the password up to the @.
+	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']*):[^\s@/"']+@`), "$1:[REDACTED]@"},
 
 	// --- PII / business data ---------------------------------------------
 	{regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}\b`), "[REDACTED_EMAIL]"},
@@ -107,9 +176,17 @@ func titusScanner() *scanner.Core {
 	return titusCore
 }
 
+// RedactBytes masks secrets in raw bytes through the three ordered stages
+// documented at the top of this file: precise vendor shapes, then Titus's wide
+// net, then shape-blind generic fallbacks. The order is what preserves vendor
+// ATTRIBUTION in the marker; see that header before reordering anything.
 func RedactBytes(input []byte) []byte {
-	out := titusRedact(input)
-	for _, p := range redactPatterns {
+	out := input
+	for _, p := range vendorPatterns {
+		out = p.re.ReplaceAll(out, []byte(p.replacement))
+	}
+	out = titusRedact(out)
+	for _, p := range genericPatterns {
 		out = p.re.ReplaceAll(out, []byte(p.replacement))
 	}
 	return out

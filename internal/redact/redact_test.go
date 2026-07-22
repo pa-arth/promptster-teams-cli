@@ -3,6 +3,7 @@ package redact
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -52,9 +53,21 @@ func TestRedactJSONSecretKeyKeepsSiblings(t *testing.T) {
 	if v["keep"] != "me" {
 		t.Errorf("sibling field damaged: %s", out)
 	}
-	if v["password"] != "[REDACTED]" {
+	if !isRedactionMarker(v["password"]) {
 		t.Errorf("password not redacted: %s", out)
 	}
+}
+
+// A value is masked if it was replaced by ANY redaction marker. Tests assert this
+// rather than the literal "[REDACTED]" because which marker wins is deliberate,
+// ordered behaviour (vendor > Titus rule-id > generic) and the generic stage is
+// forbidden from downgrading a more specific marker it finds — see redact.go.
+// Pinning the exact string would make an attribution IMPROVEMENT look like a
+// regression, which is backwards for a redaction suite: the property that matters
+// is "the secret is gone", and the marker only ever gets more informative.
+func isRedactionMarker(v interface{}) bool {
+	s, ok := v.(string)
+	return ok && strings.HasPrefix(s, "[REDACTED") && strings.HasSuffix(s, "]")
 }
 
 // A secret value containing an escaped quote must not mis-bound the JSON match:
@@ -66,7 +79,7 @@ func TestRedactJSONSecretKeyEscapedQuote(t *testing.T) {
 	if err := json.Unmarshal(out, &v); err != nil {
 		t.Fatalf("escaped-quote value broke JSON: %v\n%s", err, out)
 	}
-	if v["password"] != "[REDACTED]" {
+	if !isRedactionMarker(v["password"]) {
 		t.Errorf("password not fully redacted: %s", out)
 	}
 	if bytes.Contains(out, []byte("secrettail")) {
@@ -178,5 +191,98 @@ func TestRedactKeepsJSONValid(t *testing.T) {
 	}
 	if bytes.Contains(out, []byte("sk-proj-A1b2")) {
 		t.Errorf("secret survived redaction: %s", out)
+	}
+}
+
+// PREFIXED secret names. `_` is a word character, so the old leading `\b` could
+// never match inside `STRIPE_API_KEY` — these all reached the wire in plaintext
+// unless their VALUE happened to carry a provider shape Titus knows. Values here
+// are deliberately opaque (no `ghp_`/`sk-`/`AKIA` prefix) so a pass proves the
+// ASSIGNMENT rule fired, not Titus.
+func TestRedactPrefixedSecretNames(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		leak  string
+	}{
+		{"STRIPE_API_KEY", `STRIPE_API_KEY=zzzopaquevalue123`, "zzzopaquevalue123"},
+		{"ACME_DB_PASSWORD", `ACME_DB_PASSWORD=hunter2hunter2`, "hunter2hunter2"},
+		{"MY_CLIENT_SECRET", `MY_CLIENT_SECRET=qqqopaquevalue456`, "qqqopaquevalue456"},
+		{"AWS_SECRET_ACCESS_KEY", `AWS_SECRET_ACCESS_KEY=wwwopaquevalue789`, "wwwopaquevalue789"},
+		{"HF_TOKEN", `HF_TOKEN=eeeopaquevalue012`, "eeeopaquevalue012"},
+		{"json STRIPE_API_KEY", `{"STRIPE_API_KEY":"rrropaquevalue345","keep":"me"}`, "rrropaquevalue345"},
+		{"dotted prefix", `app.client_secret=tttopaquevalue678`, "tttopaquevalue678"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := RedactBytes([]byte(tc.input))
+			if bytes.Contains(out, []byte(tc.leak)) {
+				t.Errorf("prefixed secret value survived redaction: %q", out)
+			}
+			if !bytes.Contains(out, []byte("[REDACTED]")) {
+				t.Errorf("expected [REDACTED] marker, got %q", out)
+			}
+		})
+	}
+}
+
+// The key NAME must SURVIVE redaction — `STRIPE_API_KEY=[REDACTED]` is what makes
+// the downstream paste board actionable; a bare `[REDACTED]` names nothing.
+func TestRedactPreservesKeyName(t *testing.T) {
+	out := RedactBytes([]byte(`STRIPE_API_KEY=zzzopaquevalue123`))
+	if !bytes.Contains(out, []byte("STRIPE_API_KEY=[REDACTED]")) {
+		t.Errorf("key name lost — paste board cannot attribute the provider: %q", out)
+	}
+}
+
+// The prefix widening must NOT grow a trailing wildcard. TOKEN is a prefix of
+// TOKENS, so `[A-Za-z0-9_.-]*TOKEN[A-Za-z0-9_.-]*` would redact live spend
+// telemetry. These counts are numbers, not secrets, and must pass through.
+func TestRedactKeepsTokenCountEnvVars(t *testing.T) {
+	for _, in := range []string{
+		`MAX_TOKENS=4096`,
+		`INPUT_TOKENS=1200`,
+		`OUTPUT_TOKENS=350`,
+		`AWS_ACCESS_KEY_ID=AKIAPUBLICHALFNOTSECRET`,
+	} {
+		out := RedactBytes([]byte(in))
+		if bytes.Contains(out, []byte("[REDACTED]")) {
+			t.Errorf("over-redacted a non-secret assignment %q -> %q", in, out)
+		}
+	}
+}
+
+// The widened JSON rule must still leave parseable JSON and untouched siblings.
+func TestRedactPrefixedJSONKeepsSiblings(t *testing.T) {
+	in := []byte(`{"ACME_DB_PASSWORD":"hunter2hunter2","keep":"me"}`)
+	out := RedactBytes(in)
+	var v map[string]interface{}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
+	}
+	if !isRedactionMarker(v["ACME_DB_PASSWORD"]) {
+		t.Errorf("prefixed JSON secret not redacted: %s", out)
+	}
+	if bytes.Contains(out, []byte("hunter2hunter2")) {
+		t.Errorf("prefixed JSON secret value leaked: %s", out)
+	}
+	if v["keep"] != "me" {
+		t.Errorf("sibling field damaged: %s", out)
+	}
+}
+
+// Vendor split: the marker is the paste board's only provenance once the value is
+// gone, so sk-ant- must not collapse into the generic OpenAI marker.
+func TestRedactLLMKeyVendorSplit(t *testing.T) {
+	ant := RedactBytes([]byte(`ANTHROPIC_API_KEY=sk-ant-api03-A1b2C3d4E5f6G7h8I9j0K1l2M3n4`))
+	if !bytes.Contains(ant, []byte("[REDACTED_ANTHROPIC_KEY]")) {
+		t.Errorf("anthropic key not attributed to anthropic: %q", ant)
+	}
+	oai := RedactBytes([]byte(`OPENAI_API_KEY=sk-proj-A1b2C3d4E5f6G7h8I9j0K1l2`))
+	if !bytes.Contains(oai, []byte("[REDACTED_OPENAI_KEY]")) {
+		t.Errorf("openai key not attributed to openai: %q", oai)
+	}
+	if bytes.Contains(ant, []byte("sk-ant-api03")) || bytes.Contains(oai, []byte("sk-proj-A1b2")) {
+		t.Errorf("vendor split leaked a key value: %q %q", ant, oai)
 	}
 }
