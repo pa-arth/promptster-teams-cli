@@ -85,11 +85,9 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 			buf.WriteString("false")
 		}
 	case string:
-		b, err := json.Marshal(x)
-		if err != nil {
+		if err := writeJSONString(buf, x); err != nil {
 			return err
 		}
-		buf.Write(b)
 	case float64:
 		// json.Unmarshal decodes all numbers as float64. Emit integer form when
 		// the value has no fractional component — matches TS JSON.stringify.
@@ -131,11 +129,9 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 				buf.WriteByte(',')
 			}
 			first = false
-			kb, err := json.Marshal(k)
-			if err != nil {
+			if err := writeJSONString(buf, k); err != nil {
 				return err
 			}
-			buf.Write(kb)
 			buf.WriteByte(':')
 			if err := writeCanonical(buf, val); err != nil {
 				return err
@@ -155,6 +151,40 @@ func writeCanonical(buf *strings.Builder, v interface{}) error {
 		}
 		return writeCanonical(buf, reparsed)
 	}
+	return nil
+}
+
+// writeJSONString mirrors JSON.stringify's string escaping. encoding/json
+// differs even with HTML escaping disabled: it always escapes U+2028/U+2029,
+// while JavaScript emits both separators literally. Those spellings are valid
+// JSON but not byte-equivalent inside the SHA-256 data hash, so encode strings
+// directly for both values and object keys.
+func writeJSONString(buf *strings.Builder, s string) error {
+	buf.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"', '\\':
+			buf.WriteByte('\\')
+			buf.WriteRune(r)
+		case '\b':
+			buf.WriteString(`\b`)
+		case '\f':
+			buf.WriteString(`\f`)
+		case '\n':
+			buf.WriteString(`\n`)
+		case '\r':
+			buf.WriteString(`\r`)
+		case '\t':
+			buf.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				_, _ = fmt.Fprintf(buf, `\u%04x`, r)
+			} else {
+				buf.WriteRune(r)
+			}
+		}
+	}
+	buf.WriteByte('"')
 	return nil
 }
 

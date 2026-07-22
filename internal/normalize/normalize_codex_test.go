@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -80,6 +81,127 @@ func TestCodexRolloutNormalization(t *testing.T) {
 		if d["exitCode"].(int) != 0 {
 			t.Errorf("command exitCode = %v, want 0", d["exitCode"])
 		}
+	}
+}
+
+// Current Codex app/API hosts (observed 2026-07-22) wrap every callable tool in
+// one custom `exec` tool. Its input is JavaScript and its output is a Responses-
+// style text-part array, rather than the scalar function-call shape emitted by
+// codex-cli 0.137 above. This is intentionally a literal copy of that wire shape
+// with synthetic, non-sensitive contents.
+func TestCodexExecWrapperNormalization(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	lines := []string{
+		`{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_shell","input":"const r = await tools.exec_command({\n  cmd: \"go test ./...\",\n  workdir: \"/tmp/ws\"\n});\ntext(r.output);"}}`,
+		`{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_shell","output":[{"type":"input_text","text":"Script completed\nWall time 0.2 seconds\nOutput:\n"},{"type":"input_text","text":"ok example"}]}}`,
+		`{"timestamp":"2026-07-22T17:30:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_plan","input":"const p = await tools.update_plan({plan:[{step:\"verify\",status:\"in_progress\"}]}); text(p);"}}`,
+		`{"timestamp":"2026-07-22T17:30:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_plan","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"{}"}]}}`,
+		`{"timestamp":"2026-07-22T17:30:04Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_patch","input":"const patch = \"*** Begin Patch\\n*** Update File: src/a.go\\n@@\\n-old\\n+new\\n+extra\\n*** End Patch\"; const p = await tools.apply_patch(patch); text(p);"}}`,
+		`{"timestamp":"2026-07-22T17:30:05Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"{}"}]}}`,
+	}
+	var events []event.Event
+	for _, line := range lines {
+		events = append(events, p.Process([]byte(line))...)
+	}
+	byKind := map[string][]event.Event{}
+	for _, e := range events {
+		byKind[e.Kind] = append(byKind[e.Kind], e)
+	}
+	if len(byKind["command"]) != 1 || len(byKind["planning"]) != 1 || len(byKind["file_diff"]) != 1 {
+		t.Fatalf("wrapper kinds = command:%d planning:%d file_diff:%d; all=%v",
+			len(byKind["command"]), len(byKind["planning"]), len(byKind["file_diff"]), byKind)
+	}
+	command := byKind["command"][0].Data.(map[string]interface{})
+	if command["command"] != "go test ./..." || command["exitCode"] != 0 {
+		t.Errorf("command data = %#v", command)
+	}
+	diff := byKind["file_diff"][0].Data.(map[string]interface{})
+	if diff["path"] != "src/a.go" || diff["linesAdded"] != 2 || diff["linesRemoved"] != 1 {
+		t.Errorf("file_diff data = %#v", diff)
+	}
+	if byKind["file_diff"][0].RawPayload != "wrapped apply_patch" {
+		t.Errorf("wrapped patch raw payload retained source: %q", byKind["file_diff"][0].RawPayload)
+	}
+}
+
+func TestCodexExecWrapperUnknownToolProjectsIdentityFields(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	call := `{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_unknown","input":"const r = await tools.some_future_tool({secret:\"must not survive\"}); text(r);"}}`
+	out := `{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_unknown","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"secret output"}]}}`
+	_ = p.Process([]byte(call))
+	events := p.Process([]byte(out))
+	if len(events) != 1 || events[0].Kind != "tool_use" {
+		t.Fatalf("events = %#v", events)
+	}
+	data := events[0].Data.(map[string]interface{})
+	if data["tool"] != "exec" || data["status"] != "completed" || len(data) != 2 {
+		t.Errorf("generic tool data = %#v", data)
+	}
+}
+
+func TestCodexExecWrapperWithUnrecoverableCommandStaysGeneric(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	call := `{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_indirect","input":"const args = buildArgs(); const r = await tools.exec_command(args); text(r.output);"}}`
+	out := `{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_indirect","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"ok"}]}}`
+	_ = p.Process([]byte(call))
+	events := p.Process([]byte(out))
+	if len(events) != 1 || events[0].Kind != "tool_use" {
+		t.Fatalf("events = %#v; an unrecoverable command must not emit an invalid command event", events)
+	}
+	if got := events[0].Data.(map[string]interface{})["tool"]; got != "exec_command" {
+		t.Errorf("tool identity = %v, want exec_command", got)
+	}
+}
+
+func TestCodexExecWrapperCorrelatesDetachedCommandCompletion(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	lines := []string{
+		`{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_original","input":"const r = await tools.exec_command({cmd:\"go test ./...\"}); text(r.output);"}}`,
+		`{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_original","output":[{"type":"input_text","text":"Script running with cell ID 42464\n"}]}}`,
+		`{"timestamp":"2026-07-22T17:30:02Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_poll","input":"const r = await tools.write_stdin({session_id:42464,chars:\"\",yield_time_ms:1000}); text(r.output);"}}`,
+		`{"timestamp":"2026-07-22T17:30:03Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_poll","output":[{"type":"input_text","text":"Script completed\nOutput:\n"},{"type":"input_text","text":"ok"}]}}`,
+	}
+	var events []event.Event
+	for _, line := range lines {
+		events = append(events, p.Process([]byte(line))...)
+	}
+	if len(events) != 1 || events[0].Kind != "command" {
+		t.Fatalf("events = %#v, want one completed command", events)
+	}
+	if want := p.stableEventID("call_original", "command"); events[0].ID != want {
+		t.Errorf("command id = %q, want original call-derived %q", events[0].ID, want)
+	}
+	if events[0].Ts != "2026-07-22T17:30:03Z" {
+		t.Errorf("command timestamp = %q, want actual completion time", events[0].Ts)
+	}
+}
+
+func TestCodexExecWrapperDoesNotTreatCommandStdoutAsHandoff(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-wrapper")
+	call := `{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_echo","input":"const r = await tools.exec_command({cmd:\"printf handoff\"}); text(r.output);"}}`
+	out := `{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_echo","output":[{"type":"input_text","text":"Script completed\nOutput:\nScript running with cell ID 123\n"}]}}`
+	_ = p.Process([]byte(call))
+	events := p.Process([]byte(out))
+	if len(events) != 1 || events[0].Kind != "command" {
+		t.Fatalf("control-like stdout = %#v, want completed command", events)
+	}
+}
+
+func TestCodexExecWrapperDecodesJavaScriptStringEscapes(t *testing.T) {
+	input := `const r = await tools.exec_command({cmd:"a\v\q\x41\u0042\
+c"}); text(r.output);`
+	name, args := unwrapCodexExec(map[string]interface{}{"input": input})
+	if name != "exec_command" {
+		t.Fatalf("tool = %q", name)
+	}
+	if got, want := args["cmd"], "a\vqABc"; got != want {
+		t.Errorf("decoded JS command = %q, want %q", got, want)
+	}
+
+	patchInput := `const patch = "*** Begin Patch\n*** Add File: a.txt\n+one\vline\n*** End Patch"; await tools.apply_patch(patch);`
+	patch := extractJSCallStringArg(patchInput, "tools.apply_patch")
+	if !strings.Contains(patch, "one\vline") {
+		t.Errorf("wrapped patch lost JavaScript escape: %q", patch)
 	}
 }
 

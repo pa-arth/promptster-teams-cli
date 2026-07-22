@@ -472,3 +472,36 @@ func TestSigningMessageShape(t *testing.T) {
 		t.Errorf("part[7] (dataHash) is not hex: %v", err)
 	}
 }
+
+// JavaScript's JSON.stringify leaves shell punctuation literal. Go's
+// encoding/json escapes it by default for safe HTML embedding, which is valid
+// JSON but changes the SHA-256 bytes and made command signatures fail only when
+// they contained common operators such as && or redirects.
+func TestCanonicalJSONMatchesJavaScriptForShellPunctuation(t *testing.T) {
+	got, err := canonicalJSON(map[string]interface{}{
+		"command": "test -f a && echo ok > out < in",
+		"a&<>":    "&<>",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"a&<>":"&<>","command":"test -f a && echo ok > out < in"}`
+	if string(got) != want {
+		t.Fatalf("canonical JSON = %s, want %s (must match JSON.stringify bytes)", got, want)
+	}
+}
+
+func TestCanonicalJSONMatchesJavaScriptForUnicodeSeparators(t *testing.T) {
+	got, err := canonicalJSON(map[string]interface{}{
+		"line\u2028key": "line\u2028separator",
+		"paragraph":     "paragraph\u2029separator",
+		"escaped":       `literal \u2028 text`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "{\"escaped\":\"literal \\\\u2028 text\",\"line\u2028key\":\"line\u2028separator\",\"paragraph\":\"paragraph\u2029separator\"}"
+	if string(got) != want {
+		t.Fatalf("canonical JSON = %q, want %q (must match JSON.stringify bytes)", got, want)
+	}
+}
