@@ -1,6 +1,6 @@
 {
   "name": "@promptster/teams-cli",
-  "version": "0.10.1",
+  "version": "0.11.0",
   "description": "On-device, auditable AI-coding capture for internal engineering teams",
   "keywords": [
     "promptster",
@@ -37,11 +37,11 @@
     "access": "public"
   },
   "optionalDependencies": {
-    "@promptster/teams-cli-linux-x64": "0.10.1",
-    "@promptster/teams-cli-linux-arm64": "0.10.1",
-    "@promptster/teams-cli-darwin-x64": "0.10.1",
-    "@promptster/teams-cli-darwin-arm64": "0.10.1",
-    "@promptster/teams-cli-win32-x64": "0.10.1",
-    "@promptster/teams-cli-win32-arm64": "0.10.1"
+    "@promptster/teams-cli-linux-x64": "0.11.0",
+    "@promptster/teams-cli-linux-arm64": "0.11.0",
+    "@promptster/teams-cli-darwin-x64": "0.11.0",
+    "@promptster/teams-cli-darwin-arm64": "0.11.0",
+    "@promptster/teams-cli-win32-x64": "0.11.0",
+    "@promptster/teams-cli-win32-arm64": "0.11.0"
   }
 }

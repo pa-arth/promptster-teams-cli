@@ -6,7 +6,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.10.1] — 2026-07-23
+## [0.11.0] — 2026-07-23
+
+### Fixed
+
+- **Codex sessions that began before the capture daemon started are no longer
+  dropped.** The Codex rollout watcher now uses the same go-forward capture window
+  the Claude watcher adopted in 0.8.0: a session already in progress when the
+  daemon launches — or relaunches after a laptop sleep/restart — is captured from
+  that point forward, instead of being silently ignored because its first event
+  predated the watcher. Previously only Codex sessions started *after* the current
+  daemon launch were captured, so long or pre-restart sessions were lost fleet-wide
+  (worst on sleep-heavy laptops running long sessions). Capture is go-forward only:
+  a pre-existing session is tailed from the daemon's start point, and its earlier
+  history is not re-uploaded. A one-time progress-file migration also clears stale
+  "skip" decisions cached by the buggy watcher so previously-dropped sessions
+  re-qualify. (#109)
 
 ### Added
 
