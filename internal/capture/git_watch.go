@@ -578,7 +578,16 @@ func pollGitWatchWorkspace(session Session) {
 				reattempted++
 				continue
 			}
-			attributeAndReworkCommit(session, root, sha, preMerge, nowMs)
+			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
+				// Enqueue failed — leave the SHA out of the ledger so the next poll
+				// retries it rather than suppressing it for the ledger's whole TTL.
+				continue
+			}
+			// Mark it in the IN-MEMORY set too, not just the batch written at the end
+			// of the poll: the same commit is reachable from a repo AND from each of
+			// its worktrees, which are separate roots later in THIS loop. Without
+			// this, one poll emits it once per root.
+			attributed[sha] = struct{}{}
 			emitted = append(emitted, sha)
 		}
 	}

@@ -255,3 +255,111 @@ func TestAttributedCommitsLedgerExpiresPastTTL(t *testing.T) {
 		t.Fatalf("entry past the TTL is still remembered: %v", seen)
 	}
 }
+
+// TestAttributionNotDuplicatedAcrossWorktreesInOnePoll (Greptile P1): the same
+// commit is reachable from a repo AND from each of its worktrees, which are
+// SEPARATE roots in the same poll loop. The ledger snapshot is loaded once
+// before the loop, so unless a just-emitted SHA is added to the in-memory set
+// immediately, every root emits it again within that single poll — the exact
+// duplication the SHA-keyed design claims to prevent.
+func TestAttributionNotDuplicatedAcrossWorktreesInOnePoll(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+
+	// A detached worktree of the SAME repo, so both roots can sit on one commit.
+	wt := filepath.Join(home, "repos", "proj-wt")
+	git("worktree", "add", "--detach", wt, "HEAD")
+
+	session := Session{DeviceID: "dev-wt", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj-wt/foo.go")
+	pollGitWatchWorkspace(session) // cold-start baseline for both roots
+
+	writeCommitFile(t, repo, "bar.go", "package main\n\nfunc bar() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds bar")
+	sha := gitOut("rev-parse", "HEAD")
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/bar.go")
+	// Move the worktree onto the very same commit, so ONE poll detects it twice.
+	git("-C", wt, "checkout", "--detach", sha)
+
+	pollGitWatchWorkspace(session)
+
+	got := attributedShas(t, state.OutboxPath())
+	assertNoRepeats(t, got)
+	if countSha(got, sha) != 1 {
+		t.Fatalf("commit %s reachable from repo AND worktree was attributed %d times in one poll (%v), want 1",
+			sha, countSha(got, sha), got)
+	}
+}
+
+// TestFailedEnqueueIsNotRecordedAsAttributed (Greptile P1): emitCommitAttribution
+// used to swallow a queue failure, so a commit that never reached the outbox was
+// still written to the ledger — suppressing the retry for the ledger's whole TTL
+// and losing that attribution permanently. A failed enqueue must leave the SHA
+// unrecorded so the next poll tries again.
+func TestFailedEnqueueIsNotRecordedAsAttributed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	// An outbox path that is a DIRECTORY: every append fails to open it.
+	blocked := filepath.Join(tmp, "blocked-outbox")
+	if err := os.MkdirAll(blocked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", blocked)
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+
+	session := Session{DeviceID: "dev-fail", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session)
+
+	writeCommitFile(t, repo, "bar.go", "package main\n\nfunc bar() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds bar")
+	sha := gitOut("rev-parse", "HEAD")
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/bar.go")
+
+	nowMs := int64(1_700_000_000_000)
+	pollGitWatchWorkspace(session)
+
+	if seen := loadAttributedCommits(nowMs); len(seen) != 0 {
+		t.Fatalf("a commit whose enqueue FAILED was recorded as attributed (%v) — the retry is now "+
+			"suppressed for the ledger TTL and the attribution is lost", seen)
+	}
+
+	// With a working outbox the retry must actually go out.
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	cursors := loadGitWatchCursors()
+	bogus := map[string]string{}
+	for key := range cursors {
+		bogus[key] = "0000000000000000000000000000000000000000"
+	}
+	saveGitWatchCursors(bogus)
+	pollGitWatchWorkspace(session)
+
+	if got := attributedShas(t, state.OutboxPath()); countSha(got, sha) != 1 {
+		t.Fatalf("after the outbox recovered, %s appears %d times in %v, want exactly 1", sha, countSha(got, sha), got)
+	}
+}
