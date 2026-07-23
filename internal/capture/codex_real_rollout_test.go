@@ -58,7 +58,7 @@ func TestRealCodexRolloutCapture(t *testing.T) {
 		t.Fatal("rollout has no session_meta cwd")
 	}
 	proc := normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(rollout))
-	proc.RepoRoot, proc.RepoHost = sessionRepoIdentity(root)
+	proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(root)
 	progress := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{rollout: "yes"}}
 	session := Session{DeviceID: "dev-real-rollout-smoke", TaskRoot: root}
 

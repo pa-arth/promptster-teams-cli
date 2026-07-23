@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Sessions now report whether the working directory was a git repository at all
+  (`repoTracked`).** The repository identity has two fallbacks that produce an
+  identical-looking opaque hash: a real git repo with no `origin` remote, and a
+  directory that is not a repo at all — a home directory, or a container folder
+  someone launched the agent from one level too high. Nothing downstream could
+  tell them apart, so non-repositories occupied rows on a board titled "Top
+  repos" under a 16-character hash no human can read. The bit that separates the
+  two cases was already being computed on-device and thrown away one line later;
+  it is now reported. `repoRoot` keeps its exact current value in every case —
+  this adds information *about* the key, it never changes the key, and that is
+  pinned by a test which re-runs the previous resolution and compares byte for
+  byte. The field is emitted **explicitly as `true` or `false`** whenever a
+  `repoRoot` is emitted, and omitted entirely when one is not: absent means "this
+  CLI did not look", which is a different statement from "this is not a repo",
+  and a positive-only emit would collapse the two back together. What leaves the
+  device is one boolean about the filesystem — no path, no directory name.
+
 ## [0.10.0] — 2026-07-22
 
 ### Security
