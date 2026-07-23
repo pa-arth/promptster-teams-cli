@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.10.1] — 2026-07-23
+
 ### Added
 
 - **Sessions now report whether the working directory was a git repository at all
@@ -24,6 +26,30 @@ follows [Semantic Versioning](https://semver.org/).
   CLI did not look", which is a different statement from "this is not a repo",
   and a positive-only emit would collapse the two back together. What leaves the
   device is one boolean about the filesystem — no path, no directory name.
+
+### Fixed
+
+- **The same commit was being attributed over and over.** The git watcher kept a
+  per-repository cursor answering "has HEAD moved since I last looked here",
+  which is not the same question as "have I already reported this commit".
+  Whenever a cursor became unreachable — a rebase, a `gc`, or a deleted worktree
+  — the watcher fell back to re-listing the newest commits wholesale and sent
+  every one of them again, with nothing to suppress the repeat. On a machine
+  that creates and deletes worktrees continuously this is not an edge case: of
+  the 63 repository roots discovered on the measured device, 41 were worktree
+  directories that no longer existed. The result was ~126,000 attribution posts
+  carrying ~4,200 distinct commits over two days — roughly 30× redundant — which
+  inflated one session's stored context to 41,000 rows and pushed its queries
+  past 30 seconds. The watcher now keeps a ledger of the commits it has already
+  attributed, keyed by SHA alone: a commit is content-addressed, so the same SHA
+  reached through a second worktree of the same repository is the same commit,
+  and is reported once. The ledger expires on the same horizon the watcher uses
+  to discover repositories, so a repository can never still be polled after its
+  commits have been forgotten, and it is hard-bounded at 20,000 entries with
+  oldest-first eviction. Skipping covers rework as well as attribution —
+  re-running rework over a commit already accounted for would double-count
+  churn. Nothing about *what* leaves the device changes; this only stops the
+  same facts being sent repeatedly.
 
 ## [0.10.0] — 2026-07-22
 
@@ -649,7 +675,8 @@ follows [Semantic Versioning](https://semver.org/).
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.0...v0.9.1
