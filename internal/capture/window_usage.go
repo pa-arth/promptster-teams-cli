@@ -424,14 +424,9 @@ type claudeWindowSpool struct {
 // (latest-wins). Best-effort: the shim must never block or fail the statusline
 // render on a spool error.
 func writeClaudeWindowSpool(r windowReading) error {
-	s := claudeWindowSpool{
-		FiveHourPct:      r.FiveHourPct,
-		WeeklyPct:        r.WeeklyPct,
-		FiveHourResetsAt: r.FiveHourResetsAt,
-		WeeklyResetsAt:   r.WeeklyResetsAt,
-		ObservedAt:       r.ObservedAt,
-	}
-	data, err := json.Marshal(s)
+	// windowReading and claudeWindowSpool are field-identical (the spool type
+	// only adds json tags), so a direct conversion is exact and total.
+	data, err := json.Marshal(claudeWindowSpool(r))
 	if err != nil {
 		return err
 	}
@@ -460,13 +455,8 @@ func readClaudeWindowSpool() (windowReading, bool) {
 		return windowReading{}, false
 	}
 	_ = os.Remove(path)
-	r := windowReading{
-		FiveHourPct:      s.FiveHourPct,
-		WeeklyPct:        s.WeeklyPct,
-		FiveHourResetsAt: s.FiveHourResetsAt,
-		WeeklyResetsAt:   s.WeeklyResetsAt,
-		ObservedAt:       s.ObservedAt,
-	}
+	// Field-identical types (tags aside) — a direct conversion is exact and total.
+	r := windowReading(s)
 	if r.empty() {
 		return windowReading{}, false
 	}
