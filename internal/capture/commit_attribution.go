@@ -352,13 +352,22 @@ func assembleCommitAttributionEvent(session Session, root, sha string, files []a
 // with Sig/PrevSig and strips source), THEN enqueue the exact projected bytes on
 // the shared outbox. It reuses the process-wide outbox.StartDrain singleton the
 // transcript watchers already started — it never starts its own drain.
-func emitCommitAttribution(ev event.Event) {
+//
+// Reports whether the event was DURABLY QUEUED — i.e. whether outbox.Append
+// succeeded. The caller uses that to decide whether the commit may be recorded
+// in the attributed-commits ledger: recording a commit whose enqueue FAILED
+// would suppress the retry for the ledger's whole TTL and lose the attribution
+// outright. The local buffer does not gate the answer — if the buffer write
+// fails but the outbox write succeeds, the event still ships.
+func emitCommitAttribution(ev event.Event) (queued bool) {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		state.HookDebugf("commit attribution buffer error: %v", err)
 	}
 	if err := outbox.Append(ev); err != nil {
 		state.HookDebugf("commit attribution queue error: %v", err)
+		return false
 	}
+	return true
 }
 
 // attributeCommit builds and emits attribution for one detected commit, or does
@@ -385,12 +394,24 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 // preMerge is resolved once per root by the caller (never per commit), keeping
 // the per-commit budget constant-time. attributeCommit is the preMerge=false
 // entry point for callers (and tests) that only want attribution.
-func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) {
+//
+// Reports whether the commit may be RECORDED as attributed. That is true when
+// the event was durably queued, and ALSO when there was nothing attributable to
+// send (`!ok` — an empty diff, or a merge this parser intentionally skips):
+// that verdict is derived from the commit's own diff, so re-deriving it on a
+// later poll would reach the same answer and only cost another `git show`.
+// It is false ONLY when an emit was attempted and failed to queue, so the retry
+// survives.
+func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) (recordable bool) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
-		return
+		return true // nothing to send, and nothing a retry would change
 	}
-	emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files)))
+	if !emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files))) {
+		// Never durably queued. Do NOT let the caller remember this SHA, or the
+		// ledger would suppress the retry for its whole TTL.
+		return false
+	}
 	// From the SAME diff, capture on-device fingerprints of this commit's
 	// likely_ai lines so a later squash-merge onto the default branch can
 	// transfer attribution by content match. Fingerprints never leave the device.
@@ -399,4 +420,5 @@ func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, 
 		// Reuse the same diff + files — no extra spawn — to track pre-merge rework.
 		pollReworkCommit(session, root, sha, diff, files, nowMs)
 	}
+	return true
 }

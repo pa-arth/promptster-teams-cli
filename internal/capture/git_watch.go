@@ -36,9 +36,16 @@ const gitWatchInterval = 60 * time.Second
 // remainder drains on subsequent polls in order rather than being dropped. It
 // doubles as the recovery-window size when the cursor is gc'd (see
 // gitNewCommits). A package var, not a const, so a test can lower it without
-// building hundreds of commits. Re-seeing a SHA on a clamp/overlap is idempotent
-// (the backend upserts by SHA and attribution re-derives from the current
-// ledger), so the bounded batching is never wrong.
+// building hundreds of commits.
+//
+// ⚠️This cap is PER ROOT and a poll walks EVERY discovered root, so it does not
+// bound a poll's total emission: 63 discovered roots × 100 = 6,300, and teams
+// prod recorded a single burst of 7,482 commit_attribution POSTs 0.1s apart.
+// Bounding the per-poll TOTAL needs cursor rework — pollGitWatch advances a
+// root's cursor BEFORE attribution runs, so simply refusing to emit past a
+// budget would drop those commits permanently rather than defer them. Until
+// then, the re-emission that made those bursts expensive is absorbed by the
+// attributed-commits ledger below, not by this clamp.
 var gitWatchMaxCommitsPerPoll = 100
 
 func gitWatchCursorsPath() string {
@@ -525,6 +532,12 @@ func pollGitWatchWorkspace(session Session) {
 	// the whole AI-touched file, wrongly transferring human lines in the squash as AI.
 	pollDurability(session, roots, nowMs)
 
+	// Loaded ONCE per poll, not per root: the ledger is keyed by SHA alone, so a
+	// commit reachable from two roots (a repo and its worktree) is attributed once.
+	attributed := loadAttributedCommits(nowMs)
+	var emitted []string
+	reattempted := 0
+
 	for _, root := range roots {
 		rootKey := gitWatchRootKey(root)
 		// Rework scope, resolved ONCE per root (never per commit). Resolved BEFORE the
@@ -551,10 +564,38 @@ func pollGitWatchWorkspace(session Session) {
 		// Oldest-first: rework is STATEFUL (seed then churn across commits), so it
 		// must see commits in commit order. Attribution is per-commit independent, so
 		// the reversed order is equally correct for it. commits is newest-first.
+		//
+		// A SHA this device already attributed is skipped outright. "Detected" only
+		// means HEAD moved relative to a cursor, which is NOT the same as "not yet
+		// attributed": the recovery path in gitNewCommits re-surfaces the newest
+		// commits wholesale whenever a cursor becomes unreachable, and roots are
+		// keyed by path so worktree churn re-detects too. Skipping covers rework as
+		// well as attribution — re-running rework over a commit already accounted for
+		// would double-count its churn.
 		for i := len(commits) - 1; i >= 0; i-- {
-			attributeAndReworkCommit(session, root, commits[i], preMerge, nowMs)
+			sha := commits[i]
+			if _, done := attributed[sha]; done {
+				reattempted++
+				continue
+			}
+			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
+				// Enqueue failed — leave the SHA out of the ledger so the next poll
+				// retries it rather than suppressing it for the ledger's whole TTL.
+				continue
+			}
+			// Mark it in the IN-MEMORY set too, not just the batch written at the end
+			// of the poll: the same commit is reachable from a repo AND from each of
+			// its worktrees, which are separate roots later in THIS loop. Without
+			// this, one poll emits it once per root.
+			attributed[sha] = struct{}{}
+			emitted = append(emitted, sha)
 		}
 	}
+
+	if reattempted > 0 {
+		state.HookDebugf("git-watch: skipped %d already-attributed commit(s) this poll", reattempted)
+	}
+	recordAttributedCommits(emitted, nowMs)
 }
 
 // branchScope classifies a root's current checkout for rework tracking.
