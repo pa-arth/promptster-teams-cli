@@ -70,6 +70,18 @@ func sessionRepoRoot(cwd string) string {
 // directory is not a working tree. Returning false here is the zero value of an
 // unasked question, not an answer.
 //
+// tracked is a STAT, and deliberately not a validation. gitRootOf only checks
+// that a `.git` entry exists, so a stale or malformed marker — a worktree whose
+// admin dir was deleted by hand, say — reports tracked. Confirming it with a git
+// spawn was considered and rejected: it trades a rare, harmless false positive
+// for a plausible, damaging false negative. A false `true` leaves the directory
+// exactly where it sits today, a hash row on the board. A false `false` deletes
+// a real repo's row and folds its sessions into the untracked aggregate — and
+// every git call here is already timeout-bounded precisely because a network
+// mount or a corrupt .git can hang (see gitRemote), so gating `tracked` on one
+// would mean an NFS hiccup silently un-repos a live company checkout. A stat
+// cannot time out. The conservative direction is the one that keeps the row.
+//
 // One `git config` spawn, not two: the remote is resolved directly here and the
 // opaque fallback reached via workspaceHashKey, rather than round-tripping
 // through workspaceKey (which would re-run the same lookup).
