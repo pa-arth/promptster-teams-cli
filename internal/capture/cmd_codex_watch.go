@@ -81,7 +81,20 @@ type codexWatchProgress struct {
 	// Match: path -> "yes"|"no" classification cache so we only read+parse a
 	// file's session_meta header once.
 	Match map[string]string `json:"match"`
+	// V is the progress-file schema version. Bumped when a change to the
+	// classification rules invalidates cached decisions; loadCodexWatchProgress
+	// runs a one-time migration when the stored V is behind codexProgressSchemaV.
+	V int `json:"v"`
 }
+
+// codexProgressSchemaV is the current progress-file schema version. v1 drops
+// every cached "no" once: the old timestamp rule cached a "no" for any rollout
+// whose session_meta predated the watch cutoff (dropping long/resumed/
+// restart-spanning sessions forever), and the poll loop's `case "no": continue`
+// never re-evaluates them. Forcing one re-classification lets the go-forward
+// rule pick them up; genuinely cwd-mismatched files simply re-cache "no" next
+// poll. Mirrors claudeProgressSchemaV.
+const codexProgressSchemaV = 1
 
 func codexWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "codex-watcher-progress.json")
@@ -99,6 +112,18 @@ func loadCodexWatchProgress() codexWatchProgress {
 	}
 	if p.Match == nil {
 		p.Match = map[string]string{}
+	}
+	// One-time schema upgrade: drop every cached "no" so previously-dropped
+	// pre-cutoff sessions get re-classified under the go-forward rule (the poll
+	// loop's `case "no": continue` would otherwise never re-evaluate them).
+	// Genuinely cwd-mismatched files re-cache "no" on the next poll.
+	if p.V < codexProgressSchemaV {
+		for k, v := range p.Match {
+			if v == "no" {
+				delete(p.Match, k)
+			}
+		}
+		p.V = codexProgressSchemaV
 	}
 	return p
 }
@@ -269,9 +294,12 @@ func pollCodexRollouts(
 		if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
 			return nil
 		}
-		// Skip files last modified before this capture session started.
+		// Cheap candidate filter: skip files last modified before this capture
+		// session started WITHOUT caching a decision — a file touched later
+		// re-enters classification. Caching "no" here is the old bug that dropped
+		// long/resumed/restart-spanning rollouts forever (mirrors
+		// candidateClaudeTranscripts).
 		if info.ModTime().Before(startCutoff) {
-			progress.Match[path] = "no"
 			return nil
 		}
 
@@ -281,10 +309,29 @@ func pollCodexRollouts(
 		case "yes":
 			// proceed to tail
 		default:
-			if codexRolloutMatchesWorkspace(path, workspace, startCutoff) {
+			switch classifyCodexRollout(path, workspace, startCutoff) {
+			case codexMatchYes:
 				progress.Match[path] = "yes"
-			} else {
+			case codexMatchYesPreexisting:
+				// Go-forward: capture ongoing activity but NOT the pre-watcher
+				// history. Seed the offset to current EOF so tailing starts at new
+				// content. Only when unseen — a real prior offset (a restart-spanning
+				// session already being tailed) must be preserved. If the stat fails
+				// transiently, DON'T cache "yes" yet: leave the match undecided and
+				// retry next poll, so a later success seeds EOF instead of tailing the
+				// whole pre-watcher file from offset 0.
+				if _, ok := progress.Offsets[path]; !ok {
+					info, err := os.Stat(path)
+					if err != nil {
+						return nil
+					}
+					progress.Offsets[path] = info.Size()
+				}
+				progress.Match[path] = "yes"
+			case codexMatchNo:
 				progress.Match[path] = "no"
+				return nil
+			default: // undecided — line 1 not a readable session_meta yet; retry next poll
 				return nil
 			}
 		}
@@ -345,20 +392,42 @@ func replayCodexRolloutPrefix(path string, offset int64, proc *normalize.CodexRo
 	}
 }
 
-// codexRolloutMatchesWorkspace reads a rollout file's session_meta header and
-// reports whether its cwd is inside the workspace and its timestamp is recent
-// enough to belong to this capture session.
-func codexRolloutMatchesWorkspace(path, workspace string, startCutoff time.Time) bool {
+type codexMatchResult int
+
+const (
+	codexMatchUndecided      codexMatchResult = iota
+	codexMatchYes                             // matched; started at/after cutoff — tail from the start
+	codexMatchYesPreexisting                  // matched; started BEFORE cutoff (long/resumed/restart-spanning) — capture GO-FORWARD from EOF
+	codexMatchNo
+)
+
+// classifyCodexRollout decides whether a rollout belongs to this capture
+// session by reading its first line — the session_meta header, the ONLY rollout
+// line carrying cwd and the session start timestamp.
+//
+// cwd is authoritative: a cwd match belongs to this session regardless of when
+// it started. The timestamp only distinguishes NEW from PRE-EXISTING. A session
+// whose session_meta predates this watch start (a long/resumed session, or one
+// spanning a daemon restart — the daemon resets startCutoff every launch, and
+// laptop sleep/wake restarts it constantly) is returned as
+// codexMatchYesPreexisting and captured GO-FORWARD from current EOF, not dropped
+// (the old bug, which silently lost every restart-spanning session).
+//
+// Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on line
+// 1 only, so a file caught mid-creation whose first line is not yet a readable
+// session_meta is returned codexMatchUndecided (retry next poll) rather than
+// cached as a mismatch — caching "no" would drop it forever.
+func classifyCodexRollout(path, workspace string, startCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return false
+		return codexMatchUndecided
 	}
 	defer f.Close()
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
 	if !scanner.Scan() {
-		return false
+		return codexMatchUndecided
 	}
 	var rec struct {
 		Timestamp string `json:"timestamp"`
@@ -368,15 +437,22 @@ func codexRolloutMatchesWorkspace(path, workspace string, startCutoff time.Time)
 		} `json:"payload"`
 	}
 	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
-		return false
+		return codexMatchUndecided
 	}
 	if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
-		return false
+		return codexMatchUndecided
 	}
+	if !pathWithin(resolvePath(rec.Payload.Cwd), workspace) {
+		return codexMatchNo
+	}
+	// cwd matches. A session whose session_meta predates this watch start is
+	// pre-existing — capture it GO-FORWARD from current EOF rather than dropping
+	// it (the old bug) or re-uploading its whole history. A session started
+	// at/after the cutoff is genuinely new — tail from the start.
 	if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
-		return false
+		return codexMatchYesPreexisting
 	}
-	return pathWithin(resolvePath(rec.Payload.Cwd), workspace)
+	return codexMatchYes
 }
 
 // codexRolloutCwd returns the absolute cwd recorded in a rollout file's
