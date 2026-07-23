@@ -87,7 +87,21 @@ type ClaudeTranscriptProcessor struct {
 	// require a real provider match rather than treating a colliding owner name as
 	// one. Non-empty ONLY when RepoRoot is a remote slug; the opaque-hash cases
 	// have no remote and report "" rather than a guess. Omitted when empty.
-	RepoHost      string
+	RepoHost string
+	// RepoTracked reports whether the resolved cwd was inside a git working tree
+	// at all, resolved in the SAME capture-side pass as RepoRoot/RepoHost and
+	// threaded in the same way. It exists because the two opaque-hash cases —
+	// "git repo with no origin remote" and "not a git repo at all" — emit a
+	// structurally identical key, so without it a home directory or a container
+	// folder is indistinguishable from a real remoteless repo and occupies a row
+	// on a board titled "Top repos".
+	//
+	// It is stamped explicitly as true OR false whenever repoRoot is stamped, and
+	// omitted entirely when repoRoot is (see the emit site). Absence therefore
+	// means "a CLI too old to have looked" and is treated downstream as tracked;
+	// a positive-only emit would collapse that back into the exact ambiguity this
+	// field removes. Only meaningful alongside a non-empty RepoRoot.
+	RepoTracked   bool
 	pendingTools  map[string]claudePendingTool
 	emittedMsgIDs map[string]bool
 	accum         *claudeMsgAccum
@@ -733,6 +747,14 @@ func (p *ClaudeTranscriptProcessor) promptEvent(text string, rec map[string]inte
 	// subdirs/worktrees and joins exactly to outcome_events.repo.
 	if p.RepoRoot != "" {
 		data["repoRoot"] = p.RepoRoot
+		// repoTracked — whether that key came from a real git working tree (cases 1
+		// and 2 of the ladder) or from a directory that is not a repo at all (case
+		// 3). Stamped EXPLICITLY as true or false, and only ever beside repoRoot:
+		// the pair describes one observation of one directory, so a tracked bit
+		// without the key it describes is meaningless. Omitting it when false would
+		// make "not a repo" indistinguishable from "CLI too old to have looked",
+		// which is the ambiguity the field exists to remove.
+		data["repoTracked"] = p.RepoTracked
 	}
 
 	// repoHost — the provider the slug came from, so the backend can tell

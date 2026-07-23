@@ -162,6 +162,101 @@ func TestClaudeTranscriptPromptOmitsRepoHostWhenUnresolved(t *testing.T) {
 	}
 }
 
+// claudeRepoPrompt runs one prompt line through a processor carrying the given
+// pre-resolved session identity and returns the emitted prompt's Data.
+func claudeRepoPrompt(t *testing.T, sess, root, host string, tracked bool) map[string]interface{} {
+	t.Helper()
+	p := NewClaudeTranscriptProcessor(sess)
+	p.RepoRoot = root
+	p.RepoHost = host
+	p.RepoTracked = tracked
+	events := processAll(t, p,
+		`{"type":"user","message":{"role":"user","content":"add a retry"},"timestamp":"2026-06-10T10:00:00.000Z","cwd":"/tmp/ws","sessionId":"ide-1","promptSource":"typed","uuid":"u-`+sess+`"}`,
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	return dm(events[0])
+}
+
+// TestClaudeTranscriptPromptStampsRepoTrackedExplicitly is the tri-state
+// contract: the field is emitted as an explicit true OR false whenever repoRoot
+// is emitted, and absent only when repoRoot is. A positive-only emit (true, key
+// omitted when false) would make "this directory is not a repo" and "this CLI is
+// too old to have looked" indistinguishable — which is the exact ambiguity the
+// field exists to remove.
+func TestClaudeTranscriptPromptStampsRepoTrackedExplicitly(t *testing.T) {
+	// Case 1: repo with a remote → slug + host + tracked.
+	d := claudeRepoPrompt(t, "rt-slug", "acme/foo", "github.com", true)
+	if got, present := d["repoTracked"]; !present || got != true {
+		t.Errorf("repoTracked = %v (present %v), want true", got, present)
+	}
+
+	// Case 2: repo with no remote → hash + tracked. Same shape of key as case 3,
+	// so the bit is the only thing separating them on the wire.
+	d = claudeRepoPrompt(t, "rt-noremote", "d98ef209c46c9dd9", "", true)
+	if got, present := d["repoTracked"]; !present || got != true {
+		t.Errorf("no-remote repoTracked = %v (present %v), want true", got, present)
+	}
+
+	// Case 3: not a git repo at all → hash + NOT tracked, emitted EXPLICITLY.
+	d = claudeRepoPrompt(t, "rt-nongit", "1e06276a18347f93", "", false)
+	got, present := d["repoTracked"]
+	if !present {
+		t.Fatal("repoTracked must be PRESENT and false for a non-repo dir — omitting it is indistinguishable from an old CLI")
+	}
+	if got != false {
+		t.Errorf("non-git repoTracked = %v, want false", got)
+	}
+	// …and repoRoot is untouched: the field adds information about the key, it
+	// never changes the key.
+	if d["repoRoot"] != "1e06276a18347f93" {
+		t.Errorf("repoRoot = %v, want the hash key unchanged", d["repoRoot"])
+	}
+}
+
+// TestClaudeTranscriptPromptOmitsRepoTrackedWithoutRepoRoot: case 4 — a gone or
+// unresolvable cwd. We did not look, so we say nothing. An emitted `false` here
+// would be a positive claim that the directory is not a working tree, which we
+// never observed; absent correctly reads downstream as "unknown → treat as
+// tracked".
+func TestClaudeTranscriptPromptOmitsRepoTrackedWithoutRepoRoot(t *testing.T) {
+	d := claudeRepoPrompt(t, "rt-gone", "", "", false)
+	if _, present := d["repoRoot"]; present {
+		t.Errorf("repoRoot must be absent when unresolved, got %v", d["repoRoot"])
+	}
+	if _, present := d["repoTracked"]; present {
+		t.Errorf("repoTracked must be absent when repoRoot is, got %v", d["repoTracked"])
+	}
+}
+
+// TestClaudeTranscriptRepoRootByteIdenticalAcrossTheChange: the tracked bit must
+// not perturb repoRoot's emitted value in ANY of the four cases. The backend
+// keys repo rollups and the PR-count join on that string, so a single byte of
+// drift silently re-fragments every board.
+func TestClaudeTranscriptRepoRootByteIdenticalAcrossTheChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, root, host string
+		tracked          bool
+		wantPresent      bool
+	}{
+		{"remote", "acme/foo", "github.com", true, true},
+		{"no-remote", "d98ef209c46c9dd9", "", true, true},
+		{"non-git", "1e06276a18347f93", "", false, true},
+		{"unresolvable", "", "", false, false},
+	} {
+		d := claudeRepoPrompt(t, "rr-stable-"+tc.name, tc.root, tc.host, tc.tracked)
+		got, present := d["repoRoot"]
+		if present != tc.wantPresent {
+			t.Errorf("%s: repoRoot present = %v, want %v", tc.name, present, tc.wantPresent)
+			continue
+		}
+		if tc.wantPresent && got != tc.root {
+			t.Errorf("%s: repoRoot = %v, want %q byte-identical", tc.name, got, tc.root)
+		}
+	}
+}
+
 // TestClaudeTranscriptPromptWorkdirOutsideHome is the privacy guard: a prompt
 // whose cwd is OUTSIDE $HOME (an absolute path that may carry the OS username)
 // must produce NO data.workdir — the field is "~"-prefixed or absent, never a

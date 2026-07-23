@@ -301,10 +301,12 @@ func pollCodexRollouts(
 			}
 			// Resolve the canonical repo identity ONCE per session (this processor is
 			// created once per rollout file) from the session_meta cwd, and thread it
-			// in as session state so each prompt event carries repoRoot + repoHost.
-			// Both halves come from ONE call so the host can never be stamped from a
-			// different resolution pass than the slug.
-			proc.RepoRoot, proc.RepoHost = sessionRepoIdentity(codexRolloutCwd(path))
+			// in as session state so each prompt event carries repoRoot + repoHost +
+			// repoTracked. All three parts come from ONE call so the host and the
+			// tracked bit can never be stamped from a different resolution pass than
+			// the slug — they describe one observation of one directory, and a second
+			// pass could see it after a `git init`.
+			proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(codexRolloutCwd(path))
 			processors[path] = proc
 		}
 		n := tailCodexRollout(path, progress, proc, session, captureProse)

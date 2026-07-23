@@ -83,9 +83,20 @@ var projectFieldAllowlist = map[string][]string{
 	// same reason repoRoot does: the slug alone is ambiguous across providers
 	// (both hosts' acme/api reduce to "acme/api"), and the backend must be able to
 	// require a provider match rather than treat a colliding owner name as one.
+	// repoTracked is a BOOLEAN about the filesystem — whether the session's cwd sat
+	// inside a git working tree at all. It carries no path, no name, and no free
+	// text, so it is canary-safe by construction: one bit cannot leak a directory.
+	// It gets its own allowlisted key because the two opaque-hash repoRoot cases
+	// ("git repo, no origin remote" and "not a git repo at all") are structurally
+	// identical, and only this bit tells the backend that a key belongs to a real
+	// repo rather than a home/container directory that must come off the board.
+	// LOCKSTEP: the backend runs its own default-deny projection
+	// (packages/shared/src/eventFieldProjection.ts). A field allowlisted on only
+	// ONE side is stripped silently and reads as an older CLI — which is exactly
+	// the ambiguity this field exists to remove. Never add it here alone.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot", "repoHost"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot", "repoHost", "repoTracked"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so

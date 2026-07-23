@@ -72,7 +72,7 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			// line if a meta map is ever smuggled back onto a prompt. Its cwd is the
 			// canary — an absolute path is exactly what allowlisting the map whole
 			// would have leaked.
-			name: "prompt keeps text (the product) + command name + promptSource + workdir + repoRoot + repoHost, drops smuggled fields",
+			name: "prompt keeps text (the product) + command name + promptSource + workdir + repoRoot + repoHost + repoTracked, drops smuggled fields",
 			kind: "prompt",
 			data: map[string]interface{}{
 				"text": "fix the failing test", "command": "commit", "promptSource": "system",
@@ -87,12 +87,19 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 				// strips scheme/userinfo/port/path on-device, so what survives is a
 				// provider name, not a URL and not a path.
 				"repoHost": "github.com",
-				"meta":     map[string]interface{}{"raw": leakCanary},
-				"cwd":      leakCanary,
+				// repoTracked is a single boolean about the filesystem — was the cwd
+				// inside a git working tree at all. One bit cannot carry a path or a
+				// name, so it is canary-safe by construction; it is kept because it
+				// is the ONLY thing separating a real remoteless repo from a home or
+				// container directory, both of which hash to the same repoRoot shape.
+				"repoTracked": true,
+				"meta":        map[string]interface{}{"raw": leakCanary},
+				"cwd":         leakCanary,
 			},
 			wantKept: map[string]interface{}{
 				"text": "fix the failing test", "command": "commit", "promptSource": "system",
 				"workdir": "~/repos/foo/bar", "repoRoot": "acme/foo", "repoHost": "github.com",
+				"repoTracked": true,
 			},
 			wantDropped: []string{"meta", "cwd"},
 		},
@@ -162,6 +169,27 @@ func TestProjectEventStripsSourceFields(t *testing.T) {
 			},
 			wantKept:    map[string]interface{}{"subtype": "action", "cutTool": "Bash", "variant": "generation"},
 			wantDropped: []string{"cutToolInput"},
+		},
+		{
+			// repoTracked=false is the value the whole untracked-workdir change is
+			// FOR, and it is the one a default-deny projector is most likely to eat:
+			// a `false` that gets dropped arrives as ABSENT, which downstream reads
+			// as "an older CLI that never looked" — the exact ambiguity being fixed,
+			// re-created silently. The projector skips nil, not falsy; this pins it.
+			name: "prompt keeps repoTracked=false (absent would read as an old CLI)",
+			kind: "prompt",
+			data: map[string]interface{}{
+				"text": "run the migration", "workdir": "~/Projects/US",
+				// A container folder: hashes to the same shape as a remoteless repo,
+				// so only the boolean tells them apart.
+				"repoRoot": "1e06276a18347f93", "repoTracked": false,
+				"cwd": leakCanary,
+			},
+			wantKept: map[string]interface{}{
+				"text": "run the migration", "workdir": "~/Projects/US",
+				"repoRoot": "1e06276a18347f93", "repoTracked": false,
+			},
+			wantDropped: []string{"cwd"},
 		},
 	}
 

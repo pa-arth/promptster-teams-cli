@@ -431,6 +431,100 @@ func TestCodexPromptOmitsRepoRootWhenUnresolved(t *testing.T) {
 	}
 }
 
+// codexRepoPrompt runs one user_message through a processor carrying the given
+// pre-resolved session identity and returns the emitted prompt's Data.
+func codexRepoPrompt(t *testing.T, sess, root, host string, tracked bool) map[string]interface{} {
+	t.Helper()
+	p := NewCodexRolloutProcessor(sess)
+	p.RepoRoot = root
+	p.RepoHost = host
+	p.RepoTracked = tracked
+	var prompt *event.Event
+	for _, l := range []string{
+		`{"timestamp":"2026-06-06T20:38:45.965Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`,
+		`{"timestamp":"2026-06-06T20:38:47.624Z","type":"event_msg","payload":{"type":"user_message","message":"do the thing"}}`,
+	} {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "prompt" {
+				ev := e
+				prompt = &ev
+			}
+		}
+	}
+	if prompt == nil {
+		t.Fatal("no prompt event emitted")
+	}
+	return prompt.Data.(map[string]interface{})
+}
+
+// TestCodexPromptStampsRepoTrackedExplicitly: the codex lane builds its prompt
+// data map independently of the claude lane, so the tri-state contract is pinned
+// per-lane or one silently drifts from the other. Explicit true OR false
+// whenever repoRoot ships; a positive-only emit would make "not a repo" and "old
+// CLI" indistinguishable.
+func TestCodexPromptStampsRepoTrackedExplicitly(t *testing.T) {
+	d := codexRepoPrompt(t, "sess-rt-slug", "acme/foo", "github.com", true)
+	if got, present := d["repoTracked"]; !present || got != true {
+		t.Errorf("repoTracked = %v (present %v), want true", got, present)
+	}
+
+	d = codexRepoPrompt(t, "sess-rt-noremote", "d98ef209c46c9dd9", "", true)
+	if got, present := d["repoTracked"]; !present || got != true {
+		t.Errorf("no-remote repoTracked = %v (present %v), want true", got, present)
+	}
+
+	d = codexRepoPrompt(t, "sess-rt-nongit", "1e06276a18347f93", "", false)
+	got, present := d["repoTracked"]
+	if !present {
+		t.Fatal("repoTracked must be PRESENT and false for a non-repo dir — omitting it is indistinguishable from an old CLI")
+	}
+	if got != false {
+		t.Errorf("non-git repoTracked = %v, want false", got)
+	}
+	if d["repoRoot"] != "1e06276a18347f93" {
+		t.Errorf("repoRoot = %v, want the hash key unchanged", d["repoRoot"])
+	}
+}
+
+// TestCodexPromptOmitsRepoTrackedWithoutRepoRoot: no identity resolved means we
+// did not look, so neither field ships. Absent reads downstream as "unknown →
+// treat as tracked"; an emitted false would be a claim we never observed.
+func TestCodexPromptOmitsRepoTrackedWithoutRepoRoot(t *testing.T) {
+	d := codexRepoPrompt(t, "sess-rt-gone", "", "", false)
+	if _, present := d["repoRoot"]; present {
+		t.Errorf("repoRoot must be absent when unresolved, got %v", d["repoRoot"])
+	}
+	if _, present := d["repoTracked"]; present {
+		t.Errorf("repoTracked must be absent when repoRoot is, got %v", d["repoTracked"])
+	}
+}
+
+// TestCodexRepoRootByteIdenticalAcrossTheChange: adding the tracked bit must not
+// move repoRoot's emitted value in any case — the backend keys repo rollups and
+// the PR-count join on that exact string.
+func TestCodexRepoRootByteIdenticalAcrossTheChange(t *testing.T) {
+	for _, tc := range []struct {
+		name, root, host string
+		tracked          bool
+		wantPresent      bool
+	}{
+		{"remote", "acme/foo", "github.com", true, true},
+		{"no-remote", "d98ef209c46c9dd9", "", true, true},
+		{"non-git", "1e06276a18347f93", "", false, true},
+		{"unresolvable", "", "", false, false},
+	} {
+		d := codexRepoPrompt(t, "sess-rr-stable-"+tc.name, tc.root, tc.host, tc.tracked)
+		got, present := d["repoRoot"]
+		if present != tc.wantPresent {
+			t.Errorf("%s: repoRoot present = %v, want %v", tc.name, present, tc.wantPresent)
+			continue
+		}
+		if tc.wantPresent && got != tc.root {
+			t.Errorf("%s: repoRoot = %v, want %q byte-identical", tc.name, got, tc.root)
+		}
+	}
+}
+
 func TestCodexPatchLineRanges(t *testing.T) {
 	p := NewCodexRolloutProcessor("sess-1")
 	// A multi-hunk unified diff: an update hunk (+3,2), an insertion hunk

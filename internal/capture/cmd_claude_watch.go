@@ -561,11 +561,13 @@ func pollClaudeTranscripts(
 				// Resolve the canonical repo identity ONCE per session (this
 				// processor is created once per transcript) from the transcript's
 				// recorded cwd, and thread it in as session state so each prompt
-				// event carries repoRoot + repoHost. Sidechains emit no prompts, so
-				// they skip it. transcriptCwd reads only the cwd field, never the
-				// body. Both halves come from ONE call so the host can never be
-				// stamped from a different resolution pass than the slug.
-				proc.RepoRoot, proc.RepoHost = sessionRepoIdentity(transcriptCwd(path))
+				// event carries repoRoot + repoHost + repoTracked. Sidechains emit
+				// no prompts, so they skip it. transcriptCwd reads only the cwd
+				// field, never the body. All three parts come from ONE call so the
+				// host and the tracked bit can never be stamped from a different
+				// resolution pass than the slug — they describe one observation of
+				// one directory, and a second pass could see it after a `git init`.
+				proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(transcriptCwd(path))
 			}
 			processors[key] = proc
 		}

@@ -76,6 +76,19 @@ type CodexRolloutProcessor struct {
 	// treating a colliding owner name as one. Non-empty ONLY when RepoRoot is a
 	// remote slug; omitted when empty.
 	RepoHost string
+	// RepoTracked reports whether the resolved cwd was inside a git working tree
+	// at all, resolved in the SAME capture-side pass as RepoRoot/RepoHost and
+	// threaded in the same way. It exists because the two opaque-hash cases —
+	// "git repo with no origin remote" and "not a git repo at all" — emit a
+	// structurally identical key, so without it a home directory or a container
+	// folder is indistinguishable from a real remoteless repo and occupies a row
+	// on a board titled "Top repos".
+	//
+	// Stamped explicitly as true OR false whenever repoRoot is stamped, omitted
+	// entirely when repoRoot is. Absence means "a CLI too old to have looked" and
+	// is treated downstream as tracked. Only meaningful alongside a non-empty
+	// RepoRoot.
+	RepoTracked bool
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -216,6 +229,11 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		// across subdirs/worktrees and joins exactly to outcome_events.repo.
 		if p.RepoRoot != "" {
 			data["repoRoot"] = p.RepoRoot
+			// repoTracked — whether that key came from a real git working tree or from
+			// a directory that is not a repo at all. Stamped EXPLICITLY as true or
+			// false, and only ever beside repoRoot: omitting it when false would make
+			// "not a repo" indistinguishable from "CLI too old to have looked".
+			data["repoTracked"] = p.RepoTracked
 		}
 		// repoHost — the provider the slug came from, so the backend can tell
 		// gitlab.com/acme/api apart from github.com/acme/api. Same omit-when-empty
