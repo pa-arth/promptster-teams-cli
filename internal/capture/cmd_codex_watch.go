@@ -230,6 +230,11 @@ func RunCodexWatcher() error {
 	// tool-call/output correlation survives across polls.
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 	eventsCaptured := 0
+	// Codex rate-limit *window* emission: a throttled scan of the rollout logs
+	// for the latest token_count.rate_limits, mapped to the provider-agnostic
+	// windowUsage event. Independent of the per-line capture above (window state
+	// is account-global, not workspace-scoped). See window_usage.go.
+	var windowEmitter codexWindowEmitter
 
 	// Delivery runs off the poll loop — see the claude watcher for the full
 	// rationale. Both watchers share ONE device-wide queue and run as goroutines
@@ -257,6 +262,7 @@ func RunCodexWatcher() error {
 		captureProse := policyResolver.CaptureAssistantProse()
 		queued := pollCodexRollouts(session, workspace, startCutoff, processors, captureProse)
 		eventsCaptured += queued
+		windowEmitter.maybe(session, time.Now(), captureProse)
 
 		_ = saveCodexWatcherState(codexWatcherState{
 			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,

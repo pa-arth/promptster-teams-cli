@@ -916,3 +916,52 @@ func TestProjectEventDurabilityVerdictLivingRanges(t *testing.T) {
 		t.Errorf("living range not stripped to {start,end,ageDays,lineageId}: %+v", first)
 	}
 }
+
+// TestProjectEventWindowUsage pins the windowUsage projection (contract.md §2):
+// the seven allowlisted scalars survive, a smuggled content key is stripped, an
+// ABSENT window field stays absent (never coerced to 0), and a genuine 0 is kept.
+// This is the CLI half of the lockstep with the backend's eventFieldProjection.
+func TestProjectEventWindowUsage(t *testing.T) {
+	e := eventWithData("windowUsage", map[string]interface{}{
+		"provider":         "codex",
+		"fiveHourPct":      0, // genuine zero — must be KEPT as 0
+		"fiveHourResetsAt": 1900000000,
+		"observedAt":       1700000000,
+		"capturedAt":       1700000005,
+		// weeklyPct / weeklyResetsAt deliberately ABSENT — must stay absent.
+		// A smuggled content key must not survive.
+		"transcriptPath": leakCanary,
+		"promptText":     leakCanary,
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived windowUsage projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+
+	if data["provider"] != "codex" {
+		t.Errorf("provider lost: %+v", data["provider"])
+	}
+	// Genuine 0 kept (absent != zero, but a real 0 IS 0).
+	if v, ok := data["fiveHourPct"]; !ok || v != 0 {
+		t.Errorf("fiveHourPct genuine 0 must be kept as 0, got present=%v val=%v", ok, v)
+	}
+	if data["fiveHourResetsAt"] != 1900000000 {
+		t.Errorf("fiveHourResetsAt lost: %+v", data["fiveHourResetsAt"])
+	}
+	// Absent window fields stay absent — never fabricated as 0.
+	if _, present := data["weeklyPct"]; present {
+		t.Errorf("absent weeklyPct must not appear in projected data: %+v", data)
+	}
+	if _, present := data["weeklyResetsAt"]; present {
+		t.Errorf("absent weeklyResetsAt must not appear in projected data: %+v", data)
+	}
+	// Smuggled content keys stripped.
+	for _, k := range []string{"transcriptPath", "promptText"} {
+		if _, present := data[k]; present {
+			t.Errorf("smuggled key %q survived windowUsage projection: %+v", k, data)
+		}
+	}
+}

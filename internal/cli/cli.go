@@ -64,6 +64,12 @@ func Main(argv []string) int {
 		// Register/remove the per-user OS service that relaunches capture at
 		// login so it survives reboots (launchd / systemd --user / Task Scheduler).
 		return cmdAutostart(argv[2:])
+	case "statusline":
+		// Claude Code rate-limit WINDOW capture. `enable`/`disable` wrap/unwrap the
+		// engineer's statusLine command; `run` is the shim Claude Code invokes each
+		// tick (reads stdin, spools the window reading, passes the prior line
+		// through); `status` reports the effective-statusline drift check.
+		return cmdStatusline(argv[2:])
 	case "status":
 		cmdTeamsStatus(argv[2:])
 	case "doctor":
@@ -90,6 +96,7 @@ Commands:
   start        Capture in the background (detaches and returns your shell)
   stop         Stop background capture
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
+  statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
   watch        Foreground capture — tail transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)

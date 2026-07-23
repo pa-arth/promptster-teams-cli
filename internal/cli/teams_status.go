@@ -154,6 +154,18 @@ func cmdTeamsDoctor() {
 		printlnIndent(fmt.Sprintf("%s autostart not enabled — run `promptster-teams autostart enable` so capture survives reboots", warnGlyph))
 	}
 
+	// Claude statusline window-capture drift check: resolve the EFFECTIVE
+	// statusline across all settings layers (not just our file) so we catch a
+	// project-layer shadow or an overwrite that silently stops window capture.
+	dir, _ := os.Getwd()
+	for _, l := range capture.StatuslineDoctor(dir) {
+		glyph := okGlyph
+		if l.Warn {
+			glyph = warnGlyph
+		}
+		printlnIndent(fmt.Sprintf("%s %s", glyph, l.Text))
+	}
+
 	fmt.Println()
 	if ok {
 		printlnIndent(dimStyle.Render("Ready. Run ") + bodyStyle.Render("promptster-teams watch") + dimStyle.Render(" from a repo."))
