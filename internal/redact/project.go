@@ -221,6 +221,20 @@ var projectFieldAllowlist = map[string][]string{
 	// LOCKSTEP with promptster-backend packages/shared/src/eventFieldProjection.ts:
 	// a field allowed here but not there is silently dropped at ingest.
 	"durability_verdict": {"commitSha", "workspaceKey", "path", "durableRanges", "churnedRanges", "livingRanges", "measuredTsMs"},
+	// windowUsage is the provider-agnostic rate-limit WINDOW snapshot: how much of
+	// the engineer's own 5-hour / weekly subscription window is burned, and when
+	// each resets. Every field is a content-free scalar — a provider enum, two
+	// percentages, two absolute epoch reset times, and two capture timestamps —
+	// lifted on-device from Codex's rollout token_count.rate_limits or Claude
+	// Code's statusline stdin. NEVER a prompt, transcript path, model id, or any
+	// surrounding usage/session field. Absent != zero: a window the provider did
+	// not report is OMITTED (projectEvent drops nil/absent keys), a genuine 0 is
+	// 0, and a NaN percentage is dropped at the emitter before it reaches here.
+	// LOCKSTEP with promptster-backend packages/shared/src/eventFieldProjection.ts
+	// (§2 of usage-window-currency/contract.md): these seven keys must be
+	// allowlisted on BOTH sides in the same release — a field allowed here but not
+	// there is silently stripped at ingest and reads as an older CLI.
+	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,

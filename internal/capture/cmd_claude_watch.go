@@ -411,6 +411,10 @@ func RunClaudeWatcher() error {
 	eventsCaptured := 0
 	var bytesConsumed, bytesSinceEvent int64
 	degraded := false
+	// Claude rate-limit *window* emission: drain the spool the statusline shim
+	// writes (latest-wins) and emit the provider-agnostic windowUsage event. See
+	// window_usage.go and statusline_shim.go.
+	var windowEmitter claudeWindowEmitter
 
 	// Delivery runs off the poll loop, so a slow or rate-limited backend can no
 	// longer stall parsing, advance transcript offsets past undelivered events,
@@ -446,6 +450,7 @@ func RunClaudeWatcher() error {
 		// double-emit or lose events.
 		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
+		windowEmitter.maybe(session, time.Now(), captureProse)
 		wasDegraded := degraded
 		degraded, bytesSinceEvent = claudeDegradationStep(degraded, parsed, consumed, bytesSinceEvent)
 		switch {
