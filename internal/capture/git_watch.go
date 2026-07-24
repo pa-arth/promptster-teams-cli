@@ -38,15 +38,36 @@ const gitWatchInterval = 60 * time.Second
 // gitNewCommits). A package var, not a const, so a test can lower it without
 // building hundreds of commits.
 //
-// ⚠️This cap is PER ROOT and a poll walks EVERY discovered root, so it does not
-// bound a poll's total emission: 63 discovered roots × 100 = 6,300, and teams
-// prod recorded a single burst of 7,482 commit_attribution POSTs 0.1s apart.
-// Bounding the per-poll TOTAL needs cursor rework — pollGitWatch advances a
-// root's cursor BEFORE attribution runs, so simply refusing to emit past a
-// budget would drop those commits permanently rather than defer them. Until
-// then, the re-emission that made those bursts expensive is absorbed by the
-// attributed-commits ledger below, not by this clamp.
+// ⚠️This cap is PER ROOT and a poll walks EVERY discovered root, so on its own it
+// does not bound a poll's TOTAL emission: 63 discovered roots × 100 = 6,300, and
+// teams prod recorded a single burst of 7,482 commit_attribution POSTs 0.1s
+// apart. gitWatchMaxCommitsPerPollTotal below is the shared budget that bounds
+// the poll-wide total; this per-root cap still limits any ONE root's `git show`
+// fan-out and is the gc'd-cursor recovery-window size (see gitNewCommits).
 var gitWatchMaxCommitsPerPoll = 100
+
+// gitWatchMaxCommitsPerPollTotal bounds how many commits a SINGLE poll surfaces
+// across ALL roots combined — the global companion to the per-root cap above
+// (§0.2c). pollGitWatch spends this budget root-by-root and takes only the OLDEST
+// commits that fit: a root whose batch overflows the remaining budget has its
+// cursor advanced only to the newest commit actually taken, and a root reached
+// after the budget is spent is left with its cursor untouched. Both drain on
+// subsequent polls, in commit order — deferred, never dropped. This is what makes
+// a genuine large burst (a first import, a multi-root gc storm) land as a bounded
+// trickle instead of a 7,482-POST thundering herd against the ingest endpoint.
+//
+// 200 = 2× the per-root cap: ordinary multi-repo activity (a handful of commits
+// across a few repos per 60s) never touches it, while a pathological burst drains
+// at 200/poll. A package var, not a const, so a test can lower it. Deferring by
+// NOT advancing the cursor (rather than refusing to emit downstream, which WOULD
+// drop — the cursor would already be past the un-emitted commits) is the whole
+// point; keep the budget decision co-located with the cursor advance in
+// pollGitWatch. NB: an already-attributed commit re-surfaced by the gc'd-recovery
+// path is skipped cheaply by the attributed-commits ledger in
+// pollGitWatchWorkspace but still counts against this budget here (pollGitWatch
+// cannot see the ledger without a cost this loop is built to avoid); the effect
+// is a transient extra poll or two to clear a mass re-emission, never data loss.
+var gitWatchMaxCommitsPerPollTotal = 200
 
 func gitWatchCursorsPath() string {
 	return filepath.Join(state.StateDir(), "git-watch-cursors.json")
@@ -456,6 +477,15 @@ func pollGitWatch(roots []string) map[string][]string {
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
 
+	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
+	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
+	// without a shared cap N roots surface up to N×cap in one burst. We spend the
+	// budget root-by-root and take only the oldest commits that fit; the remainder
+	// (a partial root's newer tail, or a whole root reached after the budget is
+	// spent) keeps its old cursor and drains on the next poll — deferred, not lost.
+	budget := gitWatchMaxCommitsPerPollTotal
+	deferred := 0
+
 	for _, root := range roots {
 		head, ok := gitHead(root)
 		if !ok {
@@ -476,12 +506,33 @@ func pollGitWatch(roots []string) map[string][]string {
 			newHeads[key] = head // nothing new (e.g. a backward reset): just move to head
 			continue
 		}
+		if budget <= 0 {
+			// Poll-wide budget already spent: defer this whole root untouched (cursor
+			// stays at lastSeen so every commit re-surfaces next poll). NOT a drop.
+			deferred += len(commits)
+			continue
+		}
+		if len(commits) > budget {
+			// This root overflows the remaining budget. commits is newest-first and we
+			// drain oldest-first, so keep the OLDEST `budget` (the tail) and defer the
+			// newer remainder — the same shape as clampCommitBurst's per-root drain,
+			// just bounded by the shared budget instead of the per-root cap.
+			deferred += len(commits) - budget
+			commits = commits[len(commits)-budget:]
+		}
 		detected[key] = commits
 		// Advance only to the newest commit we actually returned. commits[0] is
-		// newest-first: it equals head on a normal or gc'd-recovery poll, but on a
-		// clamped burst it is the newest of the OLDEST batch, so the next poll
-		// enumerates commits[0]..head and drains the remainder in order.
+		// newest-first: it equals head on a normal or gc'd-recovery poll that fit the
+		// budget, but on a clamped burst (per-root OR global) it is the newest of the
+		// OLDEST batch, so the next poll enumerates commits[0]..head and drains the
+		// remainder in order.
 		newHeads[key] = commits[0]
+		budget -= len(commits)
+	}
+
+	if deferred > 0 {
+		state.HookDebugf("git-watch: per-poll global cap %d reached; deferred %d commit(s) to subsequent polls",
+			gitWatchMaxCommitsPerPollTotal, deferred)
 	}
 
 	saveGitWatchCursors(newHeads)

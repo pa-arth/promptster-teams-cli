@@ -306,6 +306,85 @@ func TestGitWatchBurstDrains(t *testing.T) {
 	}
 }
 
+// TestGitWatchGlobalCapDrainsAcrossRoots: the per-poll budget is GLOBAL, not
+// per-root (§0.2c). With several roots each holding new commits — one of them
+// alone exceeding the cap — a single poll must surface at most
+// gitWatchMaxCommitsPerPollTotal commits SUMMED across all roots, and the
+// deferred remainder must drain on later polls: every commit exactly once, in
+// per-root commit order, nothing dropped. Exercises the whole-root defer (a root
+// reached at budget 0), the partial-root slice (a root that overflows the
+// remaining budget), and eventual quiescence.
+func TestGitWatchGlobalCapDrainsAcrossRoots(t *testing.T) {
+	origTotal := gitWatchMaxCommitsPerPollTotal
+	gitWatchMaxCommitsPerPollTotal = 2
+	defer func() { gitWatchMaxCommitsPerPollTotal = origTotal }()
+
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	counts := []int{3, 2, 2} // 7 new commits total; root 0 alone exceeds the cap
+	wantTotal := 0
+	for _, c := range counts {
+		wantTotal += c
+	}
+
+	type repo struct {
+		key  string
+		want []string // this root's new commits, oldest→newest
+	}
+	var repos []repo
+	var roots []string
+	baseline := map[string]string{}
+	for _, c := range counts {
+		ws, git, gitOut := gitRepo(t)
+		git("commit", "--allow-empty", "-m", "base")
+		key := gitWatchRootKey(ws)
+		baseline[key] = gitOut("rev-parse", "HEAD") // cursor far behind head
+		var want []string
+		for i := 0; i < c; i++ {
+			git("commit", "--allow-empty", "-m", "n")
+			want = append(want, gitOut("rev-parse", "HEAD"))
+		}
+		repos = append(repos, repo{key: key, want: want})
+		roots = append(roots, ws)
+	}
+	saveGitWatchCursors(baseline)
+
+	got := map[string][]string{}
+	total := 0
+	for poll := 0; poll < 12 && total < wantTotal; poll++ {
+		batch := pollGitWatch(roots)
+		perPoll := 0
+		for key, commits := range batch {
+			perPoll += len(commits)
+			for i := len(commits) - 1; i >= 0; i-- { // newest-first → collect oldest→newest
+				got[key] = append(got[key], commits[i])
+			}
+		}
+		if perPoll > gitWatchMaxCommitsPerPollTotal {
+			t.Fatalf("poll %d surfaced %d commits across roots, exceeds global cap %d",
+				poll, perPoll, gitWatchMaxCommitsPerPollTotal)
+		}
+		total += perPoll
+	}
+
+	if total != wantTotal {
+		t.Fatalf("want all %d commits drained across polls, drained %d", wantTotal, total)
+	}
+	for _, rp := range repos {
+		if len(got[rp.key]) != len(rp.want) {
+			t.Fatalf("root %s: want %d commits, got %d (%v)", rp.key, len(rp.want), len(got[rp.key]), got[rp.key])
+		}
+		for i := range rp.want {
+			if got[rp.key][i] != rp.want[i] {
+				t.Fatalf("root %s commit %d out of order: got %s want %s", rp.key, i, got[rp.key][i], rp.want[i])
+			}
+		}
+	}
+	if d := pollGitWatch(roots); len(d) != 0 {
+		t.Fatalf("after draining, poll must report nothing, got %v", d)
+	}
+}
+
 // TestGitWatchGcdCursorRecovered: a cursor pointing at an object that is no longer
 // valid (gc'd after an aggressive rewrite) makes `rev-list lastSeen..head` ERROR.
 // The bounded recovery window (`rev-list -n cap head`) must still surface the tip
