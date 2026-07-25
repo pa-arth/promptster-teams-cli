@@ -36,8 +36,10 @@ import (
 // boundaries.
 //
 // One API response is split across MULTIPLE assistant lines (one per content
-// block), all sharing message.id and carrying identical usage — so usage is
-// deduped by message.id and text blocks are accumulated until a boundary.
+// block), all sharing message.id — so usage is deduped by message.id and text
+// blocks are accumulated until a boundary. Usage is deduped by MERGING the
+// lines (see mergeUsageMax), not by keeping the first: output_tokens grows
+// across them.
 
 // claudePendingTool holds a tool_use block awaiting its tool_result line so the
 // pair can be fed through normalizePostToolUseByTool — the SAME function the
@@ -56,7 +58,82 @@ type claudeMsgAccum struct {
 	requestID string
 	text      strings.Builder
 	usage     map[string]interface{}
+	sidechain bool      // flush as subagent_usage (no text) instead of ai_response
 	updatedAt time.Time // wall clock of last appended line, for stale flush
+}
+
+// usageMaxKeys are the token counters merged across the lines of one message;
+// every other key is carried from the latest line.
+var usageMaxKeys = []string{
+	"input_tokens",
+	"output_tokens",
+	"cache_read_input_tokens",
+	"cache_creation_input_tokens",
+}
+
+var usageCacheCreationKeys = []string{
+	"ephemeral_5m_input_tokens",
+	"ephemeral_1h_input_tokens",
+}
+
+// mergeUsageMax folds a later line's usage block into the one already held for
+// the same message.id, taking the per-field MAXIMUM.
+//
+// The input-side counters (input_tokens, cache_read, cache_creation) genuinely
+// ARE repeated verbatim on every line — they are fixed when the request is
+// sent, so max is a no-op for them. output_tokens is NOT: it is a RUNNING
+// TOTAL that grows as the stream emits, so the FIRST line of a message carries
+// a partial count. Keeping that first block (the old behaviour) undercounted
+// output by 19% of an Opus bill and 80% of a Sonnet one on a real 1.6k-session
+// corpus, while every other counter reconciled perfectly — which is exactly
+// why it went unnoticed.
+//
+// Max rather than last-wins: lines are not guaranteed monotonic on disk, and a
+// truncated or out-of-order write must never LOWER a count. Max rather than
+// sum: each line restates the whole running total, so summing would multiply
+// the bill by the line count.
+func mergeUsageMax(prev, next map[string]interface{}) map[string]interface{} {
+	if next == nil {
+		return prev
+	}
+	if prev == nil {
+		return next
+	}
+	merged := make(map[string]interface{}, len(prev)+len(next))
+	for k, v := range prev {
+		merged[k] = v
+	}
+	for k, v := range next {
+		merged[k] = v
+	}
+	for _, k := range usageMaxKeys {
+		if intField(prev, k) > intField(next, k) {
+			merged[k] = prev[k]
+		}
+	}
+	// The 5m/1h split prices differently (1.25x vs 2x input), so merge it
+	// field-wise too rather than taking whichever line happened to land last.
+	prevCC, prevOK := prev["cache_creation"].(map[string]interface{})
+	nextCC, nextOK := next["cache_creation"].(map[string]interface{})
+	switch {
+	case prevOK && nextOK:
+		cc := make(map[string]interface{}, len(prevCC)+len(nextCC))
+		for k, v := range prevCC {
+			cc[k] = v
+		}
+		for k, v := range nextCC {
+			cc[k] = v
+		}
+		for _, k := range usageCacheCreationKeys {
+			if intField(prevCC, k) > intField(nextCC, k) {
+				cc[k] = prevCC[k]
+			}
+		}
+		merged["cache_creation"] = cc
+	case prevOK:
+		merged["cache_creation"] = prevCC
+	}
+	return merged
 }
 
 // claudeTranscriptProcessor converts Claude Code transcript JSONL lines into
@@ -305,32 +382,64 @@ func (p *ClaudeTranscriptProcessor) compactBoundaryEvent(rec map[string]interfac
 	return e
 }
 
-// sidechainUsage extracts ONLY token usage from a sidechain (subagent) line:
-// one subagent_usage event per assistant message.id, carrying the request's
-// usage + model and nothing else. No accumulation is needed — every line of a
-// message repeats the same usage.
+// sidechainUsage extracts ONLY token usage from a sidechain (subagent) line.
+//
+// It ACCUMULATES per assistant message.id and emits one subagent_usage event at
+// the message boundary. It used to emit on the first line of a message and mark
+// the id emitted, which made every later line a no-op — and since output_tokens
+// grows across those lines (see mergeUsageMax), subagent output was reported at
+// its first partial value. This was the worst-hit path in the codebase: it could
+// never observe a final count, for any message.
+//
+// Text is never accumulated here — sidechain prose is agent-authored and must
+// not leave the machine. Only counters do.
 func (p *ClaudeTranscriptProcessor) sidechainUsage(rec map[string]interface{}) []event.Event {
 	typ, _ := rec["type"].(string)
 	if typ != "assistant" {
-		return nil
+		// Any non-assistant line is a boundary for the in-flight message.
+		return p.flushAccum()
 	}
 	msg, _ := rec["message"].(map[string]interface{})
 	if msg == nil {
-		return nil
+		return p.flushAccum()
 	}
 	msgID := stringField(msg, "id")
-	if msgID == "" || p.emittedMsgIDs[msgID] {
-		return nil
-	}
 	usage, _ := msg["usage"].(map[string]interface{})
+	if msgID == "" || usage == nil {
+		return p.flushAccum()
+	}
+
+	var events []event.Event
+	if p.accum != nil && p.accum.msgID != msgID {
+		events = p.flushAccum()
+	}
+	if p.accum == nil && !p.emittedMsgIDs[msgID] {
+		ts, _ := rec["timestamp"].(string)
+		p.accum = &claudeMsgAccum{
+			msgID:     msgID,
+			ts:        ts,
+			model:     stringField(msg, "model"),
+			requestID: stringField(rec, "requestId"),
+			sidechain: true,
+		}
+	}
+	if p.accum != nil && p.accum.msgID == msgID {
+		p.accum.updatedAt = time.Now()
+		p.accum.usage = mergeUsageMax(p.accum.usage, usage)
+	}
+	return events
+}
+
+// flushSidechain emits the accumulated subagent message as ONE subagent_usage
+// event. Counters only — never text.
+func (p *ClaudeTranscriptProcessor) flushSidechain(a *claudeMsgAccum) []event.Event {
+	usage := a.usage
 	if usage == nil {
 		return nil
 	}
-	p.emittedMsgIDs[msgID] = true
-
-	ts, _ := rec["timestamp"].(string)
+	msgID := a.msgID
 	// message.id is stable per subagent API response across re-reads/forks.
-	e := p.newTranscriptEvent("subagent_usage", ts, msgID)
+	e := p.newTranscriptEvent("subagent_usage", a.ts, msgID)
 	e.Provenance = transcriptAiProvenance()
 	data := map[string]interface{}{
 		"usageScope":       "request",
@@ -340,11 +449,11 @@ func (p *ClaudeTranscriptProcessor) sidechainUsage(rec map[string]interface{}) [
 		"cacheReadTokens":  intField(usage, "cache_read_input_tokens"),
 		"cacheWriteTokens": intField(usage, "cache_creation_input_tokens"),
 	}
-	if model := stringField(msg, "model"); model != "" {
-		data["model"] = model
+	if a.model != "" {
+		data["model"] = a.model
 	}
-	if reqID := stringField(rec, "requestId"); reqID != "" {
-		data["requestId"] = reqID
+	if a.requestID != "" {
+		data["requestId"] = a.requestID
 	}
 	if cc, ok := usage["cache_creation"].(map[string]interface{}); ok {
 		data["cacheWrite5mTokens"] = intField(cc, "ephemeral_5m_input_tokens")
@@ -391,12 +500,14 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 			model:     stringField(msg, "model"),
 			requestID: stringField(rec, "requestId"),
 		}
-		if u, ok := msg["usage"].(map[string]interface{}); ok {
-			p.accum.usage = u
-		}
 	}
 	if p.accum != nil && p.accum.msgID == msgID {
 		p.accum.updatedAt = time.Now()
+		// EVERY line of the message contributes usage, not just the first:
+		// output_tokens grows as the stream emits. See mergeUsageMax.
+		if u, ok := msg["usage"].(map[string]interface{}); ok {
+			p.accum.usage = mergeUsageMax(p.accum.usage, u)
+		}
 	}
 
 	// Re-derive the positional interrupt context from THIS record's own content.
@@ -463,6 +574,9 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 		return nil
 	}
 	p.emittedMsgIDs[a.msgID] = true
+	if a.sidechain {
+		return p.flushSidechain(a)
+	}
 
 	// message.id keys the whole accumulated response; it is stable across a
 	// re-read of the transcript or a resumed/forked copy of these lines, so the

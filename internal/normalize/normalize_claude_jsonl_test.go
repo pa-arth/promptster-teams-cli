@@ -2,6 +2,7 @@ package normalize
 
 import (
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -14,7 +15,23 @@ func dm(e event.Event) map[string]interface{} {
 	return m
 }
 
+// processAll feeds lines through the processor and then force-flushes, which is
+// what the watcher does: it calls FlushStale on every processor each poll, so an
+// accumulated message with no trailing boundary line is always emitted. Without
+// the trailing flush the last message of an input is invisible to tests while
+// being present in production.
 func processAll(t *testing.T, p *ClaudeTranscriptProcessor, lines ...string) []event.Event {
+	t.Helper()
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	return append(events, p.FlushStale(0)...)
+}
+
+// processNoFlush is processAll WITHOUT the trailing flush — for the tests that
+// assert accumulation itself (that nothing is emitted before a boundary).
+func processNoFlush(t *testing.T, p *ClaudeTranscriptProcessor, lines ...string) []event.Event {
 	t.Helper()
 	var events []event.Event
 	for _, l := range lines {
@@ -450,7 +467,7 @@ func TestClaudeTranscriptAssistantAccumulation(t *testing.T) {
 	p := NewClaudeTranscriptProcessor("sess-1")
 	// One API message split across two lines (text + tool_use), same id and
 	// identical usage — must produce ONE ai_response with usage counted once.
-	events := processAll(t, p,
+	events := processNoFlush(t, p,
 		`{"type":"assistant","requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"text","text":"Let me look at the config."}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":2000,"cache_creation_input_tokens":300,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":300}}},"timestamp":"2026-06-10T10:00:05Z"}`,
 		`{"type":"assistant","requestId":"req-1","message":{"id":"msg-1","model":"claude-sonnet-4-6","role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"go test ./..."}}],"usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":2000,"cache_creation_input_tokens":300}},"timestamp":"2026-06-10T10:00:05Z"}`,
 	)
@@ -629,7 +646,7 @@ func TestClaudeTranscriptErrorToolResult(t *testing.T) {
 
 func TestClaudeTranscriptFlushStale(t *testing.T) {
 	p := NewClaudeTranscriptProcessor("sess-1")
-	events := processAll(t, p,
+	events := processNoFlush(t, p,
 		`{"type":"assistant","requestId":"req-9","message":{"id":"msg-9","model":"claude-sonnet-4-6","content":[{"type":"text","text":"All done — tests pass."}],"usage":{"input_tokens":40,"output_tokens":20}},"timestamp":"2026-06-10T10:03:00Z"}`,
 	)
 	if len(events) != 0 {
@@ -1379,5 +1396,102 @@ func TestClaudeTranscriptTodoReadBackCompat(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("TodoRead produced no planning_read event: %+v", events)
+	}
+}
+
+// --- streamed usage merge -------------------------------------------------
+//
+// output_tokens is a RUNNING TOTAL across the lines of one message.id, unlike
+// the input-side counters which are fixed when the request is sent. Billing the
+// first line's block undercounted output by 19% of an Opus bill and 80% of a
+// Sonnet one on a real corpus, while every other counter reconciled exactly.
+
+func assistantLine(msgID string, out int, extra string) string {
+	return `{"type":"assistant","requestId":"req-s","message":{"id":"` + msgID +
+		`","model":"claude-sonnet-4-6","content":[{"type":"text","text":"chunk"}],` +
+		`"usage":{"input_tokens":100,"output_tokens":` + strconv.Itoa(out) +
+		`,"cache_read_input_tokens":2000,"cache_creation_input_tokens":300` + extra +
+		`}},"timestamp":"2026-06-10T10:00:05Z"}`
+}
+
+func TestStreamedUsageBillsFinalOutputTokens(t *testing.T) {
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		assistantLine("msg-s", 120, ""),
+		assistantLine("msg-s", 3400, ""),
+		assistantLine("msg-s", 9871, ""),
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly 1 ai_response, got %d: %+v", len(events), events)
+	}
+	d := dm(events[0])
+	if d["outputTokens"] != int64(9871) {
+		t.Errorf("outputTokens = %v, want 9871 (final, not the first line's partial)", d["outputTokens"])
+	}
+	// Summing would give 13391 and would multiply the bill by the line count.
+	if d["outputTokens"] == int64(13391) {
+		t.Error("usage was SUMMED across lines")
+	}
+	// Input-side counters are restated verbatim per line — they must not inflate.
+	if d["inputTokens"] != int64(100) || d["cacheReadTokens"] != int64(2000) || d["cacheWriteTokens"] != int64(300) {
+		t.Errorf("input-side inflated: in=%v cr=%v cw=%v", d["inputTokens"], d["cacheReadTokens"], d["cacheWriteTokens"])
+	}
+}
+
+func TestStreamedUsageIsOrderIndependent(t *testing.T) {
+	// Lines are not guaranteed monotonic on disk; a truncated or out-of-order
+	// write must never LOWER the count (last-wins would bill 3400 here).
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		assistantLine("msg-s", 120, ""),
+		assistantLine("msg-s", 9871, ""),
+		assistantLine("msg-s", 3400, ""),
+	)
+	if len(events) != 1 || dm(events[0])["outputTokens"] != int64(9871) {
+		t.Fatalf("outputTokens = %+v, want 9871", events)
+	}
+}
+
+func TestStreamedUsageMergesCacheCreationSplit(t *testing.T) {
+	// The 5m/1h split prices differently, so it must merge field-wise rather
+	// than be taken wholesale from whichever line landed last.
+	p := NewClaudeTranscriptProcessor("sess-1")
+	events := processAll(t, p,
+		assistantLine("msg-s", 10, `,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":300}`),
+		assistantLine("msg-s", 900, `,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":300}`),
+	)
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %+v", events)
+	}
+	d := dm(events[0])
+	if d["outputTokens"] != int64(900) || d["cacheWrite1hTokens"] != int64(300) || d["cacheWrite5mTokens"] != int64(0) {
+		t.Errorf("out=%v 1h=%v 5m=%v", d["outputTokens"], d["cacheWrite1hTokens"], d["cacheWrite5mTokens"])
+	}
+}
+
+func TestSidechainUsageBillsFinalOutputTokens(t *testing.T) {
+	// The worst-hit path: it emitted on the FIRST line and marked the id done,
+	// so it could never observe a final count for ANY message.
+	p := NewClaudeTranscriptProcessor("sess-1")
+	p.UsageOnly = true
+	events := processAll(t, p,
+		`{"type":"assistant","requestId":"req-a","message":{"id":"msg-a","model":"claude-sonnet-4-6","content":[{"type":"text","text":"a"}],"usage":{"input_tokens":11,"output_tokens":22}},"timestamp":"2026-06-10T10:05:01Z"}`,
+		`{"type":"assistant","requestId":"req-a","message":{"id":"msg-a","model":"claude-sonnet-4-6","content":[{"type":"text","text":"b"}],"usage":{"input_tokens":11,"output_tokens":4444}},"timestamp":"2026-06-10T10:05:02Z"}`,
+	)
+	if len(events) != 1 || events[0].Kind != "subagent_usage" {
+		t.Fatalf("expected 1 subagent_usage, got %+v", events)
+	}
+	d := dm(events[0])
+	if d["outputTokens"] != int64(4444) {
+		t.Errorf("outputTokens = %v, want 4444", d["outputTokens"])
+	}
+	if d["inputTokens"] != int64(11) {
+		t.Errorf("inputTokens = %v, want 11", d["inputTokens"])
+	}
+	if _, has := d["lastAssistantMessage"]; has {
+		t.Error("sidechain usage must never carry assistant text")
+	}
+	if d["sidechain"] != true || d["usageScope"] != "request" {
+		t.Errorf("sidechain=%v usageScope=%v", d["sidechain"], d["usageScope"])
 	}
 }
