@@ -474,14 +474,33 @@ func RunClaudeWatcher() error {
 
 		select {
 		case <-signals:
-			// Return immediately and let the drain die with the process. There
-			// is deliberately no flush-on-exit: whatever is still queued stays
-			// in the outbox with its cursor unadvanced, and the next start
-			// delivers it. Waiting here would only add shutdown latency to a
-			// SIGTERM (which #49 now handles, and which supervisors follow with
-			// SIGKILL on a timeout) to buy something durability already gives.
-			// Worst case is an event POSTed but not yet cursor-committed, which
-			// is re-sent once on restart — at-least-once, and the backend dedupes.
+			// Drain the PROCESSORS' in-flight accumulators first. That is a
+			// different thing from the outbox drain ruled out below, and the
+			// distinction is the whole point: an accumulated assistant message
+			// has not been QUEUED yet, so the outbox's at-least-once durability
+			// cannot re-deliver it — exiting without this loses the final
+			// message of every open transcript outright, along with its tokens.
+			// Sidechain (subagent) usage is the most exposed, because it
+			// accumulates to a message boundary and a subagent transcript's last
+			// message often IS the boundary. Queuing is local (no network wait),
+			// so unlike an outbox flush it adds no shutdown latency.
+			for _, proc := range processors {
+				for _, ev := range proc.FlushStale(0) {
+					if degraded {
+						continue // hooks owned this window and already emitted
+					}
+					eventsCaptured++
+					queueClaudeWatchEvent(ev, session, captureProse)
+				}
+			}
+			// Now return and let the drain die with the process. There is
+			// deliberately no OUTBOX flush-on-exit: whatever is queued stays in
+			// the outbox with its cursor unadvanced, and the next start delivers
+			// it. Waiting here would only add shutdown latency to a SIGTERM
+			// (which #49 now handles, and which supervisors follow with SIGKILL
+			// on a timeout) to buy something durability already gives. Worst
+			// case is an event POSTed but not yet cursor-committed, which is
+			// re-sent once on restart — at-least-once, and the backend dedupes.
 			fmt.Fprintf(os.Stderr, "claude-watcher: shutting down (captured %d events)\n", eventsCaptured)
 			return nil
 		case <-time.After(claudeWatchInterval):
