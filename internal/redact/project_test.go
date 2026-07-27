@@ -711,6 +711,25 @@ func TestScrubInlineCommand(t *testing.T) {
 			in:   "cat <<EOF\nsecret body\nEOF\necho done",
 			want: "cat <<EOF\n<inline-code-redacted>\nEOF\necho done",
 		},
+		{
+			name: "LF <<- keeps the terminator's indentation",
+			in:   "cat <<-EOF\n\tsecret body\n\tEOF\n",
+			want: "cat <<-EOF\n<inline-code-redacted>\n\tEOF\n",
+		},
+		// CRLF: the terminator line is `EOF\r`. Trimming only " \t" left it
+		// unequal to the tag, so the heredoc read as unterminated and the body
+		// survived — the on-device scrub failing OPEN. Expected outputs here are
+		// byte-for-byte the backend mirror's (scrubInlineCode.parity.test.ts).
+		{
+			name: "CRLF heredoc body dropped (fail-open regression)",
+			in:   "cat <<EOF\r\nsecret\r\nEOF\r\n",
+			want: "cat <<EOF\r\n<inline-code-redacted>\nEOF\r\n",
+		},
+		{
+			name: "CRLF <<- with indented CR-terminated terminator",
+			in:   "cat <<-EOF\r\n\tsecret\r\n\tEOF\r\n",
+			want: "cat <<-EOF\r\n<inline-code-redacted>\n\tEOF\r\n",
+		},
 		// Non-redacted cases: signal must survive.
 		{name: "plain test command untouched", in: "npm test -- --watch=false", want: "npm test -- --watch=false"},
 		{name: "git commit message untouched", in: `git commit -m "fix: races"`, want: `git commit -m "fix: races"`},
@@ -725,6 +744,28 @@ func TestScrubInlineCommand(t *testing.T) {
 				t.Errorf("scrubInlineCommand(%q)\n  got  %q\n  want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestScrubInlineCommandCRLFDoesNotFailOpen states the CRLF cases as a SECURITY
+// property rather than a formatting one: whatever the exact output bytes, the
+// heredoc body must not survive. Kept out of the table above because a row is
+// easy to delete without anyone noticing, and this is the row that mattered —
+// on a CRLF machine the scrub that runs before the command leaves the laptop
+// kept the body verbatim.
+func TestScrubInlineCommandCRLFDoesNotFailOpen(t *testing.T) {
+	for _, in := range []string{
+		"cat <<EOF\r\nsecret\r\nEOF\r\n",
+		"cat <<-EOF\r\n\tsecret\r\n\tEOF\r\n",
+		"cat > config.ts <<'EOF'\r\nexport const KEY = \"sk-live-123\";\r\nEOF\r\n",
+	} {
+		got := scrubInlineCommand(in)
+		if strings.Contains(got, "secret") || strings.Contains(got, "sk-live-123") {
+			t.Errorf("CRLF heredoc body survived the scrub\n  in   %q\n  got  %q", in, got)
+		}
+		if !strings.Contains(got, inlineCodeMarker) {
+			t.Errorf("CRLF heredoc was not scrubbed at all\n  in   %q\n  got  %q", in, got)
+		}
 	}
 }
 

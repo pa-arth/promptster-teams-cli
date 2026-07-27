@@ -428,7 +428,13 @@ var (
 // rests on the field allowlist + the backend's projection and DB CHECKs.
 //
 // LOCKSTEP: mirrors scrubInlineCode in the backend's
-// packages/shared/src/eventFieldProjection.ts.
+// packages/shared/src/eventFieldProjection.ts. The two sides use different
+// mechanisms by necessity (RE2 has no backreferences or lookbehind, so this
+// side scans procedurally), so "lockstep" means IDENTICAL OUTPUT — and that is
+// now pinned by a differential case table on the backend side at
+// packages/shared/src/__tests__/scrubInlineCode.parity.test.ts, whose
+// expectations are verbatim output of this implementation. Either side changing
+// requires re-running it rather than editing an expectation to make it green.
 func scrubInlineCommand(command string) string {
 	out := inlineExecSingle.ReplaceAllString(command, "$1'"+inlineCodeMarker+"'")
 	out = inlineExecDouble.ReplaceAllString(out, `$1"`+inlineCodeMarker+`"`)
@@ -503,7 +509,11 @@ func findHeredocTerminator(body, tag string) int {
 			line = body[offset : offset+lineEnd]
 			next = offset + lineEnd + 1
 		}
-		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), " \t")
+		// `\r` is trimmed on both ends so a CRLF command scrubs identically to
+		// an LF one. Trimming only " \t" made `EOF\r` != `EOF`, so a CRLF
+		// heredoc read as UNTERMINATED and its body was kept verbatim — the
+		// on-device scrub failing open on exactly the input it exists for.
+		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t\r"), " \t\r")
 		if trimmed == tag {
 			return offset
 		}
