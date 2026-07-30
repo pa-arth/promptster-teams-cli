@@ -101,6 +101,20 @@ type CodexRolloutProcessor struct {
 	// is treated downstream as tracked. Only meaningful alongside a non-empty
 	// RepoRoot.
 	RepoTracked bool
+	// pendingUser holds a human turn recovered from a `response_item`
+	// message/role=user line, DEFERRED until the next line tells us whether the
+	// authoritative `event_msg`/user_message follows it. See
+	// codexUserMessageLine for why the deferral (rather than a flag) is the only
+	// shape that works, and recoverUserPrompt for why the fallback exists.
+	pendingUser codexPendingUserTurn
+}
+
+// codexPendingUserTurn is one buffered response_item user turn awaiting the
+// verdict of the following line.
+type codexPendingUserTurn struct {
+	text string
+	ts   string
+	raw  string
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -172,13 +186,25 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 	ts, _ := rec["timestamp"].(string)
 	raw := strPreview(string(line), 500)
 
+	// Resolve any buffered response_item user turn BEFORE handling this line.
+	// Codex writes the response_item copy of a human turn one line AHEAD of the
+	// authoritative event_msg (verified 25/25 on real rollouts, always at line N
+	// then N+1), so "have I seen an event_msg yet?" can never be answered at the
+	// moment the response_item arrives — the answer is always "not yet". Holding
+	// it for exactly one line and discarding it the instant the event_msg lands
+	// is what makes this fallback a NO-OP for every rollout that emits event_msg.
+	var recovered []event.Event
+	if p.pendingUser.text != "" && !codexUserMessageLine(typ, payload) {
+		recovered = p.flushPendingUserPrompt()
+	}
+
 	switch typ {
 	case "session_meta":
-		return p.sessionMeta(payload, ts, raw)
+		return append(recovered, p.sessionMeta(payload, ts, raw)...)
 	case "event_msg":
-		return p.eventMsg(payload, ts, raw)
+		return append(recovered, p.eventMsg(payload, ts, raw)...)
 	case "response_item":
-		return p.responseItem(payload, ts, raw)
+		return append(recovered, p.responseItem(payload, ts, raw)...)
 	case "turn_context":
 		// turn_context carries the per-turn model (the only rollout line that does);
 		// stash it for the turn's ai_response. Assigned UNCONDITIONALLY: a
@@ -188,11 +214,106 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 		// turn with no turn_context at all leaves the last value untouched — the model
 		// genuinely persists until the next turn_context changes it. Emits no event.
 		p.model = stringField(payload, "model")
-		return nil
+		return recovered
 	default:
 		// Unknown wrappers carry no candidate-visible signal.
-		return nil
+		return recovered
 	}
+}
+
+// codexUserMessageLine reports whether a rollout line is the authoritative
+// `event_msg`/user_message record of a human turn — the one record whose arrival
+// means a buffered response_item copy must be thrown away rather than emitted.
+func codexUserMessageLine(typ string, payload map[string]interface{}) bool {
+	return typ == "event_msg" && stringField(payload, "type") == "user_message"
+}
+
+// codexSyntheticUserPrefixes are the wrappers Codex itself writes into the
+// `response_item` user channel. Nobody typed them, and unlike the event_msg
+// channel — which carries only what a person actually sent — this channel mixes
+// them in with real turns, so recovering prompts from it REQUIRES this list.
+//
+// Measured across every local rollout: `<environment_context>` (the cwd/shell
+// header, one per session), `<recommended_plugins>`, `<user_instructions>`, and
+// the `# AGENTS.md instructions for <path>` project-instruction injection.
+// Prefix-anchored for the same reason the backend's NON_HUMAN_PREFIXES is: a
+// human prompt that merely QUOTES one of these is still a human prompt.
+var codexSyntheticUserPrefixes = []string{
+	"<environment_context",
+	"<user_instructions",
+	"<recommended_plugins",
+	"# AGENTS.md instructions for",
+}
+
+// recoverUserPrompt buffers a `response_item` message/role=user line as a
+// candidate human turn.
+//
+// WHY THIS EXISTS. The normalizer has always taken human turns from
+// `event_msg`/user_message and skipped this channel as a duplicate. On
+// 2026-07-30 the first Codex customer's org showed ZERO human prompts across 29
+// sessions and a full day of work — 63 stored prompts, 60 of them Codex
+// auto-review scaffolding and 3 empty — while the same sessions captured 1,400+
+// tool calls and 400+ file diffs. raw_events proved the backend was never sent
+// one, and the watcher (tails from offset 0) and the on-device projector (which
+// explicitly allows prompt.text) were both ruled out, leaving this normalizer as
+// the only place the turn could go missing. Their rollouts evidently do not
+// carry `event_msg`/user_message, though every local rollout does — so the exact
+// upstream trigger (Codex build, IDE/exec host, config) is NOT established.
+//
+// This fallback is therefore written to be correct WITHOUT knowing that trigger:
+// the response_item copy carries the same human text (verified — it matches the
+// event_msg text on every local rollout), so taking it only when the event_msg
+// never arrives recovers the turn for any host that omits the event_msg, and
+// changes nothing for any host that emits one.
+//
+// Subagent threads are excluded here for the same reason their event_msg
+// user_message is dropped: that text is the orchestrator's instruction to a
+// delegated agent, not something a person wrote.
+func (p *CodexRolloutProcessor) recoverUserPrompt(payload map[string]interface{}, ts, raw string) {
+	if p.subagentThread {
+		return
+	}
+	text := strings.TrimSpace(codexUserContentText(payload["content"]))
+	if text == "" {
+		return
+	}
+	for _, prefix := range codexSyntheticUserPrefixes {
+		if strings.HasPrefix(text, prefix) {
+			return
+		}
+	}
+	p.pendingUser = codexPendingUserTurn{text: text, ts: ts, raw: raw}
+}
+
+// flushPendingUserPrompt mints the buffered turn as a prompt and clears it.
+func (p *CodexRolloutProcessor) flushPendingUserPrompt() []event.Event {
+	turn := p.pendingUser
+	p.pendingUser = codexPendingUserTurn{}
+	return p.newPromptEvent(turn.text, turn.ts, turn.raw)
+}
+
+// codexUserContentText joins the text parts of a response_item message's
+// content array. Non-text parts (images, attachments) contribute nothing, so a
+// turn made only of them yields "" and is correctly not treated as a prompt.
+func codexUserContentText(content interface{}) string {
+	parts, ok := content.([]interface{})
+	if !ok {
+		return ""
+	}
+	var b strings.Builder
+	for _, part := range parts {
+		m, ok := part.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if s := stringField(m, "text"); s != "" {
+			if b.Len() > 0 {
+				b.WriteString("\n")
+			}
+			b.WriteString(s)
+		}
+	}
+	return b.String()
 }
 
 // CodexConversationID resolves the LOGICAL conversation a rollout file belongs
@@ -282,6 +403,47 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 	return []event.Event{e}
 }
 
+// newPromptEvent mints a human prompt event and stamps the session metadata
+// that rides only on prompts. Shared by BOTH human-turn sources — the
+// authoritative event_msg and the recovered response_item — so a session whose
+// prompts came via the fallback still carries workdir/repoRoot/repoHost and
+// still joins to outcome_events exactly like any other.
+//
+// idSeed is the rollout line's timestamp: neither channel carries a per-item id,
+// and the line ts is the record's stable identity (copied verbatim on
+// resume/fork).
+func (p *CodexRolloutProcessor) newPromptEvent(text, ts, raw string) []event.Event {
+	e := p.newCodexEvent("prompt", ts, ts)
+	e.Provenance = event.HumanProvenance()
+	data := map[string]interface{}{"text": text}
+	// workdir rides its own allowlisted key (never raw cwd); set only when the
+	// session_meta header supplied one.
+	if p.workdir != "" {
+		data["workdir"] = p.workdir
+	}
+	// repoRoot — the canonical repo identity resolved in capture and threaded in;
+	// stamped only when non-empty (mirrors workdir). It de-fragments the repo
+	// across subdirs/worktrees and joins exactly to outcome_events.repo.
+	if p.RepoRoot != "" {
+		data["repoRoot"] = p.RepoRoot
+		// repoTracked — whether that key came from a real git working tree or from
+		// a directory that is not a repo at all. Stamped EXPLICITLY as true or
+		// false, and only ever beside repoRoot: omitting it when false would make
+		// "not a repo" indistinguishable from "CLI too old to have looked".
+		data["repoTracked"] = p.RepoTracked
+	}
+	// repoHost — the provider the slug came from, so the backend can tell
+	// gitlab.com/acme/api apart from github.com/acme/api. Same omit-when-empty
+	// rule; empty is the honest answer for a repo with no remote.
+	if p.RepoHost != "" {
+		data["repoHost"] = p.RepoHost
+	}
+	e.Data = data
+	e.RawPayload = raw
+	saveLastPromptTs()
+	return []event.Event{e}
+}
+
 func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []event.Event {
 	switch stringField(payload, "type") {
 	case "user_message":
@@ -296,38 +458,14 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		if p.subagentThread {
 			return nil
 		}
-		text := stringField(payload, "message")
+		// The authoritative record for this turn has arrived, so any response_item
+		// copy buffered from the preceding line is a duplicate — drop it. This is
+		// the line that keeps recoverUserPrompt a no-op on hosts that emit
+		// event_msg, i.e. every rollout we can observe locally.
+		p.pendingUser = codexPendingUserTurn{}
 		// event_msg lines carry no per-item id; the rollout line ts is the
 		// record's stable identity (copied verbatim on resume/fork).
-		e := p.newCodexEvent("prompt", ts, ts)
-		e.Provenance = event.HumanProvenance()
-		data := map[string]interface{}{"text": text}
-		// workdir rides its own allowlisted key (never raw cwd); set only when the
-		// session_meta header supplied one.
-		if p.workdir != "" {
-			data["workdir"] = p.workdir
-		}
-		// repoRoot — the canonical repo identity resolved in capture and threaded in;
-		// stamped only when non-empty (mirrors workdir). It de-fragments the repo
-		// across subdirs/worktrees and joins exactly to outcome_events.repo.
-		if p.RepoRoot != "" {
-			data["repoRoot"] = p.RepoRoot
-			// repoTracked — whether that key came from a real git working tree or from
-			// a directory that is not a repo at all. Stamped EXPLICITLY as true or
-			// false, and only ever beside repoRoot: omitting it when false would make
-			// "not a repo" indistinguishable from "CLI too old to have looked".
-			data["repoTracked"] = p.RepoTracked
-		}
-		// repoHost — the provider the slug came from, so the backend can tell
-		// gitlab.com/acme/api apart from github.com/acme/api. Same omit-when-empty
-		// rule; empty is the honest answer for a repo with no remote.
-		if p.RepoHost != "" {
-			data["repoHost"] = p.RepoHost
-		}
-		e.Data = data
-		e.RawPayload = raw
-		saveLastPromptTs()
-		return []event.Event{e}
+		return p.newPromptEvent(stringField(payload, "message"), ts, raw)
 
 	case "agent_message":
 		// Codex emits multiple agent_message lines per turn: "commentary" (interim
@@ -508,8 +646,18 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 		}
 		return p.emitToolEvent(call, callID, output, ts, raw)
 
+	case "message":
+		// A user message here is the response_item COPY of a human turn. It is
+		// normally a duplicate of the event_msg that follows on the next line and is
+		// discarded there; it becomes the prompt only when that event_msg never
+		// arrives. Assistant/developer messages carry no signal this channel owns.
+		if stringField(payload, "role") == "user" {
+			p.recoverUserPrompt(payload, ts, raw)
+		}
+		return nil
+
 	default:
-		// message / reasoning context items duplicate event_msg signal — skip.
+		// reasoning context items duplicate event_msg signal — skip.
 		return nil
 	}
 }
