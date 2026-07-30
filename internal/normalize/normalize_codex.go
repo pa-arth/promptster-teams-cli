@@ -115,6 +115,10 @@ type codexPendingUserTurn struct {
 	text string
 	ts   string
 	raw  string
+	// aged records that this turn has already survived one end-of-poll check,
+	// i.e. a full poll interval elapsed with no following line. See
+	// FlushStaleUserPrompt.
+	aged bool
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -283,6 +287,33 @@ func (p *CodexRolloutProcessor) recoverUserPrompt(payload map[string]interface{}
 		}
 	}
 	p.pendingUser = codexPendingUserTurn{text: text, ts: ts, raw: raw}
+}
+
+// FlushStaleUserPrompt releases a buffered turn that the next line will never
+// come for — the last human prompt of a rollout nothing is appended to again
+// (the user quit right after typing, or the agent died before answering).
+//
+// Process only ever flushes on the FOLLOWING line, so without this the final
+// turn of such a rollout stays buffered forever. That matters most for exactly
+// the customer this fallback exists for, where the recovered turn is the ONLY
+// prompt source.
+//
+// TWO polls, not one, and that is the whole design. Flushing at the end of the
+// first poll would race the authoritative record: a poll can land in the gap
+// between the response_item and the event_msg that Codex writes immediately
+// after it, and emitting there would mint the prompt AND then let the event_msg
+// mint it again next poll. Requiring the buffer to survive a full poll interval
+// — seconds, against two adjacent lines written in the same instant — makes that
+// race unreachable while still bounding the delay to one extra poll.
+func (p *CodexRolloutProcessor) FlushStaleUserPrompt() []event.Event {
+	if p.pendingUser.text == "" {
+		return nil
+	}
+	if !p.pendingUser.aged {
+		p.pendingUser.aged = true
+		return nil
+	}
+	return p.flushPendingUserPrompt()
 }
 
 // flushPendingUserPrompt mints the buffered turn as a prompt and clears it.

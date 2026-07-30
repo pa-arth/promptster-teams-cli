@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
@@ -529,6 +530,7 @@ func tailCodexRollout(
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
 	queued := 0
+	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
 	for {
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
@@ -545,34 +547,16 @@ func tailCodexRollout(
 		// patches that may contain keys/tokens the candidate pasted or printed.
 		redacted := redact.RedactBytes([]byte(trimmed))
 		for _, ev := range proc.Process(redacted) {
-			ev := ev
-			// SessionID comes from the rollout; DeviceID comes from the
-			// environment. Stamped here rather than in the normalizer, which has
-			// no business knowing what machine it runs on — keeping the two
-			// sourced separately is what stops them collapsing into one value.
-			ev.DeviceID = session.DeviceID
-			normalize.RelativizeEventPaths(&ev, session.TaskRoot)
-			// Record AI bash execution windows for later commit-attribution
-			// recovery — same as the Claude watcher. No-op unless this is an
-			// AI-attributed `command` event.
-			recordAiBashWindow(&ev, session.TaskRoot)
-			// Idempotency: skip a file_diff whose resulting content the git
-			// watcher (or another channel) has already emitted, so an apply_patch
-			// edit isn't double-counted when the working-tree poll sees it later.
-			if !dedupeFileDiff(session.TaskRoot, &ev) {
-				continue
-			}
-			// Ledger first — it projects, scrubs, and signs ev in place, so the
-			// queued copy is the exact bytes to ship. See queueClaudeWatchEvent.
-			if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
-				fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
-			}
-			if err := outbox.Append(ev); err != nil {
-				fmt.Fprintf(os.Stderr, "codex-watcher: queue error (%s): %v\n", ev.Kind, err)
-				continue
-			}
-			queued++
+			queued += emit(ev)
 		}
+	}
+
+	// Release a recovered user turn the next line will never come for. Runs on
+	// EVERY poll, including polls that consumed nothing — a rollout whose final
+	// line is the human's turn produces no further lines to flush it, so an
+	// end-of-read hook that only fired after new bytes would never reach it.
+	for _, ev := range proc.FlushStaleUserPrompt() {
+		queued += emit(ev)
 	}
 
 	if consumed > 0 {
@@ -582,6 +566,39 @@ func tailCodexRollout(
 		}
 	}
 	return queued
+}
+
+// emitCodexEvent stamps, dedupes, ledgers and queues one normalized event.
+// Shared by the line-by-line tail and the stale-prompt flush so a recovered
+// prompt goes through the IDENTICAL path as every other event — same device
+// stamping, same path relativization, same signing.
+func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
+	// SessionID comes from the rollout; DeviceID comes from the environment.
+	// Stamped here rather than in the normalizer, which has no business knowing
+	// what machine it runs on — keeping the two sourced separately is what stops
+	// them collapsing into one value.
+	ev.DeviceID = session.DeviceID
+	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
+	// Record AI bash execution windows for later commit-attribution recovery —
+	// same as the Claude watcher. No-op unless this is an AI-attributed
+	// `command` event.
+	recordAiBashWindow(&ev, session.TaskRoot)
+	// Idempotency: skip a file_diff whose resulting content the git watcher (or
+	// another channel) has already emitted, so an apply_patch edit isn't
+	// double-counted when the working-tree poll sees it later.
+	if !dedupeFileDiff(session.TaskRoot, &ev) {
+		return 0
+	}
+	// Ledger first — it projects, scrubs, and signs ev in place, so the queued
+	// copy is the exact bytes to ship. See queueClaudeWatchEvent.
+	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
+		fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
+	}
+	if err := outbox.Append(ev); err != nil {
+		fmt.Fprintf(os.Stderr, "codex-watcher: queue error (%s): %v\n", ev.Kind, err)
+		return 0
+	}
+	return 1
 }
 
 // resolvePath resolves symlinks (falling back to a cleaned path) so workspace

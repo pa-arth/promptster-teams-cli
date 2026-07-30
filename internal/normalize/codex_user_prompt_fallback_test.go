@@ -238,3 +238,55 @@ func TestCodexMixedRecoveredAndAuthoritativeTurns(t *testing.T) {
 		}
 	}
 }
+
+// The end-of-poll flush must NOT fire on the first poll. A poll can land in the
+// gap between the response_item and the event_msg Codex writes right after it;
+// flushing there would mint the prompt and then let the event_msg mint it AGAIN
+// on the next poll. Requiring the buffer to survive a full poll interval makes
+// that race unreachable.
+func TestCodexStaleFlushDoesNotFireOnFirstPoll(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-poll")
+	p.Process([]byte(strings.Replace(riUser, "%s", q("deploy the worker"), 1)))
+
+	if got := p.FlushStaleUserPrompt(); len(got) != 0 {
+		t.Fatalf("first poll flushed %d prompts, want 0 — the event_msg may still be unwritten", len(got))
+	}
+	// The event_msg lands on the next poll, exactly as it does in a live rollout.
+	evs := p.Process([]byte(strings.Replace(emUser, "%s", q("deploy the worker"), 1)))
+	prompts := 0
+	for _, e := range evs {
+		if e.Kind == "prompt" {
+			prompts++
+		}
+	}
+	if prompts != 1 {
+		t.Fatalf("event_msg produced %d prompts, want 1", prompts)
+	}
+	if got := p.FlushStaleUserPrompt(); len(got) != 0 {
+		t.Errorf("flushed %d prompts after the event_msg claimed the turn, want 0 — this is the double-count", len(got))
+	}
+}
+
+// The hole this closes: a rollout whose FINAL line is the human's turn gets no
+// following line, so Process can never flush it. Two polls with nothing in
+// between mean the event_msg is never coming.
+func TestCodexStaleFlushReleasesFinalPromptOfARollout(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-final")
+	p.Process([]byte(strings.Replace(riUser, "%s", q("one last thing before I go"), 1)))
+
+	if got := p.FlushStaleUserPrompt(); len(got) != 0 {
+		t.Fatalf("first poll flushed early")
+	}
+	got := p.FlushStaleUserPrompt()
+	if len(got) != 1 {
+		t.Fatalf("second poll flushed %d prompts, want 1 — the final turn would be lost forever", len(got))
+	}
+	d, _ := got[0].Data.(map[string]interface{})
+	if text, _ := d["text"].(string); text != "one last thing before I go" {
+		t.Errorf("flushed text = %q", text)
+	}
+	// And it must not flush a third time.
+	if again := p.FlushStaleUserPrompt(); len(again) != 0 {
+		t.Errorf("flushed the same turn twice")
+	}
+}
