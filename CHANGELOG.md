@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.3] — 2026-07-30
+
+### Fixed
+
+- **Codex sessions no longer lose the engineer's own prompts.** The rollout
+  normalizer read human turns only from the `event_msg`/`user_message` record and
+  skipped the `response_item` copy as a duplicate. On a host that writes only the
+  latter, every human turn vanished: one org captured **zero** prompts across 29
+  sessions and a full day of work — 1,400+ tool calls and 400+ file diffs, and not
+  one prompt — so the fluency dashboard graded an engineer on nothing they had
+  written. The `response_item` copy is now taken whenever the `event_msg` never
+  arrives. Because Codex writes that copy one line *ahead* of the authoritative
+  record, it is held for exactly one line and discarded the moment the `event_msg`
+  lands, so hosts that emit both are completely unaffected — replaying real
+  rollouts through the old and new normalizer produces byte-identical output.
+  Codex's own injections into that channel (`<environment_context>`,
+  `<user_instructions>`, `<recommended_plugins>`, `# AGENTS.md instructions for`)
+  are dropped rather than mistaken for prompts, and delegated subagent threads stay
+  excluded exactly as before. (#118)
+
 ## [0.11.0] — 2026-07-23
 
 ### Fixed
