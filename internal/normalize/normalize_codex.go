@@ -54,6 +54,18 @@ type CodexRolloutProcessor struct {
 	// stamped onto each prompt event so the teams dashboard can show where the
 	// session ran; the raw absolute cwd is never emitted on prompts.
 	workdir string
+	// subagentThread records whether this rollout is a DELEGATED thread rather
+	// than the one the human types into (see codexIsSubagentThread). Its
+	// user_message lines are the orchestrator's instructions to that subagent, not
+	// anything a person wrote — and since those events now roll up into the human's
+	// session (see CodexConversationID) they must say so, or the fluency judge
+	// grades machine-authored text as the engineer's own prompting.
+	subagentThread bool
+	// threadID is this rollout's OWN thread id (session_meta.payload.id, which is
+	// also the uuid in the filename). It is no longer the session id — see
+	// CodexConversationID — but it is what tells one subagent's spend apart from
+	// another's inside the merged session, so it rides subagent_usage as agentId.
+	threadID string
 	// model is the per-turn model id captured from the LATEST turn_context line
 	// (session_meta carries only model_provider — the vendor, e.g. "openai"). It is
 	// stamped onto each ai_response so the backend can price the turn against the
@@ -183,23 +195,83 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 	}
 }
 
-func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, raw string) []event.Event {
-	// The session id is stable per rollout (and identical in a forked copy).
-	// The rollout filename normally supplies it before the first line is read;
-	// fall back to session_meta here if that path did not parse, so events are
-	// never stamped "unknown" and pooled into a shared cross-session chain.
-	if p.sessionID == "" {
-		p.sessionID = stringField(payload, "id")
+// CodexConversationID resolves the LOGICAL conversation a rollout file belongs
+// to, from its session_meta payload.
+//
+// One rollout file is one Codex THREAD, and modern Codex (>= 0.145) splits ONE
+// conversation across SEVERAL threads: the user's thread plus one file per
+// subagent it delegates to. session_meta carries all three ids:
+//
+//	id                -> this thread's own id — and the uuid in the FILENAME
+//	session_id        -> the ROOT conversation the thread belongs to
+//	parent_thread_id  -> the immediate parent (present on subagent threads only)
+//
+// The watcher seeds each processor from the filename, i.e. from `id`, so every
+// subagent thread used to mint a session of its own: the user's thread carried
+// the prompts (and therefore workdir/repoRoot, which ride only on prompts) while
+// the delegated threads carried the file_diff/tool_use work, and no session held
+// both. Prefer session_id, then the parent, then the thread's own id. Rollouts
+// from older Codex builds carry only `id`, so they resolve exactly as before.
+//
+// This mirrors claudeSessionIDFromPath's subagent roll-up on the Claude side —
+// same failure, same contract: delegated work belongs to the session that
+// spawned it.
+func CodexConversationID(payload map[string]interface{}) string {
+	if s := stringField(payload, "session_id"); s != "" {
+		return s
 	}
+	if s := stringField(payload, "parent_thread_id"); s != "" {
+		return s
+	}
+	return stringField(payload, "id")
+}
+
+// codexIsSubagentThread reports whether this rollout is a delegated thread
+// rather than the one the human is typing into. `thread_source` is the vendor's
+// own marker; the id comparison is the structural backstop for builds that carry
+// the parentage without the enum.
+func codexIsSubagentThread(payload map[string]interface{}) bool {
+	if stringField(payload, "thread_source") == "subagent" {
+		return true
+	}
+	parent := stringField(payload, "parent_thread_id")
+	return parent != "" && parent != stringField(payload, "id")
+}
+
+func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, raw string) []event.Event {
+	// session_meta is line 1 of every rollout, so this runs before any event is
+	// minted — including on the replay-the-consumed-prefix path a restarted
+	// watcher takes.
+	//
+	// A conversation root that differs from this thread's own id OVERRIDES the
+	// filename-derived seed: the filename only ever carries the thread id, and
+	// nothing but session_meta knows which conversation that thread belongs to.
+	// When the rollout names no separate root (every Codex build before 0.145)
+	// the seed stands, and session_meta is the fallback exactly as before — so
+	// events are never stamped "unknown" and pooled into a shared cross-session
+	// chain.
+	conv := CodexConversationID(payload)
+	switch {
+	case conv != "" && conv != stringField(payload, "id"):
+		p.sessionID = conv
+	case p.sessionID == "":
+		p.sessionID = conv
+	}
+	p.subagentThread = codexIsSubagentThread(payload)
+	p.threadID = stringField(payload, "id")
 	// Stash the home-collapsed cwd for prompt events: session_meta is the only
 	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
 	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home
 	// cwd or a home-lookup failure yields "", so the prompt omits workdir rather
 	// than leaking an absolute path that may carry the OS username.
 	p.workdir = state.HomeRelativeStrict(stringField(payload, "cwd"))
-	e := p.newCodexEvent("session_start", ts, stringField(payload, "id"))
+	// Key session_start off the CONVERSATION, not the thread: the parent and each
+	// of its subagents open with their own session_meta, and one logical session
+	// must begin exactly once. Same conversation => same deterministic id => the
+	// backend collapses the duplicates instead of stacking N starts on one session.
+	e := p.newCodexEvent("session_start", ts, p.sessionID)
 	data := map[string]interface{}{
-		"ideSessionId": stringField(payload, "id"),
+		"ideSessionId": p.sessionID,
 		"cwd":          stringField(payload, "cwd"),
 		"source":       stringField(payload, "originator"),
 		"cliVersion":   stringField(payload, "cli_version"),
@@ -213,6 +285,17 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []event.Event {
 	switch stringField(payload, "type") {
 	case "user_message":
+		// A DELEGATED thread's user_message is the orchestrator's instruction to a
+		// subagent — machine-authored, never something a person typed. The Claude
+		// path drops sidechain "user" lines for exactly this reason ("their 'user'
+		// prompts are authored by the parent agent, not the human"), and it matters
+		// more here now that the thread rolls up into the human's real session
+		// instead of a phantom one of its own: emitted, they would inflate the
+		// engineer's prompt count with text the fluency judge then grades as their
+		// own prompting. The turn's cost is kept via subagentUsage below.
+		if p.subagentThread {
+			return nil
+		}
 		text := stringField(payload, "message")
 		// event_msg lines carry no per-item id; the rollout line ts is the
 		// record's stable identity (copied verbatim on resume/fork).
@@ -253,6 +336,13 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		if stringField(payload, "phase") != "final_answer" {
 			return nil
 		}
+		// A delegated thread's answer is written to its orchestrator, not to the
+		// human, and its turn is not the human's turn. Keep the SPEND (it is real
+		// and belongs to the session that spawned the subagent) and drop the prose
+		// and the turn timing — the same split the Claude path makes.
+		if p.subagentThread {
+			return p.subagentUsage(ts, raw)
+		}
 		// Same as the prompt: no per-item id on the event_msg line, so key off
 		// the (fork-stable) rollout line ts.
 		e := p.newCodexEvent("ai_response", ts, ts)
@@ -285,6 +375,36 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	default:
 		return nil
 	}
+}
+
+// subagentUsage emits a delegated thread's completed turn as COUNTERS ONLY.
+// The spend is real and belongs to the conversation that spawned the subagent,
+// so it must survive the roll-up; the agent prose is not the assistant's answer
+// to the human and must never enter the timeline. Mirrors
+// ClaudeTranscriptProcessor.flushSidechain, including the `sidechain` marker and
+// the agentId that keeps two concurrent subagents' spend distinguishable.
+//
+// usageScope is deliberately left unset, exactly as the codex ai_response path
+// leaves it: Codex reports total_token_usage as a running SESSION total, not a
+// per-request delta, and inventing a scope token here would assert otherwise.
+func (p *CodexRolloutProcessor) subagentUsage(ts, raw string) []event.Event {
+	_ = raw // the wrapper line is agent prose; deliberately not retained
+	// Scope the stable key by THREAD as well as line ts: sibling subagents run
+	// concurrently inside one conversation and can finish a turn in the same
+	// millisecond, and a bare-ts key would collapse one of them into the other.
+	e := p.newCodexEvent("subagent_usage", ts, p.threadID+"\x1f"+ts)
+	e.Provenance = event.AIProvenance()
+	data := map[string]interface{}{"sidechain": true}
+	if p.model != "" {
+		data["model"] = p.model
+	}
+	p.attachTokenUsage(data)
+	if p.threadID != "" {
+		data["agentId"] = p.threadID
+	}
+	e.Data = data
+	e.RawPayload = "codex subagent usage"
+	return []event.Event{e}
 }
 
 // patchApplyEnd emits one file_diff per changed file. The payload carries a

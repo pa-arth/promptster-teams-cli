@@ -41,10 +41,17 @@ func codexHome() string {
 // end rather than splitting on "-".
 var codexRolloutSessionID = regexp.MustCompile(`([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$`)
 
-// codexSessionIDFromPath derives the rollout's session uuid from its filename,
-// so a processor knows its session before reading a line. It equals
-// session_meta.payload.id (verified), which the normalizer falls back to if the
-// filename does not match — one rollout file is exactly one Codex session.
+// codexSessionIDFromPath derives the rollout's THREAD uuid from its filename,
+// so a processor has an id before reading a line. It equals
+// session_meta.payload.id (verified).
+//
+// It is a SEED, not the answer: one rollout file is one Codex thread, and since
+// 0.145 one conversation spans several threads (the user's, plus one per
+// subagent it delegates to). The filename cannot tell them apart — only
+// session_meta carries the conversation root — so normalize.CodexConversationID
+// overrides this on line 1 whenever the rollout names a root other than its own
+// thread. Trusting the filename alone is what fragmented one hour of one
+// engineer's work into a session of prompts and six sessions of orphaned work.
 func codexSessionIDFromPath(path string) string {
 	if m := codexRolloutSessionID.FindStringSubmatch(filepath.Base(path)); m != nil {
 		return m[1]
