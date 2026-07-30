@@ -965,3 +965,43 @@ func TestProjectEventWindowUsage(t *testing.T) {
 		}
 	}
 }
+
+// TestCodexSubagentUsageSurvivesProjection: the Codex path now emits
+// subagent_usage for a delegated thread's turn (see normalize_codex.go's
+// subagentUsage), reusing the kind the Claude sidechain path already ships. Pin
+// that every field that emitter sets actually survives projection — a counter
+// silently stripped here would look exactly like a subagent that cost nothing,
+// which is the failure mode the whole event is there to prevent.
+func TestCodexSubagentUsageSurvivesProjection(t *testing.T) {
+	e := event.NewEvent("subagent_usage", "conv-1")
+	e.Source = "codex"
+	e.Data = map[string]interface{}{
+		"sidechain":    true,
+		"agentId":      "019fb396-9280-7710-91d4-f36e7797376b",
+		"model":        "gpt-5",
+		"inputTokens":  int64(17718),
+		"outputTokens": int64(237),
+		// prose must never reach here, but prove projection would drop it anyway
+		"lastAssistantMessage": "allow",
+	}
+	ProjectEvent(&e, true)
+
+	got, ok := e.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("data projected to %T", e.Data)
+	}
+	for k, want := range map[string]interface{}{
+		"sidechain":    true,
+		"agentId":      "019fb396-9280-7710-91d4-f36e7797376b",
+		"model":        "gpt-5",
+		"inputTokens":  int64(17718),
+		"outputTokens": int64(237),
+	} {
+		if got[k] != want {
+			t.Errorf("projected %s = %v, want %v", k, got[k], want)
+		}
+	}
+	if _, leaked := got["lastAssistantMessage"]; leaked {
+		t.Errorf("assistant prose survived projection: %v", got)
+	}
+}
