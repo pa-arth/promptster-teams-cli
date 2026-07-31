@@ -198,7 +198,7 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 	// it for exactly one line and discarding it the instant the event_msg lands
 	// is what makes this fallback a NO-OP for every rollout that emits event_msg.
 	var recovered []event.Event
-	if p.pendingUser.text != "" && !codexUserMessageLine(typ, payload) {
+	if p.pendingUser.text != "" && !p.codexLineClaimsPendingTurn(typ, payload) {
 		recovered = p.flushPendingUserPrompt()
 	}
 
@@ -230,6 +230,46 @@ func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
 // means a buffered response_item copy must be thrown away rather than emitted.
 func codexUserMessageLine(typ string, payload map[string]interface{}) bool {
 	return typ == "event_msg" && stringField(payload, "type") == "user_message"
+}
+
+// codexLineClaimsPendingTurn reports whether this line belongs to the SAME human
+// turn already buffered — in which case the buffer must be kept (or replaced),
+// never flushed, because flushing would mint a second prompt for one turn.
+//
+// Two records claim it:
+//
+//  1. The authoritative `event_msg`/user_message. Unconditional, regardless of
+//     text: it is adjacent by construction and is the record the fallback defers
+//     to. This is the leg that makes the fallback a no-op on hosts that emit it.
+//
+//  2. ANOTHER `response_item` user message carrying the SAME text. This is the
+//     regression fixed here. A live org's rollouts repeat the user turn on that
+//     channel — three copies within a millisecond for one turn — and the plain
+//     "the next line isn't an event_msg, so the turn moved on" rule fired on each
+//     repeat, minting one prompt per copy. Verified on the customer's live data:
+//     zero millisecond-apart duplicate prompts in 3,291 prompts before, 38 in the
+//     405 captured after, codex only.
+//
+//     No local rollout reproduced it, and the reason is worth keeping: the only
+//     repeated response_item they contain is `<environment_context>`, which the
+//     synthetic drop-list removes before it ever reaches the buffer. So the
+//     replay-real-rollouts differential that proved the fallback safe was blind
+//     to this shape BY CONSTRUCTION — the same class of blind spot as writing a
+//     harness drop-list against one vendor's syntax.
+//
+// Text is compared trimmed, matching how recoverUserPrompt stores it. A repeat
+// with DIFFERENT text is a genuinely distinct turn and still flushes.
+func (p *CodexRolloutProcessor) codexLineClaimsPendingTurn(typ string, payload map[string]interface{}) bool {
+	if codexUserMessageLine(typ, payload) {
+		return true
+	}
+	if typ != "response_item" || stringField(payload, "type") != "message" {
+		return false
+	}
+	if stringField(payload, "role") != "user" {
+		return false
+	}
+	return strings.TrimSpace(codexUserContentText(payload["content"])) == p.pendingUser.text
 }
 
 // codexSyntheticUserPrefixes are the wrappers Codex itself writes into the
