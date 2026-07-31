@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.4] — 2026-07-31
+
+### Fixed
+
+- **A repeated Codex user record no longer mints duplicate prompts.** 0.11.3's
+  human-turn recovery flushed its buffered turn whenever the next line was not the
+  authoritative `event_msg`. Some rollouts repeat the user turn on the
+  `response_item` channel — three copies within a millisecond for a single turn —
+  and each repeat read as "the turn moved on", producing one prompt per copy. A
+  line carrying the same user text as the buffered turn now claims that turn
+  instead of flushing it, so one turn yields exactly one prompt; a repeat with
+  different text is still a distinct turn. Measured on live data: zero
+  millisecond-apart duplicate prompts across 3,291 captured before, 38 across the
+  405 captured after 0.11.3, codex only. (#121)
+
 ## [0.11.3] — 2026-07-30
 
 ### Fixed

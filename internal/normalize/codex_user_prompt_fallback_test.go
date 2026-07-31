@@ -290,3 +290,82 @@ func TestCodexStaleFlushReleasesFinalPromptOfARollout(t *testing.T) {
 		t.Errorf("flushed the same turn twice")
 	}
 }
+
+// LIVE REGRESSION, 2026-07-31. The customer's rollouts repeat the user turn on
+// the response_item channel — three copies of "yes" within one millisecond for a
+// single turn — and the first cut of the flush rule read each repeat as "the
+// turn moved on", minting one prompt per copy. Their dashboard gained 38 phantom
+// prompts in the first hours the fix was live.
+//
+// No local rollout reproduces this: the only repeated response_item they carry
+// is <environment_context>, which the synthetic drop-list removes before it can
+// reach the buffer — so the replay-real-rollouts differential was structurally
+// blind to it.
+func TestCodexRepeatedResponseItemForOneTurnMintsOnePrompt(t *testing.T) {
+	human := "yes"
+	for _, trailing := range []string{"event_msg", "assistant"} {
+		lines := []string{
+			strings.Replace(riUser, "%s", q(human), 1),
+			strings.Replace(riUser, "%s", q(human), 1),
+			strings.Replace(riUser, "%s", q(human), 1),
+		}
+		if trailing == "event_msg" {
+			lines = append(lines, strings.Replace(emUser, "%s", q(human), 1))
+		}
+		lines = append(lines, riAssistant)
+
+		prompts := drivePrompts(t, lines)
+		if len(prompts) != 1 {
+			t.Errorf("[%s] three response_item copies of one turn produced %d prompts %q, want 1",
+				trailing, len(prompts), promptTexts(prompts))
+		}
+	}
+}
+
+// The repeat-collapse must key on TEXT, not merely on "another user record":
+// two different turns back to back are two prompts, not one.
+func TestCodexConsecutiveDistinctUserTurnsStayDistinct(t *testing.T) {
+	prompts := drivePrompts(t, []string{
+		strings.Replace(riUser, "%s", q("first"), 1),
+		strings.Replace(riUser, "%s", q("second"), 1),
+		riAssistant,
+	})
+	if got := promptTexts(prompts); len(got) != 2 || got[0] != "first" || got[1] != "second" {
+		t.Errorf("got %q, want [first second]", got)
+	}
+}
+
+// Trailing whitespace must not defeat the collapse — the live rows were "yes\n"
+// on one channel, and recoverUserPrompt stores trimmed text.
+func TestCodexRepeatCollapseIgnoresSurroundingWhitespace(t *testing.T) {
+	prompts := drivePrompts(t, []string{
+		strings.Replace(riUser, "%s", q("ship it\n"), 1),
+		strings.Replace(riUser, "%s", q("  ship it  "), 1),
+		riAssistant,
+	})
+	if len(prompts) != 1 {
+		t.Errorf("whitespace-only difference produced %d prompts %q, want 1", len(prompts), promptTexts(prompts))
+	}
+}
+
+// Greptile P2: a same-text repeat is the same turn arriving again and must not
+// restart the staleness clock. If it did, a turn whose repeats land one per poll
+// would have its flush deferred forever.
+func TestCodexRepeatDoesNotRestartStalenessClock(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-aging")
+	p.Process([]byte(strings.Replace(riUser, "%s", q("hold this"), 1)))
+
+	if got := p.FlushStaleUserPrompt(); len(got) != 0 {
+		t.Fatalf("first poll flushed early")
+	}
+	// The same turn repeats on the next poll — it must NOT reset the clock.
+	p.Process([]byte(strings.Replace(riUser, "%s", q("hold this"), 1)))
+
+	got := p.FlushStaleUserPrompt()
+	if len(got) != 1 {
+		t.Fatalf("got %d prompts after the repeat, want 1 — a repeat must not defer the flush", len(got))
+	}
+	if d, _ := got[0].Data.(map[string]interface{}); d["text"] != "hold this" {
+		t.Errorf("text = %v", d["text"])
+	}
+}
