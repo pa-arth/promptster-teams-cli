@@ -67,6 +67,12 @@ func watchedTools() []string {
 	if dirExists(codexSessionsDir()) {
 		tools = append(tools, "codex")
 	}
+	// "cursor" must be the same string the events carry (event.Source), because
+	// the backend lines presence up with activity by that value and reads a tool
+	// missing from source_service as "this engineer captured nothing".
+	if dirExists(CursorProjectsDir()) {
+		tools = append(tools, "cursor")
+	}
 	return tools
 }
 

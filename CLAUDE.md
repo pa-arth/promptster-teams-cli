@@ -3,7 +3,7 @@
 ## Capture surfaces
 
 Capture is **transcript tailing only**. It installs no hooks, writes no
-`settings.json`, and injects nothing into any editor. Two watchers poll the
+`settings.json`, and injects nothing into any editor. Three watchers poll the
 filesystem every 3s:
 
 - **Claude Code** — `internal/capture/cmd_claude_watch.go`. Tails
@@ -11,6 +11,68 @@ filesystem every 3s:
   (default `~/.claude/projects`, `claudeConfigDir()`/`ClaudeProjectsDir()`).
 - **Codex** — `internal/capture/cmd_codex_watch.go`. Tails
   `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (default `~/.codex`).
+- **Cursor** — `internal/capture/cmd_cursor_watch.go`. Tails
+  `~/.cursor/projects/<munged-workspace>/agent-transcripts/…` (three layouts:
+  `<uuid>.jsonl`, `<uuid>/<uuid>.jsonl`, `<uuid>/subagents/<uuid>.jsonl`).
+  `PROMPTSTER_CURSOR_HOME` is a **test-only** override — it is ours, not a
+  documented Cursor variable, unlike `CODEX_HOME`/`CLAUDE_CONFIG_DIR`.
+
+### Cursor tails a transcript; it deliberately does NOT use `.cursor/hooks.json`
+
+Cursor's documented capture surface is a project-local
+`<workspace>/.cursor/hooks.json`. That was the original plan for this work and it
+was rejected on two grounds, both of which outrank the fact that the hook payload
+is richer:
+
+- **It is a tracked file inside the customer's repository.** Writing into a
+  customer repo is a line this CLI does not cross, and a hooks.json committed by
+  one engineer silently enrolls every teammate who pulls it.
+- **It is per-workspace, so enrollment is per-repo.** Claude Code and Codex are
+  one-and-done; a hooks rail would mean every repo an engineer forgets reads as
+  "captured nothing" — the exact failure this work exists to fix.
+
+The transcript rail needs neither: zero enrollment, no repo mutation, and it
+covers workspaces opened before the CLI was installed. The cost is that a Cursor
+transcript is thinner than a hook payload — see the next two headings.
+
+**Cursor transcripts carry no cwd and no timestamp.** Both gaps are worked around
+in ways that are easy to "simplify" back into bugs:
+
+- **cwd** — `cursorClassify` reads absolute paths the agent actually *touched*
+  (`normalize.CursorObservedPath`) rather than parsing the munged directory name.
+  Two munging behaviours are observable on one machine: a full-length name, and a
+  stem truncated to 43 chars with a 7-hex suffix. The truncated form is not
+  reversible, so the directory name cannot be a key. A transcript that has not
+  revealed a path yet is **UNDECIDED, never NO** — caching a "no" on a
+  still-growing file is what once dropped whole Codex sessions.
+- **time** — a forward-carrying anchor parsed from the `<timestamp>` envelope on
+  user turns, falling back to read time. Intra-turn latency is not recoverable
+  from this surface; don't pretend otherwise downstream.
+- **event ids** — `sessionID + kind + byteOffset + itemIndex` through
+  `event.DeterministicUUID`. Deliberately not a counter: a counter restarts at 0
+  mid-file after a daemon restart and mints ids that collide with earlier
+  *different* records, at which point dedupe eats real events.
+
+**Pre-existing vs new is decided by the FIRST POLL**, since there is no timestamp
+to ask. Transcripts already on disk when the watcher starts are seeded to EOF; one
+that appears on a later poll is tailed from 0. Both directions matter: seed
+everything and every new session loses its opening prompt (a transcript only
+becomes classifiable at its first tool call, several records past the prompt);
+tail everything from 0 and the first daemon run re-uploads months of history.
+
+### Cursor egresses counts, never code
+
+`normalize_cursor.go` is the only place that reads `old_string`/`new_string`, and
+the only function that touches them is `cursorLineCount`, which returns an `int`.
+No patch, no file body, no diff, ever — including in `RawPayload` and in every
+error and log path. `outcome_events` has a DB CHECK that rejects patches and file
+bodies, so this is enforced downstream too, but the CLI must not rely on that.
+
+Two tests pin it and both were mutation-tested (deliberately broken, confirmed
+failing, reverted): `TestCursorPrompt_DropsAttachedFileContents` and
+`TestCursorFileDiff_CountsOnlyNeverCode`. Prompt extraction is a **whitelist** —
+only the `<user_query>` span survives — so Cursor's attached-file context and
+rules blocks fail closed.
 
 ### What this means per surface
 
@@ -28,16 +90,20 @@ distinction does not exist at the transcript layer.
   the Claude Code desktop app, which *is* covered.
 - **claude.ai/code web sessions** — run in the cloud, nothing lands on the
   developer's disk to tail.
-- **Cursor and other non-Claude-Code assistants** — only Claude Code and Codex
-  are wired up here.
+- **Non-Claude-Code, non-Codex, non-Cursor assistants** (Windsurf, Copilot,
+  Aider, …) — nothing is wired up for them.
+- **Cursor's IDE-side chat that never invokes the agent** — only agent sessions
+  land in `~/.cursor/projects/…/agent-transcripts`. Tab completions do not.
 
 ### The real gate is cwd, not surface
 
 `classifyClaudeTranscript` (`cmd_claude_watch.go:501`) ingests a transcript only
 if its recorded `cwd` sits inside the capture workspace or one of its registered
 git worktrees (`workspaceMatchRoots`, `cmd_claude_watch.go:477`). Codex applies
-the same test (`cmd_codex_watch.go:272`). The workspace defaults to `os.Getwd()`
-and is overridable with `PROMPTSTER_TEAMS_WATCH_DIR` (`teams.go:90`).
+the same test (`cmd_codex_watch.go:272`), and Cursor applies it to observed paths
+instead of a recorded cwd (`cursorClassify`, `cmd_cursor_watch.go`). The
+workspace defaults to `os.Getwd()` and is overridable with
+`PROMPTSTER_TEAMS_WATCH_DIR` (`teams.go:90`).
 
 So a session is dropped when it runs outside the watched workspace — e.g. the
 desktop app opened on a different folder — no matter which surface produced it.

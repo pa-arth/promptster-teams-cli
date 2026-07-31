@@ -23,7 +23,7 @@ func Main(argv []string) int {
 		// pass --key), validate it, and store it locally so `watch` just works.
 		cmdLogin(argv[2:])
 	case "watch":
-		// Foreground capture: tails Claude Code + Codex transcript JSONL,
+		// Foreground capture: tails Claude Code + Codex + Cursor transcript JSONL,
 		// normalizes, redacts on-device, signs, and ships to the configured
 		// teams ingest endpoint. Holds the terminal until Ctrl-C.
 		if err := capture.RunTeamsWatch(argv[2:]); err != nil {
@@ -50,6 +50,11 @@ func Main(argv []string) int {
 	case "codex-watch":
 		if err := capture.RunCodexWatcher(); err != nil {
 			fmt.Fprintf(os.Stderr, "codex watcher error: %v\n", err)
+			return 1
+		}
+	case "cursor-watch":
+		if err := capture.RunCursorWatcher(); err != nil {
+			fmt.Fprintf(os.Stderr, "cursor watcher error: %v\n", err)
 			return 1
 		}
 	case "git-watch":
@@ -97,7 +102,7 @@ Commands:
   stop         Stop background capture
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
-  watch        Foreground capture — tail transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
+  watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
   version      Print version

@@ -181,8 +181,15 @@ func RunTeamsWatch(args []string) error {
 	stopGitWatch := StartGitWatch(cfg)
 	defer stopGitWatch()
 
-	errCh := make(chan error, 2)
+	errCh := make(chan error, 3)
 	go func() { errCh <- RunClaudeWatcher() }()
 	go func() { errCh <- RunCodexWatcher() }()
+	// Cursor rides the same transcript-tailing rail as the other two — read-only,
+	// zero enrollment, nothing installed into the engineer's workspace. Cursor
+	// also exposes a project-local hooks.json, which this CLI deliberately does
+	// NOT use: it would mean writing a tracked file into the customer's repo and
+	// enrolling per-workspace, so every repo an engineer forgot would read as
+	// "captured nothing". See internal/normalize/normalize_cursor.go.
+	go func() { errCh <- RunCursorWatcher() }()
 	return <-errCh
 }

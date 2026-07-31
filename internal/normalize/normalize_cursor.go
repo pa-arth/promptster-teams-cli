@@ -1,0 +1,450 @@
+package normalize
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
+)
+
+// Cursor transcript normalization.
+//
+// WHY A TRANSCRIPT AND NOT HOOKS. Cursor's documented capture surface is
+// `<workspace>/.cursor/hooks.json`, and the sibling hiring CLI uses it. Teams
+// does not, for two reasons that outrank everything hooks offer: hooks.json is
+// PROJECT-LOCAL, so enrollment is per-workspace and every repo an engineer
+// forgets reads as "captured nothing" — the exact failure this capture exists
+// to remove; and it is a tracked file inside the customer's repository, which
+// this CLI's whole design refuses to write (see CLAUDE.md, "Capture surfaces").
+// Cursor also writes a transcript, verified on disk, so the zero-enrollment
+// read-only rail exists and is strictly better for a fleet.
+//
+// THE FORMAT, verified against 61 real transcripts (2026-02 → 2026-07) and one
+// live `cursor-agent` run. Every record, in every file, is exactly:
+//
+//	{"role":"user"|"assistant","message":{"content":[ …items… ]}}
+//
+// and NOTHING else — no timestamp field, no cwd, no model, no token usage, and
+// no `tool_result` records at all. That is not an omission in this parser; the
+// key-set union across the whole corpus is `{role, message}` and `{content}`.
+// Do not add a field here on the assumption Cursor "must" send it — check a
+// real file first, the way this list was built.
+//
+// Content items are `{"type":"text","text":…}` or
+// `{"type":"tool_use","name":…,"input":{…}}`. The tool vocabulary observed
+// across the corpus: Shell, Read, Grep, StrReplace, Glob, UpdateCurrentStep,
+// Write, Task, TodoWrite, Await, WebSearch, CallMcpTool, WebFetch, Delete,
+// ReadLints, CreatePlan.
+//
+// WHAT LEAVES THE MACHINE. Cursor's edit tools carry the code itself —
+// StrReplace's old_string/new_string, Write's contents. Those are COUNTED here
+// and then dropped on the floor; they are never placed in Data, never placed in
+// RawPayload (which this normalizer never sets at all), and never named in an
+// error string. Reading them on-device is the job; egress is the line. The
+// redaction projector would strip them anyway — `file_diff` allowlists only
+// path/linesAdded/linesRemoved — but defence in depth is the point: a leak
+// should require two independent mistakes, not one.
+
+// cursorUserQuery isolates the human's typed text from Cursor's prompt
+// envelope.
+//
+// A user record's text is NOT the prompt. Cursor wraps it in tags and rides
+// other material alongside — `<attached_files>` (24 occurrences in the corpus)
+// carries FILE CONTENTS the engineer attached, and one transcript carries a
+// `<git_diff_from_branch_to_main>` block. Taking the whole text would ship
+// source through the one kind whose `text` field is allowlisted, which is the
+// single worst place in this pipeline to be loose.
+//
+// So this is deliberately a WHITELIST, not a blacklist: only the inside of
+// `<user_query>` is a prompt. A user record without one produces no event
+// rather than a best-effort guess — a new envelope tag we have not seen must
+// fail closed to silence, never to "ship whatever was in there".
+var cursorUserQuery = regexp.MustCompile(`(?s)<user_query>(.*?)</user_query>`)
+
+// cursorTimestamp matches the only wall-clock signal Cursor persists:
+// `<timestamp>Friday, Jul 31, 2026, 5:10 PM (UTC-5)</timestamp>`, injected into
+// the user turn's own text. It is human-formatted, MINUTE resolution, and
+// carries a whole-hour UTC offset rather than a zone name.
+//
+// It appears on user turns ONLY, and only on recent Cursor builds (4 of 209
+// user records in the corpus have it). Everything else — every assistant record
+// — has no time of its own. See cursorEventTs for what that costs and how it is
+// handled honestly.
+var cursorTimestamp = regexp.MustCompile(`<timestamp>[^,]+, ([A-Z][a-z]{2} \d{1,2}, \d{4}), (\d{1,2}:\d{2} [AP]M) \(UTC([+-]\d{1,2})\)</timestamp>`)
+
+// CursorTranscriptProcessor converts one Cursor agent transcript into canonical
+// events. One processor per transcript file, held for the daemon's life so the
+// prompt-timestamp anchor survives across polls.
+type CursorTranscriptProcessor struct {
+	sessionID string
+
+	// Sidechain marks a subagent transcript
+	// (<parent>/agent-transcripts/<parent>/subagents/<child>.jsonl). Its "user"
+	// records are agent-authored task briefs, not the engineer's prompts, so
+	// they must never enter the human timeline — the same rule the Claude
+	// processor enforces with UsageOnly, for the same reason.
+	Sidechain bool
+
+	// Workdir is the session's cwd, home-collapsed by the caller's resolution
+	// pass. Cursor records no cwd anywhere in the transcript (unlike Claude Code
+	// and Codex), so capture resolves it once from the transcript's own observed
+	// absolute paths and threads it in — see capture.cursorSessionCwd.
+	Workdir string
+
+	// RepoRoot / RepoHost / RepoTracked are the canonical per-session repo
+	// identity, resolved ONCE in internal/capture from the same cwd (git needs
+	// fs/exec, so it cannot be derived here) and threaded in as session state.
+	// Identical contract to the Claude and Codex processors: all three come from
+	// ONE resolution pass so they always describe one observation of one
+	// directory.
+	RepoRoot    string
+	RepoHost    string
+	RepoTracked bool
+
+	// tsAnchor is the last wall-clock time recovered from a user turn's
+	// <timestamp>. Assistant records that follow inherit it (see cursorEventTs).
+	tsAnchor time.Time
+}
+
+func NewCursorTranscriptProcessor(sessionID string) *CursorTranscriptProcessor {
+	return &CursorTranscriptProcessor{sessionID: sessionID}
+}
+
+// cursorRecord is the complete on-disk record shape. Deliberately exhaustive:
+// if a future Cursor build adds a field, this struct failing to grow is a
+// visible gap rather than a silent one.
+type cursorRecord struct {
+	Role    string `json:"role"`
+	Message struct {
+		Content []cursorContentItem `json:"content"`
+	} `json:"message"`
+}
+
+type cursorContentItem struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// Process parses one transcript line and returns zero or more canonical events.
+//
+// offset is the line's byte position in its transcript. It is the STABLE
+// IDENTITY of the record and the basis of every event id this processor mints:
+// a record's offset does not change when the watcher restarts, when the file is
+// re-tailed, or when an event is re-sent after a transport error, so the
+// backend can collapse duplicates at the source of identity. A counter would
+// not survive a restart mid-file (it would restart at 0 while the offset was
+// mid-file and mint ids that collide with EARLIER, different records — dedupe
+// would then silently eat real events, which is strictly worse than duplicates).
+func (p *CursorTranscriptProcessor) Process(line []byte, offset int64) []event.Event {
+	var rec cursorRecord
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return nil
+	}
+
+	var out []event.Event
+	for i, item := range rec.Message.Content {
+		switch {
+		case rec.Role == "user" && item.Type == "text":
+			if ev, ok := p.promptEvent(item.Text, offset, i); ok {
+				out = append(out, ev)
+			}
+		case rec.Role == "assistant" && item.Type == "tool_use":
+			if ev, ok := p.toolEvent(item, offset, i); ok {
+				out = append(out, ev)
+			}
+		}
+	}
+	return out
+}
+
+// promptEvent builds the human `prompt` event from a user turn.
+func (p *CursorTranscriptProcessor) promptEvent(text string, offset int64, idx int) (event.Event, bool) {
+	// Anchor first, and unconditionally: even a sidechain's brief carries the
+	// wall clock, and dropping the record must not drop the time signal that
+	// every following assistant record depends on.
+	p.noteTimestamp(text)
+
+	// A subagent's "user" record is the parent agent's task brief. It is
+	// AI-authored, so emitting it as a prompt would credit the engineer with
+	// prompts they never wrote and pollute the prompt-quality signal.
+	if p.Sidechain {
+		return event.Event{}, false
+	}
+
+	m := cursorUserQuery.FindStringSubmatch(text)
+	if m == nil {
+		return event.Event{}, false
+	}
+	query := strings.TrimSpace(m[1])
+	if query == "" {
+		return event.Event{}, false
+	}
+
+	e := p.newEvent("prompt", offset, idx)
+	e.Actor = event.HumanActor()
+	e.Provenance = transcriptHumanProvenance()
+
+	data := map[string]interface{}{"text": query}
+	// workdir / repoRoot / repoHost / repoTracked — identical contract and
+	// identical omit-when-empty rules as the Claude processor. repoTracked is
+	// stamped explicitly true OR false whenever repoRoot is, so "not a repo"
+	// stays distinguishable from "a CLI too old to have looked".
+	if p.Workdir != "" {
+		data["workdir"] = p.Workdir
+	}
+	if p.RepoRoot != "" {
+		data["repoRoot"] = p.RepoRoot
+		data["repoTracked"] = p.RepoTracked
+	}
+	if p.RepoHost != "" {
+		data["repoHost"] = p.RepoHost
+	}
+	e.Data = data
+	return e, true
+}
+
+// cursorEditInput is the union of the edit-tool inputs. old_string/new_string/
+// contents are read ONLY to be counted; see the package note.
+type cursorEditInput struct {
+	Path      string `json:"path"`
+	OldString string `json:"old_string"`
+	NewString string `json:"new_string"`
+	Contents  string `json:"contents"`
+	Command   string `json:"command"`
+}
+
+// toolEvent maps one assistant tool_use to a canonical event.
+//
+// SCOPE. Only the tools that describe WORK are mapped: edits, file creation,
+// deletion, and shell commands. Read/Grep/Glob are 782 of the corpus's 1,809
+// tool calls and say only that the agent looked at something — they are
+// deliberately unmapped rather than shipped as volume. Task/TodoWrite/
+// CreatePlan/CallMcpTool are real signals but need allowlist review on both
+// sides before they can carry anything, so they stay silent rather than
+// projecting to `{}`.
+func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int64, idx int) (event.Event, bool) {
+	var in cursorEditInput
+	if len(item.Input) > 0 {
+		// A malformed input is a dropped event, never a partial one: every
+		// branch below reads a path or a command, and half a path is worse than
+		// no event.
+		if err := json.Unmarshal(item.Input, &in); err != nil {
+			return event.Event{}, false
+		}
+	}
+
+	switch item.Name {
+	case "StrReplace":
+		if in.Path == "" {
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("file_diff", offset, idx)
+		e.Data = map[string]interface{}{
+			"path": in.Path,
+			// COUNTS ONLY. The strings themselves die with this function.
+			"linesAdded":   cursorLineCount(in.NewString),
+			"linesRemoved": cursorLineCount(in.OldString),
+		}
+		return e, true
+
+	case "Write":
+		if in.Path == "" {
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("file_create", offset, idx)
+		e.Data = map[string]interface{}{
+			"path":       in.Path,
+			"linesAdded": cursorLineCount(in.Contents),
+			"sizeBytes":  len(in.Contents),
+		}
+		return e, true
+
+	case "Delete":
+		if in.Path == "" {
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("file_delete", offset, idx)
+		e.Data = map[string]interface{}{"path": in.Path}
+		return e, true
+
+	case "Shell":
+		if in.Command == "" {
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("command", offset, idx)
+		// The command STRING only. Cursor's transcript records no tool results
+		// at all, so there is no stdout, no stderr and no exit code to leak —
+		// and none to report either. exitCode is left ABSENT rather than
+		// fabricated as 0, which would report every failed command as a success.
+		e.Data = map[string]interface{}{"command": in.Command}
+		return e, true
+	}
+
+	return event.Event{}, false
+}
+
+// newEvent builds the canonical envelope with a deterministic, offset-derived
+// id and the best timestamp available.
+func (p *CursorTranscriptProcessor) newEvent(kind string, offset int64, idx int) event.Event {
+	e := event.NewEvent(kind, p.sessionID)
+	e.ID = event.DeterministicUUID(
+		p.sessionID + "\x1f" + kind + "\x1f" + strconv.FormatInt(offset, 10) + "\x1f" + strconv.Itoa(idx),
+	)
+	// `source` is what puts "cursor" into the session row's source_service
+	// array, which is how the backend tells a genuinely captured engineer from a
+	// bare enrollment row. An engineer with no tool in source_service reads as
+	// "captured nothing" — do not change this string without changing
+	// AGENT_SOURCES and TOOL_ROSTER on the backend to match.
+	e.Source = "cursor"
+	if ts := p.eventTs(); ts != "" {
+		e.Ts = ts
+	}
+	return e
+}
+
+func (p *CursorTranscriptProcessor) newAIEvent(kind string, offset int64, idx int) event.Event {
+	e := p.newEvent(kind, offset, idx)
+	e.Actor = event.AIActor()
+	e.Provenance = transcriptAiProvenance()
+	return e
+}
+
+// noteTimestamp records the wall clock from a user turn's <timestamp> envelope,
+// if this Cursor build writes one.
+func (p *CursorTranscriptProcessor) noteTimestamp(text string) {
+	m := cursorTimestamp.FindStringSubmatch(text)
+	if m == nil {
+		return
+	}
+	offsetHours, err := strconv.Atoi(m[3])
+	if err != nil {
+		return
+	}
+	t, err := time.Parse("Jan 2, 2006 3:04 PM", m[1]+" "+m[2])
+	if err != nil {
+		return
+	}
+	// Reinterpret the parsed wall-clock reading in the zone Cursor named. The
+	// offset is whole hours in every sample; a future half-hour zone would fail
+	// the regex and fall through to the read-time default rather than land an
+	// event 30 minutes wrong.
+	p.tsAnchor = t.Add(-time.Duration(offsetHours) * time.Hour).UTC()
+}
+
+// eventTs returns the timestamp to stamp, or "" to keep event.NewEvent's
+// read-time default.
+//
+// HONEST LIMIT, because this is the one place Cursor is genuinely worse than
+// the other two surfaces. Claude Code and Codex stamp every transcript record
+// with its own RFC3339 timestamp; Cursor stamps none. All that exists is a
+// minute-resolution string injected into user turns on recent builds. So:
+//
+//   - a prompt, and every assistant action in the turn that follows it, is
+//     stamped with that turn's anchor when one is available;
+//   - with no anchor (older Cursor builds), the read time stands.
+//
+// Within-file ORDER is always exact — the file is append-only and tailed in
+// order — and because capture is go-forward-only (never a backfill of history),
+// read time is at worst one poll interval late. What is genuinely lost is
+// intra-turn latency: a 46-minute turn's actions all carry its start time. Daily
+// and weekly rollups are unaffected; per-action timing is not available from
+// this surface and must not be reported as though it were.
+func (p *CursorTranscriptProcessor) eventTs() string {
+	if p.tsAnchor.IsZero() {
+		return ""
+	}
+	return p.tsAnchor.Format(time.RFC3339Nano)
+}
+
+// cursorLineCount counts the lines a string contributes to a diff. The empty
+// string is 0 (a pure insertion has no lines on the old side), and a single
+// trailing newline is not a line of its own — "foo\n" is one line, not two.
+//
+// This function is the ONLY thing that ever touches old_string/new_string, and
+// it returns an integer. That is the containment boundary.
+func cursorLineCount(s string) int {
+	if s == "" {
+		return 0
+	}
+	return strings.Count(strings.TrimSuffix(s, "\n"), "\n") + 1
+}
+
+// CursorSessionWorkdir home-collapses an absolute cwd for the `workdir` field.
+// Exported so capture can resolve it in the same pass that resolves the repo
+// identity. HomeRelativeStrict returns "" for anything not provably under the
+// home directory, so an outside-home path is omitted rather than shipped with
+// the OS username in it.
+func CursorSessionWorkdir(cwd string) string {
+	return state.HomeRelativeStrict(cwd)
+}
+
+// CursorObservedPath extracts the first absolute filesystem path a transcript
+// line reveals, so capture can decide whether the session belongs to the
+// watched workspace.
+//
+// This exists because Cursor records no cwd. The transcript's directory name is
+// a munged form of the workspace path, and it is NOT a reliable key: two
+// different munging behaviours are observable on one machine — a full-length
+// name, and a stem truncated to 43 characters with a 7-hex-digit suffix
+// (`…-paarthjamdagne-e4e727c`). Reversing it is impossible for the truncated
+// form and would be a guess for the rest, so the workspace decision is made
+// from paths the agent actually touched, which are absolute and exact.
+//
+// Returns "" when the line reveals no path — the honest answer for a turn that
+// has not used a tool yet. The caller must treat that as UNDECIDED and retry,
+// never as a mismatch: caching a "no" on a file whose first records are pure
+// prose is the bug that silently dropped whole Codex sessions.
+func CursorObservedPath(line []byte) string {
+	var rec cursorRecord
+	if err := json.Unmarshal(line, &rec); err != nil {
+		return ""
+	}
+	for _, item := range rec.Message.Content {
+		if item.Type != "tool_use" || len(item.Input) == 0 {
+			continue
+		}
+		var in struct {
+			Path            string `json:"path"`
+			WorkingDir      string `json:"working_directory"`
+			TargetDirectory string `json:"target_directory"`
+		}
+		if err := json.Unmarshal(item.Input, &in); err != nil {
+			continue
+		}
+		for _, c := range []string{in.WorkingDir, in.TargetDirectory, in.Path} {
+			if strings.HasPrefix(c, "/") || cursorHasWindowsDrive(c) {
+				return c
+			}
+		}
+	}
+	return ""
+}
+
+// cursorHasWindowsDrive reports whether p starts with a `C:\`-style drive
+// prefix. Checked explicitly rather than via filepath.IsAbs so the decision is
+// host-independent: a unix CI runner must classify a Windows transcript the
+// same way a Windows machine does, and filepath.IsAbs does not.
+func cursorHasWindowsDrive(p string) bool {
+	if len(p) < 3 {
+		return false
+	}
+	c := p[0]
+	if !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') {
+		return false
+	}
+	return p[1] == ':' && (p[2] == '\\' || p[2] == '/')
+}
+
+// cursorDescribeSkip is used only in debug logging. It exists to make the "we
+// saw a tool we do not map" case discoverable without ever formatting a tool's
+// INPUT into a string — a log line is an egress path like any other.
+func cursorDescribeSkip(name string) string {
+	return fmt.Sprintf("cursor: unmapped tool %q (name only; input never logged)", name)
+}
