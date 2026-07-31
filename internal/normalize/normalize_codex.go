@@ -326,7 +326,12 @@ func (p *CodexRolloutProcessor) recoverUserPrompt(payload map[string]interface{}
 			return
 		}
 	}
-	p.pendingUser = codexPendingUserTurn{text: text, ts: ts, raw: raw}
+	// A same-text repeat is the SAME turn arriving again, so it must not restart
+	// the staleness clock: resetting `aged` would push the end-of-poll flush out
+	// by another poll for every repeat that straddles a poll boundary, and a turn
+	// whose repeats keep landing one per poll would never flush at all.
+	aged := p.pendingUser.aged && p.pendingUser.text == text
+	p.pendingUser = codexPendingUserTurn{text: text, ts: ts, raw: raw, aged: aged}
 }
 
 // FlushStaleUserPrompt releases a buffered turn that the next line will never

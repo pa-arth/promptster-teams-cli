@@ -347,3 +347,25 @@ func TestCodexRepeatCollapseIgnoresSurroundingWhitespace(t *testing.T) {
 		t.Errorf("whitespace-only difference produced %d prompts %q, want 1", len(prompts), promptTexts(prompts))
 	}
 }
+
+// Greptile P2: a same-text repeat is the same turn arriving again and must not
+// restart the staleness clock. If it did, a turn whose repeats land one per poll
+// would have its flush deferred forever.
+func TestCodexRepeatDoesNotRestartStalenessClock(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-aging")
+	p.Process([]byte(strings.Replace(riUser, "%s", q("hold this"), 1)))
+
+	if got := p.FlushStaleUserPrompt(); len(got) != 0 {
+		t.Fatalf("first poll flushed early")
+	}
+	// The same turn repeats on the next poll — it must NOT reset the clock.
+	p.Process([]byte(strings.Replace(riUser, "%s", q("hold this"), 1)))
+
+	got := p.FlushStaleUserPrompt()
+	if len(got) != 1 {
+		t.Fatalf("got %d prompts after the repeat, want 1 — a repeat must not defer the flush", len(got))
+	}
+	if d, _ := got[0].Data.(map[string]interface{}); d["text"] != "hold this" {
+		t.Errorf("text = %v", d["text"])
+	}
+}
