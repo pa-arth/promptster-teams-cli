@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -80,45 +81,57 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 		}
 	}
 
-	switch {
-	case len(missing) == len(cursorHookSteps):
+	if len(missing) == len(cursorHookSteps) {
+		// Nothing of ours is registered, so there is no command to validate.
 		return []CursorHookDoctorLine{{
 			Warn: true,
 			Text: "Cursor hook not enrolled — start capture (`promptster-teams start`) to enroll it; transcript capture still works, without model attribution",
 		}}
-	case len(missing) > 0:
-		// A partial enrollment is what a hand-edited hooks.json looks like. The
-		// watcher repairs it at the next startup, so this is a warning, not an
-		// error — but it is named because the missing steps are silently absent
-		// signals, not a loud failure.
-		return []CursorHookDoctorLine{{
-			Warn: true,
-			Text: fmt.Sprintf("Cursor hook enrolled for only some steps (missing: %s) — restart capture to repair", strings.Join(missing, ", ")),
-		}}
 	}
 
-	// Enrolled everywhere. The question that remains is whether the command it
-	// runs still exists.
+	// EVERY REMAINING ENTRY IS VALIDATED, INCLUDING UNDER A PARTIAL ENROLLMENT.
+	// Completeness and runnability are independent facts, and returning early on
+	// the incomplete one hides the worse one: a machine with three of seven steps
+	// registered against a deleted binary still execs a missing command inside the
+	// agent loop on those three steps' events. Reporting only "some steps are
+	// missing" there describes the least of that machine's problems. Raised by
+	// review on PR #125.
 	var dangling []string
 	for bin := range bins {
 		if bin == "" || !fileExists(bin) {
 			dangling = append(dangling, bin)
 		}
 	}
+
+	var lines []CursorHookDoctorLine
 	if len(dangling) > 0 {
-		return []CursorHookDoctorLine{{
+		sort.Strings(dangling)
+		lines = append(lines, CursorHookDoctorLine{
 			Err: true,
 			Text: fmt.Sprintf(
-				"Cursor is running a command that does not exist (%s) on EVERY prompt, edit and shell call — run `promptster-teams uninstall` to unenroll this machine, or reinstall to the managed path",
+				"Cursor is running a command that does not exist (%s) on every prompt, edit and shell call — run `promptster-teams uninstall` to unenroll this machine, or reinstall to the managed path",
 				state.HomeRelative(strings.Join(dangling, ", ")),
 			),
-		}}
+		})
+	}
+	if len(missing) > 0 {
+		// A partial enrollment is what a hand-edited hooks.json looks like. The
+		// watcher repairs it at the next startup, so this is a warning, not an
+		// error — but it is named because the missing steps are silently absent
+		// signals, not a loud failure.
+		lines = append(lines, CursorHookDoctorLine{
+			Warn: true,
+			Text: fmt.Sprintf("Cursor hook enrolled for only some steps (missing: %s) — restart capture to repair", strings.Join(missing, ", ")),
+		})
+	}
+	if len(lines) > 0 {
+		return lines
 	}
 
-	// Enrolled and runnable, but pointed somewhere other than the managed path
-	// (an old install layout, a hand-edit). Not broken — `watch` re-renders the
-	// command unconditionally at startup and replaces a stale entry — so this is
-	// information, not a warning.
+	// Enrolled everywhere and runnable. The only thing left is whether it points
+	// at the managed path — an old install layout or a hand-edit does not, and
+	// `watch` re-renders the command unconditionally at startup, so that is
+	// information rather than a warning.
 	canonical := cursorHookCommandBinary(cursorHookCommand())
 	for bin := range bins {
 		if filepath.Clean(bin) != filepath.Clean(canonical) {

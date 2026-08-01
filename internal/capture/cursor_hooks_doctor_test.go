@@ -147,6 +147,40 @@ func TestCursorHooksDoctorReportsPartialEnrollment(t *testing.T) {
 	}
 }
 
+// A PARTIAL enrollment whose binary is also gone must still report the dangling
+// command. Completeness and runnability are independent facts, and the machine
+// with three of seven steps registered against a deleted binary still execs a
+// missing command inside the agent loop on those three steps' events — reporting
+// only "some steps are missing" there describes the least of its problems.
+// Raised by review on PR #125.
+func TestCursorHooksDoctorFlagsADanglingCommandUnderPartialEnrollment(t *testing.T) {
+	home := sandboxHome(t)
+	gone := filepath.Join(home, ".promptster-teams", "bin", "promptster-teams")
+	writeCursorHooks(t, filepath.Join(home, ".cursor", "hooks.json"),
+		fmt.Sprintf("%q cursor-hook", gone), cursorHookSteps[:3])
+
+	lines := CursorHooksDoctor()
+	var sawDangling, sawPartial bool
+	for _, l := range lines {
+		if l.Err && strings.Contains(l.Text, "does not exist") {
+			sawDangling = true
+		}
+		if l.Warn && strings.Contains(l.Text, "only some steps") {
+			sawPartial = true
+		}
+	}
+	if !sawDangling {
+		t.Fatalf("the partial enrollment hid the dangling command: %+v", lines)
+	}
+	if !sawPartial {
+		t.Fatalf("the partial enrollment itself went unreported: %+v", lines)
+	}
+	// Severity order: the broken tool outranks the missing signal.
+	if !lines[0].Err {
+		t.Fatalf("the dangling command was not reported first: %+v", lines)
+	}
+}
+
 // A hooks.json that does not parse is the state enrollment REFUSES to touch, so
 // it stays unenrolled until a human fixes it — which they will never know to do
 // unless doctor says so.
