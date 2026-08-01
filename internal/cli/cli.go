@@ -83,6 +83,13 @@ func Main(argv []string) int {
 		// tick (reads stdin, spools the window reading, passes the prior line
 		// through); `status` reports the effective-statusline drift check.
 		return cmdStatusline(argv[2:])
+	case "uninstall":
+		// Undo the install: stop capture, deregister the autostart unit, unenroll
+		// the Cursor hook, restore the statusline. --purge also deletes
+		// ~/.promptster-teams. This is the ONLY uninstall path that exists —
+		// `npm rm -g` runs no uninstall script and leaves the managed binary in
+		// place, so removing the package alone stops nothing.
+		return cmdUninstall(argv[2:])
 	case "status":
 		cmdTeamsStatus(argv[2:])
 	case "doctor":
@@ -113,6 +120,7 @@ Commands:
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
+  uninstall    Undo the install — stop capture, remove autostart, unenroll the Cursor hook, restore the statusline (--purge also deletes ~/.promptster-teams)
   version      Print version
   help         Show this help
 
@@ -121,11 +129,12 @@ Getting started:
   promptster-teams autostart enable # keep capturing across reboots (starts at login)
   promptster-teams status           # confirm capture is running
   promptster-teams stop             # stop when you're done
+  promptster-teams uninstall        # remove it — npm rm / deleting the binary does NOT stop capture
 
 Capture runs detached and silent. Set PROMPTSTER_DEBUG=1 before watch/start
 to see per-event watcher logging.
 
-The CLI silently self-updates from GitHub Releases (signed) on a 24h cadence
+The CLI silently self-updates from GitHub Releases (signed) on a 30m cadence
 while watching, so the fleet doesn't drift onto old versions. Opt out per
 machine with watch/start --no-auto-update or PROMPTSTER_TEAMS_NO_AUTO_UPDATE=1;
 your org can also disable or pin the version centrally.

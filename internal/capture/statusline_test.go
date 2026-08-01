@@ -334,3 +334,47 @@ func writeSettings(t *testing.T, path string, m map[string]interface{}) {
 		t.Fatal(err)
 	}
 }
+
+// A statusLine key the engineer DELETED must stay deleted. Deleting it removes
+// our shim as surely as replacing it does, so the engineer wants no statusline —
+// writing back the command we saved when we wrapped them would resurrect
+// configuration they deliberately removed.
+//
+// Raised by review on PR #124, on the uninstall path: `statusline disable` is a
+// deliberate act by someone managing their statusline, but `uninstall` calls
+// this on every run, which is what turned a corner into something reachable.
+func TestDisableDoesNotResurrectADeletedStatusline(t *testing.T) {
+	claudeDir, _ := statuslineTestEnv(t)
+	path := filepath.Join(claudeDir, "settings.json")
+	original := statusLineConfig{Type: "command", Command: "my-cool-statusline.sh --flag"}
+	writeSettings(t, path, map[string]interface{}{"statusLine": statusLineToMap(original), "otherKey": "keep-me"})
+
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+	// The engineer deletes the statusLine key outright — shim and all.
+	m, err := readSettingsMap(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "statusLine")
+	if err := writeSettingsMap(path, m); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := DisableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	if cur, ok := readStatusLine(path); ok {
+		t.Fatalf("disable resurrected a statusLine the engineer deleted: %+v", cur)
+	}
+	if m, _ := readSettingsMap(path); m["otherKey"] != "keep-me" {
+		t.Error("disable clobbered an unrelated settings key")
+	}
+	// The stored prior describes a slot nobody holds any more; a later enable
+	// must start fresh rather than re-wrap a command that is no longer there.
+	if rec, ok := loadStatuslinePrior(); ok && rec.Prior != nil {
+		t.Errorf("the stale prior survived: %+v", rec.Prior)
+	}
+}

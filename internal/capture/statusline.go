@@ -313,6 +313,21 @@ func EnableStatusline() (StatuslineEnableResult, error) {
 	return res, nil
 }
 
+// StatuslineWrapped reports whether the user-scope statusLine is OUR shim right
+// now.
+//
+// It exists so `uninstall` can say what it actually changed rather than what it
+// attempted. DisableStatusline is deliberately a no-op in two cases (never
+// enabled, or the engineer replaced our shim with their own line afterwards),
+// and it returns nil in both — so a caller with only the error cannot tell
+// "restored your statusline" from "there was nothing of ours to restore", and
+// reporting the wrong one of those is how an uninstall gets accused of touching
+// a config it never wrote.
+func StatuslineWrapped() bool {
+	cur, ok := readStatusLine(userSettingsPath())
+	return ok && isOurShim(cur.Command)
+}
+
 // DisableStatusline restores the wrapped statusLine verbatim, or removes the key
 // if we had installed ours where none existed. A round-trip enable→disable leaves
 // the statusLine key byte-equivalent to its pre-enable state.
@@ -327,6 +342,19 @@ func DisableStatusline() error {
 	// Only touch the slot if it is actually our shim — never clobber a statusLine
 	// the engineer set after us.
 	if hasCurrent && !isOurShim(current.Command) {
+		clearStatuslinePrior()
+		return nil
+	}
+	// An ABSENT statusLine is also not ours to write. Deleting the key removes our
+	// shim as surely as replacing it does, and the engineer who did it wants no
+	// statusline — restoring the command we saved when we wrapped them would
+	// resurrect configuration they deliberately removed. The stored prior is
+	// dropped for the same reason: it describes a slot nobody is holding any more.
+	//
+	// Reached on every `uninstall`, not just a deliberate `statusline disable`,
+	// which is what turned this from a corner into something an engineer would
+	// actually hit.
+	if !hasCurrent {
 		clearStatuslinePrior()
 		return nil
 	}
