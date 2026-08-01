@@ -154,6 +154,15 @@ func cmdTeamsDoctor() {
 		printlnIndent(fmt.Sprintf("%s autostart not enabled — run `promptster-teams autostart enable` so capture survives reboots", warnGlyph))
 	}
 
+	// Cursor hook rail. The state worth catching here is an entry naming a binary
+	// that no longer exists: it is created by deleting the binary WITHOUT running
+	// `uninstall`, and once the binary is gone none of our code runs, so nothing
+	// of ours can find it from the inside. Doctor — run from a working binary,
+	// while something is already wrong — is the only place the message can land.
+	for _, l := range capture.CursorHooksDoctor() {
+		printlnIndent(fmt.Sprintf("%s %s", cursorHookGlyph(l), l.Text))
+	}
+
 	// Claude statusline window-capture drift check: resolve the EFFECTIVE
 	// statusline across all settings layers (not just our file) so we catch a
 	// project-layer shadow or an overwrite that silently stops window capture.
@@ -173,6 +182,20 @@ func cmdTeamsDoctor() {
 		printlnIndent(dimStyle.Render("Run ") + bodyStyle.Render("promptster-teams login") + dimStyle.Render(" to get set up."))
 	}
 	fmt.Println()
+}
+
+// cursorHookGlyph maps a Cursor hook diagnostic to its glyph. The Err level is
+// distinct on purpose: a dangling command degrades the ENGINEER'S tool on every
+// event, which must not render the same as "not enrolled yet".
+func cursorHookGlyph(l capture.CursorHookDoctorLine) string {
+	switch {
+	case l.Err:
+		return errGlyph
+	case l.Warn:
+		return warnGlyph
+	default:
+		return okGlyph
+	}
 }
 
 // printAutoUpdateStatus renders the self-updater's read-only state for doctor:
