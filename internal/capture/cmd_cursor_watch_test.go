@@ -393,3 +393,121 @@ func TestPollCursorTranscriptsTailsTranscriptsThatAppearAfterStartupFromZero(t *
 		t.Fatalf("offset = %d, want the whole file consumed (%d)", progress.Offsets[key], info.Size())
 	}
 }
+
+// --- review fixes ------------------------------------------------------------
+
+// An agent working in the watched workspace routinely touches something outside
+// it first — a global config, a doc under ~, a sibling repo it was asked to
+// compare against. Deciding on the FIRST path made that one record cache a
+// permanent "no", and every prompt, edit and command the session went on to make
+// inside the workspace was skipped in silence.
+func TestCursorClassifyDoesNotRejectOnASingleOutsidePath(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	ws := resolvePath(t.TempDir())
+	outside := resolvePath(t.TempDir())
+
+	path := writeCursorTranscript(t, root, "p/agent-transcripts/a/a.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>compare these</user_query>"}]}}`,
+		cursorShellLine(outside), // the agent looks somewhere else first
+		cursorShellLine(ws),      // then works in ours
+	)
+
+	result, matched := cursorClassify(path, []string{ws})
+	if result != cursorMatchYes {
+		t.Fatalf("classify = %v, want yes — one outside path is not a mismatch", result)
+	}
+	if matched != ws {
+		t.Fatalf("matched root = %q, want %q", matched, ws)
+	}
+}
+
+// The caching that keeps the 3s poll cheap has to survive: a transcript whose
+// every revealed path is outside really is another workspace's.
+func TestCursorClassifyStillRejectsWhenEveryPathIsOutside(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	ws := resolvePath(t.TempDir())
+	outside := resolvePath(t.TempDir())
+
+	path := writeCursorTranscript(t, root, "p/agent-transcripts/a/a.jsonl",
+		cursorShellLine(outside),
+		cursorShellLine(outside),
+	)
+	if result, _ := cursorClassify(path, []string{ws}); result != cursorMatchNo {
+		t.Fatalf("classify = %v, want no", result)
+	}
+}
+
+// A transcript being WRITTEN as the watcher comes up is live, not history — its
+// mtime after the watcher's own start is the proof, and it is the one case where
+// the absence of timestamps inside the file does not leave us guessing. Seeding
+// it to EOF would seek past the opening prompt of a session happening right now.
+func TestPollCursorTranscriptsTailsATranscriptStillBeingWrittenAtStartup(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws := resolvePath(t.TempDir())
+
+	// The watcher started a minute ago; this transcript was touched just now.
+	session := Session{TaskRoot: ws, DeviceID: "dev-test", StartedAt: time.Now().Add(-time.Minute)}
+	writeCursorTranscript(t, root, "p/agent-transcripts/live/live.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>the prompt that must survive</user_query>"}]}}`,
+		cursorShellLine(ws),
+	)
+
+	queued := pollCursorTranscripts(session, ws, session.StartedAt.Add(-2*time.Minute),
+		map[string]*normalize.CursorTranscriptProcessor{}, true, false)
+	if queued < 2 {
+		t.Fatalf("queued %d event(s) for a transcript written after the watcher started — its opening prompt was seeked past", queued)
+	}
+}
+
+// The other side of the same rule, and the one the split exists for: a
+// transcript that predates the watcher is history and must not be re-uploaded.
+func TestPollCursorTranscriptsStillSeedsTranscriptsOlderThanTheWatcher(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws := resolvePath(t.TempDir())
+
+	path := writeCursorTranscript(t, root, "p/agent-transcripts/old/old.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>months of history</user_query>"}]}}`,
+		cursorShellLine(ws),
+	)
+	old := time.Now().Add(-24 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{TaskRoot: ws, DeviceID: "dev-test", StartedAt: time.Now()}
+	queued := pollCursorTranscripts(session, ws, old.Add(-time.Hour),
+		map[string]*normalize.CursorTranscriptProcessor{}, true, false)
+	if queued != 0 {
+		t.Fatalf("re-uploaded %d event(s) of pre-existing history", queued)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loadCursorWatchProgress().Offsets[cursorProgressKey(path)]; got != info.Size() {
+		t.Fatalf("offset = %d, want EOF %d", got, info.Size())
+	}
+}
+
+// A zero StartedAt makes every mtime "after" it. Without a guard that would flip
+// the live-transcript rule from "tail the one session happening now" to "tail
+// every transcript on disk from byte 0" — the months-of-history replay the
+// first-poll split exists to prevent, reintroduced by an unset field.
+func TestPollCursorTranscriptsSeedsWhenTheWatcherHasNoStartTime(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws := resolvePath(t.TempDir())
+
+	writeCursorTranscript(t, root, "p/agent-transcripts/a/a.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>history</user_query>"}]}}`,
+		cursorShellLine(ws),
+	)
+
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"} // StartedAt deliberately unset
+	if queued := pollCursorTranscripts(session, ws, time.Now().Add(-time.Hour),
+		map[string]*normalize.CursorTranscriptProcessor{}, true, false); queued != 0 {
+		t.Fatalf("an unset StartedAt replayed %d event(s) of history", queued)
+	}
+}

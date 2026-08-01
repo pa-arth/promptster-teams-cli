@@ -97,12 +97,8 @@ func runCursorHookInner() {
 			res.Events, normalize.CursorSessionWorkdir(res.Workdir), root, host, tracked)
 	}
 
-	// Claim the session for the hook rail so the transcript watcher skips it.
-	// The payload names the exact transcript file, so this is an identity, not a
-	// heuristic. Recorded BEFORE emitting: if we crash between the two, the worst
-	// case is a session captured only by the watcher — thinner, never doubled.
-	// Drop a model we have already reported for this session BEFORE claiming, so
-	// the claim's model field still reflects what was actually queued.
+	// Drop a model we have already reported for this session, so the claim's
+	// model field ends up reflecting what was actually queued.
 	events := res.Events
 	if cursorHookModelAlreadyReported(res.TranscriptPath, res.SessionID, res.Model) {
 		kept := events[:0]
@@ -114,16 +110,33 @@ func runCursorHookInner() {
 		}
 		events = kept
 	}
-	if res.TranscriptPath != "" {
-		recordCursorHookClaim(res.TranscriptPath, res.SessionID, res.Model)
-	}
 
 	// captureProse=false unconditionally. The resolver does a network fetch, and
 	// invariant 2 forbids network I/O on this path; more to the point, this rail
 	// emits no assistant prose at all — the one prose field it carries is the
 	// engineer's own prompt, which is not gated by that policy.
+	queued := 0
 	for _, ev := range events {
-		emitCursorEvent(ev, session, false)
+		queued += emitCursorEvent(ev, session, false)
+	}
+
+	// CLAIM ONLY AFTER SOMETHING WAS DURABLY QUEUED, AND ONLY THEN.
+	//
+	// The claim tells the transcript watcher to stand down and advance that
+	// transcript to EOF. Claiming first — which this did originally, on the
+	// reasoning that a crash in between would leave the session "captured only by
+	// the watcher" — has it exactly backwards: the claim is what STOPS the
+	// watcher, so a claim followed by a failed enqueue means the session is
+	// captured by neither rail and the transcript is seeked past. A full outbox,
+	// a read-only state dir or a signing failure would silently erase the
+	// session, and those are ordinary conditions, not crashes.
+	//
+	// Ordering it this way inverts the residual risk into the survivable
+	// direction: a kill between the enqueue and the claim leaves the watcher
+	// covering records the hook already sent, which costs duplicates rather than
+	// data. Given the choice, duplicate beats gone.
+	if queued > 0 && res.TranscriptPath != "" {
+		recordCursorHookClaim(res.TranscriptPath, res.SessionID, res.Model)
 	}
 }
 

@@ -248,9 +248,11 @@ func RunCursorWatcher() error {
 	// device-wide queue, one drain. See outbox.StartDrain.
 	outbox.StartDrain(client, session.SessionToken)
 
-	// Org capture policy, fail-closed and refreshed off the hot path. Cursor
-	// emits no `ai_response`, so the prose gate cannot change what this watcher
-	// ships — it is threaded through anyway so every capture path reaches the
+	// Org capture policy, fail-closed and refreshed off the hot path. This
+	// watcher emits no assistant prose at all — a Cursor transcript carries no
+	// model and this rail mints no `ai_response` (the hook rail does, but it
+	// carries only a model name, never prose) — so the gate cannot change what
+	// ships here. It is threaded through anyway so every capture path reaches the
 	// buffer by the identical call, and a future kind cannot quietly bypass it.
 	policyResolver := policy.NewResolver(session.SessionToken)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
@@ -358,6 +360,31 @@ func pollCursorTranscripts(
 						delete(progress.Match, key)
 						delete(progress.Roots, key)
 						continue
+					}
+					// ONE EXCEPTION TO "PRESENT AT FIRST POLL = PRE-EXISTING":
+					// a transcript still being WRITTEN as the watcher comes up.
+					// Its mtime is after the watcher's own start, which is proof
+					// it is live rather than history — the one case where the
+					// absence of timestamps inside the file does not leave us
+					// guessing. Seeding it to EOF would seek past the opening
+					// prompt of a session happening right now, which is the
+					// single most valuable thing on this rail.
+					//
+					// The blast radius is bounded to that one live session: every
+					// older transcript still seeds, so the "first run re-uploads
+					// months of history" failure this split exists to prevent
+					// cannot come back through here.
+					//
+					// GUARDED ON A NON-ZERO StartedAt, and that guard is not
+					// defensive noise. A zero StartedAt makes EVERY mtime "after"
+					// it, so an unset field would flip this from "tail the one
+					// live session" to "tail every transcript on disk from byte
+					// 0" — precisely the months-of-history replay the split
+					// exists to prevent, reintroduced by a field nobody set. Fail
+					// to the seeding side.
+					if !session.StartedAt.IsZero() && info.ModTime().After(session.StartedAt) {
+						progress.Offsets[key] = 0
+						break
 					}
 					progress.Offsets[key] = info.Size()
 				}
@@ -519,10 +546,11 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
 	scanned := 0
+	sawOutsidePath := false
 	for scanner.Scan() {
 		scanned++
 		if scanned > cursorMaxClassifyLines {
-			return cursorMatchUndecided, ""
+			break
 		}
 		observed := normalize.CursorObservedPath(scanner.Bytes())
 		if observed == "" {
@@ -534,8 +562,32 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 				return cursorMatchYes, root
 			}
 		}
-		// A path OUTSIDE every root is a real mismatch: the agent is working in
-		// another workspace. This is the one branch that may cache a "no".
+		sawOutsidePath = true
+	}
+
+	// ONE OUTSIDE PATH IS NOT A MISMATCH, AND TREATING IT AS ONE DROPPED WHOLE
+	// SESSIONS.
+	//
+	// This used to return NO on the FIRST path that fell outside every root. But
+	// an agent working in the watched workspace routinely touches something
+	// outside it first — a global config, a doc under ~, a file in a sibling repo
+	// it was asked to compare against. That single record cached a permanent
+	// "no", and every prompt, edit and command the session went on to make inside
+	// the workspace was skipped in silence.
+	//
+	// So NO now means "every path this transcript has revealed so far is outside,
+	// across the whole scan window" — the whole file, not its first tool call.
+	// That is still cacheable: it is the honest reading of a transcript that has
+	// shown us nothing of ours.
+	//
+	// A file that revealed no path at all stays UNDECIDED, as before. Caching a
+	// "no" on a still-growing file is what once dropped whole Codex sessions.
+	//
+	// Hitting the line cap with only outside paths still caches NO. It has to:
+	// otherwise every long session belonging to another workspace would be
+	// re-scanned on every 3s poll forever, and an engineer with several repos
+	// open has plenty of those.
+	if sawOutsidePath {
 		return cursorMatchNo, ""
 	}
 	return cursorMatchUndecided, ""
