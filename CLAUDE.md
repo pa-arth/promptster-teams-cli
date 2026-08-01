@@ -226,6 +226,23 @@ the wrapped `statusLine`. `--purge` additionally deletes the state dir(s).
   command *inside the engineer's agent loop* on every prompt, edit and shell
   call. That degrades THEIR tool rather than our data. It is also the one piece
   nothing on our side can self-heal: if the binary is gone, none of our code runs.
+
+  `doctor` is therefore the ONLY place that state can ever be reported
+  (`CursorHooksDoctor`, `cursor_hooks_doctor.go`) — it needs a working binary to
+  say anything, and doctor is the command engineers run while something is
+  already wrong. It is strictly READ-ONLY: enrolling or repairing from a
+  diagnostic would write hooks.json on a machine whose owner only asked what was
+  broken, and a check that mutates what it measures cannot be trusted to describe
+  it (`TestCursorHooksDoctorWritesNothing`).
+
+  **The dangerous direction there is the FALSE ALARM, not the miss.**
+  `cursorHookCommand` renders the path with `%q`, so a Windows entry arrives
+  backslash-escaped; a naive scan to the next quote returns the path with every
+  separator doubled, `os.Stat` calls it missing, and every healthy Windows
+  machine prints the most alarming line doctor has. `cursorHookCommandBinary`
+  closes the quoted token with escape awareness and `strconv.Unquote`s it, and
+  the mutation to the naive scan is pinned by
+  `TestCursorHooksDoctorDoesNotFalseAlarmOnAnEscapedPath`.
 - **Every step runs even when an earlier one fails.** Short-circuiting on the
   first error is precisely how the hook entry survives a removal.
 - **Liveness is read BEFORE and AFTER the stop** (`capture.CaptureRunning`, the

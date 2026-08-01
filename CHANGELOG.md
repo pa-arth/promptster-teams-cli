@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`doctor` now reports the Cursor hook rail.** The state worth catching is an
+  enrolled entry naming a binary that no longer exists — created by deleting the
+  binary *without* running `uninstall` (an `rm -rf ~/.promptster-teams`, an image
+  rebuild, a restored home directory). Cursor then execs a missing command inside
+  the engineer's agent loop on every prompt, edit and shell call, and nothing on
+  our side can detect or repair it from the inside, because once the binary is
+  gone none of our code runs. `doctor` — which needs a working binary and is the
+  command engineers run while something is already wrong — is the only place the
+  message can land, and it names `uninstall` as the fix.
+
+  It also distinguishes not-enrolled (a missing signal, warning), a partial
+  enrollment that a capture restart will repair, a `hooks.json` that does not
+  parse (enrollment refuses to touch it, so it stays off until a human fixes it),
+  an entry pointed somewhere other than the managed path, and no Cursor installed
+  at all. The check is strictly read-only — it never enrolls, repairs, or writes
+  `hooks.json`.
+
 ## [0.12.1] — 2026-07-31
 
 ### Added
