@@ -84,6 +84,19 @@ func runCursorHookInner() {
 		return
 	}
 
+	// Stamp the repo identity, exactly as the transcript rail does. This rail
+	// CLAIMS the session away from the watcher, so skipping it would silently
+	// lose repo attribution for every Cursor session on an enrolled machine.
+	//
+	// The git resolution is the only disk work on this path beyond the ledger,
+	// and it happens on `beforeSubmitPrompt` alone — once per turn, not per tool
+	// call — which is why it fits inside cursorHookBudget.
+	if res.Workdir != "" {
+		root, host, tracked := sessionRepoIdentity(res.Workdir)
+		normalize.StampCursorHookRepoIdentity(
+			res.Events, normalize.CursorSessionWorkdir(res.Workdir), root, host, tracked)
+	}
+
 	// Claim the session for the hook rail so the transcript watcher skips it.
 	// The payload names the exact transcript file, so this is an identity, not a
 	// heuristic. Recorded BEFORE emitting: if we crash between the two, the worst

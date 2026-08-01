@@ -268,3 +268,77 @@ func TestCursorHookRejectsUnusablePayloads(t *testing.T) {
 		}
 	}
 }
+
+// The hook rail CLAIMS a session away from the transcript watcher. If it emitted
+// a prompt without the repo identity the watcher supplies, a machine with hooks
+// enrolled would silently lose repo attribution for every Cursor session — the
+// events still arrive, so nothing looks broken.
+func TestCursorHookPromptCarriesRepoIdentityLikeTheTranscriptRail(t *testing.T) {
+	raw := hookPayload("beforeSubmitPrompt", map[string]interface{}{
+		"prompt": "rename the handler",
+		"cwd":    "/Users/e/repos/thing",
+	})
+	res, ok := NormalizeCursorHook(raw)
+	if !ok {
+		t.Fatal("beforeSubmitPrompt produced no events")
+	}
+	if res.Workdir != "/Users/e/repos/thing" {
+		t.Fatalf("Workdir = %q, want the payload's cwd", res.Workdir)
+	}
+
+	StampCursorHookRepoIdentity(res.Events, "~/repos/thing", "deadbeef", "github.com", true)
+	e, _ := firstOfKind(res.Events, "prompt")
+	d := dataOf(t, e)
+	for k, want := range map[string]interface{}{
+		"workdir":  "~/repos/thing",
+		"repoRoot": "deadbeef",
+		"repoHost": "github.com",
+	} {
+		if d[k] != want {
+			t.Fatalf("%s = %v, want %v", k, d[k], want)
+		}
+	}
+	// Stamped explicitly, never omitempty: "not a repo" must stay
+	// distinguishable from "a CLI too old to have looked".
+	if d["repoTracked"] != true {
+		t.Fatalf("repoTracked = %v, want true", d["repoTracked"])
+	}
+	StampCursorHookRepoIdentity(res.Events, "~/x", "cafe", "", false)
+	if dataOf(t, e)["repoTracked"] != false {
+		t.Fatal("repoTracked was not stamped false for an untracked dir")
+	}
+}
+
+// workspace_roots is the fallback when a step reports no cwd of its own.
+func TestCursorHookWorkdirFallsBackToWorkspaceRoots(t *testing.T) {
+	res, ok := NormalizeCursorHook(hookPayload("beforeSubmitPrompt", map[string]interface{}{
+		"prompt":          "hi",
+		"workspace_roots": []string{"/repo/a", "/repo/b"},
+	}))
+	if !ok {
+		t.Fatal("no events")
+	}
+	if res.Workdir != "/repo/a" {
+		t.Fatalf("Workdir = %q, want /repo/a", res.Workdir)
+	}
+}
+
+// model_params carries a reasoning-effort token. It is NOT allowlisted on either
+// side, so emitting it would be stripped silently and read as "an older CLI".
+func TestCursorHookDoesNotEmitReasoningEffort(t *testing.T) {
+	res, _ := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{
+		"model_id":     "grok-4.5",
+		"model_params": []map[string]string{{"id": "effort", "value": "high"}},
+	}))
+	e, found := firstOfKind(res.Events, "ai_response")
+	if !found {
+		t.Fatal("no ai_response")
+	}
+	// Exactly one key: the model. Asserting on the whole serialized event would
+	// be a false negative waiting to happen — "high" is also the value of
+	// provenance.observability.
+	d := dataOf(t, e)
+	if len(d) != 1 || d["model"] != "grok-4.5" {
+		t.Fatalf("ai_response data = %v, want exactly {model}", d)
+	}
+}

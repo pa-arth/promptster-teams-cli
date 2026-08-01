@@ -2,7 +2,6 @@ package normalize
 
 import (
 	"encoding/json"
-	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,15 +13,22 @@ import (
 
 // Cursor transcript normalization.
 //
-// WHY A TRANSCRIPT AND NOT HOOKS. Cursor's documented capture surface is
-// `<workspace>/.cursor/hooks.json`, and the sibling hiring CLI uses it. Teams
-// does not, for two reasons that outrank everything hooks offer: hooks.json is
-// PROJECT-LOCAL, so enrollment is per-workspace and every repo an engineer
-// forgets reads as "captured nothing" — the exact failure this capture exists
-// to remove; and it is a tracked file inside the customer's repository, which
-// this CLI's whole design refuses to write (see CLAUDE.md, "Capture surfaces").
-// Cursor also writes a transcript, verified on disk, so the zero-enrollment
-// read-only rail exists and is strictly better for a fleet.
+// THIS IS ONE OF TWO CURSOR RAILS. The other is the hook rail
+// (normalize_cursor_hook.go), which is primary because its payload carries a
+// real model, exact timestamps and exact cwd — none of which exist below.
+//
+// This rail is the fallback, and it is not redundant: it needs no enrollment, so
+// it covers sessions that predate install and machines where hook enrollment
+// failed or was refused. The hook rail claims a session by transcript path and
+// this rail then skips it, so one session is never captured twice.
+//
+// The hook config we write is the USER scope, `~/.cursor/hooks.json` — a single
+// global file outside every repository. We never write Cursor's PROJECT scope,
+// `<workspace>/.cursor/hooks.json`: that one is a tracked file inside the
+// customer's repo and enrolls per-workspace, so every repo an engineer forgets
+// would read as "captured nothing". An earlier revision of this comment cited
+// those two objections as grounds for rejecting hooks ENTIRELY; they are
+// grounds for rejecting one scope. See CLAUDE.md, "Capture surfaces".
 //
 // THE FORMAT, verified against 61 real transcripts (2026-02 → 2026-07) and one
 // live `cursor-agent` run. Every record, in every file, is exactly:
@@ -442,9 +448,8 @@ func cursorHasWindowsDrive(p string) bool {
 	return p[1] == ':' && (p[2] == '\\' || p[2] == '/')
 }
 
-// cursorDescribeSkip is used only in debug logging. It exists to make the "we
-// saw a tool we do not map" case discoverable without ever formatting a tool's
-// INPUT into a string — a log line is an egress path like any other.
-func cursorDescribeSkip(name string) string {
-	return fmt.Sprintf("cursor: unmapped tool %q (name only; input never logged)", name)
-}
+// NOTE FOR ANYONE ADDING DEBUG LOGGING HERE: log the tool NAME only, never its
+// input. A log line is an egress path like any other, and a Cursor tool input is
+// where old_string/new_string/contents live. A helper that formatted exactly
+// that used to sit here unused; it was removed rather than left as a loaded
+// convenience.

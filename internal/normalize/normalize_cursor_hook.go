@@ -103,6 +103,12 @@ type CursorHookResult struct {
 	// Model is the model this payload resolved, if any. Surfaced so the capture
 	// layer can suppress a repeat without re-parsing the events.
 	Model string
+	// Workdir is the RAW absolute cwd this payload observed, before any
+	// home-collapsing. Surfaced rather than resolved here because turning a cwd
+	// into repoRoot/repoHost/repoTracked means running git, and this package
+	// does no I/O. The capture layer resolves it exactly the way the transcript
+	// rail does, so both rails stamp the identical fields.
+	Workdir string
 }
 
 // NormalizeCursorHook turns one hook payload into events.
@@ -118,7 +124,12 @@ func NormalizeCursorHook(line []byte) (CursorHookResult, bool) {
 	if sess == "" || p.HookEventName == "" {
 		return CursorHookResult{}, false
 	}
-	res := CursorHookResult{SessionID: sess, TranscriptPath: p.TranscriptPath, Model: p.modelLabel()}
+	res := CursorHookResult{
+		SessionID:      sess,
+		TranscriptPath: p.TranscriptPath,
+		Model:          p.modelLabel(),
+		Workdir:        p.workdirSource(),
+	}
 
 	switch p.HookEventName {
 	case "sessionStart":
@@ -230,17 +241,12 @@ func (p cursorHookPayload) modelLabel() string {
 	return ""
 }
 
-// effortLabel extracts the reasoning-effort parameter, the one model_params
-// entry with downstream meaning. Values are short enum-like tokens from Cursor's
-// own vocabulary (high/medium/low), never free text.
-func (p cursorHookPayload) effortLabel() string {
-	for _, mp := range p.ModelParams {
-		if mp.ID == "effort" {
-			return mp.Value
-		}
-	}
-	return ""
-}
+// NOTE ON model_params: afterAgentThought also carries a reasoning-effort
+// parameter (high/medium/low). It is deliberately NOT emitted. `effort` is not
+// allowlisted in internal/redact/project.go or the backend's
+// eventFieldProjection.ts, so emitting it would be stripped SILENTLY on one side
+// or the other and read as "an older CLI" — MUST-DO #2's exact trap. If it is
+// ever wanted, both allowlists learn it in the same change or not at all.
 
 func (p cursorHookPayload) lifecycleEvent(kind string) event.Event {
 	e := p.newEvent(kind, p.Reason+"\x1f"+p.FinalStatus)
@@ -255,6 +261,39 @@ func (p cursorHookPayload) lifecycleEvent(kind string) event.Event {
 	}
 	e.Data = data
 	return e
+}
+
+// StampCursorHookRepoIdentity writes the session's repo identity onto the events
+// that carry it, matching the transcript rail's contract field for field.
+//
+// It exists because the hook rail CLAIMS a session away from the watcher. If the
+// hook rail emitted a prompt without these, a machine with hooks enrolled would
+// silently lose repo attribution for every Cursor session — a regression against
+// the rail it replaced, and invisible, because the events still arrive.
+//
+// `repoTracked` is stamped explicitly true OR false whenever repoRoot is, so
+// "not a repo" stays distinguishable from "a CLI too old to have looked". Same
+// rule as the Claude and Codex processors; do not make it omitempty.
+func StampCursorHookRepoIdentity(evs []event.Event, workdir, repoRoot, repoHost string, repoTracked bool) {
+	for i := range evs {
+		if evs[i].Kind != "prompt" {
+			continue
+		}
+		data, ok := evs[i].Data.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if workdir != "" {
+			data["workdir"] = workdir
+		}
+		if repoRoot != "" {
+			data["repoRoot"] = repoRoot
+			data["repoTracked"] = repoTracked
+		}
+		if repoHost != "" {
+			data["repoHost"] = repoHost
+		}
+	}
 }
 
 func (p cursorHookPayload) promptEvent() (event.Event, bool) {

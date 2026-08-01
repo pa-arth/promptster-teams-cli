@@ -69,7 +69,6 @@ func cursorUserHooksPath() string {
 //   - preToolUse — it gates the tool call: a slow or wedged hook there stalls the
 //     engineer's agent before any work happens. postToolUse carries the same
 //     identity fields plus the outcome, so the blocking one buys nothing.
-//   - preToolUse — see above; postToolUse carries the same identity plus outcome.
 //   - preCompact / subagentStart / subagentStop — real signals, but out of scope
 //     for the first slice. preCompact in particular carries
 //     context_usage_percent / context_tokens / context_window_size, which is the
@@ -361,10 +360,19 @@ type cursorHookClaim struct {
 
 const (
 	cursorHookClaimsVersion = 1
-	// cursorHookClaimTTL evicts claims for sessions that are long over. It must
-	// outlive a working session by a lot: a claim that expires while the session
-	// is still running hands the transcript back to the watcher mid-flight and
-	// the tail resumes from 0, re-emitting everything the hook already sent.
+	// cursorHookClaimTTL evicts claims for sessions that are long over.
+	//
+	// It is deliberately generous, and the asymmetry is the reason. A claim only
+	// refreshes while hooks are actually firing, and an engineer can idle for
+	// hours mid-session. If the TTL expires under a session whose hooks still
+	// work, the watcher resumes and BOTH rails emit the rest of it — the exact
+	// double-capture the ledger exists to prevent. If it is too long, the only
+	// cost is that a dead session's transcript tail goes unread for a week, and
+	// the hook rail already captured that session richer. Err long.
+	//
+	// The other half of that safety is in the watcher: it advances a skipped
+	// transcript's offset to EOF, so an expiry resumes from there rather than
+	// replaying the file from byte 0.
 	cursorHookClaimTTL = 7 * 24 * time.Hour
 )
 
@@ -423,9 +431,21 @@ func recordCursorHookClaim(transcriptPath, sessionID, model string) {
 }
 
 // isCursorHookClaimed reports whether the hook rail already covers a transcript.
+//
+// IT MUST APPLY THE TTL ITSELF rather than trusting the ledger to have been
+// pruned. Eviction happens on WRITE, and only the hook process writes — so the
+// one scenario where a stale claim actually matters is precisely the scenario
+// where no write will ever come again: hooks uninstalled, the binary moved out
+// from under the registered command, Cursor updated and dropped its config.
+// Without this check those transcripts would be skipped by the watcher forever
+// and the session would be captured by neither rail, which is worse than the
+// double-capture the ledger exists to prevent.
 func isCursorHookClaimed(claims cursorHookClaims, key string) bool {
-	_, ok := claims.Claims[key]
-	return ok
+	c, ok := claims.Claims[key]
+	if !ok {
+		return false
+	}
+	return time.Since(time.UnixMilli(c.TsMs)) <= cursorHookClaimTTL
 }
 
 // cursorHookModelAlreadyReported reports whether this session has already queued
