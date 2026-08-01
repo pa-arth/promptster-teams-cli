@@ -6,6 +6,46 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-07-31
+
+### Added
+
+- **`promptster-teams uninstall` — there was no way to undo an install.** As of
+  0.12.0 installing enrolls the machine in three places nothing removed: a hook
+  entry in `~/.cursor/hooks.json`, a login service (launchd / `systemd --user` /
+  Task Scheduler), and — if `statusline enable` was run — a wrapped `statusLine`
+  in `~/.claude/settings.json`.
+
+  The package manager cannot do this, which is measured rather than assumed
+  (npm 11.5.2, sandboxed global prefix): **`npm rm -g` runs no uninstall
+  lifecycle script** — `preuninstall`/`postuninstall` fired zero times on
+  removal — **and it does not delete the managed binary**, because that binary
+  lives outside `node_modules` by design. So removing the package reported
+  success while capture kept running, kept self-updating from GitHub Releases,
+  and came back at the next login, from a binary the engineer believed they had
+  deleted.
+
+  The sharper failure is the Cursor hook. Delete the binary by hand — the obvious
+  move for a curl install — and the hooks.json entry survives pointing at a path
+  that no longer exists, so Cursor execs a missing command *inside the engineer's
+  agent loop* on every prompt, edit and shell call. That degrades their tool
+  rather than our data, and nothing on our side can self-heal it: once the binary
+  is gone, none of our code runs.
+
+  `uninstall` reverses all of it — autostart deregistered, capture stopped, the
+  Cursor hook unenrolled, the statusline restored verbatim — and touches no
+  config it did not write. Every step runs even if an earlier one fails, since
+  short-circuiting is exactly how the hook entry would survive a removal. It
+  reports what it observed rather than what it attempted, and capture that is
+  still alive after the stop is a failure with a non-zero exit, not a success
+  line. Without `--purge` it deletes no data; `--purge` also removes
+  `~/.promptster-teams` (key, unsent event queue, and the managed binary).
+
+### Changed
+
+- `install.sh` and `help` now name `uninstall`, and `help` no longer advertises
+  the old 24h self-update cadence (it has been 30m since 0.7.0).
+
 ## [0.12.0] — 2026-07-31
 
 ### Added
