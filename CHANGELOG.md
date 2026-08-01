@@ -6,6 +6,56 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-07-31
+
+### Added
+
+- **Cursor sessions are captured, on two rails.** An engineer working entirely in
+  Cursor produced a session row with no `cursor` in `source_service`, which the
+  dashboard rendered identically to an engineer who installed the CLI and never
+  used AI — two very different facts, one indistinguishable number.
+
+  The primary rail is a **user-scope** hook config, `~/.cursor/hooks.json`: one
+  global file outside every repository, enrolled automatically at watch startup.
+  Cursor's *project*-scope `<workspace>/.cursor/hooks.json` is never written — it
+  is a tracked file inside a customer repo and it enrolls per-repo, so a repo an
+  engineer forgets would read as "captured nothing".
+
+  The fallback rail tails `~/.cursor/projects/…/agent-transcripts`, needs no
+  enrollment, and therefore covers sessions that predate install and machines
+  where hook enrollment failed. A session is captured by exactly one of the two:
+  the hook payload names the exact `transcript_path`, so the handoff is an
+  identity rather than a guess, and the watcher stands down for a claimed
+  transcript while advancing its offset so an expired claim resumes instead of
+  replaying.
+
+  Events carry `source: cursor`: `prompt` (human), `file_diff` / `file_create` /
+  `file_delete` and `command` (AI), plus `session_start` / `session_end`,
+  `tool_result`, and an `ai_response` carrying the model name and nothing else.
+
+  **Counts, never code.** Cursor's hook payload hands over every edit's
+  `old_string` and `new_string`, raw command output, and the engineer's email
+  address on every single event. Exactly two functions read the edit bodies, one
+  per rail, and both return only integers; `RawPayload` is never populated on
+  either rail. Four tests pin this and all four were mutation-tested.
+
+  **No token counts are reported, and that is not an omission.** Cursor exposes
+  none — not in transcripts, `state.vscdb`, `conversation-search.db`,
+  `ai-tracking`, the per-session `store.db`, or any hook payload. The fields are
+  absent rather than zero, because a zero would read as "this turn cost nothing"
+  rather than "unknown". (#122)
+
+### Upgrading
+
+Nothing to do. An installed daemon self-updates within ~30 minutes, re-execs, and
+enrolls the Cursor hooks itself. An existing `~/.cursor/hooks.json` keeps every
+entry and top-level key it already had, and one that does not parse is left alone
+— capture falls back to the transcript rail rather than overwriting it.
+
+Cursor rows in the dashboard also require the server-side roster flip
+(promptster-backend #594); until that deploys, Cursor events are ingested but not
+displayed.
+
 ## [0.11.4] — 2026-07-31
 
 ### Fixed
