@@ -100,6 +100,9 @@ type CursorHookResult struct {
 	Events         []event.Event
 	SessionID      string
 	TranscriptPath string
+	// Model is the model this payload resolved, if any. Surfaced so the capture
+	// layer can suppress a repeat without re-parsing the events.
+	Model string
 }
 
 // NormalizeCursorHook turns one hook payload into events.
@@ -115,7 +118,7 @@ func NormalizeCursorHook(line []byte) (CursorHookResult, bool) {
 	if sess == "" || p.HookEventName == "" {
 		return CursorHookResult{}, false
 	}
-	res := CursorHookResult{SessionID: sess, TranscriptPath: p.TranscriptPath}
+	res := CursorHookResult{SessionID: sess, TranscriptPath: p.TranscriptPath, Model: p.modelLabel()}
 
 	switch p.HookEventName {
 	case "sessionStart":

@@ -350,6 +350,13 @@ type cursorHookClaims struct {
 type cursorHookClaim struct {
 	SessionID string `json:"sessionId"`
 	TsMs      int64  `json:"tsMs"`
+	// Model is the last model reported for this session. It exists to suppress
+	// repeat ai_response events: afterAgentThought fires many times per turn and
+	// every one resolves the same model, so without this a five-thought turn
+	// queues five copies. They all carry the SAME deterministic id, so the
+	// backend would collapse them anyway — this just stops us paying to ship
+	// four redundant events per turn.
+	Model string `json:"model,omitempty"`
 }
 
 const (
@@ -380,7 +387,7 @@ func loadCursorHookClaims() cursorHookClaims {
 // invocations — Cursor fires several steps per turn and does not serialise them.
 // The write goes through the shared buffer lock for the same reason the ai-paths
 // ledger does: two hooks landing at once must not truncate each other's file.
-func recordCursorHookClaim(transcriptPath, sessionID string) {
+func recordCursorHookClaim(transcriptPath, sessionID, model string) {
 	if transcriptPath == "" {
 		return
 	}
@@ -389,10 +396,10 @@ func recordCursorHookClaim(transcriptPath, sessionID string) {
 		c := loadCursorHookClaims()
 		now := time.Now()
 		if prev, ok := c.Claims[key]; ok && prev.SessionID == sessionID &&
-			now.Sub(time.UnixMilli(prev.TsMs)) < time.Minute {
-			// Refreshed within the last minute by another step of the same turn.
-			// Skip the write: Cursor fires several hooks per turn and rewriting
-			// this file on each one is pure churn.
+			prev.Model == model && now.Sub(time.UnixMilli(prev.TsMs)) < time.Minute {
+			// Refreshed within the last minute by another step of the same turn,
+			// with nothing new to record. Skip the write: Cursor fires several
+			// hooks per turn and rewriting this file on each one is pure churn.
 			return nil
 		}
 		for k, v := range c.Claims {
@@ -400,7 +407,7 @@ func recordCursorHookClaim(transcriptPath, sessionID string) {
 				delete(c.Claims, k)
 			}
 		}
-		c.Claims[key] = cursorHookClaim{SessionID: sessionID, TsMs: now.UnixMilli()}
+		c.Claims[key] = cursorHookClaim{SessionID: sessionID, TsMs: now.UnixMilli(), Model: model}
 		c.V = cursorHookClaimsVersion
 		data, err := json.Marshal(c)
 		if err != nil {
@@ -419,4 +426,15 @@ func recordCursorHookClaim(transcriptPath, sessionID string) {
 func isCursorHookClaimed(claims cursorHookClaims, key string) bool {
 	_, ok := claims.Claims[key]
 	return ok
+}
+
+// cursorHookModelAlreadyReported reports whether this session has already queued
+// an ai_response for this model, so the repeat can be dropped before it is
+// signed and queued rather than deduped downstream.
+func cursorHookModelAlreadyReported(transcriptPath, sessionID, model string) bool {
+	if transcriptPath == "" || model == "" {
+		return false
+	}
+	prev, ok := loadCursorHookClaims().Claims[cursorProgressKey(transcriptPath)]
+	return ok && prev.SessionID == sessionID && prev.Model == model
 }

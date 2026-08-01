@@ -88,15 +88,28 @@ func runCursorHookInner() {
 	// The payload names the exact transcript file, so this is an identity, not a
 	// heuristic. Recorded BEFORE emitting: if we crash between the two, the worst
 	// case is a session captured only by the watcher — thinner, never doubled.
+	// Drop a model we have already reported for this session BEFORE claiming, so
+	// the claim's model field still reflects what was actually queued.
+	events := res.Events
+	if cursorHookModelAlreadyReported(res.TranscriptPath, res.SessionID, res.Model) {
+		kept := events[:0]
+		for _, ev := range events {
+			if ev.Kind == "ai_response" {
+				continue
+			}
+			kept = append(kept, ev)
+		}
+		events = kept
+	}
 	if res.TranscriptPath != "" {
-		recordCursorHookClaim(res.TranscriptPath, res.SessionID)
+		recordCursorHookClaim(res.TranscriptPath, res.SessionID, res.Model)
 	}
 
 	// captureProse=false unconditionally. The resolver does a network fetch, and
 	// invariant 2 forbids network I/O on this path; more to the point, this rail
 	// emits no assistant prose at all — the one prose field it carries is the
 	// engineer's own prompt, which is not gated by that policy.
-	for _, ev := range res.Events {
+	for _, ev := range events {
 		emitCursorEvent(ev, session, false)
 	}
 }

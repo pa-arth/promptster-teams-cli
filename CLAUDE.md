@@ -2,9 +2,10 @@
 
 ## Capture surfaces
 
-Capture is **transcript tailing only**. It installs no hooks, writes no
-`settings.json`, and injects nothing into any editor. Three watchers poll the
-filesystem every 3s:
+Capture is **transcript tailing** for all three tools, plus **one hook rail for
+Cursor alone** (see below — Cursor's transcript is the only one thin enough to
+need it). It writes no `settings.json` and injects nothing into any editor.
+Three watchers poll the filesystem every 3s:
 
 - **Claude Code** — `internal/capture/cmd_claude_watch.go`. Tails
   `$CLAUDE_CONFIG_DIR/projects/<munged-cwd>/<session-uuid>.jsonl`
@@ -17,23 +18,85 @@ filesystem every 3s:
   `PROMPTSTER_CURSOR_HOME` is a **test-only** override — it is ours, not a
   documented Cursor variable, unlike `CODEX_HOME`/`CLAUDE_CONFIG_DIR`.
 
-### Cursor tails a transcript; it deliberately does NOT use `.cursor/hooks.json`
+### Cursor runs TWO rails: a hook (primary) and the transcript (fallback)
 
-Cursor's documented capture surface is a project-local
-`<workspace>/.cursor/hooks.json`. That was the original plan for this work and it
-was rejected on two grounds, both of which outrank the fact that the hook payload
-is richer:
+Cursor is the only tool with two rails, because its transcript is the only one
+that is genuinely too thin: it carries `role` + `message.content[]` and nothing
+else — **no model, no cwd, no timestamp, no tool result, no tokens** (verified
+exhaustively across 64 files / 1504 lines). Both other tools' transcripts carry
+all of that.
 
-- **It is a tracked file inside the customer's repository.** Writing into a
-  customer repo is a line this CLI does not cross, and a hooks.json committed by
-  one engineer silently enrolls every teammate who pulls it.
-- **It is per-workspace, so enrollment is per-repo.** Claude Code and Codex are
-  one-and-done; a hooks rail would mean every repo an engineer forgets reads as
-  "captured nothing" — the exact failure this work exists to fix.
+**The hook config is USER-SCOPE, and that is the whole reason this rail exists.**
+Cursor reads hooks from four scopes; the one we write is
+**`~/.cursor/hooks.json`** — a single global file, one-and-done, exactly like
+Claude Code and Codex enrollment. It is **not** the project-local
+`<workspace>/.cursor/hooks.json`, which is the scope Cursor's docs lead with and
+the one this CLI must never write:
 
-The transcript rail needs neither: zero enrollment, no repo mutation, and it
-covers workspaces opened before the CLI was installed. The cost is that a Cursor
-transcript is thinner than a hook payload — see the next two headings.
+- **A project-local hooks.json is a tracked file inside the customer's repo.**
+  Writing into a customer repo is a line this CLI does not cross, and one
+  committed by an engineer silently enrolls every teammate who pulls it.
+- **It is per-workspace, so enrollment is per-repo** — every repo an engineer
+  forgets reads as "captured nothing", the exact failure this work exists to fix.
+
+(An earlier revision of this file claimed hooks had been *rejected outright* on
+those two grounds. That was wrong: it read the docs' project scope as the only
+scope. The user-level file has neither problem, and the mistake cost real time —
+so state the scope, not just "hooks".)
+
+`internal/capture/cursor_hooks.go` writes it, and enrollment happens
+automatically at `watch` startup via `EnsureCursorHooksBestEffort()` — so an
+already-installed fleet gets the hook rail purely by self-updating (~30m) and
+re-execing. Nobody reinstalls anything. `loadCursorHookConfig` preserves
+top-level keys it does not model and **refuses to overwrite a hooks.json that
+does not parse** — an engineer's own config is never clobbered.
+
+**Registered steps** (`cursorHookSteps`): `sessionStart`, `sessionEnd`,
+`beforeSubmitPrompt`, `afterFileEdit`, `afterShellExecution`,
+`postToolUseFailure`, and `afterAgentThought`. An unregistered step emits
+nothing — its payload has not been audited for source content, so silence is the
+safe answer, and `TestCursorHookUnregisteredStepsEmitNothing` pins that.
+
+**`afterAgentThought` is registered for `model_id` ALONE.** It is the *only* step
+that carries a real model — every other step reports `model: "default"`, which
+describes routing, not a model. So it emits one `ai_response` carrying `{model}`
+and nothing else; its reasoning text is the agent's own prose and never leaves
+the machine. `model` was already allowlisted on `ai_response` on **both** sides
+(`projectUsageFields` / `eventFieldProjection.ts`), so this rail needed **zero
+allowlist change** — which is why MUST-DO #2 is not in play here.
+
+**Rail handoff is an identity, not a heuristic.** The hook payload names the
+exact `transcript_path`, and `conversation_id == session_id ==` the transcript
+uuid. `cursor_hooks.go` keeps a claims ledger (7-day TTL, `sign.WithBufferLock`)
+and the watcher **skips a hook-claimed transcript while advancing its offset to
+EOF without emitting** — so if the hook rail ever stops covering a session
+(uninstall, TTL expiry) the watcher resumes from there instead of replaying the
+whole file. Same session, one rail, never both.
+
+**The hook runs synchronously inside the engineer's agent loop.** That is the one
+way this rail can hurt someone the watcher never could, so `cmd_cursor_hook.go`
+holds three invariants, in descending order of regret: (1) it always exits 0 and
+never blocks past `cursorHookBudget` (2s, enforced with a goroutine + `select`,
+not assumed); (2) it does **no network I/O** — events go to the durable outbox
+and the daemon ships them, so ingest latency and ingest outages stay out of the
+agent loop; (3) it **redacts before it parses**, matching the raw-JSON ordering
+the other rails use, because the payload holds file bodies, command output and
+the engineer's email.
+
+**Two facts that cost real time, both settled empirically — do not re-derive
+them from documentation:**
+
+- **`duration` is fractional MILLISECONDS.** Read as seconds, a 2-second
+  `go build ./...` (`duration: 2021.129`) reported as **33 minutes**. Nothing
+  downstream can tell that a duration is implausible.
+  `TestCursorHookCommandDurationIsMilliseconds` pins it.
+- **Cursor exposes NO token counts anywhere.** Not in transcripts, not in
+  `state.vscdb`, not in `conversation-search.db`, not in the per-session
+  `chats/*/store.db`, and not in any hook payload. `stop` / `afterAgentResponse`
+  *construct* token fields in Cursor's shipped bundle but **never fire on the
+  headless `cursor-agent -p` path** — verified on a turn ending
+  `final_status: "completed"`. So token fields are **ABSENT, never zero**: a zero
+  reads downstream as "this turn cost nothing" rather than "unknown".
 
 **Cursor transcripts carry no cwd and no timestamp.** Both gaps are worked around
 in ways that are easy to "simplify" back into bugs:
@@ -62,17 +125,37 @@ tail everything from 0 and the first daemon run re-uploads months of history.
 
 ### Cursor egresses counts, never code
 
-`normalize_cursor.go` is the only place that reads `old_string`/`new_string`, and
-the only function that touches them is `cursorLineCount`, which returns an `int`.
-No patch, no file body, no diff, ever — including in `RawPayload` and in every
-error and log path. `outcome_events` has a DB CHECK that rejects patches and file
-bodies, so this is enforced downstream too, but the CLI must not rely on that.
+**This is the constraint the whole Cursor port exists under, and the hook rail
+makes it sharper, not looser** — a hook payload hands us *more* code than a
+transcript does, not less. The hiring CLI's `buildDiffFromCursorEdits()`
+synthesizes a unified diff from `old_string`/`new_string`; that is correct there
+and forbidden here.
 
-Two tests pin it and both were mutation-tested (deliberately broken, confirmed
-failing, reverted): `TestCursorPrompt_DropsAttachedFileContents` and
-`TestCursorFileDiff_CountsOnlyNeverCode`. Prompt extraction is a **whitelist** —
-only the `<user_query>` span survives — so Cursor's attached-file context and
-rules blocks fail closed.
+Exactly two functions in the repo read `old_string`/`new_string`, one per rail,
+and **both return only integers**:
+
+- transcript — `cursorLineCount` in `normalize_cursor.go`
+- hook — `cursorHookEditLineCounts` in `normalize_cursor_hook.go`
+
+No patch, no file body, no diff, ever — including in `RawPayload` (never
+populated on either rail) and in every error and log path. The hook rail
+additionally drops `user_email` (present on **every** hook payload), `tool_output`
+and `error_message`, all of which carry code or PII. `outcome_events` has a DB
+CHECK that rejects patches and file bodies, so this is enforced downstream too,
+but the CLI must not rely on that.
+
+Four tests pin it and all four were mutation-tested (deliberately broken,
+confirmed failing, reverted): `TestCursorPrompt_DropsAttachedFileContents`,
+`TestCursorFileDiff_CountsOnlyNeverCode`,
+`TestCursorHookFileEdit_CountsOnlyNeverCode` and
+`TestCursorHookDropsUserEmailAndOtherUnallowlistedFields`. Prompt extraction on
+the transcript rail is a **whitelist** — only the `<user_query>` span survives —
+so Cursor's attached-file context and rules blocks fail closed.
+
+**Do NOT read `~/.cursor/chats/<hash>/<uuid>/store.db`.** It sits next to a
+`meta.json` that would cheaply solve the transcript rail's cwd and timestamp
+gaps, and it holds full unified diffs, file contents and raw stdout. The
+neighbouring `meta.json` is safe; the sibling is a loaded gun.
 
 ### What this means per surface
 
