@@ -373,8 +373,11 @@ func (p *CursorTranscriptProcessor) eventTs() string {
 // string is 0 (a pure insertion has no lines on the old side), and a single
 // trailing newline is not a line of its own — "foo\n" is one line, not two.
 //
-// This function is the ONLY thing that ever touches old_string/new_string, and
-// it returns an integer. That is the containment boundary.
+// EVERY read of old_string/new_string on EITHER Cursor rail terminates here, and
+// this returns an integer. That is the containment boundary. The hook rail's
+// cursorHookEditLineCounts routes through this same function rather than
+// counting for itself, so the boundary stays one function wide as rails are
+// added — keep it that way.
 func cursorLineCount(s string) int {
 	if s == "" {
 		return 0
