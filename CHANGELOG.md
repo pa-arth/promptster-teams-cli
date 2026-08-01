@@ -41,6 +41,23 @@ follows [Semantic Versioning](https://semver.org/).
   line. Without `--purge` it deletes no data; `--purge` also removes
   `~/.promptster-teams` (key, unsent event queue, and the managed binary).
 
+### Fixed
+
+- **`statusline disable` no longer resurrects a statusLine you deleted.** If you
+  had let us wrap an existing `statusLine` and later deleted the key outright,
+  disable wrote your old command back — recreating configuration you had
+  deliberately removed. Deleting the key removes our shim as surely as replacing
+  it does, so the slot is now left alone (and the stored prior dropped) whenever
+  no statusLine is present. Latent since the statusline shim shipped; it matters
+  now because `uninstall` runs this on every invocation rather than only when
+  someone deliberately manages their statusline.
+
+- **`uninstall` deregisters autostart even when it cannot read the unit's
+  status.** `Disable` is idempotent on every platform, so attempting it blind
+  costs nothing, while skipping it on a failed status probe left the one residue
+  that undoes an uninstall by itself: a registered unit that brings capture back
+  at the next login.
+
 ### Changed
 
 - `install.sh` and `help` now name `uninstall`, and `help` no longer advertises

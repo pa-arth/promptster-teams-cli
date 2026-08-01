@@ -155,14 +155,28 @@ func runUninstall(out io.Writer, d uninstallDeps, purge bool) int {
 	// so the supervisor cannot bring capture back at the next login. Doing it
 	// before the kill also means the process we signal below is not one launchd
 	// will read as a crash and respawn.
-	if installed, _, err := d.autostartStatus(); err != nil {
-		bad("could not read autostart status: %v", err)
-	} else if !installed {
+	//
+	// A FAILED STATUS PROBE STILL ATTEMPTS THE REMOVAL. Disable is idempotent on
+	// every platform (launchctl bootout's error is ignored, os.Remove tolerates
+	// IsNotExist), so calling it blind costs nothing — while skipping it because
+	// we could not read the status leaves the single worst residue an uninstall
+	// can leave: a registered unit that brings capture back at the next login.
+	// "I don't know whether it's installed" is a reason to remove it, not a reason
+	// to stop.
+	installed, _, statusErr := d.autostartStatus()
+	switch {
+	case statusErr == nil && !installed:
 		skip("autostart was not enabled")
-	} else if err := d.autostartDisable(); err != nil {
-		bad("could not remove the autostart unit: %v", err)
-		line(dimStyle.Render("  capture will start again at your next login until this is fixed"))
-	} else {
+	default:
+		if err := d.autostartDisable(); err != nil {
+			bad("could not remove the autostart unit: %v", err)
+			line(dimStyle.Render("  capture will start again at your next login until this is fixed"))
+			break
+		}
+		if statusErr != nil {
+			ok("autostart unit removed (its status could not be read: %v)", statusErr)
+			break
+		}
 		ok("autostart unit removed — capture no longer starts at login")
 	}
 
@@ -206,9 +220,10 @@ func runUninstall(out io.Writer, d uninstallDeps, purge bool) int {
 	}
 
 	fmt.Fprintln(out)
-	if purge {
-		failed = purgeState(out, d, line, ok, bad) || failed
-	} else {
+	switch {
+	case purge:
+		purgeState(d, line, ok, skip, bad)
+	case dirExists(state.GlobalPromptsterDir()):
 		line(dimStyle.Render("Left alone: ") + bodyStyle.Render(state.HomeRelative(state.GlobalPromptsterDir())) +
 			dimStyle.Render(" — your key, the unsent event queue, and the binary."))
 		line(dimStyle.Render("Delete those too with ") + bodyStyle.Render("promptster-teams uninstall --purge") + dimStyle.Render("."))
@@ -232,18 +247,24 @@ func runUninstall(out io.Writer, d uninstallDeps, purge bool) int {
 	return 0
 }
 
-// purgeState deletes the state directories. Returns whether anything failed.
-func purgeState(out io.Writer, d uninstallDeps, line func(string), ok, bad func(string, ...any)) bool {
-	failed := false
+// purgeState deletes the state directories. Failures are recorded by `bad`,
+// which owns the exit code — this returns nothing so there is one place that
+// decides whether the run failed rather than two that can disagree.
+//
+// A run that finds nothing to delete still says so. Silence here would be the
+// only step with no output, which reads as "the purge did not happen" when it in
+// fact had nothing to do — and this is exactly the state a second run lands in.
+func purgeState(d uninstallDeps, line func(string), ok, skip, bad func(string, ...any)) {
+	deleted := 0
 	for _, dir := range d.purgeDirs() {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			continue
 		}
+		deleted++
 		left, err := removeStateDir(dir, d.self)
 		switch {
 		case err != nil:
 			bad("could not delete %s: %v", state.HomeRelative(dir), err)
-			failed = true
 		case left != "":
 			ok("deleted %s", state.HomeRelative(dir))
 			line(dimStyle.Render("  except ") + bodyStyle.Render(state.HomeRelative(left)) +
@@ -252,7 +273,9 @@ func purgeState(out io.Writer, d uninstallDeps, line func(string), ok, bad func(
 			ok("deleted %s — key, event queue, and binary", state.HomeRelative(dir))
 		}
 	}
-	return failed
+	if deleted == 0 {
+		skip("nothing to delete — %s does not exist", state.HomeRelative(state.GlobalPromptsterDir()))
+	}
 }
 
 // removeStateDir deletes dir, returning the one path it had to leave behind.
@@ -298,6 +321,11 @@ func removeAllExcept(dir, keep string) error {
 		}
 	}
 	return nil
+}
+
+func dirExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 // pathUnder reports whether p is dir or sits inside it. The separator check

@@ -140,6 +140,32 @@ func TestUninstallFailsWhenCaptureSurvivesTheStop(t *testing.T) {
 	}
 }
 
+// A status probe that fails must not stop the removal. Disable is idempotent on
+// every platform, so calling it blind costs nothing — while skipping it leaves a
+// registered unit that brings capture back at the next login, the worst residue
+// an uninstall can leave. Raised by review on PR #124.
+func TestUninstallStillDeregistersWhenTheStatusProbeFails(t *testing.T) {
+	sandboxHome(t)
+	disabled := false
+	d := noopDeps()
+	d.autostartStatus = func() (bool, string, error) { return false, "", errors.New("cannot stat the plist") }
+	d.autostartDisable = func() error { disabled = true; return nil }
+
+	var out bytes.Buffer
+	code := runUninstall(&out, d, false)
+
+	if !disabled {
+		t.Fatalf("autostart was left registered because its status could not be read:\n%s", out.String())
+	}
+	// The probe failing is not itself a failure once the removal succeeded.
+	if code != 0 {
+		t.Fatalf("exit code = %d after a successful blind removal\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "status could not be read") {
+		t.Fatalf("the output hid the failed probe:\n%s", out.String())
+	}
+}
+
 // Without --purge the key and the unsent queue survive: an accidental uninstall
 // should cost an enrollment, not a backlog of captured events.
 func TestUninstallWithoutPurgeKeepsCredentialsAndQueue(t *testing.T) {
@@ -239,6 +265,12 @@ func TestUninstallIsIdempotent(t *testing.T) {
 		var out bytes.Buffer
 		if code := runUninstall(&out, d, true); code != 0 {
 			t.Fatalf("run %d: exit code = %d\n%s", i+1, code, out.String())
+		}
+		// The second run has nothing left to delete and must SAY so. A silent
+		// purge section reads as "the purge did not run", which is the reading
+		// that sends someone hunting for a directory that is already gone.
+		if i == 1 && !strings.Contains(out.String(), "nothing to delete") {
+			t.Fatalf("the second run said nothing about the already-deleted state dir:\n%s", out.String())
 		}
 	}
 }

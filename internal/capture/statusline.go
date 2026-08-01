@@ -345,6 +345,19 @@ func DisableStatusline() error {
 		clearStatuslinePrior()
 		return nil
 	}
+	// An ABSENT statusLine is also not ours to write. Deleting the key removes our
+	// shim as surely as replacing it does, and the engineer who did it wants no
+	// statusline — restoring the command we saved when we wrapped them would
+	// resurrect configuration they deliberately removed. The stored prior is
+	// dropped for the same reason: it describes a slot nobody is holding any more.
+	//
+	// Reached on every `uninstall`, not just a deliberate `statusline disable`,
+	// which is what turned this from a corner into something an engineer would
+	// actually hit.
+	if !hasCurrent {
+		clearStatuslinePrior()
+		return nil
+	}
 
 	rec, ok := loadStatuslinePrior()
 	switch {
