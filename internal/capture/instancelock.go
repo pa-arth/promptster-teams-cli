@@ -14,6 +14,20 @@ import (
 // sweep and this lock share one directory.
 func watchLockPath() string { return filepath.Join(state.StateDir(), "watch.lock") }
 
+// CaptureRunning reports whether capture is live right now, by the same
+// authoritative signal `stop` uses — the process-lifetime lock, not a recorded
+// PID (see watchRunning).
+//
+// Exported for `uninstall`, which must state whether capture was running BEFORE
+// it stopped anything and whether it is STILL running afterwards. Those are the
+// only two facts that decide whether an uninstall actually uninstalled, and
+// DaemonStatus cannot answer either: it proves a recorded PID exists, which a
+// bare `watch` under autostart never writes and a recycled PID can fake.
+func CaptureRunning() bool {
+	_, running := watchRunning()
+	return running
+}
+
 // watchRunning reports whether a `watch` supervisor is alive. Liveness is
 // derived from the lock itself (watchLockHeld, a non-destructive try-lock), NOT
 // from the stored PID: a dead holder's lock is auto-released by the OS, so this

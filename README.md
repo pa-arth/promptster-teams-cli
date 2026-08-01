@@ -192,6 +192,27 @@ Other commands: `watch` runs capture in the foreground (Ctrl-C to stop) for
 debugging, `stop` halts background capture, and `doctor` checks your key, ingest
 reachability, and transcript dirs.
 
+### Uninstall
+
+```sh
+promptster-teams uninstall           # stop capture and unenroll this machine
+promptster-teams uninstall --purge   # also delete ~/.promptster-teams (key, queue, binary)
+```
+
+**Use this rather than removing the package.** Installing enrolls the machine in
+places a package manager does not track: a hook entry in `~/.cursor/hooks.json`,
+a login service (launchd / `systemd --user` / Task Scheduler), and — if you ran
+`statusline enable` — a wrapped `statusLine` in `~/.claude/settings.json`.
+`uninstall` reverses all three, leaving any config of your own untouched, and
+stops capture. Without `--purge` it deletes no data.
+
+`npm rm -g @promptster/teams-cli` does **not** do this, and its success message
+is misleading: npm runs no uninstall script, and it does not delete the managed
+binary at `~/.promptster-teams/bin` (npm's copy is a launcher for it, which is
+what keeps `npm ls` honest). Remove only the package and capture keeps running,
+keeps self-updating, and returns at your next login. Run `uninstall` first, then
+`npm rm -g` if you want npm's copy gone too.
+
 ### Configuration
 
 The developer key is resolved with this precedence: **`--key` flag → `PROMPTSTER_TEAMS_TOKEN` env → stored credentials file** (written by `login`). The ingest URL resolves the same way, defaulting to the hosted backend.
