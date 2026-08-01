@@ -52,6 +52,14 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "codex watcher error: %v\n", err)
 			return 1
 		}
+	case "cursor-hook":
+		// Invoked BY CURSOR, once per hook step, with the payload on stdin.
+		// Registered in ~/.cursor/hooks.json by EnsureCursorHooks. Never call it
+		// by hand except to test. It always exits 0 — it runs inside the
+		// engineer's agent loop and must not be able to break their tool.
+		if err := capture.RunCursorHook(); err != nil {
+			return 0
+		}
 	case "cursor-watch":
 		if err := capture.RunCursorWatcher(); err != nil {
 			fmt.Fprintf(os.Stderr, "cursor watcher error: %v\n", err)

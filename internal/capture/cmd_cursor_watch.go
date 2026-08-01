@@ -232,6 +232,12 @@ func RunCursorWatcher() error {
 	defer signal.Stop(signals)
 
 	client := &http.Client{Timeout: 5 * time.Second}
+	// Enroll (or repair) the user-scope Cursor hooks. Best-effort by contract:
+	// a failure here leaves transcript-only capture, which is exactly the state
+	// this watcher already provides. This is also the automatic migration for an
+	// already-installed fleet — the daemon self-updates, re-execs, and lands here.
+	EnsureCursorHooksBestEffort()
+
 	processors := map[string]*normalize.CursorTranscriptProcessor{}
 	eventsCaptured := 0
 	// See pollCursorTranscripts: the first poll seeds pre-existing transcripts to
@@ -288,10 +294,26 @@ func pollCursorTranscripts(
 ) int {
 	progress := loadCursorWatchProgress()
 	roots := workspaceMatchRoots(workspace)
+	// Sessions the hook rail already covers. Its events are strictly richer
+	// (model, real durations, session outcome), so where both rails can see a
+	// session the hook wins and this one stands down — otherwise one prompt and
+	// one file edit would be emitted twice.
+	claims := loadCursorHookClaims()
 	queued := 0
 
 	for _, path := range candidateCursorTranscripts(startCutoff) {
 		key := cursorProgressKey(path)
+		if isCursorHookClaimed(claims, key) {
+			// Advance the offset to EOF WITHOUT emitting, so that if the hook
+			// rail later stops covering this session (uninstall, claim TTL) the
+			// watcher resumes from here instead of replaying the whole file and
+			// duplicating everything the hooks already sent.
+			if info, err := os.Stat(path); err == nil {
+				progress.Offsets[key] = info.Size()
+				progress.Match[key] = "yes"
+			}
+			continue
+		}
 		switch progress.Match[key] {
 		case "no":
 			continue
