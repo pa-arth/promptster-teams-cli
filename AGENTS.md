@@ -647,6 +647,13 @@ first-touch seeding, and a rename stranding spans at a dead path. Both were
 reachable through ordinary git usage, so treat any new path that removes or
 relocates a ledger entry as suspect until it has a test.
 
+**The pre-merge rework ledger (`rework.go`) is a SECOND ledger holding the SAME
+first-touch invariant**, and the first-touch hole was reachable through both. Fix
+them together or the fix is half a fix. They differ only in tombstone lifetime:
+durability's expire on a TTL refreshed by activity, rework's carry none because
+`clearReworkLedger` drops them when the branch merges — so the guard on that
+clear must consider the tombstones, which outlive the tracked map.
+
 ## Maintaining this file
 
 Keep this file for knowledge useful to almost every future agent session in this project.

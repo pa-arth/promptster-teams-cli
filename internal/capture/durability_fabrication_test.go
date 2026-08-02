@@ -19,6 +19,11 @@ import (
 //     neither remapped nor churned. They sat at a path that no longer existed
 //     and matured into a `durable` verdict — the strongest positive signal this
 //     product emits, manufactured for a dead path.
+//
+// The sibling PRE-MERGE rework ledger states the same first-touch discipline in
+// its own header and reached (1) through the identical door, so its regression
+// lives here too rather than beside the rework unit tests: the invariant is
+// shared, and splitting them is how one side gets fixed and the other does not.
 
 // ledgerRanges reads a path's tracked spans straight out of the on-disk ledger.
 func ledgerRanges(t *testing.T, rootKey, path string) []durTrackedRange {
@@ -465,6 +470,189 @@ func TestParseUnifiedDiffRenames(t *testing.T) {
 	}
 	if len(got) != 3 {
 		t.Errorf("renames = %+v, want exactly 3", got)
+	}
+}
+
+// TestDurabilityTombstonesPrunedOnAQuietRoot pins the tombstone set's growth
+// bound, which the TTL alone does not give: an expired mark only leaves the
+// ledger when something walks it. Pruning from the commit loop is not enough,
+// because a root whose default branch stops advancing (a repo-wide reformat
+// churns every tracked path, then the work moves elsewhere) processes no further
+// commits — its marks would sit in durability.json forever. The per-poll harvest
+// prunes BEFORE its empty-root early return, which is exactly the state that root
+// is left in.
+func TestDurabilityTombstonesPrunedOnAQuietRoot(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	recordAiTouchedPath("sess-prune", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds app.go")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+
+	// A repo-wide reformat churns every tracked line: the path is tombstoned and
+	// the root's tracked map disappears with it.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "reformat rewrites all of app.go")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	if len(loadDurabilityLedger().Seeded[key]) == 0 {
+		t.Fatal("a full churn must leave a tombstone")
+	}
+	if len(loadDurabilityLedger().Roots[key]) != 0 {
+		t.Fatal("a fully churned root should have no tracked paths left")
+	}
+
+	// The default branch never moves again, so no commit is ever processed for
+	// this root. Only the per-poll harvest runs — and it must still collect the
+	// expired mark.
+	quiet := t0 + dayMs + durabilitySeedTombstoneTTLms + dayMs
+	harvestDurable(sess, ws, key, quiet)
+
+	if got := loadDurabilityLedger().Seeded[key]; len(got) != 0 {
+		t.Errorf("expired tombstones survive on a root whose branch stopped advancing: %+v", got)
+	}
+}
+
+// ── The same first-touch hole in the sibling pre-merge rework ledger ─────────
+
+// TestReworkFullChurnDoesNotReseedHumanCodeAsAi is defect 1 against rework.go,
+// which states the identical invariant in its own header and reached the identical
+// hole: a fully churned path was deleted, `remapped` only guards re-seeding within
+// the SAME commit, and a LATER commit found nothing tracked and re-seeded from the
+// path-granular 7-day AI evidence. Human lines then entered as AI, and any later
+// rewrite of them emitted a rework_verdict about code the AI never wrote.
+func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// Feature branch (rework is pre-merge only). The AI writes app.go.
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-rwb3", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds app.go")
+	sha1 := gitOut("rev-parse", "HEAD")
+	diff1, files1 := commitDiffFiles(t, ws, sha1)
+	pollReworkCommit(sess, ws, sha1, diff1, files1, t0)
+	if c := reworkCovered(key, "app.go"); !c[1] || !c[2] || !c[3] {
+		t.Fatalf("rework ledger = %+v, want 1..3 seeded", c)
+	}
+
+	// A human rewrites every AI line: all three churn and the path leaves.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites all of app.go")
+	sha2 := gitOut("rev-parse", "HEAD")
+	diff2, files2 := commitDiffFiles(t, ws, sha2)
+	if v := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs); len(v) == 0 {
+		t.Fatal("a full rewrite must emit a rework verdict")
+	}
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("after full churn tracked = %+v, want nothing", c)
+	}
+
+	// The same human appends 20 lines. No AI touched this commit — but the day-0
+	// path evidence is still inside its 7-day TTL, so attribution still reports
+	// likely_ai and the seeding branch must refuse it.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
+	git("add", "-A")
+	git("commit", "-m", "human appends 20 lines")
+	sha3 := gitOut("rev-parse", "HEAD")
+	diff3, files3 := commitDiffFiles(t, ws, sha3)
+	pollReworkCommit(sess, ws, sha3, diff3, files3, t0+2*dayMs)
+
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("a purely HUMAN commit was seeded as AI into the rework ledger: %+v", c)
+	}
+
+	// And therefore rewriting those human lines reports no rework at all.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("rewritten\n", 20))
+	git("add", "-A")
+	git("commit", "-m", "human rewrites their own 20 lines")
+	sha4 := gitOut("rev-parse", "HEAD")
+	diff4, files4 := commitDiffFiles(t, ws, sha4)
+	if v := pollReworkCommit(sess, ws, sha4, diff4, files4, t0+3*dayMs); len(v) != 0 {
+		t.Errorf("fabricated rework_verdict over human-written lines: %+v", v)
+	}
+}
+
+// TestReworkSeedTombstonesClearedOnMerge pins the rework tombstones' lifetime.
+// They carry no TTL because the merge clears them — so the clear must actually
+// reach them. The guard on that clear used to test only the tracked map, which a
+// fully churned root no longer has: the marks would then outlive the branch and
+// block seeding on every future one, converting a fabrication fix into permanent
+// silence.
+func TestReworkSeedTombstonesClearedOnMerge(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	pollGitWatchWorkspace(sess) // baseline on main
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-rwtomb", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds app.go")
+	pollGitWatchWorkspace(sess)
+	if c := reworkCovered(key, "app.go"); !c[1] {
+		t.Fatalf("expected app.go seeded on the feature branch, got %+v", c)
+	}
+
+	// Full churn: the tracked map for this root empties and the mark is left.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites all of app.go")
+	pollGitWatchWorkspace(sess)
+	if len(loadReworkLedger().Roots[key]) != 0 {
+		t.Fatal("a fully churned root should have no tracked paths left")
+	}
+	if len(loadReworkLedger().Seeded[key]) == 0 {
+		t.Fatal("a full churn must leave a rework tombstone")
+	}
+
+	// Merge back. The clear must reach the marks even though Roots[key] is gone.
+	git("checkout", "main")
+	git("merge", "--squash", "feature")
+	git("commit", "-m", "squash: feature")
+	pollGitWatchWorkspace(sess)
+	if got := loadReworkLedger().Seeded[key]; len(got) != 0 {
+		t.Fatalf("rework tombstones outlived the merge: %+v", got)
+	}
+
+	// A fresh branch may seed the same path again — the tombstone was scoped to
+	// the branch, not to the repo.
+	git("checkout", "-b", "feature2")
+	recordAiTouchedPath("sess-rwtomb", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nnew1\nnew2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai extends app.go on a new branch")
+	pollGitWatchWorkspace(sess)
+	if c := reworkCovered(key, "app.go"); len(c) == 0 {
+		t.Error("a merged tombstone permanently blocked seeding on the next branch")
 	}
 }
 

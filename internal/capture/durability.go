@@ -162,9 +162,17 @@ func seededPathTombstoned(led *durabilityLedger, rootKey, path string, nowMs int
 }
 
 // pruneSeedTombstones drops a root's expired tombstones, and the empty maps
-// behind them, so the ledger cannot grow without bound. Runs once per processed
-// commit — the ledger is already being rewritten there, so it costs one map walk
+// behind them, so the ledger cannot grow without bound. It costs one map walk
 // over one root's marks.
+//
+// It runs once per processed commit AND once per poll from harvestDurable — the
+// second call site is what makes the bound real. A root whose default branch
+// stops advancing (repo abandoned, work moved elsewhere) processes no further
+// commits, so a commit-only pruner would never walk its marks again and a
+// repo-wide reformat's tombstones would sit in durability.json forever.
+// harvestDurable runs every poll regardless of whether the tip moved, and prunes
+// BEFORE its empty-root early return, which is exactly the state a fully churned
+// root is left in.
 func pruneSeedTombstones(led *durabilityLedger, rootKey string, nowMs int64) {
 	marks := led.Seeded[rootKey]
 	for path, ts := range marks {
@@ -684,6 +692,9 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	}
 	var matured []harvested
 	mutateDurabilityLedger(func(led *durabilityLedger) {
+		// Before the early return, deliberately: an emptied root is precisely the
+		// state whose tombstones nothing else would ever walk again.
+		pruneSeedTombstones(led, rootKey, nowMs)
 		files := led.Roots[rootKey]
 		if len(files) == 0 {
 			return

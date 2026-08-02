@@ -22,8 +22,10 @@ import (
 // It reuses §2's interval machinery wholesale: the same `remapTrackedRanges`
 // churn/shift math, the same first-touch-only seeding discipline (re-seeding
 // would re-attribute a human's rewrite of an AI line as fresh AI — inflation the
-// privacy rules forbid), and the same single-locked read-modify-write ledger. The
-// ONLY differences from durability are:
+// privacy rules forbid) enforced by the same SEED TOMBSTONES (see
+// reworkLedger.Seeded — first touch is a property of the ROOT, not of the
+// ledger's current contents), and the same single-locked read-modify-write
+// ledger. The ONLY differences from durability are:
 //   - it advances on WORKING HEAD, gated to commits made while the branch is
 //     ahead of the default branch (pre-merge) — see pollGitWatchWorkspace;
 //   - a churned tracked range emits a rework_verdict immediately (there is no
@@ -43,6 +45,44 @@ const reworkLedgerVersion = 1
 type reworkLedger struct {
 	V     int                                     `json:"v"`
 	Roots map[string]map[string][]durTrackedRange `json:"roots"`
+	// Seeded is rootKey → path → true: the SEED TOMBSTONES, carrying durability's
+	// invariant that FIRST TOUCH IS A PROPERTY OF THE ROOT, NOT OF THE LEDGER'S
+	// CURRENT CONTENTS. A path leaves this ledger by exactly one route — every
+	// tracked span churned — and that deletion used to re-arm the first-touch
+	// branch, so the next commit to the path re-seeded from the path-granular
+	// 7-day AI evidence, which cannot tell "the AI rewrote its own line" from "a
+	// human rewrote an AI line". Human lines then entered as fresh AI and any
+	// later rewrite of them emitted a rework_verdict about AI code that was never
+	// AI — the inflation the header above forbids.
+	//
+	// No TTL and no pruner, unlike durability's: this ledger is wholesale cleared
+	// when the branch merges back (clearReworkLedger), so a tombstone lives at
+	// most one branch and the set cannot grow without bound.
+	//
+	// Additive — an older ledger reads it as nil, which every reader tolerates.
+	// Do NOT bump reworkLedgerVersion to add a field (same reasoning as the
+	// durability ledger's).
+	Seeded map[string]map[string]bool `json:"seeded,omitempty"`
+}
+
+// tombstoneReworkSeededPath records that this root has already first-touched
+// path, so the seeding branch cannot re-fire for it.
+func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path string) {
+	if led.Seeded == nil {
+		led.Seeded = map[string]map[string]bool{}
+	}
+	if led.Seeded[rootKey] == nil {
+		led.Seeded[rootKey] = map[string]bool{}
+	}
+	led.Seeded[rootKey][path] = true
+}
+
+// reworkSeededPathTombstoned reports whether a tombstone blocks seeding path.
+// Unlike durability's equivalent this gates the ONLY seeding path there is —
+// rework has no line-precise fingerprint carrier to preserve, and it never spans
+// a squash-merge, because merging is what clears it.
+func reworkSeededPathTombstoned(led *reworkLedger, rootKey, path string) bool {
+	return led.Seeded[rootKey][path]
 }
 
 func reworkLedgerPath() string {
@@ -105,10 +145,32 @@ func mutateReworkLedger(fn func(led *reworkLedger)) {
 // clearReworkLedger drops a root's entire rework tracking — called once the
 // branch has merged back to the default branch, so surviving AI lines pass to the
 // durability engine and a future branch never remaps against stale ranges.
+//
+// The seed tombstones go with it, and that is what bounds them: they exist to
+// keep first touch a property of the ROOT for the life of ONE branch, so keeping
+// them past the merge would block seeding on every future branch forever.
 func clearReworkLedger(rootKey string) {
 	mutateReworkLedger(func(led *reworkLedger) {
 		delete(led.Roots, rootKey)
+		delete(led.Seeded, rootKey)
+		if len(led.Seeded) == 0 {
+			led.Seeded = nil
+		}
 	})
+}
+
+// reworkLedgerHasRoot reports whether a root has any rework state left to clear —
+// tracked spans OR seed tombstones. Tombstones outlive the tracked map (a fully
+// churned root deletes its Roots entry but keeps its marks), so a Roots-only
+// check would leave them stranded past the merge and permanently block seeding on
+// the next branch.
+func reworkLedgerHasRoot(rootKey string) bool {
+	led := loadReworkLedger()
+	if _, ok := led.Roots[rootKey]; ok {
+		return true
+	}
+	_, ok := led.Seeded[rootKey]
+	return ok
 }
 
 // aiRangesForSeeding pulls the likely_ai new-side spans (content-free) out of the
@@ -157,7 +219,11 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 			if len(surv) > 0 {
 				tracked[path] = surv
 			} else {
+				// The path leaves the ledger. Tombstone it, or step (2) re-arms on a
+				// LATER commit — `remapped` only guards the same commit — and the next
+				// purely-human commit to this path is seeded as fresh AI.
 				delete(tracked, path)
+				tombstoneReworkSeededPath(led, rootKey, path)
 			}
 			if len(churned) > 0 {
 				verdicts = append(verdicts, buildReworkVerdict(session, root, sha, path, churned, nowMs))
@@ -165,8 +231,8 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 		}
 		// (2) First-touch seed newly-introduced AI paths.
 		for path, rs := range seedable {
-			if remapped[path] || len(tracked[path]) > 0 {
-				continue // already tracked / just churned — first-touch only
+			if remapped[path] || len(tracked[path]) > 0 || reworkSeededPathTombstoned(led, rootKey, path) {
+				continue // already tracked / just churned / churned earlier — first-touch only
 			}
 			lineage := durLineageID(sha, path)
 			var seeded []durTrackedRange

@@ -600,8 +600,11 @@ func pollGitWatchWorkspace(session Session) {
 			// On (or merged back to) the default branch: surviving AI lines are now the
 			// durability engine's and reworked ones already emitted, so drop the root's
 			// rework tracking before a future branch could remap against stale ranges.
-			// Guarded on presence to avoid a needless ledger write on every poll.
-			if _, tracked := loadReworkLedger().Roots[rootKey]; tracked {
+			// Guarded on presence to avoid a needless ledger write on every poll. The
+			// guard must consider the seed tombstones too: they outlive the tracked
+			// map, so a Roots-only check would strand them past the merge and block
+			// seeding on every future branch.
+			if reworkLedgerHasRoot(rootKey) {
 				clearReworkLedger(rootKey)
 			}
 		}
