@@ -27,6 +27,33 @@ follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A second `promptster-teams start` captured nothing, and said "already
+  running".** The single-instance lock lives at `<state>/watch.lock` — one per
+  user account, not one per directory. An engineer with two checkouts who ran
+  `start` in both got a message that reads like success from the second one,
+  while every session in that tree was classified as a working-directory
+  mismatch and dropped. Nothing surfaced it: `status` showed the first
+  directory, the daemon was healthy, and the events simply never existed.
+
+  A second `start` now **registers** its directory with the running capture
+  instead of declining, and the daemon picks it up on its next poll — no
+  restart. `start`, `login`, and `status` print every watched directory, since
+  widening what leaves the machine should never be silent. The Codex matcher
+  went multi-directory alongside the Claude one, which had been the only half
+  that honored more than a single root. Sessions in the newly added directory
+  that were *already* classified as mismatches are re-checked rather than
+  staying dropped — otherwise the fix would do nothing for exactly the person
+  who needs it, someone who notices the gap only after the fact.
+
+  One lock is still correct: two watchers would double-count presence and
+  corrupt seat utilization. What was missing was a way to say "also capture
+  here".
+
+- **A fresh install re-ran a one-time cache migration on its first reload.**
+  The watcher progress files were written with schema `v0` when no file existed
+  yet, so the next load treated a brand-new install as a legacy one and dropped
+  its whole classification cache for nothing.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for
