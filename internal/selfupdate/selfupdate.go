@@ -1,7 +1,7 @@
 // Package selfupdate lets the long-running `watch` daemon silently update
-// itself from GitHub Releases on the same 24h cadence as the config census, so
-// a fleet installed on an old CLI stops missing new capture features (the bug
-// that motivated this: config-census never emitted because engineers ran a
+// itself from GitHub Releases on the CheckInterval cadence, so a fleet
+// installed on an old CLI stops missing new capture features (the bug that
+// motivated this: config-census never emitted because engineers ran a
 // pre-census binary forever).
 //
 // Trust model: the release pipeline signs SHA256SUMS with a minisign key whose
@@ -35,8 +35,15 @@ import (
 )
 
 const (
-	// updateCheckInterval is how often a long-running watch re-checks for a
-	// newer release.
+	// CheckInterval is how often a long-running watch re-checks for a newer
+	// release.
+	//
+	// It is EXPORTED so anything that describes the cadence to a human can read
+	// it rather than restate it. `doctor` restated it, and told engineers an
+	// update "installs on the next 24h check" for every release after this
+	// became 30m — the one screen someone reads while already suspecting
+	// auto-update is broken. A number in prose is a number that drifts; derive
+	// it.
 	//
 	// This was 24h for one reason: the check used to GET
 	// api.github.com/repos/.../releases/latest, a ~20KB JSON response behind a
@@ -62,21 +69,21 @@ const (
 	// A real canary is a CHANNEL (a `stable` pointer lagging `latest`), not a
 	// slow clock. That is the follow-up; do not re-approximate it by raising
 	// this number.
-	updateCheckInterval = 30 * time.Minute
+	CheckInterval = 30 * time.Minute
 	// updateCheckPoll is how often the ticker CHECKS whether the interval has
 	// elapsed (against the persisted cursor), so the cadence survives laptop
 	// sleeps and watch restarts. A poll is a file read and a compare — no
 	// network unless an interval actually elapsed — so it is cheap enough to run
-	// well below updateCheckInterval. It bounds how fast an org-set
-	// minCliVersion can escalate, which is the reason it is minutes not hours.
+	// well below CheckInterval. It bounds how fast an org-set minCliVersion can
+	// escalate, which is the reason it is minutes not hours.
 	updateCheckPoll = 5 * time.Minute
-	// belowMinCheckInterval replaces updateCheckInterval while the running
-	// version is below the org's minCliVersion floor. It is the RETRY FLOOR for
-	// an escalated rollout, not a target: a fleet below the floor and failing to
+	// belowMinCheckInterval replaces CheckInterval while the running version is
+	// below the org's minCliVersion floor. It is the RETRY FLOOR for an
+	// escalated rollout, not a target: a fleet below the floor and failing to
 	// update (GitHub down, release yanked mid-rollout) should not re-check every
-	// poll. It is closer to updateCheckInterval than it used to be, which is
-	// fine — it now buys urgency over 30m rather than over 24h, and the rate
-	// limit that made the floor load-bearing is gone.
+	// poll. It is closer to CheckInterval than it used to be, which is fine — it
+	// now buys urgency over 30m rather than over 24h, and the rate limit that
+	// made the floor load-bearing is gone.
 	belowMinCheckInterval = 15 * time.Minute
 
 	// repoSlug is the public releases repo.
@@ -319,7 +326,7 @@ type updater struct {
 	// releaseBaseURL is the release base (default https://github.com),
 	// overridable in tests. It serves BOTH the latest-tag redirect and the
 	// asset downloads; there is deliberately no api.github.com base any more
-	// (see updateCheckInterval).
+	// (see CheckInterval).
 	releaseBaseURL string
 
 	// httpGet fetches a URL and returns (body, statusCode, err), bounded to
@@ -390,7 +397,7 @@ func (u *updater) checkAndApply() outcome {
 	target := strings.TrimPrefix(tag, "v")
 
 	// 3. Only strictly-newer targets proceed.
-	if !isNewer(u.currentVersion, target) {
+	if !IsNewer(u.currentVersion, target) {
 		return outcomeUpToDate
 	}
 
@@ -654,6 +661,17 @@ func envTruthy(v string) bool {
 	return false
 }
 
+// EnvNoAutoUpdate is the per-machine opt-out variable, and EnvDisablesAutoUpdate
+// decides whether a given value trips it. Both are EXPORTED for the same reason
+// as CheckInterval and IsNewer: `doctor` reports on this switch, and it inlined
+// its own copy of the comparison — which missed the trimming and case-folding
+// here, so `PROMPTSTER_TEAMS_NO_AUTO_UPDATE=TRUE` silenced the daemon while
+// doctor cheerfully reported auto-update on. A screen that describes a
+// mechanism must ask the mechanism.
+const EnvNoAutoUpdate = envNoAutoUpdate
+
+func EnvDisablesAutoUpdate(v string) bool { return envTruthy(v) }
+
 // ensureVPrefix normalizes a tag to the "vX.Y.Z" form GitHub uses for release
 // download paths.
 func ensureVPrefix(tag string) string {
@@ -670,8 +688,9 @@ func ensureVPrefix(tag string) string {
 // --- cursor + runner ---------------------------------------------------------
 
 // lastUpdateCheckPath persists when the last update check ran so restarts and
-// hourly ticks don't re-check inside the 24h window (startup always checks; the
-// cursor only paces the ticker). Mirrors census's last-census-at cursor.
+// ticker polls don't re-check inside the current interval (startup always
+// checks; the cursor only paces the ticker). Mirrors census's last-census-at
+// cursor.
 func lastUpdateCheckPath() string {
 	return filepath.Join(state.GlobalPromptsterDir(), "last-update-check")
 }
@@ -694,9 +713,9 @@ func saveLastUpdateCheck(t time.Time) {
 	_ = os.WriteFile(p, []byte(t.UTC().Format(time.RFC3339)), 0o600)
 }
 
-// checkInterval is how long this watcher waits between checks: the normal 24h
-// cadence, or the shorter escalated floor while the running version is below the
-// org's minCliVersion.
+// checkInterval is how long this watcher waits between checks: the normal
+// CheckInterval cadence, or the shorter escalated floor while the running
+// version is below the org's minCliVersion.
 //
 // The floor only moves the CADENCE. Whether an update is allowed at all, and
 // which tag it targets, stay entirely with checkAndApply — so an org that
@@ -704,11 +723,11 @@ func saveLastUpdateCheck(t time.Time) {
 // never drag a fleet to a version the newer-only gate would reject.
 func (u *updater) checkInterval() time.Duration {
 	if u.policy == nil {
-		return updateCheckInterval
+		return CheckInterval
 	}
 	min := strings.TrimPrefix(u.policy.MinCliVersion(), "v")
-	if min == "" || !isNewer(u.currentVersion, min) {
-		return updateCheckInterval
+	if min == "" || !IsNewer(u.currentVersion, min) {
+		return CheckInterval
 	}
 	return belowMinCheckInterval
 }

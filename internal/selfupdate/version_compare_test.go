@@ -33,16 +33,16 @@ func TestCompareVersions(t *testing.T) {
 }
 
 func TestIsNewer(t *testing.T) {
-	if !isNewer("0.5.2", "0.5.3") {
+	if !IsNewer("0.5.2", "0.5.3") {
 		t.Error("0.5.3 should be newer than 0.5.2")
 	}
-	if isNewer("0.5.3", "0.5.3") {
+	if IsNewer("0.5.3", "0.5.3") {
 		t.Error("equal versions are not newer")
 	}
-	if isNewer("0.5.3", "0.5.2") {
+	if IsNewer("0.5.3", "0.5.2") {
 		t.Error("older target must not be newer (no downgrade)")
 	}
-	if isNewer("1.0.0", "v1.0.0") {
+	if IsNewer("1.0.0", "v1.0.0") {
 		t.Error("v-prefixed equal must not be newer")
 	}
 }

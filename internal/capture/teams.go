@@ -161,8 +161,9 @@ func RunTeamsWatch(args []string) error {
 	stopCensus := StartConfigCensus(cfg)
 	defer stopCensus()
 
-	// Silent self-update: on startup and every 24h, check GitHub Releases for a
-	// newer signed CLI and swap in place (re-exec keeps capture running). Opt out
+	// Silent self-update: on startup and every selfupdate.CheckInterval, check
+	// GitHub Releases for a newer signed CLI and swap in place (re-exec keeps
+	// capture running). It is NOT on the census's 24h clock above. Opt out
 	// per-machine with --no-auto-update / PROMPTSTER_TEAMS_NO_AUTO_UPDATE, or
 	// org-wide via the capture policy. A dedicated resolver refreshes the org
 	// switch/pin off the hot path; fail-OPEN so a policy blip never strands the

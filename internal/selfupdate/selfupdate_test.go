@@ -397,12 +397,12 @@ func TestCheckIntervalEscalatesBelowMinCliVersion(t *testing.T) {
 		pol     PolicyView
 		want    time.Duration
 	}{
-		{"no policy", "0.5.2", nil, updateCheckInterval},
-		{"no floor set", "0.5.2", stubPolicy{enabled: true}, updateCheckInterval},
+		{"no policy", "0.5.2", nil, CheckInterval},
+		{"no floor set", "0.5.2", stubPolicy{enabled: true}, CheckInterval},
 		{"below floor escalates", "0.5.2", stubPolicy{enabled: true, min: "0.6.0"}, belowMinCheckInterval},
 		{"below floor, v-prefixed", "0.5.2", stubPolicy{enabled: true, min: "v0.6.0"}, belowMinCheckInterval},
-		{"at floor", "0.6.0", stubPolicy{enabled: true, min: "0.6.0"}, updateCheckInterval},
-		{"above floor", "0.7.0", stubPolicy{enabled: true, min: "0.6.0"}, updateCheckInterval},
+		{"at floor", "0.6.0", stubPolicy{enabled: true, min: "0.6.0"}, CheckInterval},
+		{"above floor", "0.7.0", stubPolicy{enabled: true, min: "0.6.0"}, CheckInterval},
 		// The floor escalates the CADENCE only. checkAndApply still enforces the
 		// org switch and the pin, so a disabled org polls a no-op cheaply rather
 		// than being dragged forward against its policy.

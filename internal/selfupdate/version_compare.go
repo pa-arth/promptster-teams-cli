@@ -25,10 +25,18 @@ func compareVersions(a, b string) int {
 	return 0
 }
 
-// isNewer reports whether target is strictly newer than current. This is the
+// IsNewer reports whether target is strictly newer than current. This is the
 // only predicate that authorizes a swap: equal or older targets are no-ops, so
 // a stale "latest" or a backwards org pin can never downgrade the fleet.
-func isNewer(current, target string) bool {
+//
+// It is EXPORTED so `doctor` decides "is there an update for me?" with the same
+// predicate that decides whether to install one. It used to compare the two
+// version strings for inequality, which disagrees with this in both directions:
+// a machine AHEAD of the published release (a local build, a yanked release) was
+// told a "newer release" was available, and any tag differing only by a "v"
+// prefix or a build suffix would report the same. Two answers to one question is
+// how a diagnostic screen ends up arguing with the daemon it is diagnosing.
+func IsNewer(current, target string) bool {
 	return compareVersions(current, target) < 0
 }
 
