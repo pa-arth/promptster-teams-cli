@@ -59,24 +59,7 @@ func printStatusStatic() {
 	// never held at the same instant.
 	snap := capture.Snapshot()
 
-	// Report what the LIVE daemon is watching, not what a daemon started from
-	// here would watch. The watch dir gates which transcripts are captured, and
-	// `login` scopes the daemon to $HOME — so recomputing from this process's cwd
-	// showed `status` run inside a repo that repo's path, implying a scope the
-	// running capture never had. Fall back to the env/cwd derivation only when no
-	// capture is live, where it correctly previews the next `start`.
-	root := snap.WatchDir
-	if root == "" {
-		root = os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
-	}
-	if root == "" {
-		root, _ = os.Getwd()
-	}
-	// A second `start` widens capture to more directories than the daemon's own
-	// watch dir, and the whole point of registering them is that the engineer
-	// can confirm the second tree is covered — so `status` must show the full
-	// set, not just the root the daemon happened to launch under.
-	root = watchScopeDisplay(root, capture.RegisteredCaptureRoots())
+	root := liveWatchScope(snap)
 
 	daemon := "not running — `promptster-teams login` starts it, or `autostart enable` for reboots"
 	if snap.Live {
@@ -228,6 +211,29 @@ func printAutoUpdateStatus() {
 // intervals used to be retyped into the copy by hand in the first place.
 // Anything not a whole number of hours or minutes falls back to Duration's own
 // formatting rather than inventing a rounding rule.
+// liveWatchScope renders the capture scope for both `status` views.
+//
+// It reports what the LIVE daemon is watching, not what a daemon started from
+// here would watch. The scope gates which transcripts are captured, and
+// `login` scopes the daemon to $HOME — so recomputing from this process's cwd
+// showed `status` run inside a repo that repo's path, implying a scope the
+// running capture never had. It falls back to the env/cwd derivation only when
+// no capture is live, where it correctly previews the next `start`.
+//
+// A second `start` widens capture beyond the daemon's own watch dir, and the
+// whole point of registering those directories is that an engineer can confirm
+// the second tree is covered — so both views name the full set.
+func liveWatchScope(snap capture.CaptureSnapshot) string {
+	root := snap.WatchDir
+	if root == "" {
+		root = os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
+	}
+	if root == "" {
+		root, _ = os.Getwd()
+	}
+	return watchScopeDisplay(root, capture.RegisteredCaptureRoots())
+}
+
 // watchScopeDisplay renders the `watch` row: the daemon's own root, plus any
 // directory a later `start` registered. Registered roots that are already
 // inside the daemon root are dropped — printing "~ and ~/work" would read as

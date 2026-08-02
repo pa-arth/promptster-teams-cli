@@ -4,11 +4,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -72,6 +74,10 @@ func RegisteredCaptureRoots() []string {
 // `start` in ~/work would report two watched directories when one describes
 // the truth, and the printed confirmation has to be honest to be worth
 // printing.
+// The whole read-modify-write runs under a cross-process lock, and the caller
+// MUST report a returned error rather than printing that the directory is
+// covered: a registration that failed and read as success is the exact failure
+// this feature exists to remove.
 func RegisterCaptureRoot(dir string) (added bool, all []string, err error) {
 	dir = strings.TrimSpace(dir)
 	if dir == "" {
@@ -79,44 +85,60 @@ func RegisterCaptureRoot(dir string) (added bool, all []string, err error) {
 	}
 	dir = resolvePath(dir)
 
-	existing := RegisteredCaptureRoots()
-	kept := make([]string, 0, len(existing)+1)
-	for _, r := range existing {
-		if pathWithin(dir, r) {
-			// Already covered by a root at or above dir: nothing to do, and the
-			// file must not be rewritten (a no-op write would churn the
-			// fingerprint below and pointlessly invalidate match caches).
-			return false, existing, nil
+	all = RegisteredCaptureRoots()
+	// Registration is read-modify-write on a shared set, so two concurrent
+	// `start`/`login`/`watch` invocations in different trees would otherwise
+	// both compute a replacement from the same prior state and the loser's root
+	// would vanish — silently uncaptured, which is the bug this file fixes. The
+	// same lock the ledgers use serializes them.
+	lockErr := sign.WithBufferLock(captureRootsPath()+".lock", func() error {
+		existing := RegisteredCaptureRoots()
+		all = existing
+		kept := make([]string, 0, len(existing)+1)
+		for _, r := range existing {
+			if pathWithin(dir, r) {
+				// Already covered by a root at or above dir: nothing to do, and the
+				// file must not be rewritten (a no-op write would churn the
+				// fingerprint below and pointlessly invalidate match caches).
+				return nil
+			}
+			if pathWithin(r, dir) {
+				continue // subsumed by the new, broader root
+			}
+			kept = append(kept, r)
 		}
-		if pathWithin(r, dir) {
-			continue // subsumed by the new, broader root
+		kept = append(kept, dir)
+		if len(kept) > maxCaptureRoots {
+			kept = kept[len(kept)-maxCaptureRoots:]
 		}
-		kept = append(kept, r)
-	}
-	kept = append(kept, dir)
-	if len(kept) > maxCaptureRoots {
-		kept = kept[len(kept)-maxCaptureRoots:]
-	}
 
-	if err := os.MkdirAll(filepath.Dir(captureRootsPath()), 0o700); err != nil {
-		return false, existing, err
+		if err := os.MkdirAll(filepath.Dir(captureRootsPath()), 0o700); err != nil {
+			return err
+		}
+		data, err := json.Marshal(captureRootsFile{Roots: kept})
+		if err != nil {
+			return err
+		}
+		// Atomic rename through a PID-unique temp name. The daemon reads this
+		// file mid-poll and must never see a half-written list (which unmarshals
+		// to zero roots and would NARROW capture for a poll) — and a shared temp
+		// name would let two writers interleave bytes into one file before either
+		// rename, producing exactly that.
+		tmp := fmt.Sprintf("%s.tmp.%d", captureRootsPath(), os.Getpid())
+		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, captureRootsPath()); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+		all, added = kept, true
+		return nil
+	})
+	if lockErr != nil {
+		return false, all, lockErr
 	}
-	data, err := json.Marshal(captureRootsFile{Roots: kept})
-	if err != nil {
-		return false, existing, err
-	}
-	// Atomic rename: the daemon reads this file mid-poll and must never see a
-	// half-written list (which unmarshals to zero roots and would narrow
-	// capture for one poll).
-	tmp := captureRootsPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return false, existing, err
-	}
-	if err := os.Rename(tmp, captureRootsPath()); err != nil {
-		_ = os.Remove(tmp)
-		return false, existing, err
-	}
-	return true, kept, nil
+	return added, all, nil
 }
 
 // captureRootsFingerprint is a stable digest of an effective root SET (order

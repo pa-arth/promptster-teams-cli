@@ -125,11 +125,18 @@ func RunTeamsWatch(args []string) error {
 		// launchd/npm watcher in a second checkout otherwise exited silently and
 		// that tree's sessions were never captured by anyone.
 		dir := watchDirFromEnv()
-		_, _, _ = RegisterCaptureRoot(dir)
-		if pid, running := watchRunning(); running {
-			fmt.Fprintf(os.Stderr, "promptster-teams: capture already running (pid %d) — %s handed to it instead of starting a second watcher\n", pid, dir)
+		_, _, rootErr := RegisterCaptureRoot(dir)
+		pid, running := watchRunning()
+		who := "promptster-teams: capture already running"
+		if running {
+			who = fmt.Sprintf("promptster-teams: capture already running (pid %d)", pid)
+		}
+		if rootErr != nil {
+			// Bowing out is fine; bowing out while claiming this tree was handed
+			// over is not — that reads as success and leaves it uncaptured.
+			fmt.Fprintf(os.Stderr, "%s, but %s could NOT be handed to it: %v\n", who, dir, rootErr)
 		} else {
-			fmt.Fprintf(os.Stderr, "promptster-teams: capture already running — %s handed to it instead of starting a second watcher\n", dir)
+			fmt.Fprintf(os.Stderr, "%s — %s handed to it instead of starting a second watcher\n", who, dir)
 		}
 		printWatchedRoots(os.Stderr)
 		return nil

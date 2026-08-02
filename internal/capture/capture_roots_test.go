@@ -3,6 +3,7 @@ package capture
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -270,7 +271,11 @@ func TestRegisterWatchDirUsesEnv(t *testing.T) {
 	t.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", dir)
 	t.Setenv("PROMPTSTER_TEAMS_TOKEN", "")
 
-	if got := registerWatchDir(); got != dir {
+	got, err := registerWatchDir()
+	if err != nil {
+		t.Fatalf("registration must succeed here: %v", err)
+	}
+	if got != dir {
 		t.Errorf("want %s; got %s", dir, got)
 	}
 	if got := RegisteredCaptureRoots(); len(got) != 1 || got[0] != resolvePath(dir) {
@@ -285,4 +290,64 @@ func containsPath(haystack []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// TestRegisterCaptureRootReportsWriteFailure: a registration that cannot be
+// persisted must say so. Callers print "capture now covers <dir>" off this
+// result, and a failure that reads as success recreates the exact bug capture
+// roots exist to fix — an engineer told their tree is covered when it is not.
+func TestRegisterCaptureRootReportsWriteFailure(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+
+	// Make the roots path itself a directory: every write and rename against it
+	// fails, standing in for a full disk or a read-only state dir.
+	if err := os.MkdirAll(captureRootsPath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	added, _, err := RegisterCaptureRoot(t.TempDir())
+	if err == nil {
+		t.Error("an unwritable roots file must return an error, not silent success")
+	}
+	if added {
+		t.Error("a failed registration must not report that the set changed")
+	}
+}
+
+// TestRegisterCaptureRootConcurrent: two `start` invocations racing in
+// different trees must both end up captured. Read-modify-write on a shared set
+// without serialization drops the loser's directory — silently uncaptured,
+// which is the whole bug.
+func TestRegisterCaptureRootConcurrent(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	base := t.TempDir()
+	dirs := make([]string, 8)
+	for i := range dirs {
+		d := filepath.Join(base, "tree", string(rune('a'+i)))
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		dirs[i] = resolvePath(d)
+	}
+
+	var wg sync.WaitGroup
+	for _, d := range dirs {
+		wg.Add(1)
+		go func(d string) {
+			defer wg.Done()
+			if _, _, err := RegisterCaptureRoot(d); err != nil {
+				t.Errorf("register %s: %v", d, err)
+			}
+		}(d)
+	}
+	wg.Wait()
+
+	got := RegisteredCaptureRoots()
+	for _, d := range dirs {
+		if !containsPath(got, d) {
+			t.Errorf("concurrent registration lost %s; got %v", d, got)
+		}
+	}
 }

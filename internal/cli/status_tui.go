@@ -41,9 +41,14 @@ type statusModel struct {
 	apiURL    string
 	device    string
 	autostart string
-	now       time.Time
-	tick      int
-	quitting  bool
+	// watch is the rendered capture scope: the daemon's own root plus any
+	// directory a later `start` registered. The dashboard is what an engineer
+	// sees by default, so it has to answer "is my second checkout covered?" —
+	// the static --once view is not where anyone looks first.
+	watch    string
+	now      time.Time
+	tick     int
+	quitting bool
 }
 
 func newStatusModel() statusModel {
@@ -56,6 +61,7 @@ func newStatusModel() statusModel {
 		now:    time.Now(),
 	}
 	m.snap = capture.Snapshot()
+	m.watch = liveWatchScope(m.snap)
 	m.buffered = countBufferedEvents()
 	m.autostart = autostartLine()
 	return m
@@ -93,6 +99,8 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "r":
 			m.snap = capture.Snapshot()
+			m.watch = liveWatchScope(m.snap)
+			m.watch = liveWatchScope(m.snap)
 			m.buffered = countBufferedEvents()
 			m.autostart = autostartLine()
 			return m, nil
@@ -141,6 +149,7 @@ func (m statusModel) capturePanel() string {
 	// the model — surface it live so an installed-but-idle seat is visible.
 	return kvPanel("capture",
 		"state", state,
+		"watch", m.watch,
 		"autostart", m.autostart,
 		"ingest", hostOf(m.apiURL),
 		"key", keyDisplay(m.token, m.source),

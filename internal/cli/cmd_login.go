@@ -100,13 +100,20 @@ func cmdLogin(args []string) {
 			_ = os.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", home)
 		}
 	}
-	pid, watchDir, already, startErr := capture.StartDaemon(nil)
+	res, startErr := capture.StartDaemon(nil)
 	switch {
 	case startErr != nil:
 		printlnIndent(fmt.Sprintf("%s key saved, but couldn't auto-start capture: %v", warnGlyph, startErr))
 		printlnIndent(dimStyle.Render("Start it yourself with ") + bodyStyle.Render("promptster-teams start") + dimStyle.Render("."))
-	case already:
-		printlnIndent(fmt.Sprintf("%s capture already running in the background (pid %d)", okGlyph, pid))
+	case res.AlreadyRunning:
+		printlnIndent(fmt.Sprintf("%s capture already running in the background (pid %d)", okGlyph, res.PID))
+		if res.RootErr != nil {
+			// Say it plainly rather than listing directories that omit this one:
+			// a login that silently failed to widen capture is the failure this
+			// whole feature exists to remove.
+			printlnIndent(fmt.Sprintf("%s but %s could NOT be added to it: %v", warnGlyph, prettyHome(res.WatchDir), res.RootErr))
+			break
+		}
 		// StartDaemon handed this login's directory to the running capture, so
 		// name everything it covers now — otherwise an engineer logging in from a
 		// second checkout can't tell whether that tree is included.
@@ -114,8 +121,11 @@ func cmdLogin(args []string) {
 			printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(root)))
 		}
 	default:
-		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, pid))
-		printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(watchDir)) + dimStyle.Render(" · stop with ") + bodyStyle.Render("promptster-teams stop"))
+		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, res.PID))
+		printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(res.WatchDir)) + dimStyle.Render(" · stop with ") + bodyStyle.Render("promptster-teams stop"))
+		if res.RootErr != nil {
+			printlnIndent(fmt.Sprintf("%s could not record it for later `start` calls: %v", warnGlyph, res.RootErr))
+		}
 	}
 
 	if startErr == nil {
