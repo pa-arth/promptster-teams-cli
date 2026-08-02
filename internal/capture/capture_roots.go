@@ -144,15 +144,29 @@ func captureRootsFingerprint(roots []string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
-// dropCachedMismatches removes every cached "no" from a progress match map.
-// Returns the number dropped so callers can report the rescan.
-func dropCachedMismatches(match map[string]string) int {
-	n := 0
+// syncMatchCacheToRoots reconciles a watcher's classification cache with the
+// root set it is about to classify against. When the set changed since those
+// decisions were made, every cached "no" is dropped in place so the widened set
+// is applied to files already judged mismatches; "yes" entries survive, because
+// widening never un-matches anything and clearing one would reset its byte
+// offset and re-upload a whole transcript.
+//
+// Returns the fingerprint to store, how many mismatches were dropped, and
+// whether anything changed. It is a function rather than inline poll code so
+// the decision is observable: the poll re-caches an unchanged "no" within the
+// same pass, which makes "invalidate always" and "invalidate on change" look
+// identical from the outside while differing by a full re-parse of every
+// mismatched file on every 3-second poll.
+func syncMatchCacheToRoots(match map[string]string, storedFP string, roots []string) (fp string, dropped int, changed bool) {
+	fp = captureRootsFingerprint(roots)
+	if fp == storedFP {
+		return fp, 0, false
+	}
 	for k, v := range match {
 		if v == "no" {
 			delete(match, k)
-			n++
+			dropped++
 		}
 	}
-	return n
+	return fp, dropped, true
 }

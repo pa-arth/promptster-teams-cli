@@ -106,17 +106,53 @@ func TestCaptureRootsFingerprintIgnoresOrder(t *testing.T) {
 	}
 }
 
-// TestDropCachedMismatchesKeepsMatches: widening capture may only RESURRECT
-// dropped files. Clearing a "yes" would reset its byte offset and re-upload a
-// whole transcript.
-func TestDropCachedMismatchesKeepsMatches(t *testing.T) {
-	m := map[string]string{"a": "no", "b": "yes", "c": "no"}
-	if n := dropCachedMismatches(m); n != 2 {
-		t.Errorf("want 2 mismatches dropped; got %d", n)
-	}
-	if len(m) != 1 || m["b"] != "yes" {
-		t.Errorf("matched entries must survive; got %v", m)
-	}
+// TestSyncMatchCacheToRoots pins BOTH halves of the invalidation decision.
+//
+// The "unchanged" case matters as much as the "changed" one and cannot be
+// observed through a poll: the poll re-caches an unchanged "no" in the same
+// pass, so invalidating on every poll produces an identical end state while
+// re-parsing every mismatched file every 3 seconds. On a machine with
+// thousands of rollouts that cache is the difference between a background
+// daemon and a busy one.
+func TestSyncMatchCacheToRoots(t *testing.T) {
+	roots := []string{"/a", "/b"}
+	fp := captureRootsFingerprint(roots)
+
+	t.Run("unchanged roots keep the cache", func(t *testing.T) {
+		m := map[string]string{"x": "no", "y": "yes"}
+		got, dropped, changed := syncMatchCacheToRoots(m, fp, []string{"/b", "/a"})
+		if changed || dropped != 0 {
+			t.Errorf("an unchanged root set must not invalidate; changed=%v dropped=%d", changed, dropped)
+		}
+		if got != fp {
+			t.Errorf("fingerprint must be stable; %s vs %s", got, fp)
+		}
+		if len(m) != 2 {
+			t.Errorf("cache must be untouched; got %v", m)
+		}
+	})
+
+	t.Run("widened roots drop only mismatches", func(t *testing.T) {
+		m := map[string]string{"x": "no", "y": "yes", "z": "no"}
+		got, dropped, changed := syncMatchCacheToRoots(m, fp, []string{"/a", "/b", "/c"})
+		if !changed || dropped != 2 {
+			t.Errorf("a widened root set must drop both mismatches; changed=%v dropped=%d", changed, dropped)
+		}
+		if got == fp {
+			t.Error("the stored fingerprint must advance, or every later poll re-invalidates")
+		}
+		if len(m) != 1 || m["y"] != "yes" {
+			t.Errorf("matched entries must survive (their byte offsets depend on it); got %v", m)
+		}
+	})
+
+	t.Run("first run adopts the fingerprint", func(t *testing.T) {
+		m := map[string]string{"x": "no"}
+		_, _, changed := syncMatchCacheToRoots(m, "", roots)
+		if !changed {
+			t.Error("an empty stored fingerprint must be treated as a change")
+		}
+	})
 }
 
 // TestWorkspaceMatchRootsIncludesRegisteredRoots is the core of the fix: a
@@ -222,41 +258,6 @@ func TestPollCodexRescansMismatchesAfterRootRegistered(t *testing.T) {
 	}
 	if got := loadCodexWatchProgress().Match[path]; got != "yes" {
 		t.Errorf("re-classification must cache the match; got %q", got)
-	}
-}
-
-// TestPollCodexKeepsMismatchCacheWhenRootsUnchanged pins the other side of the
-// fingerprint: an unchanged root set must NOT re-read every mismatched file's
-// header on every poll. The cache is the reason a machine with thousands of
-// rollouts does not re-parse them all every 3 seconds.
-func TestPollCodexKeepsMismatchCacheWhenRootsUnchanged(t *testing.T) {
-	root := codexSessionsRoot(t)
-	stateDir := t.TempDir()
-	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
-	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
-	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
-
-	workspace := resolvePath(t.TempDir())
-	elsewhere := resolvePath(t.TempDir())
-	dir := filepath.Join(root, "2026", "06", "14")
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(dir, "rollout-2026-06-14T09-00-00-019eb780-3081-7ce0-9ba0-8a0bad13b300.jsonl")
-	ts := time.Now().UTC().Format(time.RFC3339)
-	if err := os.WriteFile(path, []byte(codexSessionMetaLine(elsewhere, ts)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := Session{DeviceID: "sess-roots-stable", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
-	cutoff := session.StartedAt.Add(-2 * time.Minute)
-	processors := map[string]*normalize.CodexRolloutProcessor{}
-
-	pollCodexRollouts(session, workspace, cutoff, processors, false)
-	pollCodexRollouts(session, workspace, cutoff, processors, false)
-
-	if got := loadCodexWatchProgress().Match[path]; got != "no" {
-		t.Errorf("an unchanged root set must preserve the cached mismatch; got %q", got)
 	}
 }
 

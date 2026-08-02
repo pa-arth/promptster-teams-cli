@@ -314,9 +314,9 @@ func pollCodexRollouts(
 	// used to compare against the single workspace, so a registered second tree
 	// would have stayed invisible here even after the Claude side saw it.
 	roots := workspaceMatchRoots(workspace)
-	if fp := captureRootsFingerprint(roots); fp != progress.RootsFP {
-		if n := dropCachedMismatches(progress.Match); n > 0 {
-			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d previously unmatched rollout(s)\n", n)
+	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d previously unmatched rollout(s)\n", dropped)
 		}
 		progress.RootsFP = fp
 		saveCodexWatchProgress(progress)

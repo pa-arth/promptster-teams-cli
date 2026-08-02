@@ -549,9 +549,9 @@ func pollClaudeTranscripts(
 	roots := workspaceMatchRoots(workspace)
 	// A widened root set must reach files already cached as mismatches; see
 	// claudeWatchProgress.RootsFP.
-	if fp := captureRootsFingerprint(roots); fp != progress.RootsFP {
-		if n := dropCachedMismatches(progress.Match); n > 0 {
-			fmt.Fprintf(os.Stderr, "claude-watcher: capture roots changed — re-checking %d previously unmatched transcript(s)\n", n)
+	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr, "claude-watcher: capture roots changed — re-checking %d previously unmatched transcript(s)\n", dropped)
 		}
 		progress.RootsFP = fp
 		saveClaudeWatchProgress(progress)
