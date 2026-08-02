@@ -711,6 +711,34 @@ func TestScrubInlineCommand(t *testing.T) {
 			in:   "cat <<EOF\nsecret body\nEOF\necho done",
 			want: "cat <<EOF\n<inline-code-redacted>\nEOF\necho done",
 		},
+		{
+			name: "LF <<- keeps the terminator's indentation",
+			in:   "cat <<-EOF\n\tsecret body\n\tEOF\n",
+			want: "cat <<-EOF\n<inline-code-redacted>\n\tEOF\n",
+		},
+		// CRLF: the terminator line is `EOF\r`. Trimming only " \t" left it
+		// unequal to the tag, so the heredoc read as unterminated and the body
+		// survived — the on-device scrub failing OPEN. Expected outputs here are
+		// byte-for-byte the backend mirror's (scrubInlineCode.parity.test.ts).
+		{
+			name: "CRLF heredoc body dropped (fail-open regression)",
+			in:   "cat <<EOF\r\nsecret\r\nEOF\r\n",
+			want: "cat <<EOF\r\n<inline-code-redacted>\nEOF\r\n",
+		},
+		{
+			name: "CRLF <<- with indented CR-terminated terminator",
+			in:   "cat <<-EOF\r\n\tsecret\r\n\tEOF\r\n",
+			want: "cat <<-EOF\r\n<inline-code-redacted>\n\tEOF\r\n",
+		},
+		// A CR BEFORE the tag is not a terminator. Trimming `\r` off the left as
+		// well as the right (the first cut at the CRLF fix) made this body line
+		// match, ending the scrub early and passing everything after it through
+		// verbatim. The real terminator is the last line.
+		{
+			name: "CR-prefixed body line is not a terminator",
+			in:   "cat <<EOF\n\rEOF\nsecret\nEOF\n",
+			want: "cat <<EOF\n<inline-code-redacted>\nEOF\n",
+		},
 		// Non-redacted cases: signal must survive.
 		{name: "plain test command untouched", in: "npm test -- --watch=false", want: "npm test -- --watch=false"},
 		{name: "git commit message untouched", in: `git commit -m "fix: races"`, want: `git commit -m "fix: races"`},
@@ -725,6 +753,54 @@ func TestScrubInlineCommand(t *testing.T) {
 				t.Errorf("scrubInlineCommand(%q)\n  got  %q\n  want %q", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestScrubInlineCommandCRLFDoesNotFailOpen states the CRLF cases as a SECURITY
+// property rather than a formatting one: whatever the exact output bytes, the
+// heredoc body must not survive. Kept out of the table above because a row is
+// easy to delete without anyone noticing, and this is the row that mattered —
+// on a CRLF machine the scrub that runs before the command leaves the laptop
+// kept the body verbatim.
+func TestScrubInlineCommandCRLFDoesNotFailOpen(t *testing.T) {
+	for _, in := range []string{
+		"cat <<EOF\r\nsecret\r\nEOF\r\n",
+		"cat <<-EOF\r\n\tsecret\r\n\tEOF\r\n",
+		"cat > config.ts <<'EOF'\r\nexport const KEY = \"sk-live-123\";\r\nEOF\r\n",
+	} {
+		got := scrubInlineCommand(in)
+		if strings.Contains(got, "secret") || strings.Contains(got, "sk-live-123") {
+			t.Errorf("CRLF heredoc body survived the scrub\n  in   %q\n  got  %q", in, got)
+		}
+		if !strings.Contains(got, inlineCodeMarker) {
+			t.Errorf("CRLF heredoc was not scrubbed at all\n  in   %q\n  got  %q", in, got)
+		}
+	}
+}
+
+// TestScrubInlineCommandCRPrefixedBodyLineDoesNotEndHeredoc is the same security
+// property from the opposite direction, and it is here because the CRLF fix
+// above opened it: tolerating `\r` on the LEFT of the tag as well as the right
+// let a heredoc BODY line of `\rEOF` pose as the terminator. The scrub then
+// stopped there and copied the remaining body — the part with the credential in
+// it — into the projected event untouched.
+//
+// A CR is a line ENDING. It belongs after the tag and never before it, which is
+// also exactly what the backend mirror's terminator pattern enforces.
+func TestScrubInlineCommandCRPrefixedBodyLineDoesNotEndHeredoc(t *testing.T) {
+	for _, in := range []string{
+		"cat <<EOF\n\rEOF\nexport AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI\nEOF\n",
+		"cat <<'EOF'\nfirst\n\rEOF\nexport KEY=\"sk-live-123\"\nEOF\n",
+		// Indented form: `<<-` allows tab/space indentation, still never a CR.
+		"cat <<-EOF\n\t\rEOF\n\texport KEY=\"sk-live-123\"\n\tEOF\n",
+	} {
+		got := scrubInlineCommand(in)
+		if strings.Contains(got, "AWS_SECRET_ACCESS_KEY") || strings.Contains(got, "sk-live-123") {
+			t.Errorf("heredoc body survived: a CR-prefixed body line ended the scrub early\n  in   %q\n  got  %q", in, got)
+		}
+		if !strings.Contains(got, inlineCodeMarker) {
+			t.Errorf("heredoc was not scrubbed at all\n  in   %q\n  got  %q", in, got)
+		}
 	}
 }
 

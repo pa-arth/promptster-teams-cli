@@ -428,7 +428,13 @@ var (
 // rests on the field allowlist + the backend's projection and DB CHECKs.
 //
 // LOCKSTEP: mirrors scrubInlineCode in the backend's
-// packages/shared/src/eventFieldProjection.ts.
+// packages/shared/src/eventFieldProjection.ts. The two sides use different
+// mechanisms by necessity (RE2 has no backreferences or lookbehind, so this
+// side scans procedurally), so "lockstep" means IDENTICAL OUTPUT — and that is
+// now pinned by a differential case table on the backend side at
+// packages/shared/src/__tests__/scrubInlineCode.parity.test.ts, whose
+// expectations are verbatim output of this implementation. Either side changing
+// requires re-running it rather than editing an expectation to make it green.
 func scrubInlineCommand(command string) string {
 	out := inlineExecSingle.ReplaceAllString(command, "$1'"+inlineCodeMarker+"'")
 	out = inlineExecDouble.ReplaceAllString(out, `$1"`+inlineCodeMarker+`"`)
@@ -503,7 +509,24 @@ func findHeredocTerminator(body, tag string) int {
 			line = body[offset : offset+lineEnd]
 			next = offset + lineEnd + 1
 		}
-		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), " \t")
+		// `\r` is trimmed on the RIGHT only. Trimming trailing " \t" alone made
+		// `EOF\r` != `EOF`, so a CRLF heredoc read as UNTERMINATED and its body
+		// was kept verbatim — the on-device scrub failing open on exactly the
+		// input it exists for.
+		//
+		// Leading `\r` must NOT be trimmed, and that asymmetry is the point. A
+		// CRLF terminator line is `EOF\r\n`: the CR is a line ENDING, so it can
+		// only ever follow the tag. Accepting one BEFORE the tag instead lets a
+		// heredoc BODY line of `\rEOF` match, which ends the scrub early and
+		// copies the rest of the body — commands, secrets and all — into the
+		// projected event verbatim. Same fail-open, re-entered from the other
+		// side.
+		//
+		// It is also what the backend mirror already does: its terminator
+		// captures `([ \t]*)` before the tag and allows `[ \t\r]*` only after
+		// it. Trimming `\r` on the left made the two sides disagree on an input
+		// where disagreeing means a secret survives here and not there.
+		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), " \t\r")
 		if trimmed == tag {
 			return offset
 		}
