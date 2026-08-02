@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 )
 
 // fakeDevKey is a syntactically-valid but entirely fake developer key for tests
@@ -135,4 +138,52 @@ func itoa(n int) string {
 		buf[i] = '-'
 	}
 	return string(buf[i:])
+}
+
+// TestStatusModelShowsWidenedScope: the dashboard is the DEFAULT `status` view
+// (the static one needs --once or a non-TTY), so it is where an engineer looks
+// to answer "is my second checkout captured?". Registering a directory the
+// daemon's own watch dir does not contain must show up here, not only in the
+// static view.
+//
+// Asserts on the model field and the rendered capture PANEL, never on the word
+// "watch" in the whole view — the unrelated "watchers" panel contains that, so
+// a view-wide substring check stays green with the row deleted.
+func TestStatusModelShowsWidenedScope(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	t.Setenv("PROMPTSTER_TEAMS_TOKEN", fakeDevKey)
+
+	primary := t.TempDir()
+	second := t.TempDir()
+	t.Setenv("PROMPTSTER_TEAMS_WATCH_DIR", primary)
+
+	pid := os.Getpid()
+	hb := time.Now().UTC().Format(time.RFC3339)
+	writeWatcherPidfile(t, dir, "claude-watcher.json",
+		`{"pid":`+itoa(pid)+`,"startedAt":"`+hb+`","lastHeartbeat":"`+hb+`","watchDir":`+quote(primary)+`,"eventsCaptured":1}`)
+
+	if _, _, err := capture.RegisterCaptureRoot(second); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newStatusModel()
+	if !strings.Contains(m.watch, second) {
+		t.Errorf("model scope must name the registered second tree; got %q", m.watch)
+	}
+	if !strings.Contains(m.watch, primary) {
+		t.Errorf("model scope must still name the daemon's own root; got %q", m.watch)
+	}
+	// The panel renders from m.watch; assert a distinctive fragment of the scope
+	// survives into it, so deleting the row fails here.
+	panel := m.capturePanel()
+	frag := filepath.Base(second)
+	if !strings.Contains(panel, frag) {
+		t.Errorf("capture panel must render the widened scope (looking for %q)\n---\n%s", frag, panel)
+	}
+}
+
+func quote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

@@ -87,13 +87,21 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdat
 	}
 	apiURL = ingest.ResolveAPIURL(*urlFlag)
 
-	watchDir = os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR")
-	if watchDir == "" {
-		if cwd, cwdErr := os.Getwd(); cwdErr == nil {
-			watchDir = cwd
-		}
+	return token, apiURL, watchDirFromEnv(), *noUpdateFlag, nil
+}
+
+// watchDirFromEnv reports the directory this invocation would capture:
+// PROMPTSTER_TEAMS_WATCH_DIR, else the cwd. Split out of resolveWatchEnv
+// because the already-running paths need the directory WITHOUT resolving a
+// credential — they only want to register it as a capture root.
+func watchDirFromEnv() string {
+	if dir := os.Getenv("PROMPTSTER_TEAMS_WATCH_DIR"); dir != "" {
+		return dir
 	}
-	return token, apiURL, watchDir, *noUpdateFlag, nil
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return ""
 }
 
 // runTeamsWatch runs the Claude + Codex transcript watchers concurrently in the
@@ -111,11 +119,26 @@ func RunTeamsWatch(args []string) error {
 		return fmt.Errorf("could not take capture lock: %w", err)
 	}
 	if !ok {
-		if pid, running := watchRunning(); running {
-			fmt.Fprintf(os.Stderr, "promptster-teams: capture already running (pid %d) — not starting a second watcher\n", pid)
-		} else {
-			fmt.Fprintln(os.Stderr, "promptster-teams: capture already running — not starting a second watcher")
+		// Bowing out must not mean this directory goes uncaptured: register it so
+		// the watcher that DOES hold the lock picks it up on its next poll. This
+		// is the autostart path's version of the second `start` — a per-tree
+		// launchd/npm watcher in a second checkout otherwise exited silently and
+		// that tree's sessions were never captured by anyone.
+		dir := watchDirFromEnv()
+		_, _, rootErr := RegisterCaptureRoot(dir)
+		pid, running := watchRunning()
+		who := "promptster-teams: capture already running"
+		if running {
+			who = fmt.Sprintf("promptster-teams: capture already running (pid %d)", pid)
 		}
+		if rootErr != nil {
+			// Bowing out is fine; bowing out while claiming this tree was handed
+			// over is not — that reads as success and leaves it uncaptured.
+			fmt.Fprintf(os.Stderr, "%s, but %s could NOT be handed to it: %v\n", who, dir, rootErr)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s — %s handed to it instead of starting a second watcher\n", who, dir)
+		}
+		printWatchedRoots(os.Stderr)
 		return nil
 	}
 	defer release()
