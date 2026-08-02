@@ -93,6 +93,10 @@ type codexWatchProgress struct {
 	// classification rules invalidates cached decisions; loadCodexWatchProgress
 	// runs a one-time migration when the stored V is behind codexProgressSchemaV.
 	V int `json:"v"`
+	// RootsFP fingerprints the match ROOT SET the cached decisions were made
+	// against; a change drops every cached "no" so a widened set reaches files
+	// already judged mismatches. Mirrors claudeWatchProgress.RootsFP.
+	RootsFP string `json:"roots_fp"`
 }
 
 // codexProgressSchemaV is the current progress-file schema version. v1 drops
@@ -112,6 +116,12 @@ func loadCodexWatchProgress() codexWatchProgress {
 	p := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{}}
 	data, err := os.ReadFile(codexWatchProgressPath())
 	if err != nil {
+		// Nothing on disk means nothing to migrate: stamp the CURRENT schema so
+		// the first save doesn't write v0 and make the next load re-run the
+		// one-time migration on a fresh install (which drops the whole mismatch
+		// cache for no reason, and would mask a broken RootsFP check by
+		// rescanning anyway).
+		p.V = codexProgressSchemaV
 		return p
 	}
 	_ = json.Unmarshal(data, &p)
@@ -299,6 +309,18 @@ func pollCodexRollouts(
 	dir := codexSessionsDir()
 	progress := loadCodexWatchProgress()
 	sent := 0
+	// Same root set the Claude watcher matches against: the workspace, every
+	// directory registered by a later `start`, and their git worktrees. Codex
+	// used to compare against the single workspace, so a registered second tree
+	// would have stayed invisible here even after the Claude side saw it.
+	roots := workspaceMatchRoots(workspace)
+	if fp := captureRootsFingerprint(roots); fp != progress.RootsFP {
+		if n := dropCachedMismatches(progress.Match); n > 0 {
+			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d previously unmatched rollout(s)\n", n)
+		}
+		progress.RootsFP = fp
+		saveCodexWatchProgress(progress)
+	}
 
 	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -323,7 +345,7 @@ func pollCodexRollouts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyCodexRollout(path, workspace, startCutoff) {
+			switch classifyCodexRollout(path, roots, startCutoff) {
 			case codexMatchYes:
 				progress.Match[path] = "yes"
 			case codexMatchYesPreexisting:
@@ -431,7 +453,7 @@ const (
 // 1 only, so a file caught mid-creation whose first line is not yet a readable
 // session_meta is returned codexMatchUndecided (retry next poll) rather than
 // cached as a mismatch — caching "no" would drop it forever.
-func classifyCodexRollout(path, workspace string, startCutoff time.Time) codexMatchResult {
+func classifyCodexRollout(path string, roots []string, startCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
@@ -456,7 +478,7 @@ func classifyCodexRollout(path, workspace string, startCutoff time.Time) codexMa
 	if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
 		return codexMatchUndecided
 	}
-	if !pathWithin(resolvePath(rec.Payload.Cwd), workspace) {
+	if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
 		return codexMatchNo
 	}
 	// cwd matches. A session whose session_meta predates this watch start is
@@ -609,6 +631,22 @@ func resolvePath(p string) string {
 	}
 	return filepath.Clean(p)
 }
+
+// pathWithinAny reports whether child sits at or under ANY of roots. An empty
+// root list matches nothing — a watcher with no resolvable roots captures
+// nothing rather than everything.
+func pathWithinAny(child string, roots []string) bool {
+	for _, r := range roots {
+		if r != "" && pathWithin(child, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// PathWithin exports pathWithin for callers outside this package (the status
+// row folds registered roots that the daemon root already covers).
+func PathWithin(child, parent string) bool { return pathWithin(child, parent) }
 
 // pathWithin reports whether child is the same as or nested under parent.
 func pathWithin(child, parent string) bool {

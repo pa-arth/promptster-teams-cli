@@ -129,6 +129,12 @@ type claudeWatchProgress struct {
 	// classification rules invalidates cached decisions; loadClaudeWatchProgress
 	// runs a one-time migration when the stored V is behind claudeProgressSchemaV.
 	V int `json:"v"`
+	// RootsFP fingerprints the match ROOT SET the cached decisions were made
+	// against. When it changes — a `start` registered another directory, or a
+	// git worktree appeared — every cached "no" is dropped so the widened set
+	// gets applied to files already judged mismatches. Without it, widening is
+	// invisible to any transcript classified before the change.
+	RootsFP string `json:"roots_fp"`
 }
 
 // claudeProgressSchemaV is the current progress-file schema version. v1 drops
@@ -177,6 +183,7 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 		Offsets: make(map[string]int64, len(p.Offsets)),
 		Match:   make(map[string]string, len(p.Match)),
 		V:       p.V,
+		RootsFP: p.RootsFP,
 	}
 	for k, v := range p.Offsets {
 		nk := claudeProgressKey(k)
@@ -203,6 +210,12 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	p := claudeWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{}}
 	data, err := os.ReadFile(claudeWatchProgressPath())
 	if err != nil {
+		// Nothing on disk means nothing to migrate: stamp the CURRENT schema so
+		// the first save doesn't write v0 and make the next load re-run the
+		// one-time migration on a fresh install (which drops the whole mismatch
+		// cache for no reason, and would mask a broken RootsFP check by
+		// rescanning anyway).
+		p.V = claudeProgressSchemaV
 		return p
 	}
 	_ = json.Unmarshal(data, &p)
@@ -534,6 +547,15 @@ func pollClaudeTranscripts(
 	parsed := 0
 	var consumed int64
 	roots := workspaceMatchRoots(workspace)
+	// A widened root set must reach files already cached as mismatches; see
+	// claudeWatchProgress.RootsFP.
+	if fp := captureRootsFingerprint(roots); fp != progress.RootsFP {
+		if n := dropCachedMismatches(progress.Match); n > 0 {
+			fmt.Fprintf(os.Stderr, "claude-watcher: capture roots changed — re-checking %d previously unmatched transcript(s)\n", n)
+		}
+		progress.RootsFP = fp
+		saveClaudeWatchProgress(progress)
+	}
 
 	for _, path := range candidateClaudeTranscripts(startCutoff) {
 		key := claudeProgressKey(path)
@@ -689,26 +711,45 @@ const (
 	claudeMatchNo
 )
 
-// workspaceMatchRoots returns the workspace plus every git worktree
-// registered to its repository. A developer who parallelizes with
-// `git worktree add ../fix` runs claude processes whose cwd is OUTSIDE the
-// workspace directory; those transcripts belong to this capture session and
-// must be tailed. Re-read every poll so worktrees created mid-session are
-// picked up before their transcripts get classified.
+// workspaceMatchRoots returns every directory whose transcripts this capture
+// session owns: the daemon's own workspace, every directory registered by a
+// later `promptster-teams start` (see capture_roots.go), and every git worktree
+// registered to any of their repositories.
+//
+// The worktree expansion is why a developer who parallelizes with
+// `git worktree add ../fix` still gets captured — those claude processes have a
+// cwd OUTSIDE the workspace directory. The registered roots are why a second
+// tree that shares nothing with the workspace gets captured at all: one lock
+// per user account means one daemon, so the second tree can only be reached by
+// widening this list.
+//
+// Re-read every poll (both the file and the worktree lists) so a directory
+// registered mid-session is picked up without restarting the daemon.
 func workspaceMatchRoots(workspace string) []string {
-	roots := []string{workspace}
-	// #nosec G204 -- constant argv; workspace is the capture session's own root dir, not user input. Reads only the local worktree list.
-	out, err := exec.Command("git", "-C", workspace, "worktree", "list", "--porcelain").Output()
-	if err != nil {
-		return roots
+	seeds := []string{workspace}
+	seeds = append(seeds, RegisteredCaptureRoots()...)
+
+	roots := make([]string, 0, len(seeds))
+	seen := map[string]bool{}
+	add := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		roots = append(roots, p)
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.HasPrefix(line, "worktree ") {
+	for _, seed := range seeds {
+		add(seed)
+		// #nosec G204 -- constant argv; seed is this install's own capture root, not attacker input. Reads only the local worktree list.
+		out, err := exec.Command("git", "-C", seed, "worktree", "list", "--porcelain").Output()
+		if err != nil {
 			continue
 		}
-		p := resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree ")))
-		if p != "" && p != workspace {
-			roots = append(roots, p)
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "worktree ") {
+				continue
+			}
+			add(resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))))
 		}
 	}
 	return roots

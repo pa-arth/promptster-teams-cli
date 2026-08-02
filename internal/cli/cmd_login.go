@@ -107,6 +107,12 @@ func cmdLogin(args []string) {
 		printlnIndent(dimStyle.Render("Start it yourself with ") + bodyStyle.Render("promptster-teams start") + dimStyle.Render("."))
 	case already:
 		printlnIndent(fmt.Sprintf("%s capture already running in the background (pid %d)", okGlyph, pid))
+		// StartDaemon handed this login's directory to the running capture, so
+		// name everything it covers now — otherwise an engineer logging in from a
+		// second checkout can't tell whether that tree is included.
+		for _, root := range capture.RegisteredCaptureRoots() {
+			printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(root)))
+		}
 	default:
 		printlnIndent(fmt.Sprintf("%s capturing in the background (pid %d)", okGlyph, pid))
 		printlnIndent(dimStyle.Render("Watching ") + bodyStyle.Render(prettyHome(watchDir)) + dimStyle.Render(" · stop with ") + bodyStyle.Render("promptster-teams stop"))

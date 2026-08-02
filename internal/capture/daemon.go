@@ -3,6 +3,7 @@ package capture
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,9 +95,14 @@ func DaemonStatus() (pid int, running bool) {
 // plain banner; `login` prints a styled line). It is idempotent: if a supervisor
 // is already alive it spawns nothing and returns that pid with alreadyRunning=true.
 // `stop` tears it down.
+//
+// Either way it registers the resolved watch dir as a capture root, so a second
+// `start` from an unrelated tree WIDENS the running daemon instead of quietly
+// changing nothing. watchDir is returned on the already-running path too —
+// callers need it to tell the engineer which directory is now covered.
 func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, err error) {
 	if p, running := DaemonStatus(); running {
-		return p, "", true, nil
+		return p, registerWatchDir(), true, nil
 	}
 	// A watcher launched some other way (foreground `watch` or the autostart
 	// service) holds the single-instance lock but never wrote supervisor.json —
@@ -104,13 +110,16 @@ func StartDaemon(args []string) (pid int, watchDir string, alreadyRunning bool, 
 	// the lock and exit. Idempotent, like the DaemonStatus check above; callers
 	// render their own UX.
 	if p, running := watchRunning(); running {
-		return p, "", true, nil
+		return p, registerWatchDir(), true, nil
 	}
 
 	token, apiURL, watchDir, noAutoUpdate, err := resolveWatchEnv(args)
 	if err != nil {
 		return 0, "", false, err
 	}
+	// Record the first root too, so the watched-directory list a later `start`
+	// prints is the whole truth rather than only the additions.
+	_, _, _ = RegisterCaptureRoot(watchDir)
 
 	logPath := daemonLogPath()
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
@@ -179,12 +188,40 @@ func StartTeamsDaemon(args []string) error {
 		return err
 	}
 	if already {
-		fmt.Fprintf(os.Stderr, "promptster-teams: background capture already running (pid %d) — stop it with `promptster-teams stop`\n", pid)
+		fmt.Fprintf(os.Stderr, "promptster-teams: background capture already running (pid %d) — capture now covers %s\n", pid, watchDir)
+		printWatchedRoots(os.Stderr)
+		fmt.Fprintf(os.Stderr, "promptster-teams: stop with `promptster-teams stop`\n")
 		return nil
 	}
 	fmt.Fprintf(os.Stderr, "promptster-teams: capturing in background (pid %d) under %s → %s\n", pid, watchDir, ingest.APIHost())
+	printWatchedRoots(os.Stderr)
 	fmt.Fprintf(os.Stderr, "promptster-teams: logs at %s · stop with `promptster-teams stop`\n", daemonLogPath())
 	return nil
+}
+
+// registerWatchDir adds the directory this invocation would have watched to the
+// captured set and returns it. Used on the already-running paths, where the
+// credential never has to be resolved — a second `start` should widen capture
+// even from a shell with no key in scope, since the running daemon owns the
+// credential.
+func registerWatchDir() string {
+	dir := watchDirFromEnv()
+	_, _, _ = RegisterCaptureRoot(dir)
+	return dir
+}
+
+// printWatchedRoots names every directory now being captured. Widening capture
+// is consent-shaped: `start` must never quietly extend what leaves the machine,
+// so the full list is printed on every start, not just the directory added.
+func printWatchedRoots(w io.Writer) {
+	roots := RegisteredCaptureRoots()
+	if len(roots) < 2 {
+		return // a single root is already named by the line above
+	}
+	fmt.Fprintf(w, "promptster-teams: watching %d directories:\n", len(roots))
+	for _, r := range roots {
+		fmt.Fprintf(w, "promptster-teams:   %s\n", r)
+	}
 }
 
 // StopTeamsDaemon terminates the background capture recorded in THIS state dir's

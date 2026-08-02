@@ -85,7 +85,7 @@ func TestClassifyCodexRolloutCutoffRouting(t *testing.T) {
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			path := write(fmt.Sprintf("rollout-%d.jsonl", i), tc.cwd, tc.ts)
-			if got := classifyCodexRollout(path, ws, cutoff); got != tc.want {
+			if got := classifyCodexRollout(path, []string{ws}, cutoff); got != tc.want {
 				t.Errorf("classifyCodexRollout = %v, want %v", got, tc.want)
 			}
 		})
@@ -107,7 +107,7 @@ func TestClassifyCodexRolloutUndecidedWhenNotSessionMeta(t *testing.T) {
 	if err := os.WriteFile(empty, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := classifyCodexRollout(empty, ws, cutoff); got != codexMatchUndecided {
+	if got := classifyCodexRollout(empty, []string{ws}, cutoff); got != codexMatchUndecided {
 		t.Errorf("empty file = %v, want undecided", got)
 	}
 
@@ -116,7 +116,7 @@ func TestClassifyCodexRolloutUndecidedWhenNotSessionMeta(t *testing.T) {
 	if err := os.WriteFile(notMeta, []byte(`{"type":"response_item","payload":{}}`+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := classifyCodexRollout(notMeta, ws, cutoff); got != codexMatchUndecided {
+	if got := classifyCodexRollout(notMeta, []string{ws}, cutoff); got != codexMatchUndecided {
 		t.Errorf("non-session_meta first line = %v, want undecided", got)
 	}
 }

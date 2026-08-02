@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
@@ -71,6 +72,11 @@ func printStatusStatic() {
 	if root == "" {
 		root, _ = os.Getwd()
 	}
+	// A second `start` widens capture to more directories than the daemon's own
+	// watch dir, and the whole point of registering them is that the engineer
+	// can confirm the second tree is covered — so `status` must show the full
+	// set, not just the root the daemon happened to launch under.
+	root = watchScopeDisplay(root, capture.RegisteredCaptureRoots())
 
 	daemon := "not running — `promptster-teams login` starts it, or `autostart enable` for reboots"
 	if snap.Live {
@@ -222,6 +228,25 @@ func printAutoUpdateStatus() {
 // intervals used to be retyped into the copy by hand in the first place.
 // Anything not a whole number of hours or minutes falls back to Duration's own
 // formatting rather than inventing a rounding rule.
+// watchScopeDisplay renders the `watch` row: the daemon's own root, plus any
+// directory a later `start` registered. Registered roots that are already
+// inside the daemon root are dropped — printing "~ and ~/work" would read as
+// two scopes when one describes the truth. Pure so its formatting is testable
+// without a live daemon.
+func watchScopeDisplay(root string, registered []string) string {
+	extra := []string{}
+	for _, r := range registered {
+		if r == "" || r == root || capture.PathWithin(r, root) {
+			continue
+		}
+		extra = append(extra, r)
+	}
+	if len(extra) == 0 {
+		return root
+	}
+	return root + " (+ " + strings.Join(extra, ", ") + ")"
+}
+
 func humanInterval(d time.Duration) string {
 	switch {
 	case d >= time.Hour && d%time.Hour == 0:
