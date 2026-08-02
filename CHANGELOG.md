@@ -25,6 +25,30 @@ follows [Semantic Versioning](https://semver.org/).
   at all. The check is strictly read-only — it never enrolls, repairs, or writes
   `hooks.json`.
 
+### Fixed
+
+- **`doctor` contradicted the updater it reports on.** Its auto-update line
+  restated three facts that `internal/selfupdate` owns, and every one of them had
+  since drifted: it promised an update "installs on the next **24h** check" for
+  every release after the cadence became 30m; it decided whether an update
+  existed by comparing version *strings*, so a machine running **ahead** of the
+  published release (a local build, or a release yanked after it shipped) was
+  told a newer one was available, and a tag differing only by a `v` prefix read
+  as an upgrade; and it matched the opt-out variable without trimming or folding
+  case, so `PROMPTSTER_TEAMS_NO_AUTO_UPDATE=TRUE` silenced the daemon while
+  `doctor` cheerfully reported auto-update on.
+
+  All three now read from `selfupdate` — `CheckInterval`, `IsNewer` (the same
+  predicate that authorizes an actual swap), and `EnvDisablesAutoUpdate` — so the
+  screen cannot disagree with the mechanism again. This is more than a copy fix:
+  `doctor` is the one command an engineer runs while they *already* suspect
+  capture or updating is broken, so a wrong line there sends the investigation
+  the wrong way.
+
+  The line also reports the version actually **running** when it is up to date
+  (claiming "up to date (0.12.1)" while running 0.13.0 is the same lie inverted),
+  and cadences render as `30m` / `5m` rather than Go's `30m0s` / `5m0s`.
+
 ## [0.12.1] — 2026-07-31
 
 ### Added

@@ -167,7 +167,7 @@ func (r *Resolver) PinnedCliVersion() string {
 // MinCliVersion returns the version floor the org wants the fleet on, or "".
 // Like the other self-update fields it uses the last known value with no TTL
 // decay. It is an ESCALATION lever only: it makes a lagging watcher check
-// sooner than the 24h cadence, and never overrides the autoUpdate switch or a
+// sooner than the normal cadence, and never overrides the autoUpdate switch or a
 // pin — both of those are still enforced in selfupdate.checkAndApply.
 func (r *Resolver) MinCliVersion() string {
 	r.mu.Lock()

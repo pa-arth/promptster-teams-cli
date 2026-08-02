@@ -93,7 +93,7 @@ func printStatusStatic() {
 		"autostart", autostart,
 		"device", capture.DeviceID(),
 		"identity", "anonymous — device hash + team key, no email",
-		"presence", fmt.Sprintf("heartbeat every %s during watch", capture.PresenceHeartbeatInterval),
+		"presence", fmt.Sprintf("heartbeat every %s during watch", humanInterval(capture.PresenceHeartbeatInterval)),
 		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
 	)))
 	fmt.Println()
@@ -139,7 +139,7 @@ func cmdTeamsDoctor() {
 		printlnIndent(fmt.Sprintf("%s Claude Code transcript dir not found yet: %s", warnGlyph, capture.ClaudeProjectsDir()))
 	}
 
-	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, capture.PresenceHeartbeatInterval))
+	printlnIndent(fmt.Sprintf("%s presence heartbeat every %s while watching — device + tools only, no identity/email", okGlyph, humanInterval(capture.PresenceHeartbeatInterval)))
 
 	// Delivery-queue health. Deliberately does not touch `ok`: a stuck or full
 	// queue is not a login problem, and `ok` only chooses between the "run watch"
@@ -204,23 +204,69 @@ func cursorHookGlyph(l capture.CursorHookDoctorLine) string {
 // watching (it needs an authenticated fetch), so doctor reports the machine-
 // local switch and a short-timeout latest-version probe that degrades silently.
 func printAutoUpdateStatus() {
-	if v := os.Getenv("PROMPTSTER_TEAMS_NO_AUTO_UPDATE"); v == "1" || v == "true" || v == "yes" || v == "on" {
-		printlnIndent(fmt.Sprintf("%s auto-update disabled (PROMPTSTER_TEAMS_NO_AUTO_UPDATE set)", warnGlyph))
-		return
+	env := os.Getenv(selfupdate.EnvNoAutoUpdate)
+	// Only probe the network when the answer can still depend on it — the two
+	// early branches below decide without it. The condition MUST match
+	// autoUpdateStatusLine's own gates, or doctor degrades to the vaguest line
+	// for a set-but-falsy opt-out (PROMPTSTER_TEAMS_NO_AUTO_UPDATE=0).
+	latest, latestOK := "", false
+	if !selfupdate.EnvDisablesAutoUpdate(env) && version.Version != "dev" && version.Version != "" {
+		latest, latestOK = selfupdate.LatestVersionBestEffort(3 * time.Second)
 	}
-	if version.Version == "dev" || version.Version == "" {
-		printlnIndent(fmt.Sprintf("%s auto-update inactive for dev build", warnGlyph))
-		return
+	printlnIndent(autoUpdateStatusLine(env, version.Version, latest, latestOK))
+}
+
+// humanInterval renders a cadence the way a person writes one. Go's
+// Duration.String gives "30m0s" and "5m0s" — machine-shaped noise on a screen
+// engineers read while something is already wrong, and the reason these
+// intervals used to be retyped into the copy by hand in the first place.
+// Anything not a whole number of hours or minutes falls back to Duration's own
+// formatting rather than inventing a rounding rule.
+func humanInterval(d time.Duration) string {
+	switch {
+	case d >= time.Hour && d%time.Hour == 0:
+		return fmt.Sprintf("%dh", int64(d/time.Hour))
+	case d >= time.Minute && d%time.Minute == 0:
+		return fmt.Sprintf("%dm", int64(d/time.Minute))
+	default:
+		return d.String()
 	}
-	if latest, ok := selfupdate.LatestVersionBestEffort(3 * time.Second); ok {
-		if latest != version.Version {
-			printlnIndent(fmt.Sprintf("%s auto-update on — newer release available (%s); it installs on the next 24h check while watching", okGlyph, latest))
-		} else {
-			printlnIndent(fmt.Sprintf("%s auto-update on — up to date (%s)", okGlyph, latest))
+}
+
+// autoUpdateStatusLine builds doctor's auto-update line. Pure so every branch is
+// assertable without a network probe or an environment — the wrong branch here
+// is not a cosmetic bug, it is doctor telling an engineer the opposite of what
+// the daemon will do.
+//
+// Every fact in the line is READ from selfupdate rather than restated here, and
+// all three restatements this replaces were wrong at the time of writing:
+//
+//   - "is there an update for me?" now asks selfupdate.IsNewer, the predicate
+//     that authorizes an actual swap. The string comparison it replaces told a
+//     machine running AHEAD of the published release that a newer one existed.
+//   - the cadence is selfupdate.CheckInterval. The hardcoded "24h" here outlived
+//     the move to 30m by several releases.
+//   - the opt-out is selfupdate.EnvDisablesAutoUpdate, which trims and folds
+//     case. The inline comparison it replaces did neither, so a machine set to
+//     `TRUE` had auto-update off and was told it was on.
+func autoUpdateStatusLine(envOptOut, current, latest string, latestOK bool) string {
+	if selfupdate.EnvDisablesAutoUpdate(envOptOut) {
+		return fmt.Sprintf("%s auto-update disabled (%s set)", warnGlyph, selfupdate.EnvNoAutoUpdate)
+	}
+	if current == "dev" || current == "" {
+		return fmt.Sprintf("%s auto-update inactive for dev build", warnGlyph)
+	}
+	if latestOK {
+		if selfupdate.IsNewer(current, latest) {
+			return fmt.Sprintf("%s auto-update on — newer release available (%s); it installs on the next check (every %s) while watching",
+				okGlyph, latest, humanInterval(selfupdate.CheckInterval))
 		}
-		return
+		// Not newer covers both equal and ahead-of-latest (a local build, a
+		// yanked release). Report the version actually RUNNING: claiming to be
+		// "up to date (0.12.1)" while running 0.13.0 is the same lie in reverse.
+		return fmt.Sprintf("%s auto-update on — up to date (%s)", okGlyph, current)
 	}
-	printlnIndent(fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph))
+	return fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph)
 }
 
 // countBufferedEvents reports how many captured events are still waiting to be
