@@ -149,7 +149,7 @@ func parseUnifiedDiffNewRanges(diff string) map[string][]attrLineRange {
 // path. Git prefixes the new side with `b/`; a deletion targets `/dev/null`,
 // which yields "" (no new-side path). Git already emits forward slashes.
 func parseDiffNewPath(s string) string {
-	s = strings.TrimSpace(s)
+	s = unquoteDiffPath(strings.TrimSpace(s))
 	if s == "/dev/null" {
 		return ""
 	}
