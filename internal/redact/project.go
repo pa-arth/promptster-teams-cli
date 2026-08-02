@@ -509,11 +509,24 @@ func findHeredocTerminator(body, tag string) int {
 			line = body[offset : offset+lineEnd]
 			next = offset + lineEnd + 1
 		}
-		// `\r` is trimmed on both ends so a CRLF command scrubs identically to
-		// an LF one. Trimming only " \t" made `EOF\r` != `EOF`, so a CRLF
-		// heredoc read as UNTERMINATED and its body was kept verbatim — the
-		// on-device scrub failing open on exactly the input it exists for.
-		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t\r"), " \t\r")
+		// `\r` is trimmed on the RIGHT only. Trimming trailing " \t" alone made
+		// `EOF\r` != `EOF`, so a CRLF heredoc read as UNTERMINATED and its body
+		// was kept verbatim — the on-device scrub failing open on exactly the
+		// input it exists for.
+		//
+		// Leading `\r` must NOT be trimmed, and that asymmetry is the point. A
+		// CRLF terminator line is `EOF\r\n`: the CR is a line ENDING, so it can
+		// only ever follow the tag. Accepting one BEFORE the tag instead lets a
+		// heredoc BODY line of `\rEOF` match, which ends the scrub early and
+		// copies the rest of the body — commands, secrets and all — into the
+		// projected event verbatim. Same fail-open, re-entered from the other
+		// side.
+		//
+		// It is also what the backend mirror already does: its terminator
+		// captures `([ \t]*)` before the tag and allows `[ \t\r]*` only after
+		// it. Trimming `\r` on the left made the two sides disagree on an input
+		// where disagreeing means a secret survives here and not there.
+		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), " \t\r")
 		if trimmed == tag {
 			return offset
 		}
