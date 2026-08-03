@@ -2,6 +2,16 @@ package capture
 
 import "time"
 
+// transcriptHistoryWindow matches the product's longest per-day context view.
+// Claude and Codex transcripts carry trustworthy session timestamps, so their
+// first poll can safely replay this bounded window instead of starting empty.
+// Cursor has no trustworthy transcript timestamp and stays go-forward only.
+const transcriptHistoryWindow = 28 * 24 * time.Hour
+
+func transcriptHistoryCutoff(now time.Time) time.Time {
+	return now.Add(-transcriptHistoryWindow)
+}
+
 // Session is the teams capture context. Unlike the hiring CLI, it is NOT a
 // redeemed assessment: it is built from environment configuration at watch
 // start and carries ONLY what the transcript watchers need — where to send,
@@ -25,6 +35,8 @@ type Session struct {
 	ApiURL string
 	// CaptureMode is always "transcript" — the only capture channel teams uses.
 	CaptureMode string
-	// StartedAt bounds which transcripts are in scope (those modified at/after).
+	// StartedAt bounds timestamp-less Cursor capture. Timestamped Claude and
+	// Codex sessions use transcriptHistoryWindow so first boot can backfill the
+	// product's historical views.
 	StartedAt time.Time
 }
