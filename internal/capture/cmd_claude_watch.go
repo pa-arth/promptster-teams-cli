@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -69,6 +70,13 @@ const claudeDegradedByteThreshold = 256 * 1024
 // per 3s poll drains a heavy 28-day history in a few minutes. A var, not a
 // const, so a test can lower it.
 var claudeWatchMaxBytesPerPoll int64 = 8 << 20
+
+// transcriptMaxRecordBytes is the largest JSONL record the transcript readers
+// support. It matches the scanners used for transcript classification. A
+// larger record cannot be parsed safely within one bounded poll, so it is
+// discarded in bounded chunks rather than making every future poll reread the
+// same prefix forever.
+const transcriptMaxRecordBytes int64 = 8 << 20
 
 // claudeDegradationStep advances the degraded-detection state machine for one
 // poll: any parsed event proves the parser works (reset); otherwise consumed
@@ -607,11 +615,11 @@ func pollClaudeTranscripts(
 	}
 	deferredWork := false
 	roots := workspaceMatchRoots(workspace)
-	// A widened root set must reach files already cached as mismatches; see
-	// claudeWatchProgress.RootsFP.
+	// Any root-set change must revalidate cached decisions: widening can admit a
+	// prior mismatch, while narrowing must revoke a prior match. See RootsFP.
 	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
 		if dropped > 0 {
-			fmt.Fprintf(os.Stderr, "claude-watcher: capture roots changed — re-checking %d previously unmatched transcript(s)\n", dropped)
+			fmt.Fprintf(os.Stderr, "claude-watcher: capture roots changed — re-checking %d cached transcript(s)\n", dropped)
 		}
 		progress.RootsFP = fp
 		saveClaudeWatchProgress(progress)
@@ -976,7 +984,8 @@ func tailClaudeTranscript(
 		return 0, 0, false
 	}
 
-	reader := bufio.NewReader(f)
+	limited := &io.LimitedReader{R: f, N: budget}
+	reader := bufio.NewReader(limited)
 	consumed := int64(0)
 	parsed := 0
 	truncated := false
@@ -987,6 +996,16 @@ func tailClaudeTranscript(
 		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
+			if err == io.EOF && limited.N == 0 {
+				truncated = true
+				// A partial record is normally retried intact next poll. When a
+				// single record itself reaches the supported 8 MiB maximum, no
+				// future bounded poll can complete it; advance over this bounded
+				// fragment so subsequent polls discard the rest up to its newline.
+				if consumed == 0 && budget == transcriptMaxRecordBytes && int64(len(line)) == budget {
+					consumed = int64(len(line))
+				}
+			}
 			break // partial line — next poll
 		}
 		consumed += int64(len(line))

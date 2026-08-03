@@ -485,6 +485,87 @@ func TestPollClaudeTranscriptsChunksBackfill(t *testing.T) {
 	}
 }
 
+// TestTailClaudeTranscriptDoesNotCrossBudgetMidRecord proves the byte cap is a
+// hard read boundary, not a check performed after ReadBytes has already pulled
+// an arbitrarily large record into memory. A record that does not fit in the
+// remaining budget stays intact for the next poll.
+func TestTailClaudeTranscriptDoesNotCrossBudgetMidRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line1 := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"first"}}`+"\n", workspace, ts)
+	line2 := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"second record must remain whole"}}`+"\n", workspace, ts)
+	path := filepath.Join(t.TempDir(), "budget.jsonl")
+	if err := os.WriteFile(path, []byte(line1+line2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	key := claudeProgressKey(path)
+	progress := claudeWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{key: "yes"}, V: claudeProgressSchemaV}
+	proc := normalize.NewClaudeTranscriptProcessor("budget-claude")
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
+	budget := int64(len(line1) + len(line2)/2)
+
+	_, consumed, more := tailClaudeTranscript(path, progress, proc, session, true, false, budget)
+	if !more || consumed != int64(len(line1)) {
+		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", consumed, more, len(line1))
+	}
+	if got := progress.Offsets[key]; got != int64(len(line1)) {
+		t.Fatalf("partial second record advanced offset to %d, want %d", got, len(line1))
+	}
+
+	_, consumed, _ = tailClaudeTranscript(path, progress, proc, session, true, false, int64(len(line2)+1))
+	if consumed != int64(len(line2)) || progress.Offsets[key] != int64(len(line1)+len(line2)) {
+		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", consumed, progress.Offsets[key])
+	}
+}
+
+// TestPollClaudeRevalidatesMatchAfterRootsNarrow proves a durable positive
+// decision cannot outlive the capture scope that authorized it. The offset is
+// retained, but content appended after the root is removed is not parsed.
+func TestPollClaudeRevalidatesMatchAfterRootsNarrow(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	oldWorkspace := resolvePath(t.TempDir())
+	newWorkspace := resolvePath(t.TempDir())
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line1 := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"captured while watched"}}`+"\n", oldWorkspace, ts)
+	line2 := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"must stay private after removal"}}`+"\n", oldWorkspace, ts)
+	dir := filepath.Join(root, "-Users-me-removed")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "removed-root.jsonl")
+	if err := os.WriteFile(path, []byte(line1+line2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	key := claudeProgressKey(path)
+	saveClaudeWatchProgress(claudeWatchProgress{
+		Offsets: map[string]int64{key: int64(len(line1))},
+		Match:   map[string]string{key: "yes"},
+		RootsFP: captureRootsFingerprint(workspaceMatchRoots(oldWorkspace)),
+		V:       claudeProgressSchemaV,
+	})
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: newWorkspace, StartedAt: time.Now()}
+	parsed, consumed := pollClaudeTranscripts(session, newWorkspace, transcriptHistoryCutoff(time.Now()), map[string]*normalize.ClaudeTranscriptProcessor{}, true, false)
+	if parsed != 0 || consumed != 0 {
+		t.Fatalf("removed workspace content was captured: parsed=%d consumed=%d", parsed, consumed)
+	}
+	saved := loadClaudeWatchProgress()
+	if saved.Match[key] != "no" || saved.Offsets[key] != int64(len(line1)) {
+		t.Fatalf("removed match was not revoked without moving its offset: match=%q offset=%d", saved.Match[key], saved.Offsets[key])
+	}
+}
+
 // TestPollClaudeTranscriptsDefersUnderOutboxPressure pins the backpressure. The
 // transcript is already durable on disk with its offset unmoved, so declining
 // to read defers the work perfectly; reading on would race the outbox to the
@@ -576,6 +657,82 @@ func TestPollCodexRolloutsChunksBackfill(t *testing.T) {
 	}
 	if got := loadCodexWatchProgress().Offsets[path]; got != size {
 		t.Fatalf("backfill drained %d of %d bytes across polls", got, size)
+	}
+}
+
+// TestTailCodexRolloutDoesNotCrossBudgetMidRecord is the Codex half of the
+// hard budget boundary. The second complete JSONL record is physically bounded
+// by the limited reader and logically retried from its original offset.
+func TestTailCodexRolloutDoesNotCrossBudgetMidRecord(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line1 := codexSessionMetaLine(workspace, ts)
+	line2 := fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":"second record must remain whole","images":[]}}`+"\n", ts)
+	path := filepath.Join(t.TempDir(), "rollout-budget.jsonl")
+	if err := os.WriteFile(path, []byte(line1+line2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	progress := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{path: "yes"}, V: codexProgressSchemaV}
+	proc := normalize.NewCodexRolloutProcessor("budget-codex")
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
+	budget := int64(len(line1) + len(line2)/2)
+
+	_, consumed, more := tailCodexRollout(path, progress, proc, session, false, budget)
+	if !more || consumed != int64(len(line1)) {
+		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", consumed, more, len(line1))
+	}
+	if got := progress.Offsets[path]; got != int64(len(line1)) {
+		t.Fatalf("partial second record advanced offset to %d, want %d", got, len(line1))
+	}
+
+	_, consumed, _ = tailCodexRollout(path, progress, proc, session, false, int64(len(line2)+1))
+	if consumed != int64(len(line2)) || progress.Offsets[path] != int64(len(line1)+len(line2)) {
+		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", consumed, progress.Offsets[path])
+	}
+}
+
+// TestPollCodexRevalidatesMatchAfterRootsNarrow mirrors the Claude security
+// regression for Codex's globally persisted rollout cache.
+func TestPollCodexRevalidatesMatchAfterRootsNarrow(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	oldWorkspace := resolvePath(t.TempDir())
+	newWorkspace := resolvePath(t.TempDir())
+	ts := time.Now().UTC().Format(time.RFC3339)
+	line1 := codexSessionMetaLine(oldWorkspace, ts)
+	line2 := fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":"must stay private after removal","images":[]}}`+"\n", ts)
+	dir := filepath.Join(root, "2026", "08", "03")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-removed-root.jsonl")
+	if err := os.WriteFile(path, []byte(line1+line2), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	saveCodexWatchProgress(codexWatchProgress{
+		Offsets: map[string]int64{path: int64(len(line1))},
+		Match:   map[string]string{path: "yes"},
+		RootsFP: captureRootsFingerprint(workspaceMatchRoots(oldWorkspace)),
+		V:       codexProgressSchemaV,
+	})
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: newWorkspace, StartedAt: time.Now()}
+	if queued := pollCodexRollouts(session, newWorkspace, transcriptHistoryCutoff(time.Now()), map[string]*normalize.CodexRolloutProcessor{}, false); queued != 0 {
+		t.Fatalf("removed workspace content queued %d events", queued)
+	}
+	saved := loadCodexWatchProgress()
+	if saved.Match[path] != "no" || saved.Offsets[path] != int64(len(line1)) {
+		t.Fatalf("removed match was not revoked without moving its offset: match=%q offset=%d", saved.Match[path], saved.Offsets[path])
 	}
 }
 

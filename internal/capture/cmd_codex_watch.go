@@ -341,7 +341,7 @@ func pollCodexRollouts(
 	roots := workspaceMatchRoots(workspace)
 	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
 		if dropped > 0 {
-			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d previously unmatched rollout(s)\n", dropped)
+			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d cached rollout(s)\n", dropped)
 		}
 		progress.RootsFP = fp
 		saveCodexWatchProgress(progress)
@@ -602,7 +602,8 @@ func tailCodexRollout(
 		return 0, 0, false
 	}
 
-	reader := bufio.NewReader(f)
+	limited := &io.LimitedReader{R: f, N: budget}
+	reader := bufio.NewReader(limited)
 	consumed := int64(0)
 	queued := 0
 	truncated := false
@@ -614,6 +615,12 @@ func tailCodexRollout(
 		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
+			if err == io.EOF && limited.N == 0 {
+				truncated = true
+				if consumed == 0 && budget == transcriptMaxRecordBytes && int64(len(line)) == budget {
+					consumed = int64(len(line))
+				}
+			}
 			// No trailing newline yet — leave this partial line for next poll.
 			break
 		}

@@ -133,17 +133,28 @@ func TestSyncMatchCacheToRoots(t *testing.T) {
 		}
 	})
 
-	t.Run("widened roots drop only mismatches", func(t *testing.T) {
+	t.Run("widened roots revalidate every cached decision", func(t *testing.T) {
 		m := map[string]string{"x": "no", "y": "yes", "z": "no"}
 		got, dropped, changed := syncMatchCacheToRoots(m, fp, []string{"/a", "/b", "/c"})
-		if !changed || dropped != 2 {
-			t.Errorf("a widened root set must drop both mismatches; changed=%v dropped=%d", changed, dropped)
+		if !changed || dropped != 3 {
+			t.Errorf("a changed root set must drop every cached decision; changed=%v dropped=%d", changed, dropped)
 		}
 		if got == fp {
 			t.Error("the stored fingerprint must advance, or every later poll re-invalidates")
 		}
-		if len(m) != 1 || m["y"] != "yes" {
-			t.Errorf("matched entries must survive (their byte offsets depend on it); got %v", m)
+		if len(m) != 0 {
+			t.Errorf("all cached decisions must be revalidated; got %v", m)
+		}
+	})
+
+	t.Run("narrowed roots invalidate accepted transcripts", func(t *testing.T) {
+		m := map[string]string{"inside": "yes", "outside": "yes"}
+		_, dropped, changed := syncMatchCacheToRoots(m, fp, []string{"/a"})
+		if !changed || dropped != 2 {
+			t.Fatalf("a narrowed root set must revalidate accepted transcripts; changed=%v dropped=%d", changed, dropped)
+		}
+		if len(m) != 0 {
+			t.Fatalf("cached matches outlived the watched roots: %v", m)
 		}
 	})
 
