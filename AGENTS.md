@@ -696,7 +696,7 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   unchanged branch. A per-poll flag therefore expired mid-range, which lost the
   deferred branch outright and left a clamped one holding spans positioned
   mid-branch: the next live commit remapped those into a verdict about lines
-  nobody wrote. `pollGitWatch`'s second return is what says a root drained.
+  nobody wrote. `pollGitWatch`'s `drained` map is what says a root drained.
 
 - **A NEW ROOT is a third way into that same loss, and it is one-shot.** A fresh
   `git worktree add` is a new `gitWatchRootKey`, so `pollGitWatch` cold-starts it:
@@ -714,7 +714,7 @@ Two things about it that are easy to get wrong, both learned the expensive way:
 
   Three things decide WHERE the rebuilt spans land, and each was a live
   mispositioning before it was pinned. **The range is resolved against the head
-  SHA `pollGitWatch` baselined the cursor to** — `pollGitWatch`'s third return
+  SHA `pollGitWatch` baselined the cursor to** — `pollGitWatch`'s `coldStart` map
   carries that SHA, not a bool — because re-reading `HEAD` a whole poll later lets
   a commit made in between be folded here AND detected as new next poll, folding
   its hunks twice. **`--first-parent`**, because `gitCommitRawDiff` reads every
@@ -731,7 +731,7 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   into the same ledger.
 
 - **ATTRIBUTION AND THE REWORK FOLD TAKE DELIBERATELY DIFFERENT RANGES, and
-  `gitNewCommits`' second return is that split.** `gitCommitRawDiff` reads every
+  `gitNewCommits`' `foldable` return is that split.** `gitCommitRawDiff` reads every
   commit with `-m --first-parent`, so a merge's diff already carries the
   second-parent side; the live range (`rev-list <cursor>..HEAD`) returns the merge
   AND that side's own commits, so folding both applied each merged-in edit twice —
@@ -796,9 +796,11 @@ Two things about it that are easy to get wrong, both learned the expensive way:
     a later rewrite of the human lines that moved into those coordinates emits a
     `rework_verdict` over code the AI never wrote.
   - **`git rebase -i` on a tracked feature branch reaches it through the
-    detached-HEAD half, and the watcher polls every 3s, so any rebase that takes
-    longer than that lands inside one.** This is routine usage, not a corner
-    case, and not a transient one — the span stays wrong for good.
+    detached-HEAD half, and the git watcher polls every `gitWatchInterval` (60s,
+    `git_watch.go:29` — NOT the transcript watchers' 3s), so any rebase that
+    takes longer than that lands inside one, and an interactive rebase blocks on
+    the engineer's editor for far longer than a minute.** This is routine usage,
+    not a corner case, and not a transient one — the span stays wrong for good.
 
   It is PRE-EXISTING (the `preMerge` gate has always worked this way; round 4
   only renamed it `foldRework`) and is tracked on the same task, to be fixed in

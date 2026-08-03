@@ -225,7 +225,8 @@ follows [Semantic Versioning](https://semver.org/).
   it sees. Those commits are never revisited, so their hunks never move the spans
   that were kept, and a later rewrite of the human lines that shifted into those
   coordinates emits a `rework_verdict` for code the AI never wrote. **The watcher
-  polls every 3 seconds, so any rebase taking longer than that lands inside one.
+  polls every 60 seconds, so any rebase taking longer than that lands inside one,
+  and an interactive rebase blocks on your editor for far longer than a minute.
   This is routine usage, not a corner case, and the wrong position is permanent
   rather than transient.** It is pre-existing behaviour, unchanged by this
   release, and it is tracked on the same task as the durability double-count
