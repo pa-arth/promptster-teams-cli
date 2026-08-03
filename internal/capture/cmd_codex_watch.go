@@ -248,9 +248,6 @@ func RunCodexWatcher() error {
 	// Resolve the workspace path through symlinks once (macOS /tmp -> /private/tmp)
 	// so cwd comparison against rollout session_meta is reliable.
 	workspace := resolvePath(session.TaskRoot)
-	// Backfill the same bounded history the product visualizes. The rollout's
-	// session_meta timestamp, not file mtime, is the authoritative age gate.
-	historyCutoff := transcriptHistoryCutoff(time.Now().UTC())
 
 	// SIGTERM as well as SIGINT — see the matching note in RunClaudeWatcher.
 	signals := make(chan os.Signal, 1)
@@ -292,9 +289,11 @@ func RunCodexWatcher() error {
 
 	for {
 		captureProse := policyResolver.CaptureAssistantProse()
+		// Backfill the same bounded history the product visualizes. The rollout's
+		// session_meta timestamp, not file mtime, is the authoritative age gate.
 		// Recomputed every poll so the window actually ROLLS; frozen at boot it
 		// is an absolute date a long-lived daemon drifts away from.
-		historyCutoff = transcriptHistoryCutoff(time.Now().UTC())
+		historyCutoff := transcriptHistoryCutoff(time.Now().UTC())
 		queued := pollCodexRollouts(session, workspace, historyCutoff, processors, captureProse)
 		eventsCaptured += queued
 		windowEmitter.maybe(session, time.Now(), captureProse)
