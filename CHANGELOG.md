@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.2] — 2026-08-03
+
 ### Added
 
 - **`doctor` now reports the Cursor hook rail.** The state worth catching is an
@@ -25,7 +27,37 @@ follows [Semantic Versioning](https://semver.org/).
   at all. The check is strictly read-only — it never enrolls, repairs, or writes
   `hooks.json`.
 
+### Changed
+
+- Secret scanner `github.com/praetorian-inc/titus` 1.2.6 → 1.2.7, and the
+  GitHub Actions group across six actions.
+
 ### Fixed
+
+- **Every Cursor edit was attributed as human.** The wiring was already there —
+  `emitCursorEvent` relativizes paths and records each one via
+  `recordAiTouchedPath` — but the keys were written in the wrong space.
+  `TaskRoot` falls back to `os.Getwd()`, which is correct for a process the
+  engineer starts and wrong for one **Cursor** spawns, because Cursor picks the
+  cwd and it is not the daemon's workspace. `TaskRoot` decides both the base
+  paths are relativized against and the ledger key that gets written, so a wrong
+  root does not mislabel a path — it writes keys
+  `reconcileCommitAttribution` can never look up.
+
+  The failure is silent by construction: a missed ledger hit is indistinguishable
+  from a human edit. So every Cursor edit landed as unknown/human, with no
+  `likely_ai`, no `ai_revised_by_human`, and nothing for durability to follow.
+  Measured on a live device before the fix: 35 of 40 absolute Cursor paths were
+  under `HOME` and should have relativized, against 0 of 33 for `claude-code` and
+  0 of 75 for Codex — both daemon-driven, and therefore already holding the right
+  root. The hook now reads the workspace the daemon persisted. Cursor durability
+  lands at PATH granularity, since the line ranges come from the git commit
+  rather than from us.
+
+- **Cursor's routing sentinel was recorded as a model.** `model_id` of `default`
+  is rejected rather than stored, and a real model already on the session is
+  preserved across hook claims that carry no model at all. Stop-token hooks stay
+  deliberately unregistered, which is now documented rather than merely true.
 
 - **A second `promptster-teams start` captured nothing, and said "already
   running".** The single-instance lock lives at `<state>/watch.lock` — one per
@@ -135,6 +167,50 @@ follows [Semantic Versioning](https://semver.org/).
   The line also reports the version actually **running** when it is up to date
   (claiming "up to date (0.12.1)" while running 0.13.0 is the same lie inverted),
   and cadences render as `30m` / `5m` rather than Go's `30m0s` / `5m0s`.
+
+### Security
+
+- **Heredoc bodies shipped unredacted from CRLF machines.**
+  `findHeredocTerminator` trimmed only space and tab, so a terminator line of
+  `EOF\r` never equalled `EOF`. The heredoc read as UNTERMINATED, and
+  `scrubHeredocBodies` took its "leave as-is" branch — keeping the entire body
+  verbatim. On a CRLF machine the on-device scrub, whose whole purpose is running
+  before a command leaves the laptop, did not scrub:
+
+  ```
+  in    cat <<EOF\r\nexport const KEY = "sk-live-123";\r\nEOF\r\n
+  got   (unchanged — the key ships)
+  want  cat <<EOF\r\n<inline-code-redacted>\nEOF\r\n
+  ```
+
+  This is a fail-OPEN in the redactor, so the exposure is silent on both ends:
+  nothing on the device reports a skipped scrub, and the backend cannot tell a
+  body that was scrubbed from one that never needed to be. Fixed by trimming
+  `\r` alongside space and tab; the scanner is otherwise untouched, and a CR
+  *before* the tag is still not a terminator.
+
+  Found by extracting the functions into a standalone harness and running them
+  against the backend's TypeScript mirror (`scrubInlineCode`) over shared inputs,
+  rather than by reading either implementation — 5 of 18 cases diverged, 0 of 20
+  after. The two sides cannot share source (RE2 has no backreferences and no
+  lookbehind, which is why this side scans procedurally), so lockstep means
+  identical OUTPUT, now pinned by a differential case table on the backend.
+
+### Upgrading
+
+- **Reported rework figures move upward after this release, and the movement is
+  the fix rather than a regression.** A pre-merge commit that only *deletes*
+  files now emits its `rework_verdict`s immediately instead of stranding them
+  until merge, so verdicts that previously went unreported start being counted.
+  Expect a step change in rework rate at the upgrade boundary on any fleet that
+  deletes files before merging — it is not a behaviour change in how anyone
+  writes code, and it is not comparable to the pre-upgrade series.
+
+- **Cursor attribution starts from zero at the upgrade, not from history.** Every
+  Cursor edit before this release was attributed as human, and nothing
+  backfills — the ledger keys those edits needed were never written. A fleet
+  using Cursor should expect its AI share to rise once the new binary is
+  running, and should not read the earlier flat line as a real measurement.
 
 ## [0.12.1] — 2026-07-31
 
@@ -962,7 +1038,13 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...HEAD
+[0.12.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.1...v0.12.2
+[0.12.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.11.4...v0.12.0
+[0.11.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.11.3...v0.11.4
+[0.11.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.11.2...v0.11.3
+[0.11.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.1...v0.11.0
 [0.10.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.9.1...v0.9.2
