@@ -198,6 +198,8 @@ func TestLoadClaudeWatchProgressMigratesOnDisk(t *testing.T) {
 	legacy := map[string]interface{}{
 		"offsets": map[string]int64{oldKeyA: 9000, oldKeyB: 1000},
 		"match":   map[string]string{oldKeyA: "yes", oldKeyB: "yes"},
+		// Isolate the path-key migration from later progress migrations.
+		"v": claudeProgressSchemaV,
 	}
 	data, err := json.Marshal(legacy)
 	if err != nil {

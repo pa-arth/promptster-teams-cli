@@ -125,10 +125,12 @@ in ways that are easy to "simplify" back into bugs:
 
 **Pre-existing vs new is decided by the FIRST POLL**, since there is no timestamp
 to ask. Transcripts already on disk when the watcher starts are seeded to EOF; one
-that appears on a later poll is tailed from 0. Both directions matter: seed
-everything and every new session loses its opening prompt (a transcript only
-becomes classifiable at its first tool call, several records past the prompt);
-tail everything from 0 and the first daemon run re-uploads months of history.
+that appears on a later poll is tailed from 0. This remains Cursor-only behavior:
+Claude and Codex carry timestamps and safely backfill a bounded 28-day window.
+Both Cursor directions matter: seed everything and every new session loses its
+opening prompt (a transcript only becomes classifiable at its first tool call,
+several records past the prompt); tail everything from 0 and the first daemon run
+re-uploads months of unbounded history.
 
 ### Cursor egresses counts, never code
 

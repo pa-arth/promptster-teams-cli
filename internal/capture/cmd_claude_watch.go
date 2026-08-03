@@ -137,13 +137,12 @@ type claudeWatchProgress struct {
 	RootsFP string `json:"roots_fp"`
 }
 
-// claudeProgressSchemaV is the current progress-file schema version. v1 drops
-// every cached "no" once: the old timestamp rule cached a "no" for any session
-// that started before the watch cutoff (dropping long/resumed/restart-spanning
-// sessions forever), and the poll loop's `case "no": continue` never
-// re-evaluates them. Forcing one re-classification lets the go-forward rule pick
-// them up; genuinely cwd-mismatched files simply re-cache "no" next poll.
-const claudeProgressSchemaV = 1
+// claudeProgressSchemaV is the current progress-file schema version. v1 dropped
+// stale timestamp-based "no" decisions. v2 reopens previously matched files so
+// the new bounded history policy gets exactly one chance to replay the last 28
+// days. Deterministic event ids make overlap with already-captured live tails
+// idempotent at ingest.
+const claudeProgressSchemaV = 2
 
 func claudeWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "claude-watcher-progress.json")
@@ -228,18 +227,29 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	// Idempotent: already-relative keys map to themselves, so this runs
 	// harmlessly on every load and needs no version flag.
 	migrated := migrateClaudeProgressKeys(p)
-	// One-time schema upgrade: drop every cached "no" so previously-dropped
-	// pre-cutoff sessions get re-classified under the go-forward rule (the poll
-	// loop's `case "no": continue` would otherwise never re-evaluate them).
-	// Genuinely cwd-mismatched files re-cache "no" on the next poll.
-	if migrated.V < claudeProgressSchemaV {
+	// v1: drop every cached "no" written by the old timestamp gate. Genuinely
+	// cwd-mismatched files re-cache "no" on the next poll.
+	if migrated.V < 1 {
 		for k, v := range migrated.Match {
 			if v == "no" {
 				delete(migrated.Match, k)
 			}
 		}
-		migrated.V = claudeProgressSchemaV
 	}
+	// v2: old "yes" entries bypass classification, so merely resetting their
+	// offsets would replay an arbitrarily old, recently-touched transcript. Drop
+	// those decisions and offsets together: the timestamp gate will replay only
+	// in-window sessions and seed older active sessions to EOF. Keep v1-era "no"
+	// decisions because they are genuine cwd mismatches.
+	if migrated.V < 2 {
+		migrated.Offsets = map[string]int64{}
+		for k, v := range migrated.Match {
+			if v == "yes" {
+				delete(migrated.Match, k)
+			}
+		}
+	}
+	migrated.V = claudeProgressSchemaV
 	return migrated
 }
 
@@ -400,12 +410,12 @@ func RunClaudeWatcher() error {
 	}
 
 	workspace := resolvePath(session.TaskRoot)
-	startCutoff := session.StartedAt.Add(-2 * time.Minute)
+	historyCutoff := transcriptHistoryCutoff(time.Now().UTC())
 
 	// If hooks took over while no watcher was alive, skip everything already
 	// on disk — those lines' events were emitted by the hook path.
 	if _, err := os.Stat(claudeHookTakeoverPath()); err == nil {
-		fastForwardClaudeTranscripts(workspace, startCutoff)
+		fastForwardClaudeTranscripts(workspace, historyCutoff)
 		_ = os.Remove(claudeHookTakeoverPath())
 		fmt.Fprintf(os.Stderr, "claude-watcher: hooks covered an outage window — fast-forwarded past existing transcript content\n")
 	}
@@ -461,7 +471,7 @@ func RunClaudeWatcher() error {
 		// owns emission and hooks suppress again. This handoff means neither a
 		// real mid-session format break nor a false-positive degradation can
 		// double-emit or lose events.
-		parsed, consumed := pollClaudeTranscripts(session, workspace, startCutoff, processors, degraded, captureProse)
+		parsed, consumed := pollClaudeTranscripts(session, workspace, historyCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
 		windowEmitter.maybe(session, time.Now(), captureProse)
 		wasDegraded := degraded
@@ -538,7 +548,7 @@ func RunClaudeWatcher() error {
 func pollClaudeTranscripts(
 	session Session,
 	workspace string,
-	startCutoff time.Time,
+	historyCutoff time.Time,
 	processors map[string]*normalize.ClaudeTranscriptProcessor,
 	dryRun bool,
 	captureProse bool,
@@ -557,7 +567,7 @@ func pollClaudeTranscripts(
 		saveClaudeWatchProgress(progress)
 	}
 
-	for _, path := range candidateClaudeTranscripts(startCutoff) {
+	for _, path := range candidateClaudeTranscripts(historyCutoff) {
 		key := claudeProgressKey(path)
 		switch progress.Match[key] {
 		case "no":
@@ -565,16 +575,16 @@ func pollClaudeTranscripts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyClaudeTranscript(path, roots, startCutoff) {
+			switch classifyClaudeTranscript(path, roots, historyCutoff) {
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
 			case claudeMatchYesPreexisting:
-				// Go-forward: capture ongoing activity but NOT the pre-watcher
+				// Go-forward: capture ongoing activity but not out-of-window
 				// history. Seed the offset to current EOF so tailing starts at new
 				// content. Only when unseen — a real prior offset must be preserved.
 				// If the stat fails transiently, DON'T cache "yes" yet: leave the
 				// match undecided and retry next poll, so a later success seeds EOF
-				// instead of tailing the whole pre-watcher file from offset 0.
+				// instead of tailing the whole old file from offset 0.
 				if _, ok := progress.Offsets[key]; !ok {
 					info, err := os.Stat(path)
 					if err != nil {
@@ -643,7 +653,7 @@ func pollClaudeTranscripts(
 // included — their token usage is real spend — but processed in UsageOnly
 // mode (see isClaudeSidechainFile): their "user" messages are agent-authored
 // prompts that must not enter the candidate's timeline.
-func candidateClaudeTranscripts(startCutoff time.Time) []string {
+func candidateClaudeTranscripts(historyCutoff time.Time) []string {
 	var out []string
 	_ = filepath.Walk(ClaudeProjectsDir(), func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
@@ -652,7 +662,7 @@ func candidateClaudeTranscripts(startCutoff time.Time) []string {
 		if !strings.HasSuffix(filepath.Base(path), ".jsonl") {
 			return nil
 		}
-		if info.ModTime().Before(startCutoff) {
+		if info.ModTime().Before(historyCutoff) {
 			return nil
 		}
 		out = append(out, path)
@@ -706,8 +716,8 @@ type claudeMatchResult int
 
 const (
 	claudeMatchUndecided      claudeMatchResult = iota
-	claudeMatchYes                              // matched; started at/after cutoff — tail from the start
-	claudeMatchYesPreexisting                   // matched; started BEFORE cutoff (long/resumed/restart-spanning) — capture GO-FORWARD from EOF
+	claudeMatchYes                              // matched; inside the history window — tail from the start
+	claudeMatchYesPreexisting                   // matched; older than the history window — capture go-forward from EOF
 	claudeMatchNo
 )
 
@@ -761,14 +771,10 @@ func workspaceMatchRoots(workspace string) []string {
 // (mode, permission-mode, ...) often lack cwd, so a file with no cwd yet stays
 // undecided rather than being cached as a mismatch.
 //
-// cwd is authoritative: a cwd match belongs to this session regardless of when
-// it started. The timestamp only distinguishes NEW from PRE-EXISTING. A session
-// whose first activity predates this watch start (a long/resumed session, or
-// one spanning a daemon restart — the daemon resets startCutoff every launch,
-// and laptop sleep/wake restarts it constantly) is returned as
-// claudeMatchYesPreexisting and captured GO-FORWARD from current EOF, not
-// dropped (the old bug, which silently lost every restart-spanning session).
-func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time) claudeMatchResult {
+// cwd is authoritative. The timestamp admits sessions in the bounded history
+// window from byte zero; older matched sessions are returned as
+// claudeMatchYesPreexisting and captured go-forward from current EOF.
+func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Time) claudeMatchResult {
 	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
@@ -808,14 +814,10 @@ func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time
 		if !matched {
 			return claudeMatchNo
 		}
-		// cwd matches. A session whose first activity predates this watch start is
-		// pre-existing (a long/resumed session, or one that spans a daemon restart —
-		// the daemon resets startCutoff every launch, and laptop sleep/wake restarts
-		// it constantly). Capture it GO-FORWARD from current EOF rather than dropping
-		// it (the old bug) or re-uploading its whole history. A session started
-		// at/after the cutoff is genuinely new — tail from the start.
+		// Replay in-window history from the start. Anything older remains eligible
+		// for go-forward capture without uploading its historical prefix.
 		if rec.Timestamp != "" {
-			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
+			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(historyCutoff) {
 				return claudeMatchYesPreexisting
 			}
 		}
@@ -828,16 +830,16 @@ func classifyClaudeTranscript(path string, roots []string, startCutoff time.Time
 // fastForwardClaudeTranscripts sets every currently-matched transcript's
 // offset to its current size, so tailing resumes at content written from now
 // on. Used after a hook-takeover window.
-func fastForwardClaudeTranscripts(workspace string, startCutoff time.Time) {
+func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 	progress := loadClaudeWatchProgress()
 	roots := workspaceMatchRoots(workspace)
-	for _, path := range candidateClaudeTranscripts(startCutoff) {
+	for _, path := range candidateClaudeTranscripts(historyCutoff) {
 		key := claudeProgressKey(path)
 		if progress.Match[key] == "no" {
 			continue
 		}
 		if progress.Match[key] != "yes" {
-			if classifyClaudeTranscript(path, roots, startCutoff) != claudeMatchYes {
+			if classifyClaudeTranscript(path, roots, historyCutoff) != claudeMatchYes {
 				continue
 			}
 			progress.Match[key] = "yes"

@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Context history now appears after first boot instead of starting on install
+  day.** Claude Code and Codex capture now backfill the previous 28 days of local
+  sessions whose recorded cwd is inside a watched root. The bound matches the
+  context re-read heatmap, and each transcript's own timestamp is authoritative;
+  older sessions remain go-forward only. Existing installs receive the backfill
+  once through a progress-state migration, with deterministic event ids keeping
+  overlap idempotent. Cursor remains go-forward because its transcripts expose
+  neither a trustworthy session timestamp nor the token telemetry this view
+  needs.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added

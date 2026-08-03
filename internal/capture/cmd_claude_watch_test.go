@@ -73,11 +73,9 @@ func TestClassifyClaudeTranscriptCutoffRouting(t *testing.T) {
 	}
 }
 
-// TestLoadClaudeWatchProgressDropsStaleNo is the load-migration regression: a
-// v0 progress file's cached "no" entries were written under the OLD timestamp
-// rule, which dropped pre-cutoff sessions. On upgrade to v1 they must be
-// deleted (forcing one re-classification), while "yes" entries survive and the
-// schema version advances so this only runs once.
+// TestLoadClaudeWatchProgressMigratesHistoryBackfill covers both progress
+// migrations at once: v0's stale timestamp decisions are discarded, then v2
+// clears accepted offsets so the bounded history gate can classify them again.
 func TestLoadClaudeWatchProgressDropsStaleNo(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
@@ -99,8 +97,11 @@ func TestLoadClaudeWatchProgressDropsStaleNo(t *testing.T) {
 	if _, ok := got.Match["x.jsonl"]; ok {
 		t.Errorf(`stale "no" entry must be dropped on v0->v1 upgrade; still present: %v`, got.Match)
 	}
-	if got.Match["y.jsonl"] != "yes" {
-		t.Errorf(`"yes" entry must survive; got %q`, got.Match["y.jsonl"])
+	if _, ok := got.Match["y.jsonl"]; ok {
+		t.Errorf(`old "yes" entry must be reopened for bounded backfill; got %v`, got.Match)
+	}
+	if len(got.Offsets) != 0 {
+		t.Errorf("old offsets must be cleared for bounded backfill; got %v", got.Offsets)
 	}
 	if got.V != claudeProgressSchemaV {
 		t.Errorf("schema version = %d, want %d", got.V, claudeProgressSchemaV)
@@ -119,8 +120,57 @@ func TestLoadClaudeWatchProgressDropsStaleNo(t *testing.T) {
 	}
 }
 
-// TestPollSeedsPreexistingOffsetToEOF is the poll-level go-forward proof: a
-// matched transcript whose first activity predates the cutoff has its offset
+func TestLoadClaudeWatchProgressV2PreservesCwdMismatch(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	saveClaudeWatchProgress(claudeWatchProgress{
+		Offsets: map[string]int64{"accepted.jsonl": 20},
+		Match:   map[string]string{"accepted.jsonl": "yes", "outside.jsonl": "no"},
+		V:       1,
+	})
+
+	got := loadClaudeWatchProgress()
+	if len(got.Offsets) != 0 || got.Match["accepted.jsonl"] != "" {
+		t.Fatalf("accepted transcript was not reopened: offsets=%v match=%v", got.Offsets, got.Match)
+	}
+	if got.Match["outside.jsonl"] != "no" {
+		t.Fatalf("genuine cwd mismatch must survive v2 migration; got %v", got.Match)
+	}
+}
+
+func TestPollBackfillsInWindowHistory(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	now := time.Now().UTC()
+	line := fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"%s","message":{"role":"user","content":"historical prompt"}}`+"\n",
+		resolvePath(workspace), now.Add(-7*24*time.Hour).Format(time.RFC3339))
+	dir := filepath.Join(root, "-Users-me-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "history-sess.jsonl")
+	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "sess-history", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	parsed, _ := pollClaudeTranscripts(session, resolvePath(workspace), transcriptHistoryCutoff(now), map[string]*normalize.ClaudeTranscriptProcessor{}, true, false)
+	if parsed != 1 {
+		t.Fatalf("in-window history parsed %d events, want 1", parsed)
+	}
+	saved := loadClaudeWatchProgress()
+	if saved.Offsets[claudeProgressKey(path)] != int64(len(line)) {
+		t.Fatalf("in-window history offset = %d, want %d", saved.Offsets[claudeProgressKey(path)], len(line))
+	}
+}
+
+// TestPollSeedsPreexistingOffsetToEOF is the bounded-history proof: a matched
+// transcript whose first activity predates the 28-day cutoff has its offset
 // seeded to the current file size, so pre-watcher history is NOT re-uploaded and
 // only future content is tailed. Parses nothing this poll (already at EOF).
 func TestPollSeedsPreexistingOffsetToEOF(t *testing.T) {
@@ -132,10 +182,9 @@ func TestPollSeedsPreexistingOffsetToEOF(t *testing.T) {
 
 	workspace := t.TempDir()
 	const uuid = "preexisting-sess.jsonl"
-	// First (and only) line's timestamp is well before the watch start, so the
-	// session is pre-existing.
+	// First activity is outside the history window, so it remains go-forward.
 	line := fmt.Sprintf(`{"type":"user","cwd":"%s","timestamp":"%s","message":{"role":"user","content":"old history"}}`+"\n",
-		resolvePath(workspace), time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339))
+		resolvePath(workspace), time.Now().Add(-29*24*time.Hour).UTC().Format(time.RFC3339))
 	dir := filepath.Join(root, "-Users-me-repo")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -149,13 +198,12 @@ func TestPollSeedsPreexistingOffsetToEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// StartedAt now; startCutoff = now-2min. The line's -2h timestamp is
-	// pre-cutoff, so classify returns yesPreexisting.
-	session := Session{DeviceID: "sess-pre", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
-	startCutoff := session.StartedAt.Add(-2 * time.Minute)
+	now := time.Now().UTC()
+	session := Session{DeviceID: "sess-pre", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	historyCutoff := transcriptHistoryCutoff(now)
 	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
 
-	parsed, _ := pollClaudeTranscripts(session, resolvePath(workspace), startCutoff, processors, false, false)
+	parsed, _ := pollClaudeTranscripts(session, resolvePath(workspace), historyCutoff, processors, false, false)
 	if parsed != 0 {
 		t.Errorf("pre-existing history must NOT be parsed (offset seeded to EOF); got %d parsed", parsed)
 	}

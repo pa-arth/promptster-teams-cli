@@ -99,14 +99,11 @@ type codexWatchProgress struct {
 	RootsFP string `json:"roots_fp"`
 }
 
-// codexProgressSchemaV is the current progress-file schema version. v1 drops
-// every cached "no" once: the old timestamp rule cached a "no" for any rollout
-// whose session_meta predated the watch cutoff (dropping long/resumed/
-// restart-spanning sessions forever), and the poll loop's `case "no": continue`
-// never re-evaluates them. Forcing one re-classification lets the go-forward
-// rule pick them up; genuinely cwd-mismatched files simply re-cache "no" next
-// poll. Mirrors claudeProgressSchemaV.
-const codexProgressSchemaV = 1
+// codexProgressSchemaV is the current progress-file schema version. v1 dropped
+// stale timestamp-based "no" decisions. v2 reopens previously matched files so
+// the new bounded history policy gets exactly one chance to replay the last 28
+// days. Mirrors claudeProgressSchemaV.
+const codexProgressSchemaV = 2
 
 func codexWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "codex-watcher-progress.json")
@@ -131,18 +128,25 @@ func loadCodexWatchProgress() codexWatchProgress {
 	if p.Match == nil {
 		p.Match = map[string]string{}
 	}
-	// One-time schema upgrade: drop every cached "no" so previously-dropped
-	// pre-cutoff sessions get re-classified under the go-forward rule (the poll
-	// loop's `case "no": continue` would otherwise never re-evaluate them).
-	// Genuinely cwd-mismatched files re-cache "no" on the next poll.
-	if p.V < codexProgressSchemaV {
+	// v1: drop cached "no" decisions written by the old timestamp gate.
+	if p.V < 1 {
 		for k, v := range p.Match {
 			if v == "no" {
 				delete(p.Match, k)
 			}
 		}
-		p.V = codexProgressSchemaV
 	}
+	// v2: reset old matched offsets so classification can replay only the new
+	// bounded window. Preserve genuine cwd mismatches from v1.
+	if p.V < 2 {
+		p.Offsets = map[string]int64{}
+		for k, v := range p.Match {
+			if v == "yes" {
+				delete(p.Match, k)
+			}
+		}
+	}
+	p.V = codexProgressSchemaV
 	return p
 }
 
@@ -234,9 +238,9 @@ func RunCodexWatcher() error {
 	// Resolve the workspace path through symlinks once (macOS /tmp -> /private/tmp)
 	// so cwd comparison against rollout session_meta is reliable.
 	workspace := resolvePath(session.TaskRoot)
-	// Only consider rollout sessions that started at/after this capture session
-	// began, so we never replay unrelated prior codex sessions.
-	startCutoff := session.StartedAt.Add(-2 * time.Minute)
+	// Backfill the same bounded history the product visualizes. The rollout's
+	// session_meta timestamp, not file mtime, is the authoritative age gate.
+	historyCutoff := transcriptHistoryCutoff(time.Now().UTC())
 
 	// SIGTERM as well as SIGINT — see the matching note in RunClaudeWatcher.
 	signals := make(chan os.Signal, 1)
@@ -278,7 +282,7 @@ func RunCodexWatcher() error {
 
 	for {
 		captureProse := policyResolver.CaptureAssistantProse()
-		queued := pollCodexRollouts(session, workspace, startCutoff, processors, captureProse)
+		queued := pollCodexRollouts(session, workspace, historyCutoff, processors, captureProse)
 		eventsCaptured += queued
 		windowEmitter.maybe(session, time.Now(), captureProse)
 
@@ -302,7 +306,7 @@ func RunCodexWatcher() error {
 func pollCodexRollouts(
 	session Session,
 	workspace string,
-	startCutoff time.Time,
+	historyCutoff time.Time,
 	processors map[string]*normalize.CodexRolloutProcessor,
 	captureProse bool,
 ) int {
@@ -330,12 +334,12 @@ func pollCodexRollouts(
 		if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
 			return nil
 		}
-		// Cheap candidate filter: skip files last modified before this capture
-		// session started WITHOUT caching a decision — a file touched later
+		// Cheap candidate filter: skip files last modified before the history
+		// window WITHOUT caching a decision — a file touched later
 		// re-enters classification. Caching "no" here is the old bug that dropped
 		// long/resumed/restart-spanning rollouts forever (mirrors
 		// candidateClaudeTranscripts).
-		if info.ModTime().Before(startCutoff) {
+		if info.ModTime().Before(historyCutoff) {
 			return nil
 		}
 
@@ -345,17 +349,17 @@ func pollCodexRollouts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyCodexRollout(path, roots, startCutoff) {
+			switch classifyCodexRollout(path, roots, historyCutoff) {
 			case codexMatchYes:
 				progress.Match[path] = "yes"
 			case codexMatchYesPreexisting:
-				// Go-forward: capture ongoing activity but NOT the pre-watcher
+				// Go-forward: capture ongoing activity but not out-of-window
 				// history. Seed the offset to current EOF so tailing starts at new
 				// content. Only when unseen — a real prior offset (a restart-spanning
 				// session already being tailed) must be preserved. If the stat fails
 				// transiently, DON'T cache "yes" yet: leave the match undecided and
 				// retry next poll, so a later success seeds EOF instead of tailing the
-				// whole pre-watcher file from offset 0.
+				// whole old file from offset 0.
 				if _, ok := progress.Offsets[path]; !ok {
 					info, err := os.Stat(path)
 					if err != nil {
@@ -432,8 +436,8 @@ type codexMatchResult int
 
 const (
 	codexMatchUndecided      codexMatchResult = iota
-	codexMatchYes                             // matched; started at/after cutoff — tail from the start
-	codexMatchYesPreexisting                  // matched; started BEFORE cutoff (long/resumed/restart-spanning) — capture GO-FORWARD from EOF
+	codexMatchYes                             // matched; inside the history window — tail from the start
+	codexMatchYesPreexisting                  // matched; older than the history window — capture go-forward from EOF
 	codexMatchNo
 )
 
@@ -441,19 +445,15 @@ const (
 // session by reading its first line — the session_meta header, the ONLY rollout
 // line carrying cwd and the session start timestamp.
 //
-// cwd is authoritative: a cwd match belongs to this session regardless of when
-// it started. The timestamp only distinguishes NEW from PRE-EXISTING. A session
-// whose session_meta predates this watch start (a long/resumed session, or one
-// spanning a daemon restart — the daemon resets startCutoff every launch, and
-// laptop sleep/wake restarts it constantly) is returned as
-// codexMatchYesPreexisting and captured GO-FORWARD from current EOF, not dropped
-// (the old bug, which silently lost every restart-spanning session).
+// cwd is authoritative. The timestamp admits sessions in the bounded history
+// window from byte zero; older matched sessions are returned as
+// codexMatchYesPreexisting and captured go-forward from current EOF.
 //
 // Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on line
 // 1 only, so a file caught mid-creation whose first line is not yet a readable
 // session_meta is returned codexMatchUndecided (retry next poll) rather than
 // cached as a mismatch — caching "no" would drop it forever.
-func classifyCodexRollout(path string, roots []string, startCutoff time.Time) codexMatchResult {
+func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
@@ -481,11 +481,9 @@ func classifyCodexRollout(path string, roots []string, startCutoff time.Time) co
 	if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
 		return codexMatchNo
 	}
-	// cwd matches. A session whose session_meta predates this watch start is
-	// pre-existing — capture it GO-FORWARD from current EOF rather than dropping
-	// it (the old bug) or re-uploading its whole history. A session started
-	// at/after the cutoff is genuinely new — tail from the start.
-	if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
+	// Replay in-window history from the start. Anything older remains eligible
+	// for go-forward capture without uploading its historical prefix.
+	if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(historyCutoff) {
 		return codexMatchYesPreexisting
 	}
 	return codexMatchYes
