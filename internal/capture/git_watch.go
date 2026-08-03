@@ -369,9 +369,10 @@ func gitHead(root string) (string, bool) {
 //     rewrite): `rev-list lastSeen..head` ERRORS. We fall back to a bounded
 //     recovery window, `rev-list -n <cap> head`, so the tip region is still
 //     attributed instead of the commits being skipped forever, ok=true.
-//   - Failure (even the recovery rev-list errors — not a repo / bad head): ok=false,
-//     so the caller KEEPS the old cursor and retries next poll rather than
-//     advancing past an undetermined window.
+//   - Failure (the recovery rev-list errors — not a repo / bad head — or the
+//     first-parent probe below could not run): ok=false, so the caller KEEPS the
+//     old cursor and retries next poll rather than advancing past an undetermined
+//     window.
 //
 // THE RANGE IS DELIBERATELY SPLIT BETWEEN ITS TWO CONSUMERS, and the second
 // return is that split. `commits` is what ATTRIBUTION EMISSION walks and it is
@@ -389,11 +390,19 @@ func gitHead(root string) (string, bool) {
 // already applied and makes the next rewrite report over lines nobody wrote. The
 // first-parent chain is the one sequence of diffs that composes to head's tree.
 //
-// The narrowing can only LOSE rework state, never invent it: a second-parent
+// That narrowing is a definitive ANSWER about a commit — it is on the chain or
+// it is not — and it can only LOSE rework state, never invent it: a second-parent
 // commit no longer seeds its own AI ranges, and where it was the only attributed
 // commit backing a replay, that replay is declined. Both are undercounts, which
 // is the direction these ledgers always resolve toward, and the same narrowing
 // already reaches the cold-start replay through gitBranchCommitsSinceDefault.
+//
+// A chain probe that could not RUN is not that answer, and it is reported as
+// ok=false rather than as a commit list with nothing foldable in it. The two were
+// once collapsed: an empty subset leaves every commit unfoldable while the caller
+// still attributes and records each one, so the tracked spans keep coordinates
+// the unfolded hunks have already moved, and the next rewrite reports over lines
+// nobody wrote. That INFLATES. commitsWithFoldableChain is what keeps them apart.
 //
 // Spawn budget stays sane: the normal path is one `rev-list`, plus a second only
 // when it actually returned commits; the fallback adds at most one more, in the
@@ -402,8 +411,7 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, foldable map[
 	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", lastSeen+".."+head).Output()
 	if err == nil {
-		shas := clampCommitBurst(parseRevListShas(out), root)
-		return shas, gitFirstParentSet(root, len(shas) > 0, lastSeen+".."+head), true
+		return commitsWithFoldableChain(root, clampCommitBurst(parseRevListShas(out), root), lastSeen+".."+head)
 	}
 	// lastSeen is unreachable (gc'd/pruned, or a corrupt cursor): recover the tip
 	// region rather than skip it. If even that errors, keep the cursor and retry.
@@ -416,35 +424,57 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, foldable map[
 	shas := parseRevListShas(out)
 	state.HookDebugf("git-watch: cursor %s unreachable on %s; recovered newest %d commit(s) from head",
 		lastSeen, gitWatchRootKey(root), len(shas))
-	return shas, gitFirstParentSet(root, len(shas) > 0, "-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), head), true
+	return commitsWithFoldableChain(root, shas, head)
 }
 
-// gitFirstParentSet resolves which commits of a rev-list range sit on head's
-// first-parent chain — the fold-eligible subset described on gitNewCommits. It
-// runs the caller's own rev-list arguments with `--first-parent` bolted on, so
-// the two lists can never be taken over different ranges.
+// commitsWithFoldableChain pairs a detected commit list with its fold-eligible
+// subset, and it is the ONLY way gitNewCommits hands either one out — so a caller
+// cannot receive commits whose fold status was never established.
 //
-// want=false skips the spawn entirely (a poll that surfaced no commits has
-// nothing to fold), and a failed spawn returns an EMPTY set rather than nil-means-
-// everything: if we cannot tell which commits are on the chain, folding none of
-// them under-reports, while folding all of them is the double-apply this exists
-// to stop.
-func gitFirstParentSet(root string, want bool, revListArgs ...string) map[string]struct{} {
-	set := map[string]struct{}{}
-	if !want {
-		return set
+// rev is a single revision argument, deliberately not a set of rev-list flags,
+// because the probe's walk must COVER every commit in shas: the whole range on
+// the normal path, and unbounded head on the gc'd-cursor recovery path, whose own
+// list is bounded by `-n` instead. Bounding the probe the same way would make the
+// two windows different sets — a deep first-parent commit could fall inside the
+// all-parents window and outside the chain window under a skewed committer clock
+// — and "absent from the set" would then mean either "not on the chain" or "past
+// the probe's bound", which is exactly the collapse below. There is no parameter
+// left to reintroduce it with.
+//
+// A probe that FAILS is inconclusive, not empty. ok=false leaves the caller's
+// cursor untouched and the whole poll — attribution and fold alike — retries;
+// a commit is never recorded as attributed on the strength of a fold that was
+// silently skipped.
+func commitsWithFoldableChain(root string, shas []string, rev string) ([]string, map[string]struct{}, bool) {
+	if len(shas) == 0 {
+		return shas, map[string]struct{}{}, true // nothing detected, so nothing to fold and nothing to disagree about
 	}
-	args := append([]string{"-C", root, "rev-list", "--first-parent"}, revListArgs...)
-	// #nosec G204 -- constant argv plus the caller's own rev-list range, whose SHAs come from git rev-parse output. Read-only.
-	out, err := exec.Command("git", args...).Output()
+	chain, ok := gitFirstParentProbe(root, rev)
+	if !ok {
+		return nil, nil, false
+	}
+	return shas, chain, true
+}
+
+// gitFirstParentProbe is the chain probe commitsWithFoldableChain runs. It is a
+// variable so tests can drive the failing-probe path; production never reassigns it.
+var gitFirstParentProbe = gitFirstParentSet
+
+// gitFirstParentSet enumerates the commits of rev that sit on head's first-parent
+// chain — the fold-eligible subset described on gitNewCommits. The bool separates
+// an empty chain from a probe that could not run.
+func gitFirstParentSet(root, rev string) (map[string]struct{}, bool) {
+	// #nosec G204 -- constant argv plus the caller's own revision, whose SHAs come from git rev-parse output. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent", rev).Output()
 	if err != nil {
-		state.HookDebugf("git-watch: first-parent chain unresolvable on %s; folding no rework this poll", gitWatchRootKey(root))
-		return set
+		state.HookDebugf("git-watch: first-parent chain unresolvable on %s; deferring the whole poll for this root", gitWatchRootKey(root))
+		return nil, false
 	}
+	set := map[string]struct{}{}
 	for _, sha := range parseRevListShas(out) {
 		set[sha] = struct{}{}
 	}
-	return set
+	return set, true
 }
 
 // gitBranchCommitsSinceDefault lists the commits a root's checked-out branch

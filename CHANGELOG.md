@@ -181,6 +181,42 @@ follows [Semantic Versioning](https://semver.org/).
   history containing merges report LESS, by removing a double count. Neither
   re-sends a commit already accounted for.
 
+  **The merge double-count is fixed in the rework ledger ONLY, and the two
+  ledgers therefore disagree on a history containing merges.** Stated plainly,
+  because a reader must not conclude from this release that merges are now
+  handled consistently:
+
+  - the **rework** ledger (`rework_verdict`, pre-merge iteration) folds the
+    first-parent chain, so a merge's edits are counted once;
+  - the **durability** ledger (`durability_verdict`, surviving AI lines on the
+    default branch) still folds the full range, so its figures still
+    double-count on a merge;
+  - so on such a history the two ledgers' numbers are not reconcilable with each
+    other, and that is a known, tracked gap rather than intended behaviour.
+
+  Fixing durability is a separate change, not an oversight in this one: it
+  advances its cursor per commit inside its own ledger transaction, so skipping
+  commits there needs a deliberate answer for where that cursor lands. It is
+  tracked as its own task.
+
+- **A failed internal `git rev-list` could strand tracked AI spans at stale
+  coordinates.** Resolving which commits sit on the merge's first-parent chain
+  is a second `rev-list`, and when it failed to run, the result was read as "no
+  commit is foldable" instead of "we do not know". The poll then attributed and
+  recorded every commit in the range while folding none of them, so the tracked
+  spans kept coordinates the recorded commits had already moved — and because a
+  recorded commit is never revisited, they stayed there. The next rewrite of
+  whatever now sat at those lines emitted a `rework_verdict` for code the AI
+  never wrote. That is FABRICATION, the failure mode these ledgers rank above
+  every other, and it was reachable from a plain fork/exec failure.
+
+  A probe that cannot run now makes the whole comparison inconclusive: the
+  cursor stays where it is and the entire poll — attribution and folding alike
+  — retries on the next one. A commit is never recorded as accounted for on the
+  strength of a fold that was silently skipped. The same rule closes a narrower
+  variant where the two `rev-list` calls were bounded differently, so a commit
+  outside one window read as though it were off the chain.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for

@@ -742,8 +742,42 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   counts as AI-written is a product question that was deliberately not answered
   here. Where the ranges disagree the ledger can only LOSE state — such a commit
   no longer seeds its own ranges, and a replay backed solely by one is declined
-  by the attributed-in-range gate — never invent it. A failed `rev-list` returns
-  an EMPTY set, not nil-means-everything, for the same reason.
+  by the attributed-in-range gate — never invent it.
+
+  **"Not on the chain" and "the probe could not run" are DIFFERENT FACTS, and
+  collapsing them into one empty set INFLATES.** An earlier revision of this file
+  claimed a failed `rev-list` returning an empty set was safe because folding
+  nothing under-reports. That was wrong, and writing it down was worse than the
+  bug, because it is what would stop the next reader checking: an empty subset
+  leaves every commit unfoldable while `pollGitWatchWorkspace` still attributes
+  each one and `recordAttributedCommits` writes them all down, so the tracked
+  spans keep coordinates the unfolded hunks have already moved and the next
+  rewrite emits a verdict over lines nobody wrote. `commitsWithFoldableChain` is
+  the one door both values come through, and a failed probe returns `ok=false`
+  from `gitNewCommits` — cursor untouched, attribution and fold both retried next
+  poll. It also takes ONE revision, never rev-list flags, so the probe cannot be
+  bounded differently from the list it describes: the gc'd-cursor recovery path
+  bounds its own list with `-n` and probes unbounded head, because a chain commit
+  falling inside the all-parents window and outside a `-n`-bounded chain window
+  reads as "not on the chain" and is the same collapse by another route.
+
+- **THE TWO LEDGERS DISAGREE WITH EACH OTHER ON A HISTORY CONTAINING MERGES.**
+  This is a known, tracked gap, not intended behaviour:
+
+  - the REWORK ledger folds the first-parent chain, so a merge's edits are
+    counted once;
+  - the DURABILITY ledger still folds the FULL range (`pollDurability` takes
+    `gitNewCommits`' first return and discards the foldable subset), so
+    surviving-line figures still double-count on a merge — the same hunks
+    applied once in the merged-away branch's coordinate space and again in the
+    merge's;
+  - so the two ledgers' numbers are not reconcilable on such a history, and
+    neither is authoritative over the other there.
+
+  It is filed as its own task (`cli-durability-ledger-double-counts-merg-ca`)
+  rather than fixed alongside the rework narrowing, because `pollDurabilityCommit`
+  advances the durability cursor per commit inside its own ledger transaction, so
+  skipping commits needs a deliberate answer for where that cursor lands.
 
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
