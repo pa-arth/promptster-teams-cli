@@ -77,6 +77,28 @@ func runCursorHookInner() {
 		// event and a chatty hook on an unconfigured machine is pure noise.
 		return
 	}
+	// THE HOOK'S CWD IS CURSOR'S, NOT OURS — SO IT MUST NOT DECIDE THE PATH SPACE.
+	//
+	// loadSession falls back to os.Getwd() for TaskRoot, which is right for a
+	// process the engineer started and wrong for one Cursor spawns: Cursor picks
+	// the cwd, and it is not the daemon's workspace. That single value decides two
+	// things downstream — RelativizeEventPaths' base, and the rootKey/relPath
+	// recordAiTouchedPath writes — so getting it wrong does not merely mislabel a
+	// path, it writes ledger keys in a DIFFERENT SPACE from the one the git
+	// watcher reads back (which is anchored to the daemon's workspace). The lookup
+	// in reconcileCommitAttribution then misses every time, and Cursor edits
+	// attribute as unknown/human: no likely_ai, no ai_revised_by_human, no
+	// durability. Silently, because a missing ledger hit is indistinguishable from
+	// a human edit.
+	//
+	// Measured before the fix: 35 of 40 absolute Cursor file paths were under HOME
+	// and should have relativized, against 0 of 33 for claude-code, whose watcher
+	// IS the daemon and therefore already had the right root.
+	//
+	// The daemon persists its workspace for exactly this reason — see WatchDir on
+	// claudeWatcherState, added because `status` "falls back to its own cwd, which
+	// is routinely wrong". Same failure, same fix, one rail later.
+	session.TaskRoot = cursorHookTaskRoot(session.TaskRoot)
 
 	redacted := redact.RedactBytes(raw)
 	res, ok := normalize.NormalizeCursorHook(redacted)
@@ -138,6 +160,41 @@ func runCursorHookInner() {
 	if queued > 0 && res.TranscriptPath != "" {
 		recordCursorHookClaim(res.TranscriptPath, res.SessionID, res.Model)
 	}
+}
+
+// cursorHookTaskRoot picks the workspace this hook invocation writes paths
+// against: the daemon's recorded workspace when there is one, else the caller's
+// value (loadSession's env-or-cwd). Kept as its own function so the choice is
+// testable without standing up a whole hook run — the call site is one line and
+// the interesting behaviour is entirely here.
+func cursorHookTaskRoot(fallback string) string {
+	if root := daemonWatchRoot(); root != "" {
+		return root
+	}
+	return fallback
+}
+
+// daemonWatchRoot reports the workspace the local daemon is scoped to, or "" if
+// there is nothing recorded to trust.
+//
+// Read from the watcher state the daemon writes, cursor rail first and claude
+// rail second. Both are written by the SAME process with the same TaskRoot
+// (autostart runs one `watch`), so the second is a plain redundancy for the case
+// where the cursor watcher has not yet had its first heartbeat.
+//
+// Deliberately NOT gated on the recorded pid being alive. A stale entry still
+// names the workspace every existing ai-paths key was written under, so honouring
+// it keeps the hook in the ledger's key space; falling back to cwd because the
+// daemon is momentarily down would start writing keys nothing can ever read. The
+// value is a path space, not a liveness claim.
+func daemonWatchRoot() string {
+	if s, err := loadCursorWatcherState(); err == nil && s.WatchDir != "" {
+		return s.WatchDir
+	}
+	if s, err := loadClaudeWatcherState(); err == nil && s.WatchDir != "" {
+		return s.WatchDir
+	}
+	return ""
 }
 
 // EnsureCursorHooksBestEffort installs the user-scope hook entries and reports
