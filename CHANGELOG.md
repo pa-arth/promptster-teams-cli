@@ -145,11 +145,14 @@ follows [Semantic Versioning](https://semver.org/).
   AI-touched path are seeded as AI. Those branches keep the old behaviour and
   under-report, which is the direction these ledgers always resolve toward.
 
-  **Reported figures will move for anyone who cuts a fresh worktree.** A copy
-  that previously showed no pre-merge AI spans now shows the branch's, and
-  rewrites in it that emitted nothing now emit the verdict they always should
-  have. Nothing is re-sent for commits already accounted for, so totals rise from
-  work that was being dropped, not from double counting.
+  **What this delivers is the route, not yet the number.** The cold-start path no
+  longer baselines past a branch's existing commits, so the rebuild now RUNS
+  where it previously did not, and it runs against the branch's head rather than
+  mid-history. Because AI-path evidence is still keyed per checkout, a genuine
+  second directory replays the right commits and finds no AI ranges to seed, so
+  those spans do not come back until that keying gap is closed — which is tracked
+  as its own task. Nothing is re-sent for commits already accounted for either
+  way, so no total can rise from double counting.
 
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had

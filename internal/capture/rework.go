@@ -605,11 +605,27 @@ func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64
 // start instead of through the attributed-commits skip, and the captain's normal
 // case reaches it: several worktrees against one repository.
 //
-// THE RANGE is the branch's own commits, default..HEAD — exactly the scope
+// THE RANGE is the branch's own commits, default..head — exactly the scope
 // rework covers — folded oldest-first into the empty ledger adoption just left,
 // so nothing is applied twice and the last commit folded IS head. Spans are
 // therefore addressed in head's line space, which is the only position that is
 // not a fabrication waiting for the next commit to remap it.
+//
+// That guarantee is not an assumption about how git happens to sort: it rests on
+// gitBranchCommitsSinceDefault asking for `--topo-order --first-parent` against
+// an explicit head SHA. Reversed, a first-parent chain in topological order puts
+// every parent strictly before its child and head strictly last, and each diff is
+// read against the parent it is composed onto. Reverse commit-date order (the
+// rev-list default) promises none of that once a committer clock is skewed, and a
+// full range double-folds whatever a merge already carries — both land spans in a
+// line space no checkout ever had. The head SHA is the one the caller's cursor was
+// baselined to, so a commit made mid-poll is neither replayed here nor replayed
+// again by the next poll that detects it.
+//
+// CALLERS MUST HAVE JUST ADOPTED. The fold assumes the empty ledger
+// adoptReworkBranch leaves behind; run over a root that still holds tracked
+// spans it re-applies hunks already applied. pollGitWatchWorkspace gates on
+// adoption having fired THIS poll, never on the persisted obligation.
 //
 // THE GATE is that this device already holds attribution for at least one commit
 // in the range. That is what keeps a genuinely fresh install unchanged: a new
@@ -640,8 +656,8 @@ func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64
 // already at head, so a replay skipped here never comes back. Bounding it twice
 // would buy one poll's worth of git spawns at the price of the permanent silent
 // loss this exists to close.
-func replayReworkForColdStartBranch(session Session, root string, attributed map[string]struct{}, nowMs int64) {
-	shas := gitBranchCommitsSinceDefault(root)
+func replayReworkForColdStartBranch(session Session, root, head string, attributed map[string]struct{}, nowMs int64) {
+	shas := gitBranchCommitsSinceDefault(root, head)
 	if len(shas) == 0 {
 		return
 	}

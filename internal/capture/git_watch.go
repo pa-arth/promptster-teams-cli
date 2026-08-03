@@ -401,6 +401,31 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 // replayReworkForColdStartBranch); nothing else calls it, and it never advances
 // a cursor.
 //
+// head is the SHA pollGitWatch BASELINED THE CURSOR TO, and the range is built
+// against that SHA rather than against a second read of `HEAD`. The two reads are
+// separated by a whole poll's worth of git spawns (pollDurability over every
+// root, then loadAttributedCommits), so a commit landing in that window would be
+// folded here while the cursor still sits behind it — and the next poll, seeing
+// it as new, would fold its hunks a SECOND time and slide every recovered span
+// by an offset already applied. Resolving a moving reference twice is the defect;
+// there is nothing to re-check.
+//
+// --first-parent and --topo-order are what make the returned list foldable, and
+// neither is cosmetic:
+//
+//   - --first-parent, because gitCommitRawDiff reads every commit with
+//     `-m --first-parent`. A merge's diff therefore ALREADY carries everything
+//     the second-parent side brought in, so folding that side's own commits too
+//     applies the same hunks twice, and applies them in the merged-away
+//     coordinate space of a sibling branch. The first-parent chain is the one
+//     sequence of diffs that composes exactly to head's tree.
+//   - --topo-order, because rev-list's default is reverse COMMIT-DATE order,
+//     which git does not promise is topological. A commit whose committer clock
+//     runs ahead sorts past its own descendants, and reversed that folds a parent
+//     after its child — spans addressed in a line space no checkout ever had.
+//     TestReworkColdStartSkewedClockFoldsTheBranchInHeadsLineSpace builds that
+//     shape from real committer dates.
+//
 // It returns NOTHING when that range exceeds gitWatchMaxCommitsPerPoll, and the
 // refusal — rather than a clamp — is the point.
 //
@@ -429,13 +454,17 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 // whole range or none of it.
 //
 // One read-only spawn (the default ref itself is cached).
-func gitBranchCommitsSinceDefault(root string) []string {
+func gitBranchCommitsSinceDefault(root, head string) []string {
+	if head == "" {
+		return nil
+	}
 	defRef := durabilityDefaultRef(root)
 	if defRef == "" {
 		return nil // no resolvable default branch — no pre-merge range to speak of
 	}
-	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and defRef is a ref name resolved by git itself, not user input. Read-only.
-	out, err := exec.Command("git", "-C", root, "rev-list", defRef+"..HEAD").Output()
+	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir, defRef is a ref name resolved by git itself and head came from git rev-parse. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", defRef+".."+head).Output()
 	if err != nil {
 		return nil
 	}
@@ -536,18 +565,25 @@ func saveGitWatchCursors(heads map[string]string) {
 // long as this flag is false.
 //
 // The third return names the roots that COLD-STARTED here — baselined with no
-// prior cursor at all. It is reported rather than acted on, because the cursor
-// discipline must not change: a cold-start root still reports nothing and still
-// emits nothing. What the flag buys the caller is the ability to tell "this root
-// has never been seen" apart from "this root has nothing new", which are
-// identical from here (both baseline to head and drain) and mean opposite things
-// to branch adoption — see replayReworkForColdStartBranch.
-func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[string]bool) {
+// prior cursor at all — and maps each to THE EXACT SHA ITS CURSOR WAS BASELINED
+// TO. It is reported rather than acted on, because the cursor discipline must not
+// change: a cold-start root still reports nothing and still emits nothing. What
+// it buys the caller is the ability to tell "this root has never been seen" apart
+// from "this root has nothing new", which are identical from here (both baseline
+// to head and drain) and mean opposite things to branch adoption — see
+// replayReworkForColdStartBranch.
+//
+// The SHA, not just the fact, is returned because the caller runs much later in
+// the same poll and must resolve its replay range against the same commit this
+// cursor now claims. Re-reading `HEAD` there would let a commit made in between
+// be folded by the replay AND detected as new by the next poll, which folds its
+// hunks twice.
+func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[string]string) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
 	drained := map[string]bool{}
-	coldStart := map[string]bool{}
+	coldStart := map[string]string{}
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -574,7 +610,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[str
 			// AI history this device recorded through another copy of the repo.
 			newHeads[key] = head
 			drained[key] = true
-			coldStart[key] = true
+			coldStart[key] = head
 			continue
 		}
 		if lastSeen == head {
@@ -700,6 +736,11 @@ func pollGitWatchWorkspace(session Session) {
 		// recovery re-surfaces skipped commits with no branch change, and folding
 		// one of those into live state re-applies its hunks.
 		adopting := false
+		// Set only where adoptReworkBranch actually FIRED this poll — i.e. where the
+		// root's rework state was emptied a few lines above. `adopting` cannot stand
+		// in for it: it is read from the ledger on purpose, so it stays true across
+		// later polls that adopt nothing.
+		justAdopted := false
 		switch scope {
 		case scopeDefault:
 			// On (or merged back to) the default branch: surviving AI lines are now the
@@ -721,6 +762,7 @@ func pollGitWatchWorkspace(session Session) {
 			if branch != "" && recorded != branch {
 				adoptReworkBranch(rootKey, branch)
 				pending = true
+				justAdopted = true
 			}
 			adopting = pending
 		}
@@ -733,8 +775,19 @@ func pollGitWatchWorkspace(session Session) {
 		// replayed nothing, leaving that copy of the branch with no AI spans at all.
 		// The replay is one-shot by construction and takes its own range from git,
 		// because there is no cursor for a later poll to drain against.
-		if adopting && coldStart[rootKey] {
-			replayReworkForColdStartBranch(session, root, attributed, nowMs)
+		//
+		// THE SAME COMMIT'S HUNKS ARE NEVER FOLDED TWICE INTO THE SAME LEDGER, which
+		// is why the gate is justAdopted and not `adopting`. `adopting` is an
+		// obligation read from the ledger and deliberately outlives the poll that
+		// created it, so a root whose CURSOR is lost while its LEDGER survives —
+		// an unreadable or version-bumped cursors file, or a best-effort save that
+		// never landed — cold-starts on a branch it has already recorded, leaves the
+		// tracked spans in place, and would replay the whole range over them.
+		// justAdopted is true only where adoptReworkBranch just emptied this root's
+		// state, so the range is always folded into the empty ledger it assumes. A
+		// genuinely new root always takes that path: its recorded branch is "".
+		if justAdopted && coldStart[rootKey] != "" {
+			replayReworkForColdStartBranch(session, root, coldStart[rootKey], attributed, nowMs)
 		}
 
 		commits := detected[rootKey]

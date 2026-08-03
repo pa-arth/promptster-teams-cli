@@ -702,7 +702,7 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   `git worktree add` is a new `gitWatchRootKey`, so `pollGitWatch` cold-starts it:
   the cursor goes straight to head and the branch's commits are never surfaced,
   while adoption fires anyway and immediately finishes a rebuild that rebuilt
-  nothing. `replayReworkForColdStartBranch` folds `default..HEAD` for state,
+  nothing. `replayReworkForColdStartBranch` folds `default..head` for state,
   gated on this device ALREADY holding attribution for a commit in the range —
   that gate, not the cold-start cursor, is what keeps a fresh install from
   importing history it never measured. It takes the range WHOLE or not at all
@@ -711,6 +711,24 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   ends FABRICATE — the older leaves spans a commit behind head, the newer makes
   the first replayed commit look like a first touch and seeds a human's added
   lines on an AI-touched path as AI (measured, not predicted).
+
+  Three things decide WHERE the rebuilt spans land, and each was a live
+  mispositioning before it was pinned. **The range is resolved against the head
+  SHA `pollGitWatch` baselined the cursor to** — `pollGitWatch`'s third return
+  carries that SHA, not a bool — because re-reading `HEAD` a whole poll later lets
+  a commit made in between be folded here AND detected as new next poll, folding
+  its hunks twice. **`--first-parent`**, because `gitCommitRawDiff` reads every
+  commit with `-m --first-parent`, so a merge's diff already carries the
+  second-parent side; folding that side's own commits too applies the same hunks
+  twice, in a sibling branch's coordinates. **`--topo-order`**, because rev-list's
+  default is reverse COMMIT-DATE order, which git does not promise is topological:
+  one skewed committer clock sorts a parent past its own descendants and the
+  reversed fold applies it after its child. **And the caller gates on adoption
+  having fired THIS poll (`justAdopted`), never on the persisted `Adopting`
+  obligation** — that obligation deliberately outlives its poll, so a root whose
+  cursor is lost while its ledger survives would otherwise replay the whole range
+  over spans it already tracks. The same commit's hunks are never folded twice
+  into the same ledger.
 
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
