@@ -318,9 +318,20 @@ func saveClaudeWatcherState(s claudeWatcherState) error {
 	return os.Rename(tmp, path)
 }
 
+// clearClaudeWatcherState drops the watcher's LIVENESS state — pid, heartbeat,
+// log path — which is meaningless once the process is gone.
+//
+// It deliberately leaves claude-watcher-progress.json alone. Those offsets are
+// the durable record of what has already been read, and the file's schema
+// version is what grants the 28-day history replay exactly once. Deleting it on
+// a clean exit made every restart — every login under autostart, every
+// self-update re-exec (<=30m), every sleep/wake — re-read and re-ship the whole
+// window. Deterministic event ids keep that idempotent at ingest, so the cost is
+// invisible: repeated disk reads, repeated uploads, and repeated replay-stamped
+// ledger writes with nothing to show for them. `uninstall --purge` removes the
+// whole state dir, which is where discarding progress belongs.
 func clearClaudeWatcherState() {
 	_ = os.Remove(claudeWatcherStatePath())
-	_ = os.Remove(claudeWatchProgressPath())
 }
 
 func isClaudeWatcherRunning() (claudeWatcherState, bool) {
