@@ -217,6 +217,21 @@ follows [Semantic Versioning](https://semver.org/).
   variant where the two `rev-list` calls were bounded differently, so a commit
   outside one window read as though it were off the chain.
 
+  **That rule is NOT yet enforced everywhere, and the remaining hole is reached
+  by an ordinary `git rebase -i`.** While a repository's default branch cannot be
+  resolved, or while `HEAD` is detached — which is what a rebase does — the
+  watcher deliberately keeps the branch's tracked AI spans rather than wiping
+  them, but it folds nothing, while still attributing and recording every commit
+  it sees. Those commits are never revisited, so their hunks never move the spans
+  that were kept, and a later rewrite of the human lines that shifted into those
+  coordinates emits a `rework_verdict` for code the AI never wrote. **The watcher
+  polls every 3 seconds, so any rebase taking longer than that lands inside one.
+  This is routine usage, not a corner case, and the wrong position is permanent
+  rather than transient.** It is pre-existing behaviour, unchanged by this
+  release, and it is tracked on the same task as the durability double-count
+  above — the two are one invariant, that recording a commit and folding its
+  hunks must never disagree — to be fixed together in a dedicated pass.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for

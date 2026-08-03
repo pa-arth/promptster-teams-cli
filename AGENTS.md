@@ -774,10 +774,48 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   - so the two ledgers' numbers are not reconcilable on such a history, and
     neither is authoritative over the other there.
 
-  It is filed as its own task (`cli-durability-ledger-double-counts-merg-ca`)
-  rather than fixed alongside the rework narrowing, because `pollDurabilityCommit`
-  advances the durability cursor per commit inside its own ledger transaction, so
-  skipping commits needs a deliberate answer for where that cursor lands.
+  It is filed as its own task (`cli-durability-ledger-double-counts-merg-ca`,
+  since retitled "make record-and-fold agree") rather than fixed alongside the
+  rework narrowing, because `pollDurabilityCommit` advances the durability cursor
+  per commit inside its own ledger transaction, so skipping commits needs a
+  deliberate answer for where that cursor lands.
+
+- **`scopeUnknown` ATTRIBUTES AND RECORDS COMMITS WITHOUT FOLDING THEM, and an
+  ordinary `git rebase -i` reaches it.** This is the second live violation of the
+  one invariant that task covers — the code that RECORDS a commit as attributed
+  and the code that FOLDS its hunks must never disagree — and it is unfixed:
+
+  - `reworkScope` returns `scopeUnknown` when `durabilityDefaultRef` yields `""`
+    or `HEAD` is detached. `pollGitWatchWorkspace`'s scope switch has no
+    `scopeUnknown` case, deliberately: the root KEEPS its tracked spans, because
+    a transient detach mid-rebase must not wipe a real branch's tracking.
+  - But `preMerge` is false there, so `foldRework` is false for every commit in
+    the range, while `attributeAndReworkCommit` still emits and
+    `recordAttributedCommits` still writes each SHA down. A recorded commit is
+    never revisited, so those hunks never shift the spans the root just kept, and
+    a later rewrite of the human lines that moved into those coordinates emits a
+    `rework_verdict` over code the AI never wrote.
+  - **`git rebase -i` on a tracked feature branch reaches it through the
+    detached-HEAD half, and the watcher polls every 3s, so any rebase that takes
+    longer than that lands inside one.** This is routine usage, not a corner
+    case, and not a transient one — the span stays wrong for good.
+
+  It is PRE-EXISTING (the `preMerge` gate has always worked this way; round 4
+  only renamed it `foldRework`) and is tracked on the same task, to be fixed in
+  one pass with the durability double-count: same file, same loop, same open
+  question about where the cursor lands on a skip.
+
+  **The rest of that sweep came back clean, and the bound was ESTABLISHED rather
+  than assumed** — do not redo it. Four other sites were checked for the same
+  signature (an empty or narrowed result treated as harmless while commits are
+  still attributed and recorded): `gitBranchCommitsSinceDefault` returning nil
+  records no attribution at all, so it is a pure documented undercount (the
+  cold-start cursor is already at head); `commitsWithFoldableChain`'s
+  `len(shas)==0` case has no commits to disagree about;
+  `replayReworkForAdoptedCommit`'s empty-diff early return runs only on commits
+  already attributed and carries no hunks to lose; and
+  `attributeAndReworkCommit`'s `!ok` branch skips the fold only when the diff is
+  empty, which has nothing to shift.
 
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
