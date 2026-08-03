@@ -29,7 +29,9 @@ import (
 //   - it reuses the attribution watcher's ALREADY-fetched `git show` diff + files
 //     (no extra spawn), so a pre-merge commit stays one `git show`;
 //   - it carries branch identity, because it is branch-scoped state (see
-//     reworkLedger.Branches).
+//     reworkLedger.Branches), and a root that adopts a branch another root
+//     already attributed OWES a state-only replay of those commits (see
+//     reworkLedger.Adopting and replayReworkForAdoptedCommit).
 //
 // SEEDING: INFERENCE IS BLOCKED, EVIDENCE IS NOT. The unsafe thing was never
 // "seeding a path twice" — it was seeding a path as AI merely BECAUSE WE HAD
