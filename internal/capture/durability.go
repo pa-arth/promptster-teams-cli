@@ -178,15 +178,18 @@ func durabilitySeedAuthorized(led *durabilityLedger, rootKey, path string, write
 // empty maps behind them, so the ledger does not grow without bound. It costs
 // one map walk over one root's marks.
 //
-// The bound is EVIDENCE, not time, and that is what makes dropping a mark safe
-// rather than merely cheap. Path-level seeding fires only for a path the
-// AI-paths ledger still carries, so a tombstone for a path with NO live
-// per-write stamp cannot block anything today; and if a stamp for that path ever
-// reappears it is necessarily a new write, which is precisely what the gate
-// would have authorized anyway. Keeping such a mark and dropping it are
-// therefore the same decision — the difference is only that one of them is
-// unbounded. A path whose evidence IS live keeps its mark, which is exactly the
-// case the tombstone exists for.
+// The bound is EVIDENCE, not time, and what makes dropping a mark safe is that
+// the caller hands in the SEED GATE'S OWN predicate — the same aiPathKnown value
+// the fallback below is guarded by, not a second expression that merely looks
+// compatible. A mark the gate can never consult cannot change any decision, so
+// keeping it and dropping it are the same decision and only one of them is
+// unbounded; a path whose evidence IS live keeps its mark, which is the case the
+// tombstone exists for.
+//
+// Judging a mark by its WRITE STAMP instead is what breaks that: an AI-paths
+// ledger written before per-path stamps existed carries its paths with a 0 stamp
+// for the whole 7-day TTL, so every tombstone on a deployed install would be
+// deleted while the gate was still consulting the path.
 //
 // It runs once per processed commit AND once per poll from harvestDurable — the
 // second call site is what makes the bound real. A root whose default branch
@@ -196,10 +199,10 @@ func durabilitySeedAuthorized(led *durabilityLedger, rootKey, path string, write
 // harvestDurable runs every poll regardless of whether the tip moved, and prunes
 // BEFORE its empty-root early return, which is exactly the state a fully churned
 // root is left in.
-func pruneSeedTombstones(led *durabilityLedger, rootKey string, writeStamp func(string) int64) {
+func pruneSeedTombstones(led *durabilityLedger, rootKey string, aiPathKnown func(string) bool) {
 	marks := led.Seeded[rootKey]
 	for path := range marks {
-		if writeStamp(path) == 0 {
+		if !aiPathKnown(path) {
 			delete(marks, path)
 		}
 	}
@@ -617,6 +620,10 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	// thing in this ledger that distinguishes "an agent wrote this file again"
 	// from "this path is still sitting in a 7-day presence cache".
 	marks := readAiPathMarks(scope.aiKey)
+	// ONE predicate, read in exactly two places: the path-level seed gate below and
+	// pruneSeedTombstones. A tombstone is worth keeping precisely while the gate it
+	// guards can still fire, so both read this func value, not two that agree.
+	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
 	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
 
 	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
@@ -643,7 +650,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 		if files == nil {
 			files = map[string][]durTrackedRange{}
 		}
-		pruneSeedTombstones(led, rootKey, writeStamp)
+		pruneSeedTombstones(led, rootKey, aiPathKnown)
 		applyDurabilityRenames(led, rootKey, files, renames, writeStamp)
 		for path, hs := range hunks {
 			if existing := files[path]; len(existing) > 0 {
@@ -686,7 +693,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 					r.BornTsMs = nowMs
 					seeded = append(seeded, r)
 				}
-			} else if _, isAI := marks[scope.ledgerPath(path)]; isAI {
+			} else if aiPathKnown(path) {
 				written := writeStamp(path)
 				if !durabilitySeedAuthorized(led, rootKey, path, written) {
 					continue
@@ -741,13 +748,14 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	// current now, exactly as the churn route is.
 	scope := resolveLedgerScope(root, session.TaskRoot)
 	marks := readAiPathMarks(scope.aiKey)
+	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
 	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
 
 	var matured []harvested
 	mutateDurabilityLedger(func(led *durabilityLedger) {
 		// Before the early return, deliberately: an emptied root is precisely the
 		// state whose tombstones nothing else would ever walk again.
-		pruneSeedTombstones(led, rootKey, writeStamp)
+		pruneSeedTombstones(led, rootKey, aiPathKnown)
 		files := led.Roots[rootKey]
 		if len(files) == 0 {
 			return

@@ -568,9 +568,9 @@ func TestParseUnifiedDiffRenames(t *testing.T) {
 // empty-root early return, which is exactly the state that root is left in.
 //
 // What makes dropping the mark safe is that it is bounded by EVIDENCE, not by
-// time: the path fallback cannot fire for a path with no live per-path write
-// stamp, and a stamp that reappears later is by definition a newer write, which
-// the gate would authorize with or without the mark.
+// time, and on the seed gate's OWN predicate: the path fallback cannot fire for a
+// path the AI-paths ledger no longer carries, so a mark for such a path is
+// unreachable. Here the whole ledger is gone, which is that state at its limit.
 func TestDurabilityTombstonesPrunedOnAQuietRoot(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	ws, git, gitOut := gitRepo(t)
@@ -1279,5 +1279,86 @@ func TestDurabilityRenameCarriesTheTombstone(t *testing.T) {
 	if got := trackedLineCount(t, key, "new.go"); got != 0 {
 		t.Errorf("the tombstone did not follow the rename: %d human lines seeded as AI at new.go (ranges %+v)",
 			got, ledgerRanges(t, key, "new.go"))
+	}
+}
+
+// TestDurabilityTombstoneSurvivesAStamplessAiPathsLedger runs the sequence every
+// ALREADY-DEPLOYED install is in, which no other test here can reach: they all
+// seed evidence through recordAiTouchedPath, which always writes a per-path
+// stamp. An ai-paths.json written before PathTs existed has Paths populated and
+// no stamps at all, and its version is deliberately not bumped, so it is read for
+// its full 7-day TTL with every WriteMs reading 0.
+//
+// A tombstone stamped from that evidence therefore holds 0 — correctly, since 0
+// means "no per-write evidence, only presence". Pruning on the stamp read that as
+// a dead mark and deleted it on the very next poll, one statement before the seed
+// gate consulted the path it was still carrying, and the human commit that
+// followed re-entered the ledger as fresh AI. The gate and the pruner must be the
+// same predicate for that reason and not merely compatible ones.
+func TestDurabilityTombstoneSurvivesAStamplessAiPathsLedger(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	// Written by hand, NOT through recordAiTouchedPath: the point is the shape a
+	// pre-PathTs daemon left on disk. TsMs is real time because the reader's TTL
+	// check is against the wall clock, not the ledger's simulated one.
+	legacy := aiPathsLedger{V: aiPathsLedgerVersion, Sessions: map[string]aiPathsEntry{
+		"legacy-session": {
+			Paths:   map[string]bool{"app.go": true},
+			TsMs:    time.Now().UnixMilli(),
+			RootKey: key,
+		},
+	}}
+	blob, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aiPathsLedgerPath(), blob, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAiPathMarks(key)["app.go"]; got.WriteMs != 0 {
+		t.Fatalf("setup: a stampless entry must read WriteMs 0, got %d", got.WriteMs)
+	}
+
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds app.go")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	if got := trackedLineCount(t, key, "app.go"); got != 3 {
+		t.Fatalf("setup: presence must seed the path, got %d lines", got)
+	}
+
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites all of app.go")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	if got := trackedLineCount(t, key, "app.go"); got != 0 {
+		t.Fatalf("setup: the full churn must empty the path, got %d lines", got)
+	}
+	if _, tombstoned := loadDurabilityLedger().Seeded[key]["app.go"]; !tombstoned {
+		t.Fatal("setup: the churn must leave a tombstone")
+	}
+
+	// The next poll prunes before it seeds. The path is still in the ledger the
+	// gate reads, so the mark is still live and this human commit stays human.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 8))
+	git("add", "-A")
+	git("commit", "-m", "human appends")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+
+	if _, tombstoned := loadDurabilityLedger().Seeded[key]["app.go"]; !tombstoned {
+		t.Error("a 0-stamp tombstone was pruned while its path was still seedable")
+	}
+	if got := trackedLineCount(t, key, "app.go"); got != 0 {
+		t.Errorf("human code re-seeded as AI on a stampless ledger: %d lines tracked, want 0 (ranges %+v)",
+			got, ledgerRanges(t, key, "app.go"))
 	}
 }
