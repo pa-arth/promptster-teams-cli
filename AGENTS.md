@@ -667,6 +667,16 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   -c` off a feature branch and a per-branch worktree never stand on the default
   branch at all.
 
+- **Two ledgers with different keys lose data where they meet.** Rework state is
+  per-ROOT and expires with its branch; the attributed-commits ledger is keyed by
+  SHA ALONE and shared across roots. Each is right alone, so a root adopting a
+  branch another worktree (or an earlier checkout) already attributed starts
+  empty and has every rebuilding commit skipped — the branch reads as holding no
+  AI work. `replayReworkForAdoptedCommit` rebuilds that state silently, and it
+  runs ONLY on an adopting poll: cursor recovery re-surfaces skipped commits with
+  no branch change, and re-folding one there re-applies its insertion hunk and
+  slides live spans out of the file's real line space.
+
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
 and the commit would never reach `pollReworkCommit` at all. It returns the raw

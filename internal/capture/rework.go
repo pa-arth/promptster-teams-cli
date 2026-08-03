@@ -379,6 +379,24 @@ func aiRangesForSeeding(files []attrFile) map[string][]durTrackedRange {
 // evidence rule in the file header. Returns (and emits) one verdict per
 // (commit, path) that had a churn.
 func pollReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64) []event.Event {
+	verdicts := foldReworkCommit(session, root, sha, diff, files, nowMs)
+	for i := range verdicts {
+		emitReworkVerdict(verdicts[i])
+	}
+	return verdicts
+}
+
+// foldReworkCommit is pollReworkCommit's ledger half, split out so a commit can
+// be folded for its STATE without emitting anything. It returns the verdicts the
+// commit produced and emits none of them; pollReworkCommit is the emitting entry
+// point and stays the only caller that ships events.
+//
+// The silent caller is replayReworkForAdoptedCommit. Its commits were already
+// attributed — by another worktree, or by this root before a branch switch — so
+// their verdicts have already been emitted once. Re-emitting them is exactly the
+// double-count the attribution skip exists to prevent, which is why the split is
+// at emission rather than at the ledger write.
+func foldReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64) []event.Event {
 	hunks := parseUnifiedDiffHunks(diff)
 	renames := parseUnifiedDiffRenames(diff)
 	seedable := aiRangesForSeeding(files)
@@ -460,10 +478,48 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 		}
 	})
 
-	for i := range verdicts {
-		emitReworkVerdict(verdicts[i])
-	}
 	return verdicts
+}
+
+// replayReworkForAdoptedCommit rebuilds one already-attributed commit's rework
+// STATE, emitting nothing.
+//
+// Why it has to exist. Rework state is per-ROOT and expires with the branch it
+// describes; the attributed-commits ledger is keyed by SHA ALONE and shared
+// across roots. Both are right on their own, and together they lose data: a root
+// that adopts a branch starts with no spans, and every commit that would rebuild
+// them is skipped as already-attributed before it can. The branch then looks like
+// it contains no AI work at all, so later rewrites of its AI lines emit no
+// rework_verdict — silent under-reporting, reachable through two ordinary moves
+// (park on the default branch and come back, or run several worktrees on one
+// repository).
+//
+// The fix deliberately does NOT relax the skip. Attribution stays skipped, no
+// commit_attribution is re-emitted, and no fingerprints are re-recorded — the
+// commit really was accounted for. Only the ledger state a later commit needs in
+// order to recognise its own churn is rebuilt, and only silently.
+//
+// It is called ONLY on a poll that adopted the branch, which is what makes it
+// safe to fold a commit the ledger may have seen before: adoption has just
+// emptied this root's state, so there is nothing to apply twice. Without that
+// guard, gitNewCommits' cursor-recovery path — which re-surfaces the newest
+// commits wholesale after a history rewrite — would re-fold commits whose spans
+// are already tracked and remap surviving ranges a second time.
+//
+// Costs one `git show` per replayed commit, on adoption polls only; a steady-state
+// poll on an unchanged branch replays nothing.
+func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64) {
+	diff, files, _, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
+	if diff == "" {
+		return // nothing this commit can contribute (merge commit, empty diff)
+	}
+	if !ok {
+		// Mirrors attributeAndReworkCommit's !ok branch: a pure rename and a
+		// delete-only commit both still move or churn tracked spans, and neither
+		// may seed — removing a file is not evidence that anyone wrote anything.
+		files = nil
+	}
+	foldReworkCommit(session, root, sha, diff, files, nowMs)
 }
 
 // reworkVerdictData is the CLOSED payload of a rework_verdict event: the commit

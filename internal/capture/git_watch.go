@@ -596,6 +596,13 @@ func pollGitWatchWorkspace(session Session) {
 		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
 		// `git checkout main` after a feature branch merged).
 		scope, branch := reworkScope(root)
+		// Set when this poll bound the root to a DIFFERENT branch than it held.
+		// Adoption empties the root's rework state, and the skip below then drops
+		// the very commits that would rebuild it, so the adopted branch's AI spans
+		// are lost — see replayReworkForAdoptedCommit. Only an adopting poll
+		// replays, which is also what makes replaying safe: there is no surviving
+		// state left to apply a commit to twice.
+		adopted := false
 		switch scope {
 		case scopeDefault:
 			// On (or merged back to) the default branch: surviving AI lines are now the
@@ -615,6 +622,7 @@ func pollGitWatchWorkspace(session Session) {
 			// ranges and tombstones would otherwise carry over silently.
 			if branch != "" && reworkLedgerBranch(rootKey) != branch {
 				adoptReworkBranch(rootKey, branch)
+				adopted = true
 			}
 		}
 
@@ -639,6 +647,14 @@ func pollGitWatchWorkspace(session Session) {
 			sha := commits[i]
 			if _, done := attributed[sha]; done {
 				reattempted++
+				// Attribution stays skipped — this commit really was accounted for,
+				// and nothing here emits. But on a poll that just adopted the branch,
+				// this SHA is also the only thing that can rebuild the rework state
+				// adoption emptied, and skipping it outright is what left an adopted
+				// branch looking like it held no AI work.
+				if preMerge && adopted {
+					replayReworkForAdoptedCommit(session, root, sha, nowMs)
+				}
 				continue
 			}
 			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
