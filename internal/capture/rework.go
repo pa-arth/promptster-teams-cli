@@ -355,7 +355,9 @@ func applyReworkRenames(led *reworkLedger, rootKey string, tracked map[string][]
 }
 
 // aiRangesForSeeding pulls the likely_ai new-side spans (content-free) out of the
-// reconciled attribution files, keyed by path, for first-touch seeding.
+// reconciled attribution files, keyed by path, as the candidate spans for
+// seeding. Whether a candidate may actually seed is decided later, by
+// reworkSeedAuthorized — this is path presence, not per-write evidence.
 func aiRangesForSeeding(files []attrFile) map[string][]durTrackedRange {
 	out := map[string][]durTrackedRange{}
 	for _, f := range files {

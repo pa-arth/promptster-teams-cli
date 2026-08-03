@@ -656,8 +656,9 @@ Two things about it that are easy to get wrong, both learned the expensive way:
 - **A seed tombstone blocks INFERENCE, not seeding.** The unsafe act was never
   "seeding a path twice" — it was seeding a path as AI because we had merely seen
   it before. So a tombstone stores the AI-write evidence already spent on that
-  path, and only *different* evidence (an agent actually writing the file again)
-  re-authorizes it. Blocking outright silences the canonical agent loop — write,
+  path, and only a *strictly newer* per-path AI write stamp — an agent
+  demonstrably wrote the file again — re-authorizes it; a stamp that merely
+  differs does not. Blocking outright silences the canonical agent loop — write,
   rewrite, rewrite again — which is the very thing rework measures. Both failure
   directions are pinned by tests; do not "simplify" the token comparison back into
   a boolean.

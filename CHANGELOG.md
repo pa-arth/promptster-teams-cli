@@ -54,6 +54,37 @@ follows [Semantic Versioning](https://semver.org/).
   yet, so the next load treated a brand-new install as a legacy one and dropped
   its whole classification cache for nothing.
 
+- **The AI-line ledgers reported human code as AI, and reported lines as
+  surviving at a path they had left.** Both are FABRICATION rather than loss —
+  they corrupt the only numbers `durability_verdict` and `rework_verdict` exist
+  to report — and both were reachable through ordinary git usage.
+
+  Seeding a path is deliberately first-touch-only, so that a later human rewrite
+  of an AI line is never re-attributed as fresh AI. But a path *leaves* the
+  ledger by three routes — every tracked range churned, every range matured into
+  a durable verdict, or the file renamed away — and each of those deletions
+  re-armed the first-touch branch, so the next purely-human commit to that path
+  was seeded as fresh AI off stale AI-path evidence. "First touch" is now a
+  property of the repo, not of the ledger's current contents: every route out
+  leaves a mark, and the path-level seeding fallback refuses to fire while one
+  stands. Line-precise fingerprint transfer — the only carrier of lineage through
+  a squash-merge — is deliberately unaffected.
+
+  A pure rename emits no `@@` hunks under the tracked path, so its spans were
+  neither moved nor churned: they sat at a path that no longer existed and
+  matured into a `durable` verdict for lines that had stopped existing there
+  weeks earlier. Renames are now read out of the diff git already emits and the
+  spans carried to the new path with their birth timestamp and lineage intact, so
+  a rename no longer restarts the 30-day clock or breaks lineage. `copy from` is
+  deliberately ignored — a copy leaves the source file in place.
+
+  Two related corrections in the pre-merge rework ledger: its state is now bound
+  to the branch it describes, so `git switch -c` off a feature branch or a
+  per-branch worktree expires it instead of carrying stale ranges across (the
+  clear on returning to the default branch never fired in either case); and a
+  pre-merge commit that only *deletes* files now emits its rework verdicts
+  immediately rather than stranding them until merge.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for
