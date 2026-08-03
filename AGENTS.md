@@ -225,12 +225,21 @@ parts of that funnel assumed "this just happened". Four rules, all pinned by
   distinguishes two LIVE writes in one millisecond, and letting history take it
   manufactures the "the agent wrote this again" evidence `durabilitySeedAuthorized`
   is checking for.
-- **A replayed `file_diff` skips the dedup claim entirely** (`eventIsReplay`,
-  threshold `diffDedupTTL` — live tailing sees a line within a 3s poll, so an
-  older event cannot be racing another channel). The claim key is the file's
-  CURRENT content hash, so keeping it collapses every replayed edit of one path
-  onto today's bytes: first wins, rest vanish, and the claim then blocks a
+- **A replayed `file_diff` skips the dedup claim entirely.** The claim key is the
+  file's CURRENT content hash, so keeping it collapses every replayed edit of one
+  path onto today's bytes: first wins, rest vanish, and the claim then blocks a
   genuine live edit for the next 5 minutes.
+- **`replay` is a PRODUCER signal, never inferred inside the shared funnel.**
+  `dedupeFileDiff` and `recordAiBashWindow` take it as an argument. Only Claude
+  and Codex pass `transcriptEventIsHistorical` (age vs `diffDedupTTL`), because
+  age means age only where every record carries its OWN timestamp. **Cursor
+  passes a hard `false` on both rails** — it never backfills, and
+  `CursorTranscriptProcessor.eventTs` stamps every action in a turn with that
+  TURN'S START anchor, so a 46-minute turn's live edits look 46 minutes old.
+  Inferring from age there silently disabled live cross-channel dedupe and froze
+  the per-path stamp `durabilitySeedAuthorized` reads as "the agent wrote this
+  again". A live observation is stamped NOW whatever the transcript claims; only
+  a replay is stamped from `e.Ts`.
 - **The age gate fails CLOSED.** An absent or unparseable transcript timestamp
   routes to `…YesPreexisting` (seed to EOF), because mtime is the only other
   bound and a six-month-old session resumed today has today's mtime.

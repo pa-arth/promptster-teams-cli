@@ -1038,10 +1038,15 @@ func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
 	// (a `sed -i`/codegen edit produces no file_diff, so its paths never enter
 	// the ai-paths ledger — this is the only signal we keep for them). No-op for
 	// anything that is not an AI-attributed `command` event.
-	recordAiBashWindow(&ev, session.TaskRoot)
+	// Claude Code stamps every transcript record with its own timestamp, so age
+	// here genuinely means age and the bounded-history replay is separable from
+	// the live tail on a per-event basis. A resumed session mixes both inside
+	// one tail, which is why this is decided per event rather than per file.
+	replay := transcriptEventIsHistorical(&ev)
+	recordAiBashWindow(&ev, session.TaskRoot, replay)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.
-	if !dedupeFileDiff(session.TaskRoot, &ev) {
+	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
 		return
 	}
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {

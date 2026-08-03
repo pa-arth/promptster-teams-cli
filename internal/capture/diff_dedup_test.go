@@ -31,13 +31,13 @@ func TestDedupeFileDiffAcrossChannels(t *testing.T) {
 
 	// Channel 1 (AI) emits first → wins.
 	ai := fileDiffEvent("a.txt", "@@\n+hello world")
-	if !dedupeFileDiff(ws, &ai) {
+	if !dedupeFileDiff(ws, &ai, false) {
 		t.Fatal("first emission should be allowed")
 	}
 
 	// Channel 2 (git watcher) sees the SAME resulting content → deduped.
 	git := fileDiffEvent("a.txt", "diff --git a/a.txt b/a.txt\n+hello world")
-	if dedupeFileDiff(ws, &git) {
+	if dedupeFileDiff(ws, &git, false) {
 		t.Error("second emission of identical content should be deduped")
 	}
 
@@ -46,7 +46,7 @@ func TestDedupeFileDiffAcrossChannels(t *testing.T) {
 		t.Fatal(err)
 	}
 	human := fileDiffEvent("a.txt", "diff --git a/a.txt b/a.txt\n+EDITED")
-	if !dedupeFileDiff(ws, &human) {
+	if !dedupeFileDiff(ws, &human, false) {
 		t.Error("a new resulting content must be emitted, not deduped")
 	}
 }
@@ -183,7 +183,7 @@ func TestDedupeIgnoresNonFileDiff(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
 	cmd := event.NewEvent("command", "sess-1")
 	cmd.Data = map[string]interface{}{"command": "ls"}
-	if !dedupeFileDiff("/ws", &cmd) {
+	if !dedupeFileDiff("/ws", &cmd, false) {
 		t.Error("non-file_diff events must always pass through")
 	}
 }

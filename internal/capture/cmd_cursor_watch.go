@@ -661,12 +661,23 @@ func emitCursorEvent(ev event.Event, session Session, captureProse bool) int {
 	// session on a machine look like one session.
 	ev.DeviceID = session.DeviceID
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
+	// Cursor is ALWAYS live — the false below is a fact about this surface, not
+	// a default. Two independent reasons, either one sufficient: it never
+	// backfills (no trustworthy session timestamp to bound a replay with, which
+	// is why the 28-day history window is Claude + Codex only), and its events
+	// carry the TURN'S START anchor rather than a per-record time
+	// (CursorTranscriptProcessor.eventTs), so a 46-minute turn's live edits look
+	// arbitrarily old. Inferring replay from age here would silently disable
+	// live cross-channel dedupe and freeze the per-path write stamp that
+	// durabilitySeedAuthorized and reworkSeedEvidence read as "the agent wrote
+	// this again".
+	const replay = false
 	// Record AI bash execution windows for later commit-attribution recovery.
 	// No-op unless this is an AI-attributed `command` event.
-	recordAiBashWindow(&ev, session.TaskRoot)
+	recordAiBashWindow(&ev, session.TaskRoot, replay)
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// git watcher already emitted.
-	if !dedupeFileDiff(session.TaskRoot, &ev) {
+	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
 		return 0
 	}
 	// Ledger first — it projects, scrubs and signs ev in place, so the queued

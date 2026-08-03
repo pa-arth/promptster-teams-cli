@@ -664,11 +664,15 @@ func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
 	// Record AI bash execution windows for later commit-attribution recovery —
 	// same as the Claude watcher. No-op unless this is an AI-attributed
 	// `command` event.
-	recordAiBashWindow(&ev, session.TaskRoot)
+	// Codex stamps every rollout record with its own timestamp, so the bounded
+	// history replay is separable from the live tail per event — same terms as
+	// the Claude funnel.
+	replay := transcriptEventIsHistorical(&ev)
+	recordAiBashWindow(&ev, session.TaskRoot, replay)
 	// Idempotency: skip a file_diff whose resulting content the git watcher (or
 	// another channel) has already emitted, so an apply_patch edit isn't
 	// double-counted when the working-tree poll sees it later.
-	if !dedupeFileDiff(session.TaskRoot, &ev) {
+	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
 		return 0
 	}
 	// Ledger first — it projects, scrubs, and signs ev in place, so the queued

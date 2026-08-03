@@ -130,22 +130,22 @@ func TestRecordAiBashWindowOnlyAICommands(t *testing.T) {
 	ai := event.NewEvent("command", "ai-sess")
 	ai.Ts = ts
 	ai.Provenance = event.AIProvenance()
-	recordAiBashWindow(&ai, "")
+	recordAiBashWindow(&ai, "", false)
 
 	human := event.NewEvent("command", "human-sess")
 	human.Ts = ts
 	human.Provenance = event.HumanProvenance()
-	recordAiBashWindow(&human, "")
+	recordAiBashWindow(&human, "", false)
 
 	noProv := event.NewEvent("command", "noprov-sess")
 	noProv.Ts = ts
-	recordAiBashWindow(&noProv, "")
+	recordAiBashWindow(&noProv, "", false)
 
 	// A non-command AI event must never record a bash window.
 	fileDiff := event.NewEvent("file_diff", "ai-sess")
 	fileDiff.Ts = ts
 	fileDiff.Provenance = event.AIProvenance()
-	recordAiBashWindow(&fileDiff, "")
+	recordAiBashWindow(&fileDiff, "", false)
 
 	got := readBashWindows("")
 	if len(got) != 1 {
