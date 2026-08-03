@@ -637,15 +637,6 @@ func saveGitWatchCursors(heads map[string]string) {
 // attribution PR consumes); a cold-start root (no prior cursor) is baselined
 // WITHOUT reporting, matching git-ai's cold-start discipline.
 //
-// The second return says, per root, whether this poll left that root's cursor AT
-// ITS HEAD — i.e. whether the root DRAINED. A root is not drained when the
-// shared budget deferred it whole, when a burst was clamped to a partial batch,
-// or when the comparison was inconclusive; in each of those cases commits this
-// poll already knows about are still owed to a later poll. Only the caller can
-// act on that, and it must: state it drops on the strength of "this root's
-// commits are being processed now" (branch adoption) stays owed for exactly as
-// long as this flag is false.
-//
 // The second return carries gitNewCommits' foldable subset per root — the
 // first-parent chain of what was detected. It rides alongside the detected list
 // rather than replacing it because the two have different consumers on purpose;
