@@ -196,6 +196,22 @@ follows [Semantic Versioning](https://semver.org/).
   lookbehind, which is why this side scans procedurally), so lockstep means
   identical OUTPUT, now pinned by a differential case table on the backend.
 
+### Upgrading
+
+- **Reported rework figures move upward after this release, and the movement is
+  the fix rather than a regression.** A pre-merge commit that only *deletes*
+  files now emits its `rework_verdict`s immediately instead of stranding them
+  until merge, so verdicts that previously went unreported start being counted.
+  Expect a step change in rework rate at the upgrade boundary on any fleet that
+  deletes files before merging — it is not a behaviour change in how anyone
+  writes code, and it is not comparable to the pre-upgrade series.
+
+- **Cursor attribution starts from zero at the upgrade, not from history.** Every
+  Cursor edit before this release was attributed as human, and nothing
+  backfills — the ledger keys those edits needed were never written. A fleet
+  using Cursor should expect its AI share to rise once the new binary is
+  running, and should not read the earlier flat line as a real measurement.
+
 ## [0.12.1] — 2026-07-31
 
 ### Added
