@@ -116,8 +116,9 @@ func TestCursorHookDropsUserEmailAndOtherUnallowlistedFields(t *testing.T) {
 // --- the fields the rail exists for ------------------------------------------
 
 // Real model attribution is the headline reason this rail exists. Only
-// afterAgentThought carries model_id; every other step reports "default", which
-// describes routing rather than a model.
+// afterAgentThought carries a real model_id; every other step — and often
+// afterAgentThought itself — reports "default", which describes routing rather
+// than a model. model_id:"default" must not become a reported model either.
 func TestCursorHookModelComesFromModelIDNotTheDefaultLabel(t *testing.T) {
 	// A step whose only model signal is "default" must report no model at all —
 	// emitting "default" as a model would poison any model-mix metric.
@@ -129,12 +130,24 @@ func TestCursorHookModelComesFromModelIDNotTheDefaultLabel(t *testing.T) {
 		t.Fatalf("Model = %q, want empty", res.Model)
 	}
 
+	// model_id:"default" is the IDE sentinel (measured 2026-08-03). Same rule.
+	res, ok := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{
+		"model_id": "default",
+		"text":     "reasoning that must never be emitted",
+	}))
+	if ok {
+		t.Fatal(`model_id "default" must produce no events (would claim the transcript for nothing)`)
+	}
+	if res.Model != "" {
+		t.Fatalf("Model = %q for model_id=default, want empty", res.Model)
+	}
+
 	raw := hookPayload("afterAgentThought", map[string]interface{}{
 		"model_id":     "grok-4.5",
 		"model_params": []map[string]string{{"id": "effort", "value": "high"}},
 		"text":         "internal reasoning that must never be emitted",
 	})
-	res, ok := NormalizeCursorHook(raw)
+	res, ok = NormalizeCursorHook(raw)
 	if !ok {
 		t.Fatal("afterAgentThought produced no events")
 	}

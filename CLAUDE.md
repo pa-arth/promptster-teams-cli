@@ -57,13 +57,15 @@ does not parse** — an engineer's own config is never clobbered.
 nothing — its payload has not been audited for source content, so silence is the
 safe answer, and `TestCursorHookUnregisteredStepsEmitNothing` pins that.
 
-**`afterAgentThought` is registered for `model_id` ALONE.** It is the *only* step
-that carries a real model — every other step reports `model: "default"`, which
-describes routing, not a model. So it emits one `ai_response` carrying `{model}`
-and nothing else; its reasoning text is the agent's own prose and never leaves
-the machine. `model` was already allowlisted on `ai_response` on **both** sides
-(`projectUsageFields` / `eventFieldProjection.ts`), so this rail needed **zero
-allowlist change** — which is why MUST-DO #2 is not in play here.
+**`afterAgentThought` is registered for `model_id` ALONE.** Empirically it is the
+step that sometimes carries a real model; every other step — and often this one
+too — reports `model` / `model_id: "default"` (routing, not a model). The
+normalizer rejects that sentinel (omit the field, never emit `"default"`). So it
+emits one `ai_response` carrying `{model}` and nothing else; its reasoning text
+is the agent's own prose and never leaves the machine. `model` was already
+allowlisted on `ai_response` on **both** sides (`projectUsageFields` /
+`eventFieldProjection.ts`), so this rail needed **zero allowlist change** —
+which is why MUST-DO #2 is not in play here.
 
 **Rail handoff is an identity, not a heuristic.** The hook payload names the
 exact `transcript_path`, and `conversation_id == session_id ==` the transcript
@@ -90,13 +92,18 @@ them from documentation:**
   `go build ./...` (`duration: 2021.129`) reported as **33 minutes**. Nothing
   downstream can tell that a duration is implausible.
   `TestCursorHookCommandDurationIsMilliseconds` pins it.
-- **Cursor exposes NO token counts anywhere.** Not in transcripts, not in
-  `state.vscdb`, not in `conversation-search.db`, not in the per-session
-  `chats/*/store.db`, and not in any hook payload. `stop` / `afterAgentResponse`
-  *construct* token fields in Cursor's shipped bundle but **never fire on the
-  headless `cursor-agent -p` path** — verified on a turn ending
-  `final_status: "completed"`. So token fields are **ABSENT, never zero**: a zero
-  reads downstream as "this turn cost nothing" rather than "unknown".
+- **Promptster does not capture Cursor token counts.** Transcripts,
+  `state.vscdb`, `conversation-search.db`, and per-session `chats/*/store.db`
+  expose none. Cursor's bundle *constructs* token fields for `stop` /
+  `afterAgentResponse`; headless `cursor-agent -p` never fires those steps.
+  IDE `stop` *is* requested and other enrolled hooks (claude-user →
+  `presence.sh`) have been seen with nonzero `input_tokens` in Cursor's own
+  hooks log — but a logger enrolled in **our** `~/.cursor/hooks.json` got
+  **zero** stop scratch files in a 2026-08-03 IDE probe, so we do not register
+  `stop` and do not claim those tokens. `afterAgentResponse`: zero platform
+  requests in that session. Token fields stay **ABSENT, never zero**.
+  `model` / `model_id: "default"` is a routing sentinel and is rejected (omit
+  the field), including on `afterAgentThought`.
 
 **Cursor transcripts carry no cwd and no timestamp.** Both gaps are worked around
 in ways that are easy to "simplify" back into bugs:

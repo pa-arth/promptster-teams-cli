@@ -32,14 +32,23 @@ import (
 //   - error_message / failure_type / is_interrupt on postToolUseFailure
 //   - workspace_roots (exact cwd) and transcript_path
 //
-// TOKENS ARE NOT AVAILABLE AND THIS IS SETTLED. The shipped dispatch code does
-// construct input_tokens/output_tokens/cache_read_tokens/cache_write_tokens for
-// the `stop` and `afterAgentResponse` steps, but neither step fires on the
-// headless `cursor-agent -p` path — verified on a turn that ended
-// final_status:"completed", not just on failed runs. Do not re-derive a token
-// metric from this surface, and do not reintroduce those two steps below on the
-// strength of reading Cursor's bundle: they were read there and they did not
-// fire.
+// TOKENS ARE NOT CAPTURED HERE — AND THAT IS DELIBERATE. Cursor's shipped
+// dispatch builds input_tokens/output_tokens/cache_*_tokens for `stop` and
+// `afterAgentResponse`. Empirically (2026-08-03):
+//
+//   - Headless `cursor-agent -p`: neither step fires.
+//   - IDE: `stop` IS requested and other enrolled hooks (e.g. Claude's
+//     claude-user Stop → presence.sh) receive nonzero token JSON. But a
+//     logger enrolled in OUR `~/.cursor/hooks.json` did not receive any
+//     stop payload across a 20-minute IDE probe (zero `*-stop.json` scratch
+//     files; Cursor also requested zero stop steps for that window after
+//     enrollment). `afterAgentResponse` had zero `Hook step requested`
+//     lines in the same session log.
+//
+// So we do NOT register `stop` / `afterAgentResponse`, and we do not claim
+// Promptster captures Cursor tokens. Token fields stay ABSENT, never zero.
+// Re-open only with OUR enrolled logger's on-disk payloads — Cursor's own
+// hooks log for another product's command is not that bar.
 //
 // WHY THE USER SCOPE, NOT THE PROJECT SCOPE. Cursor resolves four hook configs
 // and merges them:
@@ -65,7 +74,8 @@ func cursorUserHooksPath() string {
 // cursorHookSteps are the steps we register.
 //
 // Deliberately NOT registered:
-//   - stop / afterAgentResponse — do not fire on the headless path (see above).
+//   - stop / afterAgentResponse — see TOKENS note above. Do not reintroduce
+//     them without OUR enrolled logger's on-disk payloads.
 //   - preToolUse — it gates the tool call: a slow or wedged hook there stalls the
 //     engineer's agent before any work happens. postToolUse carries the same
 //     identity fields plus the outcome, so the blocking one buys nothing.
@@ -413,6 +423,16 @@ func recordCursorHookClaim(transcriptPath, sessionID, model string) {
 		for k, v := range c.Claims {
 			if now.Sub(time.UnixMilli(v.TsMs)) > cursorHookClaimTTL {
 				delete(c.Claims, k)
+			}
+		}
+		// Preserve a previously remembered model when this step only saw the
+		// "default" sentinel (model == ""). afterFileEdit / afterShellExecution
+		// claim with an empty model and must not wipe the real one
+		// afterAgentThought already recorded — that field gates repeat-model
+		// suppression.
+		if model == "" {
+			if prev, ok := c.Claims[key]; ok && prev.SessionID == sessionID {
+				model = prev.Model
 			}
 		}
 		c.Claims[key] = cursorHookClaim{SessionID: sessionID, TsMs: now.UnixMilli(), Model: model}

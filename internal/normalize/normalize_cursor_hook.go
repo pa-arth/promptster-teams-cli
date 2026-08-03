@@ -21,12 +21,14 @@ import (
 // re-capture rather than reasoning about it: register a hook that appends stdin
 // to a file and run one turn.
 //
-// TWO THINGS THAT ARE NOT HERE AND ARE NOT COMING:
+// TWO THINGS THAT ARE NOT HERE AND ARE NOT COMING (without new evidence):
 //
-//   - Tokens. `stop` and `afterAgentResponse` construct input/output/cache token
-//     fields in Cursor's shipped code, but neither step fires on the headless
-//     agent path — confirmed on a turn that ended final_status:"completed". There
-//     is no token or cost number on this surface.
+//   - Tokens. Cursor constructs input/output/cache token fields for `stop` /
+//     `afterAgentResponse`. Headless never fires them. IDE stop payloads with
+//     nonzero tokens appear in Cursor's hooks log for *other* enrolled commands
+//     (claude-user), but a 2026-08-03 probe that enrolled OUR user-scope logger
+//     captured zero stop scratch files — so this normalizer does not emit token
+//     fields. ABSENT, never zero.
 //   - Anything resembling source. tool_output, edits[].old_string/new_string and
 //     afterShellExecution's `output` all arrive in the payload and NONE of them
 //     is read except to count lines. See cursorHookEditLineCounts.
@@ -37,10 +39,10 @@ type cursorHookPayload struct {
 	GenerationID   string `json:"generation_id"`
 	CursorVersion  string `json:"cursor_version"`
 
-	// Model identity. `model` is the display/routing name and is frequently the
-	// literal "default"; `model_id` is the resolved model and is the field worth
-	// trusting. Both are kept because a session that only ever reports "default"
-	// is still a fact about routing.
+	// Model identity. `model` is frequently the literal "default" (routing).
+	// `model_id` is usually the resolved model — except Cursor also sends
+	// model_id:"default" as a sentinel (IDE afterAgentThought, measured
+	// 2026-08-03). modelLabel rejects both sentinels.
 	Model       string                `json:"model"`
 	ModelID     string                `json:"model_id"`
 	ModelParams []cursorHookModelParm `json:"model_params"`
@@ -228,12 +230,15 @@ func (p cursorHookPayload) newAIEvent(kind, discriminator string) event.Event {
 	return e
 }
 
-// modelLabel resolves the model to report. model_id is the resolved model;
-// `model` is often the literal "default", which describes routing rather than a
-// model and is worth nothing downstream on its own.
+// modelLabel resolves the model to report. model_id is usually the resolved
+// model, but Cursor also sends the literal "default" there as a routing
+// sentinel (IDE afterAgentThought, measured 2026-08-03). Treating that as a
+// real model poisons model-mix metrics and used to mint an ai_response that
+// claimed the transcript away from the watcher with nothing useful on it.
+// `model` is often the same sentinel and is worth nothing on its own.
 func (p cursorHookPayload) modelLabel() string {
-	if p.ModelID != "" {
-		return p.ModelID
+	if id := p.ModelID; id != "" && id != "default" {
+		return id
 	}
 	if p.Model != "" && p.Model != "default" {
 		return p.Model

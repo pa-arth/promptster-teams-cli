@@ -347,3 +347,16 @@ func TestRepeatModelIsSuppressedWithinASession(t *testing.T) {
 		t.Fatal("suppressed across sessions")
 	}
 }
+
+// A later claim with an empty model (afterFileEdit etc.) must not wipe the real
+// model afterAgentThought already recorded — that field gates suppression.
+func TestCursorHookClaimPreservesModelWhenLaterStepHasNone(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	path := "/home/u/.cursor/projects/p/agent-transcripts/a/a.jsonl"
+
+	recordCursorHookClaim(path, "a", "grok-4.5")
+	recordCursorHookClaim(path, "a", "") // file edit / shell — no model on payload
+	if !cursorHookModelAlreadyReported(path, "a", "grok-4.5") {
+		t.Fatal("empty-model claim wiped the remembered model")
+	}
+}
