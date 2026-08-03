@@ -45,6 +45,31 @@ const claudeWatcherStaleAfter = 30 * time.Second
 // self-heals anyway via the recovery handoff in runClaudeWatcher.
 const claudeDegradedByteThreshold = 256 * 1024
 
+// claudeWatchMaxBytesPerPoll bounds how many transcript bytes ONE poll reads,
+// across all matched transcripts combined — the byte analogue of
+// gitWatchMaxCommitsPerPollTotal, and for the same reason.
+//
+// Ordinary tailing never approaches it: a 3s poll sees kilobytes. It exists for
+// the bounded-history backfill, where the first poll after an install or an
+// upgrade would otherwise read every in-window transcript to EOF in one
+// synchronous pass. Three things break at that size, and the budget fixes all
+// three because the loop's exit is what they all hang off:
+//
+//   - The signal select sits AFTER the poll, so `stop` and every supervisor
+//     teardown block for the whole pass. Bounded poll, bounded shutdown.
+//   - Offsets are only durable once saved. A SIGKILL escalation or a crash
+//     mid-pass used to discard the entire pass's progress, so a restart loop
+//     could never finish the backfill — it replayed from byte zero forever.
+//     Progress is now saved after every file that consumed bytes.
+//   - A single burst can outrun delivery and push the outbox to its cap, where
+//     Append DROPS. See the outbox.UnderPressure check in pollClaudeTranscripts.
+//
+// Deferring by NOT advancing the offset is the whole point: the transcript file
+// is itself the durable buffer, so a deferred read is never a lost read. 8 MiB
+// per 3s poll drains a heavy 28-day history in a few minutes. A var, not a
+// const, so a test can lower it.
+var claudeWatchMaxBytesPerPoll int64 = 8 << 20
+
 // claudeDegradationStep advances the degraded-detection state machine for one
 // poll: any parsed event proves the parser works (reset); otherwise consumed
 // bytes accumulate toward the threshold.
@@ -471,6 +496,10 @@ func RunClaudeWatcher() error {
 		// owns emission and hooks suppress again. This handoff means neither a
 		// real mid-session format break nor a false-positive degradation can
 		// double-emit or lose events.
+		// Recomputed every poll so the window actually ROLLS. Frozen at boot it
+		// is an absolute date, so a daemon up for 60 days would still admit an
+		// 88-day-old transcript from byte zero.
+		historyCutoff = transcriptHistoryCutoff(time.Now().UTC())
 		parsed, consumed := pollClaudeTranscripts(session, workspace, historyCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
 		windowEmitter.maybe(session, time.Now(), captureProse)
@@ -556,6 +585,16 @@ func pollClaudeTranscripts(
 	progress := loadClaudeWatchProgress()
 	parsed := 0
 	var consumed int64
+	// Shared per-poll read budget (see claudeWatchMaxBytesPerPoll). Zeroed
+	// outright while the queue is under pressure: the transcript bytes are
+	// durable on disk and the offset has not moved, so declining to read defers
+	// the work, whereas reading on would race the outbox to its cap where
+	// Append DROPS — and take live capture down with the backfill.
+	budget := claudeWatchMaxBytesPerPoll
+	if outbox.UnderPressure() {
+		budget = 0
+	}
+	deferredWork := false
 	roots := workspaceMatchRoots(workspace)
 	// A widened root set must reach files already cached as mismatches; see
 	// claudeWatchProgress.RootsFP.
@@ -601,6 +640,15 @@ func pollClaudeTranscripts(
 			}
 		}
 
+		if budget <= 0 {
+			// Budget spent: leave this transcript's offset untouched so every
+			// unread byte re-surfaces next poll. Deferred, never dropped. Skipped
+			// before the processor is built, because building one shells out to
+			// git for the repo identity.
+			deferredWork = true
+			continue
+		}
+
 		// Keyed by identity, like the offsets: two slugs of one transcript must
 		// share a processor, or the second alias would accumulate a partial
 		// assistant message against half the lines.
@@ -627,9 +675,20 @@ func pollClaudeTranscripts(
 			}
 			processors[key] = proc
 		}
-		n, c := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse)
+		n, c, more := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget)
 		parsed += n
 		consumed += c
+		budget -= c
+		if more {
+			deferredWork = true
+		}
+		if c > 0 {
+			// Persist after every file that moved, not once at the end: an
+			// unsaved offset is replayed from byte zero after a SIGKILL or a
+			// crash, which is what makes a restart loop unable to ever finish a
+			// long backfill.
+			saveClaudeWatchProgress(progress)
+		}
 	}
 
 	// Force-flush assistant messages that stopped receiving lines (turn ended
@@ -642,6 +701,11 @@ func pollClaudeTranscripts(
 			}
 			queueClaudeWatchEvent(ev, session, captureProse)
 		}
+	}
+
+	if deferredWork && verboseWatch() {
+		fmt.Fprintf(os.Stderr, "claude-watcher: per-poll read budget spent (%d bytes) — remaining transcript history deferred to the next poll\n",
+			claudeWatchMaxBytesPerPoll)
 	}
 
 	saveClaudeWatchProgress(progress)
@@ -814,12 +878,16 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 		if !matched {
 			return claudeMatchNo
 		}
-		// Replay in-window history from the start. Anything older remains eligible
-		// for go-forward capture without uploading its historical prefix.
-		if rec.Timestamp != "" {
-			if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(historyCutoff) {
-				return claudeMatchYesPreexisting
-			}
+		// Replay in-window history from the start. Anything older — INCLUDING a
+		// session whose age cannot be established — remains eligible for
+		// go-forward capture without uploading its historical prefix. The gate
+		// fails CLOSED because mtime is the only other bound left: a session
+		// started six months ago and resumed today has today's mtime, so an
+		// absent or unparseable first timestamp would otherwise replay its entire
+		// history. Seeding to EOF undercounts; admitting it re-uploads months.
+		t, err := time.Parse(time.RFC3339, rec.Timestamp)
+		if rec.Timestamp == "" || err != nil || t.Before(historyCutoff) {
+			return claudeMatchYesPreexisting
 		}
 		return claudeMatchYes
 	}
@@ -857,7 +925,14 @@ func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 // tailClaudeTranscript reads new complete lines from path starting at the
 // stored offset, processes them, queues resulting events, and advances the
 // offset. A trailing partial line is left for the next poll. Returns (events
-// parsed, bytes consumed).
+// parsed, bytes consumed, whether readable bytes remain unread).
+//
+// budget caps the bytes THIS call may read, so one enormous transcript cannot
+// consume a whole poll on its own (the poll-wide cap alone would not stop it —
+// the first file would spend the entire budget before the loop could check).
+// Stopping early is safe for exactly the reason the offset advance is: the
+// unread bytes stay on disk and the offset stops short of them, so the next
+// poll resumes at the byte after the last complete line processed.
 //
 // Advancing the offset unconditionally is now SAFE, which it was not before.
 // This loop used to POST inline and advance regardless of the result, so a
@@ -872,11 +947,12 @@ func tailClaudeTranscript(
 	session Session,
 	dryRun bool,
 	captureProse bool,
-) (int, int64) {
+	budget int64,
+) (int, int64, bool) {
 	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0
+		return 0, 0, false
 	}
 	defer f.Close()
 
@@ -886,13 +962,18 @@ func tailClaudeTranscript(
 	// already-tailed transcript reads nothing and contributes nothing. That is
 	// exactly the desired outcome — the alias is not new content.
 	if _, err := f.Seek(offset, 0); err != nil {
-		return 0, 0
+		return 0, 0, false
 	}
 
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
 	parsed := 0
+	truncated := false
 	for {
+		if consumed >= budget {
+			truncated = true
+			break
+		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			break // partial line — next poll
@@ -921,7 +1002,7 @@ func tailClaudeTranscript(
 			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
 	}
-	return parsed, consumed
+	return parsed, consumed, truncated
 }
 
 // queueClaudeWatchEvent runs the shared per-event funnel: stamp device

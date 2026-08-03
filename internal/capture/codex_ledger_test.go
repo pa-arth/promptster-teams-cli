@@ -2,6 +2,7 @@ package capture
 
 import (
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
@@ -20,7 +21,12 @@ func TestCodexFileDiffReachesAiPathsLedger(t *testing.T) {
 	taskRoot := t.TempDir()
 
 	// A real codex patch_apply_end rollout line → the Codex normalizer's file_diff.
-	line := `{"timestamp":"2026-06-06T20:38:50.783Z","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_A","success":true,"changes":{"pkg/target.go":{"type":"update","unified_diff":"@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"}},"status":"completed"}}`
+	// Stamped NOW, not with the capture date of the rollout this fixture came
+	// from: the ledger is stamped from the event, so a frozen fixture ages out of
+	// the 7-day TTL and this would start failing on the calendar rather than on
+	// the plumbing it exists to pin. Replay behaviour has its own coverage in
+	// history_backfill_test.go.
+	line := `{"timestamp":"` + time.Now().UTC().Format(time.RFC3339Nano) + `","type":"event_msg","payload":{"type":"patch_apply_end","call_id":"call_A","success":true,"changes":{"pkg/target.go":{"type":"update","unified_diff":"@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n"}},"status":"completed"}}`
 	p := normalize.NewCodexRolloutProcessor("codex-sess")
 	events := p.Process([]byte(line))
 
