@@ -98,6 +98,28 @@ type diffDedupEntry struct {
 // recorded under one rootKey. Restamping RootKey below therefore never retags a
 // prior root's paths — it re-writes the same value.
 func recordAiTouchedPath(sessionID, rootKey, relPath string) {
+	recordAiTouchedPathAt(sessionID, rootKey, relPath, time.Now().UnixMilli(), false)
+}
+
+// recordAiTouchedPathAt is recordAiTouchedPath with the write stamp supplied by
+// the caller, and is what the transcript watchers use.
+//
+// Every consumer of this ledger asks "how RECENTLY did an agent write this
+// path" — the 7-day TTL bounds the ai_revised_by_human residual, and
+// durabilitySeedAuthorized compares per-path stamps to decide whether an agent
+// demonstrably wrote a file again. The watchers replay a bounded window of
+// local history on first boot, so stamping the wall clock there would report
+// weeks-old work as happening now: purely human commits would attribute
+// likely_ai and seed AI durability spans. That is the fabrication class the
+// durability and rework ledgers exist to refuse, so a replayed edit carries the
+// stamp of when it actually happened and ages out of the TTL on its own.
+//
+// replay additionally forbids the collision bump below from carrying a
+// historical write PAST a stamp already recorded for that path: the bump exists
+// so two LIVE writes in one millisecond stay distinguishable, and letting an
+// older event win it would manufacture exactly the "the agent wrote this again"
+// evidence the seed gate is checking for.
+func recordAiTouchedPathAt(sessionID, rootKey, relPath string, writeMs int64, replay bool) {
 	if sessionID == "" || relPath == "" {
 		return
 	}
@@ -115,6 +137,12 @@ func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 		}
 
 		nowMs := time.Now().UnixMilli()
+		// A stamp in the future would outlive the TTL and outrank every real
+		// write, so the wall clock is the ceiling regardless of what the
+		// transcript claimed.
+		if writeMs <= 0 || writeMs > nowMs {
+			writeMs = nowMs
+		}
 		entry, ok := ledger.Sessions[sessionID]
 		if !ok || entry.Paths == nil {
 			entry = aiPathsEntry{Paths: map[string]bool{}}
@@ -127,12 +155,23 @@ func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 		// backwards host clock, would otherwise mint the SAME stamp twice, and a
 		// consumer that reads the stamp as "has the agent written this again"
 		// (reworkSeedEvidence) would read a real second write as no write at all.
-		writeMs := nowMs
-		if prev, seen := entry.PathTs[relPath]; seen && writeMs <= prev {
-			writeMs = prev + 1
+		// A replayed write never advances the clock past what is already
+		// recorded — it describes the past, not a new write.
+		stampMs := writeMs
+		if prev, seen := entry.PathTs[relPath]; seen && stampMs <= prev {
+			if replay {
+				stampMs = prev
+			} else {
+				stampMs = prev + 1
+			}
 		}
-		entry.PathTs[relPath] = writeMs
-		entry.TsMs = nowMs
+		entry.PathTs[relPath] = stampMs
+		// Session activity is the NEWEST write it has recorded, so replaying an
+		// old session cannot present it as live (and cannot evict a genuinely
+		// live session through pruneAiPaths' 64-entry cap).
+		if writeMs > entry.TsMs {
+			entry.TsMs = writeMs
+		}
 		entry.RootKey = rootKey
 		ledger.Sessions[sessionID] = entry
 		pruneAiPaths(&ledger, nowMs)
@@ -463,6 +502,13 @@ func recordAiBashWindow(e *event.Event, taskRoot string) {
 	if !ok {
 		return
 	}
+	// A replayed command whose window already sits outside the reader's TTL can
+	// never recover a file (readBashWindows would drop it), so recording it buys
+	// nothing and costs a slot in pruneBashWindows' 64-entry cap — which a first
+	// boot replaying weeks of history would spend evicting the live session.
+	if time.Now().UnixMilli()-endMs > aiPathsTTL.Milliseconds() {
+		return
+	}
 	// Derive the workspace root key AFTER the guards so the resolvePath syscall
 	// only runs for an AI command, not for every watcher event.
 	rootKey := ""
@@ -539,10 +585,38 @@ func claimFileDiff(relPath, hash string) bool {
 	return won
 }
 
+// eventIsReplay reports whether an event describes activity old enough that no
+// other channel's observation of the SAME edit can still be in flight, along
+// with the millisecond stamp of when that activity actually happened.
+//
+// diffDedupTTL is the threshold because it is exactly the window this file's
+// cross-channel claims live in: live tailing sees a transcript line within a
+// 3s poll, so an event older than the claim TTL cannot be racing a hook or the
+// git watcher — it is history the watcher is replaying. An unreadable stamp is
+// treated as live, which is the pre-existing behaviour and only ever costs an
+// extra dedupe (an undercount, never an invention).
+func eventIsReplay(e *event.Event) (int64, bool) {
+	nowMs := time.Now().UnixMilli()
+	tsMs, ok := eventTsMs(e.Ts)
+	if !ok || tsMs > nowMs {
+		return nowMs, false
+	}
+	return tsMs, nowMs-tsMs > diffDedupTTL.Milliseconds()
+}
+
 // dedupeFileDiff reports whether a file_diff event should be emitted. It is a
-// no-op (returns true) for non-file_diff events. For file_diffs it hashes the
-// resulting on-disk content (falling back to the diff text when the file is
+// no-op (returns true) for non-file_diff events. For live file_diffs it hashes
+// the resulting on-disk content (falling back to the diff text when the file is
 // gone, e.g. a delete) and claims it in the shared ledger.
+//
+// A REPLAYED file_diff skips the claim entirely, because the ledger key is the
+// file's CURRENT content and the event describes content from days ago. Hashing
+// it would key every replayed edit of one path to the same value: the first
+// wins, the rest are silently dropped, and the claim then blocks a genuine live
+// edit landing on that content for the next diffDedupTTL. Nothing is
+// double-counted by skipping — no other channel replays history, and the
+// watchers mint deterministic event ids, so an overlap with an already-captured
+// live tail is idempotent at ingest.
 func dedupeFileDiff(taskRoot string, e *event.Event) bool {
 	if e == nil || e.Kind != "file_diff" {
 		return true
@@ -555,27 +629,32 @@ func dedupeFileDiff(taskRoot string, e *event.Event) bool {
 	if rel == "" {
 		return true
 	}
-	abs := rel
-	if !filepath.IsAbs(rel) && taskRoot != "" {
-		abs = filepath.Join(taskRoot, rel)
+	writeMs, replay := eventIsReplay(e)
+	won := true
+	if !replay {
+		abs := rel
+		if !filepath.IsAbs(rel) && taskRoot != "" {
+			abs = filepath.Join(taskRoot, rel)
+		}
+		hash, ok := fileContentSHA(abs)
+		if !ok {
+			// File unreadable (deleted/moved) — fall back to the diff text so repeated
+			// emissions of the same delete still dedupe within a channel.
+			diff, _ := data["diff"].(string)
+			hash = hashString("∅:" + diff)
+		}
+		won = claimFileDiff(rel, hash)
 	}
-	hash, ok := fileContentSHA(abs)
-	if !ok {
-		// File unreadable (deleted/moved) — fall back to the diff text so repeated
-		// emissions of the same delete still dedupe within a channel.
-		diff, _ := data["diff"].(string)
-		hash = hashString("∅:" + diff)
-	}
-	won := claimFileDiff(rel, hash)
 	// Track AI-edited paths for later git-watcher attribution
 	// (ai_revised_by_human vs likely_human). Recorded regardless of claim
-	// outcome — a deduped re-observation is still an AI edit to this path.
+	// outcome — a deduped re-observation is still an AI edit to this path — and
+	// stamped with when the edit HAPPENED, never with the replay's wall clock.
 	if e.Provenance != nil && e.Provenance.Attribution == "likely_ai" {
 		rootKey := ""
 		if taskRoot != "" {
 			rootKey = gitWatchRootKey(taskRoot)
 		}
-		recordAiTouchedPath(e.SessionID, rootKey, rel)
+		recordAiTouchedPathAt(e.SessionID, rootKey, rel, writeMs, replay)
 	}
 	return won
 }

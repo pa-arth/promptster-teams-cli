@@ -203,6 +203,46 @@ When triaging "why didn't X get captured", check cwd before suspecting the
 surface. Transcripts carry no surface marker at all, so capture could not
 distinguish CLI from IDE even if it wanted to.
 
+### Claude + Codex replay 28 days of history through the LIVE funnel
+
+`transcriptHistoryCutoff` (`session.go`) bounds it, both watch loops recompute it
+**every poll** (frozen at boot it is an absolute date a long-lived daemon drifts
+away from), and a progress-schema bump (v2) grants the replay exactly once.
+Cursor is excluded — no trustworthy timestamp.
+
+The hazard is not the reading, it is that replayed events go through
+`queueClaudeWatchEvent` / `emitCodexEvent`, the same funnel live events use — and
+parts of that funnel assumed "this just happened". Four rules, all pinned by
+`history_backfill_test.go` and all mutation-tested:
+
+- **The attribution ledgers are stamped from the EVENT, never the wall clock.**
+  `recordAiTouchedPathAt` takes the stamp; `dedupeFileDiff` passes `e.Ts`. Stamp
+  `time.Now()` instead and a file an agent last touched 20 days ago re-enters the
+  ai-paths ledger as touched TODAY — the git watcher then tags the next commit's
+  purely human lines `likely_ai` and `aiPathKnown` seeds them as AI durability
+  spans. That is the fabrication class the durability ledger exists to refuse.
+  A replayed write also must not win the per-path collision bump: the bump
+  distinguishes two LIVE writes in one millisecond, and letting history take it
+  manufactures the "the agent wrote this again" evidence `durabilitySeedAuthorized`
+  is checking for.
+- **A replayed `file_diff` skips the dedup claim entirely** (`eventIsReplay`,
+  threshold `diffDedupTTL` — live tailing sees a line within a 3s poll, so an
+  older event cannot be racing another channel). The claim key is the file's
+  CURRENT content hash, so keeping it collapses every replayed edit of one path
+  onto today's bytes: first wins, rest vanish, and the claim then blocks a
+  genuine live edit for the next 5 minutes.
+- **The age gate fails CLOSED.** An absent or unparseable transcript timestamp
+  routes to `…YesPreexisting` (seed to EOF), because mtime is the only other
+  bound and a six-month-old session resumed today has today's mtime.
+- **A poll's reads are BUDGETED** (`claudeWatchMaxBytesPerPoll` /
+  `codexWatchMaxBytesPerPoll`, 8 MiB, the byte analogue of
+  `gitWatchMaxCommitsPerPollTotal`), progress is saved per file, and the budget
+  is zeroed outright while `outbox.UnderPressure()`. Deferring costs nothing —
+  the transcript IS the durable buffer and the offset has not moved — whereas an
+  unbounded first pass blocks every shutdown for its full duration (the signal
+  select sits after the poll) and races the outbox to `OutboxMaxBytes`, where
+  `Append` DROPS and takes live capture down with the backfill.
+
 ## Uninstall (`uninstall`, `internal/cli/uninstall.go`)
 
 `uninstall` is the ONLY uninstall path that exists, and it has to be, because

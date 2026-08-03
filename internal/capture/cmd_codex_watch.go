@@ -26,6 +26,13 @@ import (
 
 const codexWatchInterval = 3 * time.Second
 
+// codexWatchMaxBytesPerPoll bounds how many rollout bytes ONE poll reads across
+// all matched rollouts combined. Mirrors claudeWatchMaxBytesPerPoll — see that
+// comment for why a bounded poll is what keeps shutdown responsive, keeps
+// backfill progress durable across a SIGKILL, and keeps a first-boot burst from
+// racing the outbox to the cap where Append drops. A var so a test can lower it.
+var codexWatchMaxBytesPerPoll int64 = 8 << 20
+
 // codexHome returns the codex state dir (CODEX_HOME or ~/.codex), where session
 // rollout files live under sessions/YYYY/MM/DD/rollout-*.jsonl.
 func codexHome() string {
@@ -282,6 +289,9 @@ func RunCodexWatcher() error {
 
 	for {
 		captureProse := policyResolver.CaptureAssistantProse()
+		// Recomputed every poll so the window actually ROLLS; frozen at boot it
+		// is an absolute date a long-lived daemon drifts away from.
+		historyCutoff = transcriptHistoryCutoff(time.Now().UTC())
 		queued := pollCodexRollouts(session, workspace, historyCutoff, processors, captureProse)
 		eventsCaptured += queued
 		windowEmitter.maybe(session, time.Now(), captureProse)
@@ -313,6 +323,15 @@ func pollCodexRollouts(
 	dir := codexSessionsDir()
 	progress := loadCodexWatchProgress()
 	sent := 0
+	// Shared per-poll read budget; zeroed while the queue is under pressure so
+	// the backfill defers instead of pushing the outbox to its dropping cap.
+	// The rollout bytes stay on disk with the offset unmoved, so a deferred read
+	// is never a lost read. See claudeWatchMaxBytesPerPoll.
+	budget := codexWatchMaxBytesPerPoll
+	if outbox.UnderPressure() {
+		budget = 0
+	}
+	deferredWork := false
 	// Same root set the Claude watcher matches against: the workspace, every
 	// directory registered by a later `start`, and their git worktrees. Codex
 	// used to compare against the single workspace, so a registered second tree
@@ -376,6 +395,15 @@ func pollCodexRollouts(
 			}
 		}
 
+		if budget <= 0 {
+			// Budget spent: leave this rollout's offset untouched so its unread
+			// bytes re-surface next poll. Deferred, never dropped. Checked before
+			// the processor is built, because a cold processor replays the whole
+			// consumed prefix and shells out to git for the repo identity.
+			deferredWork = true
+			return nil
+		}
+
 		proc := processors[path]
 		if proc == nil {
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
@@ -396,10 +424,25 @@ func pollCodexRollouts(
 			proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(codexRolloutCwd(path))
 			processors[path] = proc
 		}
-		n := tailCodexRollout(path, progress, proc, session, captureProse)
+		n, consumed, more := tailCodexRollout(path, progress, proc, session, captureProse, budget)
 		sent += n
+		budget -= consumed
+		if more {
+			deferredWork = true
+		}
+		if consumed > 0 {
+			// Persist after every rollout that moved: an unsaved offset replays
+			// from byte zero after a SIGKILL, which is what stops a restart loop
+			// ever finishing a long backfill.
+			saveCodexWatchProgress(progress)
+		}
 		return nil
 	})
+
+	if deferredWork && verboseWatch() {
+		fmt.Fprintf(os.Stderr, "codex-watcher: per-poll read budget spent (%d bytes) — remaining rollout history deferred to the next poll\n",
+			codexWatchMaxBytesPerPoll)
+	}
 
 	saveCodexWatchProgress(progress)
 	return sent
@@ -481,9 +524,13 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 	if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
 		return codexMatchNo
 	}
-	// Replay in-window history from the start. Anything older remains eligible
-	// for go-forward capture without uploading its historical prefix.
-	if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(historyCutoff) {
+	// Replay in-window history from the start. Anything older — INCLUDING a
+	// rollout whose session_meta timestamp will not parse — remains eligible for
+	// go-forward capture without uploading its historical prefix. The gate fails
+	// CLOSED for the same reason the Claude one does: mtime is the only other
+	// bound, and a months-old session resumed today has today's mtime.
+	t, err := time.Parse(time.RFC3339, rec.Timestamp)
+	if err != nil || t.Before(historyCutoff) {
 		return codexMatchYesPreexisting
 	}
 	return codexMatchYes
@@ -523,7 +570,12 @@ func codexRolloutCwd(path string) string {
 // tailCodexRollout reads new complete lines from path (starting at the stored
 // offset), processes them, queues resulting events, and advances the offset.
 // A trailing partial line (no newline yet) is left for the next poll. Returns
-// the number of events parsed and queued.
+// (events queued, bytes consumed, whether readable bytes remain unread).
+//
+// budget caps the bytes THIS call may read so one enormous rollout cannot spend
+// a whole poll before the caller's loop gets to check. Stopping early is safe
+// for the same reason the offset advance is: unread bytes stay on disk and the
+// offset stops short of them.
 //
 // As in the claude watcher, advancing the offset unconditionally is only safe
 // because delivery is now durable: this loop used to POST inline and advance
@@ -534,24 +586,30 @@ func tailCodexRollout(
 	proc *normalize.CodexRolloutProcessor,
 	session Session,
 	captureProse bool,
-) int {
+	budget int64,
+) (int, int64, bool) {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0
+		return 0, 0, false
 	}
 	defer f.Close()
 
 	offset := progress.Offsets[path]
 	if _, err := f.Seek(offset, 0); err != nil {
-		return 0
+		return 0, 0, false
 	}
 
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
 	queued := 0
+	truncated := false
 	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
 	for {
+		if consumed >= budget {
+			truncated = true
+			break
+		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			// No trailing newline yet — leave this partial line for next poll.
@@ -575,8 +633,12 @@ func tailCodexRollout(
 	// EVERY poll, including polls that consumed nothing — a rollout whose final
 	// line is the human's turn produces no further lines to flush it, so an
 	// end-of-read hook that only fired after new bytes would never reach it.
-	for _, ev := range proc.FlushStaleUserPrompt() {
-		queued += emit(ev)
+	// Skipped when the budget cut the read short: the lines that would complete
+	// that turn are sitting unread in the file, not absent.
+	if !truncated {
+		for _, ev := range proc.FlushStaleUserPrompt() {
+			queued += emit(ev)
+		}
 	}
 
 	if consumed > 0 {
@@ -585,7 +647,7 @@ func tailCodexRollout(
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
 	}
-	return queued
+	return queued, consumed, truncated
 }
 
 // emitCodexEvent stamps, dedupes, ledgers and queues one normalized event.
