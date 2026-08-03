@@ -207,8 +207,7 @@ func TestReworkColdStartWorktreeRecoversTheBranchesAiHistory(t *testing.T) {
 		t.Fatalf("rework_verdict emitted over lines the AI never wrote: %v", got)
 	}
 
-	// RECOVERY CHECK, and the loss that actually reaches the product: rewriting
-	// the AI's own lines must now report, where before the fix it reported nothing.
+	// RECOVERY CHECK: the AI's own lines, at 31..33, report exactly once.
 	writeCommitFile(t, ws, "a.go", head+reworked.String()+"z1\nz2\nz3\n")
 	git("add", "-A")
 	git("commit", "-m", "rewrite the ai lines")
@@ -391,7 +390,7 @@ func TestReworkColdStartReplaysTheBaselinedHeadNotAMovingOne(t *testing.T) {
 	// The cursor half of the poll, exactly as pollGitWatchWorkspace runs it. The
 	// SHA it hands back is the contract: the replay must resolve its range against
 	// that commit, not against whatever `HEAD` says by the time it runs.
-	_, _, coldStart := pollGitWatch([]string{ws})
+	_, _, _, coldStart := pollGitWatch([]string{ws})
 	if coldStart[key] != sha2 {
 		t.Fatalf("cold start reported head %q, want the SHA it cursored (%s)", coldStart[key], sha2)
 	}

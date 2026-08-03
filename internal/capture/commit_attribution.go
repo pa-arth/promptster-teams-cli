@@ -394,12 +394,17 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 }
 
 // attributeAndReworkCommit does attribution for one detected working-HEAD commit
-// and, when preMerge is true (the working branch is ahead of the default branch),
-// ALSO folds the commit into the pre-merge rework ledger — reusing the SAME
-// `git show` diff + reconciled files, so a pre-merge commit stays one spawn.
-// preMerge is resolved once per root by the caller (never per commit), keeping
-// the per-commit budget constant-time. attributeCommit is the preMerge=false
-// entry point for callers (and tests) that only want attribution.
+// and, when foldRework is true, ALSO folds the commit into the pre-merge rework
+// ledger — reusing the SAME `git show` diff + reconciled files, so such a commit
+// stays one spawn.
+//
+// ATTRIBUTION IS UNCONDITIONAL AND foldRework GATES ONLY THE FOLD. The caller
+// resolves it once per root (the branch is ahead of the default branch) and once
+// per commit (the commit sits on the detected range's first-parent chain), and
+// gitNewCommits documents why those two consumers take deliberately different
+// ranges. Every commit that reaches here is attributed either way, including one
+// reachable only through a merge's second parent. attributeCommit is the
+// foldRework=false entry point for callers (and tests) that only want attribution.
 //
 // Reports whether the commit may be RECORDED as attributed. That is true when
 // the event was durably queued, and ALSO when there was nothing attributable to
@@ -408,7 +413,7 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 // later poll would reach the same answer and only cost another `git show`.
 // It is false ONLY when an emit was attempted and failed to queue, so the retry
 // survives.
-func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) (recordable bool) {
+func attributeAndReworkCommit(session Session, root, sha string, foldRework bool, nowMs int64) (recordable bool) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
 		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
@@ -421,7 +426,7 @@ func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, 
 		//
 		// Passing no attributable files means neither shape can SEED: removing a file
 		// is not evidence that anyone wrote anything.
-		if preMerge && diff != "" {
+		if foldRework && diff != "" {
 			pollReworkCommit(session, root, sha, diff, nil, nowMs)
 		}
 		return true
@@ -435,7 +440,7 @@ func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, 
 	// likely_ai lines so a later squash-merge onto the default branch can
 	// transfer attribution by content match. Fingerprints never leave the device.
 	recordAiFingerprints(gitWatchRootKey(root), sha, diff, files, nowMs)
-	if preMerge {
+	if foldRework {
 		// Reuse the same diff + files — no extra spawn — to track pre-merge rework.
 		pollReworkCommit(session, root, sha, diff, files, nowMs)
 	}

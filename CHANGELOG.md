@@ -154,6 +154,33 @@ follows [Semantic Versioning](https://semver.org/).
   as its own task. Nothing is re-sent for commits already accounted for either
   way, so no total can rise from double counting.
 
+- **An ordinary `git merge sidebranch` counted the merged-in edits twice, so
+  RECORDED REWORK FIGURES MOVE DOWN for anyone whose history contains merges.**
+  Every commit is read with `git show -m --first-parent`, so a merge's own diff
+  already carries everything the second-parent side brought in — while the range
+  the watcher walks (`rev-list <cursor>..HEAD`) returns the merge AND the side
+  branch's own commits. Each merged-in edit was therefore applied to the AI-line
+  ledger twice: once in the side branch's coordinate space and once in the
+  merge's. Tracked AI spans drifted by an offset that had already been applied,
+  and a later rewrite of the file reported churn over whatever now sat at those
+  coordinates. A number that drops after this lands was counting the same edits
+  more than once; it was never counting extra work.
+
+  Only the rework FOLD is narrowed, to the merge's first-parent chain. **What
+  gets attributed does not change**: a commit reachable only through a merge's
+  second parent is still reported exactly as before, because whether work that
+  arrived through a merge counts as AI-written is a product question and this is
+  not the change that answers it. Where the two ranges now disagree the ledger
+  can only lose state, never invent it — a second-parent commit no longer seeds
+  its own AI ranges, and a rebuild backed solely by such a commit is declined —
+  which is an under-report, the direction these ledgers always resolve toward.
+
+  **The two entries above move figures in OPPOSITE directions, and they are
+  independent.** The cold-start entry can only make a copy report MORE, by
+  running a rebuild that previously did not run at all; this entry makes any
+  history containing merges report LESS, by removing a double count. Neither
+  re-sends a commit already accounted for.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for

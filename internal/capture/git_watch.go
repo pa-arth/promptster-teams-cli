@@ -373,13 +373,37 @@ func gitHead(root string) (string, bool) {
 //     so the caller KEEPS the old cursor and retries next poll rather than
 //     advancing past an undetermined window.
 //
-// Spawn budget stays sane: the normal path is one `rev-list`; the fallback adds
-// at most one more, only in the rare gc'd case. No merge-base spawn.
-func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
+// THE RANGE IS DELIBERATELY SPLIT BETWEEN ITS TWO CONSUMERS, and the second
+// return is that split. `commits` is what ATTRIBUTION EMISSION walks and it is
+// unnarrowed: whatever commit_attribution reports today it reports after this
+// split, including a commit that is reachable only through a merge's SECOND
+// parent. Whether work that arrived through a merge counts as AI-written is a
+// product question and is not answered here.
+//
+// `foldable` is the subset the REWORK FOLD may apply, and it is the first-parent
+// chain of the same range. The fold has no choice: gitCommitRawDiff reads every
+// commit with `-m --first-parent`, so a merge's own diff ALREADY carries
+// everything the second-parent side brought in. Folding that side's commits as
+// well applies the same hunks twice — once in the sibling branch's coordinate
+// space and once in the merge's — which slides every tracked AI span by an offset
+// already applied and makes the next rewrite report over lines nobody wrote. The
+// first-parent chain is the one sequence of diffs that composes to head's tree.
+//
+// The narrowing can only LOSE rework state, never invent it: a second-parent
+// commit no longer seeds its own AI ranges, and where it was the only attributed
+// commit backing a replay, that replay is declined. Both are undercounts, which
+// is the direction these ledgers always resolve toward, and the same narrowing
+// already reaches the cold-start replay through gitBranchCommitsSinceDefault.
+//
+// Spawn budget stays sane: the normal path is one `rev-list`, plus a second only
+// when it actually returned commits; the fallback adds at most one more, in the
+// rare gc'd case. No merge-base spawn.
+func gitNewCommits(root, lastSeen, head string) (commits []string, foldable map[string]struct{}, ok bool) {
 	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", lastSeen+".."+head).Output()
 	if err == nil {
-		return clampCommitBurst(parseRevListShas(out), root), true
+		shas := clampCommitBurst(parseRevListShas(out), root)
+		return shas, gitFirstParentSet(root, len(shas) > 0, lastSeen+".."+head), true
 	}
 	// lastSeen is unreachable (gc'd/pruned, or a corrupt cursor): recover the tip
 	// region rather than skip it. If even that errors, keep the cursor and retry.
@@ -387,12 +411,40 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 	out, rerr := exec.Command("git", "-C", root, "rev-list",
 		"-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), head).Output()
 	if rerr != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	shas := parseRevListShas(out)
 	state.HookDebugf("git-watch: cursor %s unreachable on %s; recovered newest %d commit(s) from head",
 		lastSeen, gitWatchRootKey(root), len(shas))
-	return shas, true
+	return shas, gitFirstParentSet(root, len(shas) > 0, "-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), head), true
+}
+
+// gitFirstParentSet resolves which commits of a rev-list range sit on head's
+// first-parent chain — the fold-eligible subset described on gitNewCommits. It
+// runs the caller's own rev-list arguments with `--first-parent` bolted on, so
+// the two lists can never be taken over different ranges.
+//
+// want=false skips the spawn entirely (a poll that surfaced no commits has
+// nothing to fold), and a failed spawn returns an EMPTY set rather than nil-means-
+// everything: if we cannot tell which commits are on the chain, folding none of
+// them under-reports, while folding all of them is the double-apply this exists
+// to stop.
+func gitFirstParentSet(root string, want bool, revListArgs ...string) map[string]struct{} {
+	set := map[string]struct{}{}
+	if !want {
+		return set
+	}
+	args := append([]string{"-C", root, "rev-list", "--first-parent"}, revListArgs...)
+	// #nosec G204 -- constant argv plus the caller's own rev-list range, whose SHAs come from git rev-parse output. Read-only.
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		state.HookDebugf("git-watch: first-parent chain unresolvable on %s; folding no rework this poll", gitWatchRootKey(root))
+		return set
+	}
+	for _, sha := range parseRevListShas(out) {
+		set[sha] = struct{}{}
+	}
+	return set
 }
 
 // gitBranchCommitsSinceDefault lists the commits a root's checked-out branch
@@ -564,7 +616,21 @@ func saveGitWatchCursors(heads map[string]string) {
 // commits are being processed now" (branch adoption) stays owed for exactly as
 // long as this flag is false.
 //
-// The third return names the roots that COLD-STARTED here — baselined with no
+// The second return carries gitNewCommits' foldable subset per root — the
+// first-parent chain of what was detected. It rides alongside the detected list
+// rather than replacing it because the two have different consumers on purpose;
+// gitNewCommits documents the split and why only the rework fold is narrowed.
+//
+// The third return says, per root, whether this poll left that root's cursor AT
+// ITS HEAD — i.e. whether the root DRAINED. A root is not drained when the
+// shared budget deferred it whole, when a burst was clamped to a partial batch,
+// or when the comparison was inconclusive; in each of those cases commits this
+// poll already knows about are still owed to a later poll. Only the caller can
+// act on that, and it must: state it drops on the strength of "this root's
+// commits are being processed now" (branch adoption) stays owed for exactly as
+// long as this flag is false.
+//
+// The fourth return names the roots that COLD-STARTED here — baselined with no
 // prior cursor at all — and maps each to THE EXACT SHA ITS CURSOR WAS BASELINED
 // TO. It is reported rather than acted on, because the cursor discipline must not
 // change: a cold-start root still reports nothing and still emits nothing. What
@@ -578,10 +644,11 @@ func saveGitWatchCursors(heads map[string]string) {
 // cursor now claims. Re-reading `HEAD` there would let a commit made in between
 // be folded by the replay AND detected as new by the next poll, which folds its
 // hunks twice.
-func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[string]string) {
+func pollGitWatch(roots []string) (map[string][]string, map[string]map[string]struct{}, map[string]bool, map[string]string) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
+	foldable := map[string]map[string]struct{}{}
 	drained := map[string]bool{}
 	coldStart := map[string]string{}
 
@@ -618,7 +685,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[str
 			drained[key] = true
 			continue
 		}
-		commits, ok := gitNewCommits(root, lastSeen, head)
+		commits, onFirstParent, ok := gitNewCommits(root, lastSeen, head)
 		if !ok {
 			continue // comparison inconclusive — keep the old cursor, retry next poll
 		}
@@ -642,6 +709,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[str
 			commits = commits[len(commits)-budget:]
 		}
 		detected[key] = commits
+		foldable[key] = onFirstParent
 		// Advance only to the newest commit we actually returned. commits[0] is
 		// newest-first: it equals head on a normal or gc'd-recovery poll that fit the
 		// budget, but on a clamped burst (per-root OR global) it is the newest of the
@@ -658,7 +726,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[str
 	}
 
 	saveGitWatchCursors(newHeads)
-	return detected, drained, coldStart
+	return detected, foldable, drained, coldStart
 }
 
 // pollGitWatchWorkspace enumerates the workspace's roots (workspace + its git
@@ -683,7 +751,7 @@ func pollGitWatchWorkspace(session Session) {
 		aiRoots,
 		loadDiscoveredRepos(nowMs),
 	))
-	detected, drained, coldStart := pollGitWatch(roots)
+	detected, foldable, drained, coldStart := pollGitWatch(roots)
 
 	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
 	// detected this poll. A merely-idle repo is left to age out after the horizon.
@@ -801,7 +869,8 @@ func pollGitWatchWorkspace(session Session) {
 			continue
 		}
 		preMerge := scope == scopePreMerge
-		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v)", len(commits), rootKey, preMerge)
+		onFirstParent := foldable[rootKey]
+		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v, foldable=%d)", len(commits), rootKey, preMerge, len(onFirstParent))
 		// Oldest-first: rework is STATEFUL (seed then churn across commits), so it
 		// must see commits in commit order. Attribution is per-commit independent, so
 		// the reversed order is equally correct for it. commits is newest-first.
@@ -815,6 +884,8 @@ func pollGitWatchWorkspace(session Session) {
 		// would double-count its churn.
 		for i := len(commits) - 1; i >= 0; i-- {
 			sha := commits[i]
+			_, foldRework := onFirstParent[sha]
+			foldRework = foldRework && preMerge
 			if _, done := attributed[sha]; done {
 				reattempted++
 				// Attribution stays skipped — this commit really was accounted for,
@@ -822,12 +893,12 @@ func pollGitWatchWorkspace(session Session) {
 				// this SHA is also the only thing that can rebuild the rework state
 				// adoption emptied, and skipping it outright is what left an adopted
 				// branch looking like it held no AI work.
-				if preMerge && adopting {
+				if foldRework && adopting {
 					replayReworkForAdoptedCommit(session, root, sha, nowMs)
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
+			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs) {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

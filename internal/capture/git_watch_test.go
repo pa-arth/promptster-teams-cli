@@ -54,20 +54,20 @@ func TestGitWatchDetectsNewCommits(t *testing.T) {
 	key := gitWatchRootKey(ws)
 
 	// Cold start: record HEAD as baseline, report no new commits.
-	if d, _, _ := pollGitWatch(roots); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch(roots); len(d) != 0 {
 		t.Fatalf("cold start must report no commits, got %v", d)
 	}
 
 	// New commit B → reported exactly, and only B (not the baseline A).
 	git("commit", "--allow-empty", "-m", "B")
 	headB := gitOut("rev-parse", "HEAD")
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) != 1 || d[key][0] != headB {
 		t.Fatalf("expected only B (%s), got %v", headB, d[key])
 	}
 
 	// Idle poll → cursor already at HEAD, nothing new.
-	if d, _, _ := pollGitWatch(roots); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch(roots); len(d) != 0 {
 		t.Fatalf("idle poll must report nothing, got %v", d)
 	}
 }
@@ -118,7 +118,7 @@ func TestGitWatchForwardCommitAttributed(t *testing.T) {
 	git("commit", "-m", "ai adds ai.go")
 	sha := gitOut("rev-parse", "HEAD")
 
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) != 1 || d[key][0] != sha {
 		t.Fatalf("want only %s detected, got %v", sha, d[key])
 	}
@@ -154,7 +154,7 @@ func TestGitWatchAmendReattributed(t *testing.T) {
 		t.Fatal("amend did not change the SHA")
 	}
 
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) != 1 || d[key][0] != amended {
 		t.Fatalf("want only amended %s detected, got %v", amended, d[key])
 	}
@@ -190,7 +190,7 @@ func TestGitWatchSquashMergeAttributed(t *testing.T) {
 	git("commit", "-m", "squash feature")
 	sha := gitOut("rev-parse", "HEAD")
 
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) != 1 || d[key][0] != sha {
 		t.Fatalf("want only squash %s detected, got %v", sha, d[key])
 	}
@@ -231,7 +231,7 @@ func TestGitWatchCherryPickAttributed(t *testing.T) {
 		t.Fatal("cherry-pick produced the same SHA")
 	}
 
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) != 1 || d[key][0] != picked {
 		t.Fatalf("want only cherry-picked %s detected, got %v", picked, d[key])
 	}
@@ -253,7 +253,7 @@ func TestGitWatchResetBackwardReportsNothing(t *testing.T) {
 	pollGitWatch(roots) // baseline at B
 
 	git("reset", "--hard", shaA)
-	if d, _, _ := pollGitWatch(roots); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch(roots); len(d) != 0 {
 		t.Fatalf("reset backward must report nothing, got %v", d)
 	}
 }
@@ -285,7 +285,7 @@ func TestGitWatchBurstDrains(t *testing.T) {
 
 	var got []string
 	for poll := 0; poll < 4 && len(got) < len(want); poll++ {
-		detected, _, _ := pollGitWatch(roots)
+		detected, _, _, _ := pollGitWatch(roots)
 		batch := detected[key]
 		if len(batch) > gitWatchMaxCommitsPerPoll {
 			t.Fatalf("poll %d exceeded cap %d: got %d", poll, gitWatchMaxCommitsPerPoll, len(batch))
@@ -302,7 +302,7 @@ func TestGitWatchBurstDrains(t *testing.T) {
 			t.Fatalf("commit %d out of order: got %s, want %s", i, got[i], want[i])
 		}
 	}
-	if d, _, _ := pollGitWatch(roots); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch(roots); len(d) != 0 {
 		t.Fatalf("after draining, poll must report nothing, got %v", d)
 	}
 }
@@ -353,7 +353,7 @@ func TestGitWatchGlobalCapDrainsAcrossRoots(t *testing.T) {
 	got := map[string][]string{}
 	total := 0
 	for poll := 0; poll < 12 && total < wantTotal; poll++ {
-		batch, _, _ := pollGitWatch(roots)
+		batch, _, _, _ := pollGitWatch(roots)
 		perPoll := 0
 		for key, commits := range batch {
 			perPoll += len(commits)
@@ -381,7 +381,7 @@ func TestGitWatchGlobalCapDrainsAcrossRoots(t *testing.T) {
 			}
 		}
 	}
-	if d, _, _ := pollGitWatch(roots); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch(roots); len(d) != 0 {
 		t.Fatalf("after draining, poll must report nothing, got %v", d)
 	}
 }
@@ -407,7 +407,7 @@ func TestGitWatchGcdCursorRecovered(t *testing.T) {
 	saveGitWatchCursors(map[string]string{key: strings.Repeat("0", 40)})
 
 	recordAiTouchedPath("sess-gc", gitWatchRootKey(ws), "ai.go")
-	d, _, _ := pollGitWatch(roots)
+	d, _, _, _ := pollGitWatch(roots)
 	if len(d[key]) == 0 {
 		t.Fatal("gc'd cursor must recover the tip, got nothing (silent skip)")
 	}
@@ -424,12 +424,12 @@ func TestGitWatchHandlesDegenerateRoots(t *testing.T) {
 
 	// Repo with no commits: rev-parse HEAD fails → skipped cleanly.
 	empty, _, _ := gitRepo(t)
-	if d, _, _ := pollGitWatch([]string{empty}); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch([]string{empty}); len(d) != 0 {
 		t.Errorf("repo with no commits must report nothing, got %v", d)
 	}
 
 	// Not a git repo at all → skipped cleanly.
-	if d, _, _ := pollGitWatch([]string{t.TempDir()}); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch([]string{t.TempDir()}); len(d) != 0 {
 		t.Errorf("non-repo must report nothing, got %v", d)
 	}
 
@@ -439,7 +439,7 @@ func TestGitWatchHandlesDegenerateRoots(t *testing.T) {
 	git("commit", "--allow-empty", "-m", "B")
 	git("checkout", "--detach", "HEAD~1")
 	pollGitWatch([]string{ws}) // cold-start baseline at detached HEAD
-	if d, _, _ := pollGitWatch([]string{ws}); len(d) != 0 {
+	if d, _, _, _ := pollGitWatch([]string{ws}); len(d) != 0 {
 		t.Errorf("detached HEAD steady state must report nothing, got %v", d)
 	}
 }

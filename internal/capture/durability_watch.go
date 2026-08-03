@@ -171,7 +171,7 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 		case lastSeen == "":
 			advanceDurabilityCursor(rootKey, tip) // baseline only
 		case lastSeen != tip:
-			commits, ok := gitNewCommits(root, lastSeen, tip)
+			commits, _, ok := gitNewCommits(root, lastSeen, tip)
 			if !ok {
 				continue // inconclusive — keep the cursor, retry next poll
 			}

@@ -730,6 +730,21 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   over spans it already tracks. The same commit's hunks are never folded twice
   into the same ledger.
 
+- **ATTRIBUTION AND THE REWORK FOLD TAKE DELIBERATELY DIFFERENT RANGES, and
+  `gitNewCommits`' second return is that split.** `gitCommitRawDiff` reads every
+  commit with `-m --first-parent`, so a merge's diff already carries the
+  second-parent side; the live range (`rev-list <cursor>..HEAD`) returns the merge
+  AND that side's own commits, so folding both applied each merged-in edit twice —
+  once in a sibling's coordinate space, once in the merge's — and slid tracked
+  spans by an offset already applied. So the fold walks the FIRST-PARENT chain
+  (`gitFirstParentSet`) while EMISSION keeps the full range: a commit reachable
+  only through a second parent is still attributed, because whether merged-in work
+  counts as AI-written is a product question that was deliberately not answered
+  here. Where the ranges disagree the ledger can only LOSE state — such a commit
+  no longer seeds its own ranges, and a replay backed solely by one is declined
+  by the attributed-in-range gate — never invent it. A failed `rev-list` returns
+  an EMPTY set, not nil-means-everything, for the same reason.
+
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
 and the commit would never reach `pollReworkCommit` at all. It returns the raw
