@@ -84,6 +84,12 @@ var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // false when nothing changed (empty diff / no new-side ranges), which suppresses
 // emission. `--unified=0`/`--format=`/`--root` keep the diff tight and header-free
 // (message/author never enter the buffer).
+//
+// A false ok still returns the RAW DIFF whenever git produced one, because "no
+// new-side ranges" is not the same as "nothing happened": a pure rename has that
+// exact shape — a real diff with `rename from`/`rename to` and not one `@@` — and
+// the rework ledger has to see it or the renamed file's tracked spans strand at a
+// path that no longer exists. Only a failed `git show` yields an empty diff.
 func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
 	diff, ok = gitCommitRawDiff(root, sha)
 	if !ok || diff == "" {
@@ -91,7 +97,7 @@ func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files [
 	}
 	fileRanges := parseUnifiedDiffNewRanges(diff)
 	if len(fileRanges) == 0 {
-		return "", nil, "", false
+		return diff, nil, "", false
 	}
 	// The ledgers are anchored to the workspace (taskRoot), not to each polled
 	// repo — in the daemon taskRoot is HOME and root is a repo discovered under it.
@@ -149,7 +155,7 @@ func parseUnifiedDiffNewRanges(diff string) map[string][]attrLineRange {
 // path. Git prefixes the new side with `b/`; a deletion targets `/dev/null`,
 // which yields "" (no new-side path). Git already emits forward slashes.
 func parseDiffNewPath(s string) string {
-	s = strings.TrimSpace(s)
+	s = unquoteDiffPath(strings.TrimSpace(s))
 	if s == "/dev/null" {
 		return ""
 	}
@@ -405,7 +411,20 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) (recordable bool) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
-		return true // nothing to send, and nothing a retry would change
+		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
+		// shapes land here that rework still has to see. A pure RENAME: its tracked
+		// spans must be carried to the new path or they strand at a dead one. A
+		// DELETE-only commit: parseUnifiedDiffHunks keys those hunks under the old
+		// path, so rework churns the deleted spans and EMITS a rework_verdict, which
+		// is correct — deleting AI lines pre-merge is discarded AI work, and the
+		// early return used to strand them until merge.
+		//
+		// Passing no attributable files means neither shape can SEED: removing a file
+		// is not evidence that anyone wrote anything.
+		if preMerge && diff != "" {
+			pollReworkCommit(session, root, sha, diff, nil, nowMs)
+		}
+		return true
 	}
 	if !emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files))) {
 		// Never durably queued. Do NOT let the caller remember this SHA, or the

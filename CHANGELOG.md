@@ -54,6 +54,66 @@ follows [Semantic Versioning](https://semver.org/).
   yet, so the next load treated a brand-new install as a legacy one and dropped
   its whole classification cache for nothing.
 
+- **The AI-line ledgers reported human code as AI, and reported lines as
+  surviving at a path they had left.** Both are FABRICATION rather than loss —
+  they corrupt the only numbers `durability_verdict` and `rework_verdict` exist
+  to report — and both were reachable through ordinary git usage.
+
+  Seeding a path is deliberately first-touch-only, so that a later human rewrite
+  of an AI line is never re-attributed as fresh AI. But a path *leaves* the
+  ledger by three routes — every tracked range churned, every range matured into
+  a durable verdict, or the file renamed away — and each of those deletions
+  re-armed the first-touch branch, so the next purely-human commit to that path
+  was seeded as fresh AI off stale AI-path evidence. "First touch" is now a
+  property of the repo, not of the ledger's current contents: every route out
+  leaves a mark, and the path-level seeding fallback refuses to fire while one
+  stands. Line-precise fingerprint transfer — the only carrier of lineage through
+  a squash-merge — is deliberately unaffected.
+
+  A pure rename emits no `@@` hunks under the tracked path, so its spans were
+  neither moved nor churned: they sat at a path that no longer existed and
+  matured into a `durable` verdict for lines that had stopped existing there
+  weeks earlier. Renames are now read out of the diff git already emits and the
+  spans carried to the new path with their birth timestamp and lineage intact, so
+  a rename no longer restarts the 30-day clock or breaks lineage. `copy from` is
+  deliberately ignored — a copy leaves the source file in place.
+
+  Two related corrections in the pre-merge rework ledger: its state is now bound
+  to the branch it describes, so `git switch -c` off a feature branch or a
+  per-branch worktree expires it instead of carrying stale ranges across (the
+  clear on returning to the default branch never fired in either case); and a
+  pre-merge commit that only *deletes* files now emits its rework verdicts
+  immediately rather than stranding them until merge.
+
+  Once a path has been seeded, mere *presence* in the 7-day AI-paths cache never
+  re-seeds it again, however long it has been out of the ledger — that presence
+  is the evidence already spent. Only a strictly newer per-path AI **write**
+  re-opens it, and that re-entry takes a fresh lineage and a fresh birth stamp.
+  This cuts both ways and both directions were wrong before: the previous mark
+  was renewed on every blocked attempt, so a file the AI kept working on kept
+  burying itself, and every AI contribution to it after the first `durable`
+  harvest went unreported.
+
+- **An adopted branch's AI lines read as though they were never written.**
+  Rework state describes one branch and is dropped when a root switches to
+  another, while the attributed-commits ledger is keyed by SHA alone and shared
+  across roots. Both are right on their own, and together they lost data: the
+  commits that would rebuild an adopted branch's spans are exactly the ones the
+  loop skips as already attributed, so the branch came back holding nothing and
+  every later rewrite of its AI lines emitted no `rework_verdict`. Two ordinary
+  moves reached it — park on the default branch and come back, or run several
+  worktrees against one repository.
+
+  Those commits are now re-folded for their STATE alone on a root that owes the
+  rebuild: nothing is re-attributed, no fingerprints are re-recorded, and no
+  verdict is re-emitted. The obligation is recorded on disk rather than inferred
+  from a single poll, because a branch's commits arrive over several polls under
+  the per-poll caps — an authorization that expired with the first poll left the
+  rest of the branch either silently missing or, worse, holding spans positioned
+  mid-branch for the next commit to churn into a verdict about lines nobody
+  wrote. Reports move for existing branches: spans reappear, and rewrites that
+  previously emitted nothing now emit the verdict they always should have.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for

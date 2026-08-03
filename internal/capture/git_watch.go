@@ -472,10 +472,20 @@ func saveGitWatchCursors(heads map[string]string) {
 // returns the newly-detected commit SHAs keyed by root (the seam the later
 // attribution PR consumes); a cold-start root (no prior cursor) is baselined
 // WITHOUT reporting, matching git-ai's cold-start discipline.
-func pollGitWatch(roots []string) map[string][]string {
+//
+// The second return says, per root, whether this poll left that root's cursor AT
+// ITS HEAD — i.e. whether the root DRAINED. A root is not drained when the
+// shared budget deferred it whole, when a burst was clamped to a partial batch,
+// or when the comparison was inconclusive; in each of those cases commits this
+// poll already knows about are still owed to a later poll. Only the caller can
+// act on that, and it must: state it drops on the strength of "this root's
+// commits are being processed now" (branch adoption) stays owed for exactly as
+// long as this flag is false.
+func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
+	drained := map[string]bool{}
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -496,6 +506,7 @@ func pollGitWatch(roots []string) map[string][]string {
 		lastSeen, hadCursor := prior[key]
 		if !hadCursor || lastSeen == head {
 			newHeads[key] = head // cold start (baseline only) or nothing moved
+			drained[key] = true
 			continue
 		}
 		commits, ok := gitNewCommits(root, lastSeen, head)
@@ -504,6 +515,7 @@ func pollGitWatch(roots []string) map[string][]string {
 		}
 		if len(commits) == 0 {
 			newHeads[key] = head // nothing new (e.g. a backward reset): just move to head
+			drained[key] = true
 			continue
 		}
 		if budget <= 0 {
@@ -527,6 +539,7 @@ func pollGitWatch(roots []string) map[string][]string {
 		// OLDEST batch, so the next poll enumerates commits[0]..head and drains the
 		// remainder in order.
 		newHeads[key] = commits[0]
+		drained[key] = commits[0] == head
 		budget -= len(commits)
 	}
 
@@ -536,7 +549,7 @@ func pollGitWatch(roots []string) map[string][]string {
 	}
 
 	saveGitWatchCursors(newHeads)
-	return detected
+	return detected, drained
 }
 
 // pollGitWatchWorkspace enumerates the workspace's roots (workspace + its git
@@ -561,7 +574,7 @@ func pollGitWatchWorkspace(session Session) {
 		aiRoots,
 		loadDiscoveredRepos(nowMs),
 	))
-	detected := pollGitWatch(roots)
+	detected, drained := pollGitWatch(roots)
 
 	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
 	// detected this poll. A merely-idle repo is left to age out after the horizon.
@@ -595,19 +608,58 @@ func pollGitWatchWorkspace(session Session) {
 		// no-new-commits guard so that returning to the default branch clears stale
 		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
 		// `git checkout main` after a feature branch merged).
-		scope := reworkScope(root)
-		if scope == scopeDefault {
+		scope, branch := reworkScope(root)
+		// Set while this root still OWES the replay that binding it to a new branch
+		// made necessary. Adoption empties the root's rework state, and the skip
+		// below then drops the very commits that would rebuild it, so the adopted
+		// branch's AI spans are lost — see replayReworkForAdoptedCommit.
+		//
+		// It is read from the LEDGER, not from "did this poll adopt", because the
+		// commit range the replay covers is not bounded by one poll: a root the
+		// shared budget deferred whole surfaces no commits at all on the adopting
+		// poll, and a burst clamped to the per-root cap leaves its newer tail for
+		// later polls. A per-poll flag left both ranges skipped with nothing to
+		// replay them — the first silently, the second while holding spans
+		// positioned at the middle of the branch, which the next live commit
+		// remaps into lines the AI never wrote. The marker is therefore cleared
+		// only once the root has actually drained (drained[rootKey]), and dropping
+		// it is what restores the steady-state guard: gitNewCommits' cursor
+		// recovery re-surfaces skipped commits with no branch change, and folding
+		// one of those into live state re-applies its hunks.
+		adopting := false
+		switch scope {
+		case scopeDefault:
 			// On (or merged back to) the default branch: surviving AI lines are now the
 			// durability engine's and reworked ones already emitted, so drop the root's
 			// rework tracking before a future branch could remap against stale ranges.
-			// Guarded on presence to avoid a needless ledger write on every poll.
-			if _, tracked := loadReworkLedger().Roots[rootKey]; tracked {
+			// Guarded on presence to avoid a needless ledger write on every poll. The
+			// guard must consider the seed tombstones and the recorded branch too: both
+			// outlive the tracked map, so a Roots-only check would strand them.
+			if reworkLedgerHasRoot(rootKey) {
 				clearReworkLedger(rootKey)
 			}
+		case scopePreMerge:
+			// Rework state belongs to ONE branch. Binding it to the checked-out branch
+			// here is what expires it: `git switch -c next-thing` straight off a feature
+			// branch, and a per-branch worktree that never visits the default branch,
+			// both skip the scopeDefault clear above entirely, and the previous branch's
+			// ranges and tombstones would otherwise carry over silently.
+			recorded, pending := reworkLedgerBranchState(rootKey)
+			if branch != "" && recorded != branch {
+				adoptReworkBranch(rootKey, branch)
+				pending = true
+			}
+			adopting = pending
 		}
 
 		commits := detected[rootKey]
 		if len(commits) == 0 {
+			// A root with no commits this poll either has nothing left to replay
+			// (drained) or was deferred with its whole range still owed. Only the
+			// first ends the adoption.
+			if adopting && drained[rootKey] {
+				finishReworkAdoption(rootKey)
+			}
 			continue
 		}
 		preMerge := scope == scopePreMerge
@@ -627,6 +679,14 @@ func pollGitWatchWorkspace(session Session) {
 			sha := commits[i]
 			if _, done := attributed[sha]; done {
 				reattempted++
+				// Attribution stays skipped — this commit really was accounted for,
+				// and nothing here emits. But on a poll that just adopted the branch,
+				// this SHA is also the only thing that can rebuild the rework state
+				// adoption emptied, and skipping it outright is what left an adopted
+				// branch looking like it held no AI work.
+				if preMerge && adopting {
+					replayReworkForAdoptedCommit(session, root, sha, nowMs)
+				}
 				continue
 			}
 			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
@@ -640,6 +700,13 @@ func pollGitWatchWorkspace(session Session) {
 			// this, one poll emits it once per root.
 			attributed[sha] = struct{}{}
 			emitted = append(emitted, sha)
+		}
+		// The replay is owed until the root reaches its head. A clamped burst
+		// processed only the oldest slice of the range, so the branch's remaining
+		// commits — every one of them already attributed — still have to be
+		// replayed on later polls.
+		if adopting && drained[rootKey] {
+			finishReworkAdoption(rootKey)
 		}
 	}
 
@@ -673,19 +740,24 @@ const (
 // checked-out branch name to the default branch name is push-state independent.
 // Two constant-time read-only spawns per root per poll (symbolic-ref HEAD + the
 // cached default ref).
-func reworkScope(root string) branchScope {
+//
+// It also RETURNS the checked-out branch name, which the rework ledger records
+// as the identity of the state it holds. Returning it from here rather than
+// re-resolving it at the call site keeps the spawn budget where the comment above
+// says it is — the name has already been read to classify the scope.
+func reworkScope(root string) (branchScope, string) {
 	defRef := durabilityDefaultRef(root)
 	if defRef == "" {
-		return scopeUnknown
+		return scopeUnknown, ""
 	}
 	head := gitSymbolicRef(root, "HEAD")
 	if head == "" {
-		return scopeUnknown // detached or unborn — no branch name to compare
+		return scopeUnknown, "" // detached or unborn — no branch name to compare
 	}
 	if shortBranchName(head) == shortBranchName(defRef) {
-		return scopeDefault
+		return scopeDefault, shortBranchName(head)
 	}
-	return scopePreMerge
+	return scopePreMerge, shortBranchName(head)
 }
 
 // shortBranchName reduces a full ref name to its branch short name:
