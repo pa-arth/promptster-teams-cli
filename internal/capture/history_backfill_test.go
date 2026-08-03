@@ -579,6 +579,131 @@ func TestPollCodexRolloutsChunksBackfill(t *testing.T) {
 	}
 }
 
+// TestCleanShutdownPreservesClaudeBackfillProgress pins the restart half of the
+// bounded backfill. The watcher's deferred cleanup drops its LIVENESS state on
+// every clean exit; it must not drop the DURABLE offsets with it. Wiping them
+// used to cost nothing (a restart's re-read was bounded to the last two
+// minutes), but with the 28-day window it means every login, every self-update
+// re-exec and every sleep/wake re-reads and re-ships the whole window.
+func TestCleanShutdownPreservesClaudeBackfillProgress(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	path, size := writeClaudeHistory(t, root, ws, "restart.jsonl", 6)
+	key := claudeProgressKey(path)
+
+	session := Session{DeviceID: "sess-restart", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	cutoff := func() time.Time { return transcriptHistoryCutoff(time.Now().UTC()) }
+
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+	if _, consumed := pollClaudeTranscripts(session, ws, cutoff(), processors, true, false); consumed != size {
+		t.Fatalf("first boot backfilled %d of %d bytes", consumed, size)
+	}
+
+	// A clean shutdown — exactly what RunClaudeWatcher's deferred cleanup runs.
+	clearClaudeWatcherState()
+
+	if _, err := os.Stat(claudeWatchProgressPath()); err != nil {
+		t.Fatalf("a clean shutdown must preserve durable transcript progress: %v", err)
+	}
+	if got := loadClaudeWatchProgress().Offsets[key]; got != size {
+		t.Fatalf("offset after a clean shutdown = %d, want %d", got, size)
+	}
+
+	// Restart: fresh processors, same on-disk progress. Nothing already
+	// processed may be read again.
+	processors = map[string]*normalize.ClaudeTranscriptProcessor{}
+	if parsed, consumed := pollClaudeTranscripts(session, ws, cutoff(), processors, true, false); consumed != 0 || parsed != 0 {
+		t.Fatalf("restart replayed %d bytes / %d events of already-processed history", consumed, parsed)
+	}
+
+	// Live capture survives the restart: an appended turn is still picked up.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"live turn"}}`+"\n",
+		ws, time.Now().UTC().Format(time.RFC3339))
+	if _, err := f.WriteString(line); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	parsed, consumed := pollClaudeTranscripts(session, ws, cutoff(), processors, true, false)
+	if consumed != int64(len(line)) || parsed == 0 {
+		t.Fatalf("live append after a restart parsed %d events over %d bytes; want the %d appended bytes", parsed, consumed, len(line))
+	}
+}
+
+// TestCleanShutdownPreservesCodexBackfillProgress is the Codex half of the
+// restart guarantee.
+func TestCleanShutdownPreservesCodexBackfillProgress(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	dir := filepath.Join(root, "2026", "07", "22")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now().Add(-7 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	body := codexSessionMetaLine(ws, ts) +
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"user_message","message":"history","images":[]}}` + "\n"
+	path := filepath.Join(dir, "rollout-restart.jsonl")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	size := int64(len(body))
+
+	session := Session{DeviceID: "sess-codex-restart", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	cutoff := func() time.Time { return transcriptHistoryCutoff(time.Now().UTC()) }
+
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+	if sent := pollCodexRollouts(session, ws, cutoff(), processors, false); sent == 0 {
+		t.Fatal("first boot must backfill the in-window rollout")
+	}
+	if got := loadCodexWatchProgress().Offsets[path]; got != size {
+		t.Fatalf("offset after the first boot = %d, want %d", got, size)
+	}
+
+	clearCodexWatcherState()
+
+	if _, err := os.Stat(codexWatchProgressPath()); err != nil {
+		t.Fatalf("a clean shutdown must preserve durable rollout progress: %v", err)
+	}
+	if got := loadCodexWatchProgress().Offsets[path]; got != size {
+		t.Fatalf("offset after a clean shutdown = %d, want %d", got, size)
+	}
+
+	processors = map[string]*normalize.CodexRolloutProcessor{}
+	if sent := pollCodexRollouts(session, ws, cutoff(), processors, false); sent != 0 {
+		t.Fatalf("restart re-emitted %d already-processed event(s)", sent)
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := `{"timestamp":"` + time.Now().UTC().Format(time.RFC3339) + `","type":"event_msg","payload":{"type":"user_message","message":"live turn","images":[]}}` + "\n"
+	if _, err := f.WriteString(live); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+
+	if sent := pollCodexRollouts(session, ws, cutoff(), processors, false); sent == 0 {
+		t.Fatal("live append after a restart must still be captured")
+	}
+}
+
 // TestPollCodexRolloutsDefersUnderOutboxPressure is the Codex half of the
 // backpressure.
 func TestPollCodexRolloutsDefersUnderOutboxPressure(t *testing.T) {

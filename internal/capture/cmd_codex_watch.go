@@ -197,9 +197,12 @@ func saveCodexWatcherState(s codexWatcherState) error {
 	return os.Rename(tmp, path)
 }
 
+// clearCodexWatcherState drops only the watcher's liveness state; the durable
+// rollout offsets survive a clean exit so the bounded history window is
+// backfilled once rather than at every restart. See clearClaudeWatcherState for
+// the full reasoning — both watchers hold the identical invariant.
 func clearCodexWatcherState() {
 	_ = os.Remove(codexWatcherStatePath())
-	_ = os.Remove(codexWatchProgressPath())
 }
 
 func isCodexWatcherRunning() (codexWatcherState, bool) {
