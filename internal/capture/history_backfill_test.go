@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -44,7 +45,7 @@ func TestReplayedFileDiffDoesNotFabricateFreshAiActivity(t *testing.T) {
 	}
 
 	old := aiFileDiffAt("sess-replay", "foo.go", "@@\n+package foo", time.Now().Add(-20*24*time.Hour))
-	dedupeFileDiff(ws, &old)
+	dedupeFileDiff(ws, &old, true)
 
 	if got := readAiTouchedPaths(""); len(got) != 0 {
 		t.Fatalf("a 20-day-old replayed edit must not read as AI-touched today; got %v", got)
@@ -52,7 +53,7 @@ func TestReplayedFileDiffDoesNotFabricateFreshAiActivity(t *testing.T) {
 
 	// The same funnel, live, still records — the fix must not silence real work.
 	live := aiFileDiffAt("sess-live", "bar.go", "@@\n+package bar", time.Now())
-	dedupeFileDiff(ws, &live)
+	dedupeFileDiff(ws, &live, false)
 	if readAiTouchedPaths("")["bar.go"] != "sess-live" {
 		t.Fatalf("a live AI edit must still be recorded; got %v", readAiTouchedPaths(""))
 	}
@@ -74,7 +75,7 @@ func TestReplayedFileDiffCarriesHistoricalWriteStamp(t *testing.T) {
 
 	threeDaysAgo := time.Now().Add(-3 * 24 * time.Hour)
 	replayed := aiFileDiffAt("sess-hist", "app.go", "@@\n+one", threeDaysAgo)
-	dedupeFileDiff(ws, &replayed)
+	dedupeFileDiff(ws, &replayed, true)
 
 	mark := readAiPathMarks("")["app.go"]
 	if mark.SessionID != "sess-hist" {
@@ -90,14 +91,14 @@ func TestReplayedFileDiffCarriesHistoricalWriteStamp(t *testing.T) {
 	// not to let history manufacture "the agent wrote this again" evidence.
 	before := mark.WriteMs
 	older := aiFileDiffAt("sess-hist", "app.go", "@@\n+two", threeDaysAgo.Add(-time.Hour))
-	dedupeFileDiff(ws, &older)
+	dedupeFileDiff(ws, &older, true)
 	if after := readAiPathMarks("")["app.go"].WriteMs; after > before {
 		t.Fatalf("an older replayed write advanced the stamp %d -> %d", before, after)
 	}
 
 	// A genuine live write to the same path still advances it.
 	live := aiFileDiffAt("sess-hist", "app.go", "@@\n+three", time.Now())
-	dedupeFileDiff(ws, &live)
+	dedupeFileDiff(ws, &live, false)
 	if after := readAiPathMarks("")["app.go"].WriteMs; after <= before {
 		t.Fatalf("a live write must advance the stamp; %d -> %d", before, after)
 	}
@@ -120,7 +121,7 @@ func TestReplayedFileDiffsAreNotCollapsedByCurrentContent(t *testing.T) {
 	base := time.Now().Add(-10 * 24 * time.Hour)
 	for i := 0; i < 5; i++ {
 		e := aiFileDiffAt("sess-replay", "svc.go", fmt.Sprintf("@@\n+edit %d", i), base.Add(time.Duration(i)*time.Hour))
-		if !dedupeFileDiff(ws, &e) {
+		if !dedupeFileDiff(ws, &e, true) {
 			t.Fatalf("replayed edit %d was collapsed against current on-disk content", i)
 		}
 	}
@@ -128,12 +129,12 @@ func TestReplayedFileDiffsAreNotCollapsedByCurrentContent(t *testing.T) {
 	// Replay must also leave no claim behind that would swallow a genuine live
 	// edit landing on this same content inside the next dedup TTL.
 	live := aiFileDiffAt("sess-live", "svc.go", "@@\n+live", time.Now())
-	if !dedupeFileDiff(ws, &live) {
+	if !dedupeFileDiff(ws, &live, false) {
 		t.Fatal("replay poisoned the dedup ledger against a live edit")
 	}
 	// Live cross-channel dedup itself is untouched.
 	again := aiFileDiffAt("sess-git", "svc.go", "diff --git", time.Now())
-	if dedupeFileDiff(ws, &again) {
+	if dedupeFileDiff(ws, &again, false) {
 		t.Fatal("live cross-channel dedup must still collapse identical resulting content")
 	}
 }
@@ -150,16 +151,177 @@ func TestReplayedAiBashWindowIsNotRecorded(t *testing.T) {
 	old := event.NewEvent("command", "sess-old")
 	old.Ts = time.Now().Add(-20 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	old.Provenance = &event.Provenance{Attribution: "likely_ai", Confidence: 1}
-	recordAiBashWindow(&old, "")
+	recordAiBashWindow(&old, "", true)
 	if got := readBashWindows(""); len(got) != 0 {
 		t.Fatalf("a 20-day-old replayed command must not enter the window ledger; got %v", got)
 	}
 
 	live := event.NewEvent("command", "sess-live")
 	live.Provenance = &event.Provenance{Attribution: "likely_ai", Confidence: 1}
-	recordAiBashWindow(&live, "")
+	recordAiBashWindow(&live, "", false)
 	if got := readBashWindows(""); len(got) != 1 {
 		t.Fatalf("a live AI command must still be recorded; got %v", got)
+	}
+}
+
+// TestAnchoredLiveEventIsNotTreatedAsReplay is the Cursor guard. Cursor stamps
+// every action in a turn with that TURN'S START anchor, so a long turn hands
+// the shared funnel live edits that look arbitrarily old. Inferring replay from
+// that age silently disables live cross-channel dedupe and freezes the per-path
+// write stamp durabilitySeedAuthorized and reworkSeedEvidence read as "the
+// agent wrote this again". Replay is the producer's call, and Cursor's answer
+// is always no.
+func TestAnchoredLiveEventIsNotTreatedAsReplay(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+
+	ws := t.TempDir()
+	target := filepath.Join(ws, "turn.go")
+	if err := os.WriteFile(target, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A 46-minute turn: every action carries the turn's start anchor.
+	anchor := time.Now().Add(-46 * time.Minute)
+
+	first := aiFileDiffAt("cursor-sess", "turn.go", "@@\n+first", anchor)
+	if !dedupeFileDiff(ws, &first, false) {
+		t.Fatal("first live edit must emit")
+	}
+	// Live cross-channel dedupe must still fire for an anchored event: the git
+	// watcher seeing this same resulting content has to be collapsed.
+	gitEcho := aiFileDiffAt("cursor-sess", "turn.go", "diff --git", anchor)
+	if dedupeFileDiff(ws, &gitEcho, false) {
+		t.Fatal("an anchored live edit must still claim the dedup ledger")
+	}
+
+	before := readAiPathMarks("")["turn.go"].WriteMs
+	if before == 0 {
+		t.Fatalf("anchored live edit was not recorded: %+v", readAiPathMarks(""))
+	}
+	// Two genuine edits to one path inside a single turn share the anchor. The
+	// collision bump must still distinguish them, or a tombstoned path is never
+	// re-authorized by the second write.
+	if err := os.WriteFile(target, []byte("second\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second := aiFileDiffAt("cursor-sess", "turn.go", "@@\n+second", anchor)
+	if !dedupeFileDiff(ws, &second, false) {
+		t.Fatal("a second live edit with new content must emit")
+	}
+	if after := readAiPathMarks("")["turn.go"].WriteMs; after <= before {
+		t.Fatalf("a second live edit in the same turn must advance the stamp; %d -> %d", before, after)
+	}
+
+	// The session's activity stamp must be NOW, not the turn anchor — it feeds
+	// the 7-day TTL and the 64-entry eviction order.
+	drift := time.Now().UnixMilli() - readAiPathMarks("")["turn.go"].WriteMs
+	if drift > time.Minute.Milliseconds() {
+		t.Fatalf("live stamp lags the wall clock by %dms; the turn anchor leaked in", drift)
+	}
+}
+
+// TestEmitCursorEventNeverReplays pins the producer signal at the funnel Cursor
+// actually calls, so the constant cannot drift back to an inferred one.
+func TestEmitCursorEventNeverReplays(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "c.go"), []byte("body\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := Session{DeviceID: "dev-cursor", SessionToken: "PSE-TEST", TaskRoot: ws}
+
+	ev := aiFileDiffAt("cursor-sess", filepath.Join(ws, "c.go"), "@@\n+body", time.Now().Add(-46*time.Minute))
+	if n := emitCursorEvent(ev, session, false); n != 1 {
+		t.Fatalf("anchored cursor edit queued %d events, want 1", n)
+	}
+	mark := readAiPathMarks(gitWatchRootKey(ws))["c.go"]
+	if mark.SessionID != "cursor-sess" {
+		t.Fatalf("cursor edit missing from the ai-paths ledger: %+v", readAiPathMarks(gitWatchRootKey(ws)))
+	}
+	if drift := time.Now().UnixMilli() - mark.WriteMs; drift > time.Minute.Milliseconds() {
+		t.Fatalf("cursor write stamped %dms ago; the turn anchor leaked in as a replay stamp", drift)
+	}
+}
+
+// TestReplayedBashWindowDoesNotRefreshSessionActivity pins the sibling ledger's
+// half of the same rule. pruneBashWindows evicts oldest-by-TsMs against the same
+// 64-session cap the ai-paths ledger uses, so a backfill stamping the wall clock
+// spends that cap on history and evicts the live session's windows.
+func TestReplayedBashWindowDoesNotRefreshSessionActivity(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+
+	// In-TTL history: recorded, but as three-day-old activity.
+	replayed := event.NewEvent("command", "sess-hist")
+	replayed.Ts = time.Now().Add(-3 * 24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	replayed.Provenance = &event.Provenance{Attribution: "likely_ai", Confidence: 1}
+	recordAiBashWindow(&replayed, "", true)
+
+	data, err := os.ReadFile(bashWindowsLedgerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ledger bashWindowsLedger
+	if err := json.Unmarshal(data, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	entry, ok := ledger.Sessions["sess-hist"]
+	if !ok {
+		t.Fatalf("an in-TTL replayed window must still be recorded; got %v", ledger.Sessions)
+	}
+	if drift := time.Now().UnixMilli() - entry.TsMs; drift < (2 * 24 * time.Hour).Milliseconds() {
+		t.Fatalf("replayed session stamped active %dms ago; want its own ~3-day-old time", drift)
+	}
+
+	// Live activity on the same session still moves it forward.
+	live := event.NewEvent("command", "sess-hist")
+	live.Provenance = &event.Provenance{Attribution: "likely_ai", Confidence: 1}
+	recordAiBashWindow(&live, "", false)
+
+	data, err = os.ReadFile(bashWindowsLedgerPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger = bashWindowsLedger{}
+	if err := json.Unmarshal(data, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	if drift := time.Now().UnixMilli() - ledger.Sessions["sess-hist"].TsMs; drift > time.Minute.Milliseconds() {
+		t.Fatalf("live activity must refresh the session stamp; %dms stale", drift)
+	}
+}
+
+// TestOutOfTtlReplayWritesNoLedger pins the early return. A replayed write
+// already past the TTL would otherwise take the ledger lock, rewrite the file
+// and let pruneAiPaths delete the entry in the same call — pure contention
+// against live capture, once per historical edit across a 28-day backfill.
+func TestOutOfTtlReplayWritesNoLedger(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+
+	recordAiTouchedPathAt("sess-old", "", "old.go", time.Now().Add(-20*24*time.Hour).UnixMilli(), true)
+	if _, err := os.Stat(aiPathsLedgerPath()); !os.IsNotExist(err) {
+		t.Fatalf("an out-of-TTL replayed write must not touch the ledger file at all (stat err = %v)", err)
+	}
+
+	// A replay with no usable stamp lands in the same fail-closed branch.
+	recordAiTouchedPathAt("sess-nots", "", "nots.go", 0, true)
+	if _, err := os.Stat(aiPathsLedgerPath()); !os.IsNotExist(err) {
+		t.Fatalf("a stampless replayed write must not touch the ledger file (stat err = %v)", err)
+	}
+
+	// In-TTL history and live writes still land.
+	recordAiTouchedPathAt("sess-recent", "", "recent.go", time.Now().Add(-time.Hour).UnixMilli(), true)
+	if readAiTouchedPaths("")["recent.go"] != "sess-recent" {
+		t.Fatalf("in-TTL replayed write must be recorded; got %v", readAiTouchedPaths(""))
 	}
 }
 

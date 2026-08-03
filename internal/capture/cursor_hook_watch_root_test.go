@@ -127,7 +127,7 @@ func TestCursorEditReachesTheLedgerInTheWatcherKeySpace(t *testing.T) {
 		Provenance: &event.Provenance{Attribution: "likely_ai", Methods: []string{"cursor-hook"}},
 	}
 	normalize.RelativizeEventPaths(&ev, root)
-	dedupeFileDiff(root, &ev)
+	dedupeFileDiff(root, &ev, false)
 
 	var ledger aiPathsLedger
 	data, err := os.ReadFile(aiPathsLedgerPath())

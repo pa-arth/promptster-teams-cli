@@ -119,8 +119,21 @@ func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 // so two LIVE writes in one millisecond stay distinguishable, and letting an
 // older event win it would manufacture exactly the "the agent wrote this again"
 // evidence the seed gate is checking for.
+//
+// replay is a PRODUCER signal, never inferred from age here — see
+// transcriptEventIsHistorical for why an event's age only means what it looks
+// like on the two rails that stamp every record individually.
 func recordAiTouchedPathAt(sessionID, rootKey, relPath string, writeMs int64, replay bool) {
 	if sessionID == "" || relPath == "" {
+		return
+	}
+	// A replayed write already older than the TTL would be read, mutated,
+	// marshalled and renamed under the ledger lock only for pruneAiPaths to
+	// delete it in the same call — pure lock contention against live capture
+	// across a 28-day backfill. Same early return recordAiBashWindow takes.
+	// A replay with no usable stamp (writeMs <= 0) lands here too, which is the
+	// fail-closed direction: the ledger cannot be told when it happened.
+	if replay && time.Now().UnixMilli()-writeMs > aiPathsTTL.Milliseconds() {
 		return
 	}
 	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
@@ -384,6 +397,19 @@ const (
 // The window scoping below removes only the CROSS-repo case; the temporal
 // same-workspace overlap is a documented tradeoff of the opt-in heuristic.
 func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
+	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli())
+}
+
+// recordBashWindowAt is recordBashWindow with the session-activity stamp
+// supplied by the caller, so a replayed command cannot present its session as
+// live. This is the same rule its sibling ledger holds in recordAiTouchedPathAt,
+// and the two must agree about what "this session was recently active" means:
+// pruneBashWindows evicts oldest-by-TsMs against the same 64-session cap, so a
+// backfill stamping the wall clock would spend that cap on history and evict
+// the genuinely live session's windows. Losing those costs a bash-mtime
+// recovery pass — an undercount, but exactly the one the ledger exists to
+// prevent.
+func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64) {
 	if sessionID == "" {
 		return
 	}
@@ -400,12 +426,17 @@ func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 		}
 
 		nowMs := time.Now().UnixMilli()
+		if activityMs <= 0 || activityMs > nowMs {
+			activityMs = nowMs
+		}
 		entry := ledger.Sessions[sessionID]
 		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
 		if len(entry.Windows) > bashWindowsMaxPerSession {
 			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
 		}
-		entry.TsMs = nowMs
+		if activityMs > entry.TsMs {
+			entry.TsMs = activityMs
+		}
 		entry.RootKey = rootKey
 		ledger.Sessions[sessionID] = entry
 		pruneBashWindows(&ledger, nowMs)
@@ -491,7 +522,8 @@ func pruneBashWindows(ledger *bashWindowsLedger, nowMs int64) {
 //
 // Only the command END time is observable (see the ledger header), so the stored
 // window is the point [endMs, endMs]; recovery widens it by ± the δ/ε tolerance.
-func recordAiBashWindow(e *event.Event, taskRoot string) {
+// replay is declared by the caller, on the same terms as dedupeFileDiff's.
+func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if e == nil || e.Kind != "command" {
 		return
 	}
@@ -502,12 +534,19 @@ func recordAiBashWindow(e *event.Event, taskRoot string) {
 	if !ok {
 		return
 	}
-	// A replayed command whose window already sits outside the reader's TTL can
-	// never recover a file (readBashWindows would drop it), so recording it buys
-	// nothing and costs a slot in pruneBashWindows' 64-entry cap — which a first
-	// boot replaying weeks of history would spend evicting the live session.
-	if time.Now().UnixMilli()-endMs > aiPathsTTL.Milliseconds() {
-		return
+	activityMs := time.Now().UnixMilli()
+	if replay {
+		// A replayed command whose window already sits outside the reader's TTL
+		// can never recover a file (readBashWindows would drop it), so recording
+		// it buys nothing and costs a slot in pruneBashWindows' 64-entry cap —
+		// which a first boot replaying weeks of history would spend evicting the
+		// live session.
+		if activityMs-endMs > aiPathsTTL.Milliseconds() {
+			return
+		}
+		if endMs < activityMs {
+			activityMs = endMs
+		}
 	}
 	// Derive the workspace root key AFTER the guards so the resolvePath syscall
 	// only runs for an AI command, not for every watcher event.
@@ -515,7 +554,7 @@ func recordAiBashWindow(e *event.Event, taskRoot string) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindow(e.SessionID, rootKey, endMs, endMs)
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs)
 }
 
 // eventTsMs parses an event's RFC3339Nano Ts into Unix ms.
@@ -585,23 +624,34 @@ func claimFileDiff(relPath, hash string) bool {
 	return won
 }
 
-// eventIsReplay reports whether an event describes activity old enough that no
-// other channel's observation of the SAME edit can still be in flight, along
-// with the millisecond stamp of when that activity actually happened.
+// transcriptEventIsHistorical reports whether an event coming off the CLAUDE or
+// CODEX transcript rail describes activity the watcher is replaying rather than
+// tailing live.
 //
 // diffDedupTTL is the threshold because it is exactly the window this file's
-// cross-channel claims live in: live tailing sees a transcript line within a
-// 3s poll, so an event older than the claim TTL cannot be racing a hook or the
-// git watcher — it is history the watcher is replaying. An unreadable stamp is
-// treated as live, which is the pre-existing behaviour and only ever costs an
-// extra dedupe (an undercount, never an invention).
-func eventIsReplay(e *event.Event) (int64, bool) {
-	nowMs := time.Now().UnixMilli()
-	tsMs, ok := eventTsMs(e.Ts)
-	if !ok || tsMs > nowMs {
-		return nowMs, false
+// cross-channel claims live in: live tailing sees a transcript line within a 3s
+// poll, so an event older than the claim TTL cannot be racing a hook or the git
+// watcher. An unreadable stamp reads as LIVE, the undercount direction — it
+// costs an extra dedupe, never an invention.
+//
+// ⚠️ THIS IS VALID ONLY ON THOSE TWO RAILS, and that is why it is not called
+// from dedupeFileDiff itself. Age means "how long ago did this happen" only
+// where every record carries its OWN timestamp, which is true of Claude Code
+// and Codex and false of Cursor: CursorTranscriptProcessor.eventTs stamps every
+// action in a turn with that TURN'S START anchor, so its own doc comment's
+// 46-minute turn would hand this function a live edit that looks 46 minutes
+// old. Cursor also never backfills (it has no trustworthy session timestamp to
+// bound one with), so its answer is a constant false — see emitCursorEvent.
+// Keep replay a producer signal; do not re-derive it inside the shared funnel.
+func transcriptEventIsHistorical(e *event.Event) bool {
+	if e == nil {
+		return false
 	}
-	return tsMs, nowMs-tsMs > diffDedupTTL.Milliseconds()
+	tsMs, ok := eventTsMs(e.Ts)
+	if !ok {
+		return false
+	}
+	return time.Now().UnixMilli()-tsMs > diffDedupTTL.Milliseconds()
 }
 
 // dedupeFileDiff reports whether a file_diff event should be emitted. It is a
@@ -617,7 +667,13 @@ func eventIsReplay(e *event.Event) (int64, bool) {
 // double-counted by skipping — no other channel replays history, and the
 // watchers mint deterministic event ids, so an overlap with an already-captured
 // live tail is idempotent at ingest.
-func dedupeFileDiff(taskRoot string, e *event.Event) bool {
+//
+// replay is declared by the CALLER, not inferred from e.Ts here. Only the
+// Claude and Codex funnels ever pass true (see transcriptEventIsHistorical for
+// why age is meaningful only there); Cursor passes false unconditionally on
+// both of its rails, because it never backfills and its transcript events carry
+// a turn-start anchor rather than a per-record time.
+func dedupeFileDiff(taskRoot string, e *event.Event, replay bool) bool {
 	if e == nil || e.Kind != "file_diff" {
 		return true
 	}
@@ -629,9 +685,23 @@ func dedupeFileDiff(taskRoot string, e *event.Event) bool {
 	if rel == "" {
 		return true
 	}
-	writeMs, replay := eventIsReplay(e)
+	// A live observation happened NOW, whatever stamp the transcript carries —
+	// that is what the ledger's consumers are asking about, and it keeps a
+	// turn-anchored Cursor edit from aging its own session out of the TTL.
+	writeMs := time.Now().UnixMilli()
 	won := true
-	if !replay {
+	if replay {
+		ts, ok := eventTsMs(e.Ts)
+		if !ok {
+			// A replayed event with no readable stamp cannot be placed in time,
+			// and "now" would be the fabrication this path exists to refuse. Emit
+			// it; record nothing.
+			return true
+		}
+		if ts < writeMs {
+			writeMs = ts
+		}
+	} else {
 		abs := rel
 		if !filepath.IsAbs(rel) && taskRoot != "" {
 			abs = filepath.Join(taskRoot, rel)
