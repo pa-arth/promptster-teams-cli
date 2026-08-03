@@ -47,6 +47,12 @@ Read straight from the AI tool's own transcript `.jsonl`:
   command output
 - Per-request token usage and the exact model, for cost estimation
 - Timestamps, so the timeline reflects when work happened
+- On first run, the **previous 28 days** of Claude Code and Codex sessions that
+  ran in the watched directory — those transcripts are already on your disk and
+  each record carries its own timestamp, so your team's 28-day views are
+  accurate from day one instead of starting empty. Older sessions are captured
+  only from that point forward. The backfill goes through the same allowlist and
+  redaction as live capture, so it egresses nothing live capture would not.
 
 ## What it does NOT capture
 

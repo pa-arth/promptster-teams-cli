@@ -357,7 +357,8 @@ func (p *CursorTranscriptProcessor) noteTimestamp(text string) {
 //   - with no anchor (older Cursor builds), the read time stands.
 //
 // Within-file ORDER is always exact — the file is append-only and tailed in
-// order — and because capture is go-forward-only (never a backfill of history),
+// order — and because CURSOR capture is go-forward-only (its missing timestamp
+// is exactly why the 28-day history backfill covers Claude and Codex alone),
 // read time is at worst one poll interval late. What is genuinely lost is
 // intra-turn latency: a 46-minute turn's actions all carry its start time. Daily
 // and weekly rollups are unaffected; per-action timing is not available from
