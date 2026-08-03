@@ -661,7 +661,16 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   differs does not. Blocking outright silences the canonical agent loop — write,
   rewrite, rewrite again — which is the very thing rework measures. Both failure
   directions are pinned by tests; do not "simplify" the token comparison back into
-  a boolean.
+  a boolean. **Durability's tombstone holds the identical rule** (its own
+  `durabilitySeedAuthorized`), and the two halves that took a second pass are worth
+  not re-deriving: refreshing the mark on every BLOCKED attempt made live AI work
+  the thing that kept a path buried — a file the agent kept editing went unreported
+  for good after its first `durable` harvest — and a rename must carry the LATER of
+  the source's spent stamp and the destination's own, since a mark holding only the
+  source's is read against a different path's clock and the agent that renamed the
+  file usually recorded the new name too. Durability's marks are pruned by EVIDENCE
+  rather than by a TTL: a mark whose path has no live write stamp cannot block
+  anything, and a stamp that reappears is by definition newer.
 - **Its state is scoped to a BRANCH, and `reworkLedger.Branches` is what enforces
   that.** The clear on `scope == scopeDefault` alone is not a bound: `git switch
   -c` off a feature branch and a per-branch worktree never stand on the default
@@ -673,9 +682,17 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   branch another worktree (or an earlier checkout) already attributed starts
   empty and has every rebuilding commit skipped — the branch reads as holding no
   AI work. `replayReworkForAdoptedCommit` rebuilds that state silently, and it
-  runs ONLY on an adopting poll: cursor recovery re-surfaces skipped commits with
-  no branch change, and re-folding one there re-applies its insertion hunk and
-  slides live spans out of the file's real line space.
+  runs ONLY while the root still OWES the rebuild (`reworkLedger.Adopting`, set by
+  adoption and cleared the poll the root's cursor reaches its head): cursor
+  recovery re-surfaces skipped commits with no branch change, and re-folding one
+  there re-applies its insertion hunk and slides live spans out of the file's real
+  line space. That obligation is ON DISK because the range it covers is not
+  bounded by one poll — `pollGitWatch`'s shared budget defers a whole root and its
+  burst clamp splits a branch across polls, and every poll after the first sees an
+  unchanged branch. A per-poll flag therefore expired mid-range, which lost the
+  deferred branch outright and left a clamped one holding spans positioned
+  mid-branch: the next live commit remapped those into a verdict about lines
+  nobody wrote. `pollGitWatch`'s second return is what says a root drained.
 
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`

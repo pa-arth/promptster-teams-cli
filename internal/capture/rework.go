@@ -92,6 +92,25 @@ type reworkLedger struct {
 	// worktree parked on one long-lived branch keeps that branch's marks for as
 	// long as the branch exists, which is correct — they ARE that branch's state.
 	Branches map[string]string `json:"branches,omitempty"`
+	// Adopting is rootKey → true while an adoption still OWES its replay: the
+	// root's spans were dropped for the incoming branch and the already-attributed
+	// commits that rebuild them have not all been folded back yet.
+	//
+	// It is ON DISK because the range it authorizes is not bounded by one poll.
+	// pollGitWatch spends a per-poll budget shared across roots and clamps each
+	// root's burst, so an adopted branch's commits routinely arrive over several
+	// polls — and every poll after the first sees an UNCHANGED branch, which is
+	// indistinguishable from steady state without this marker. Deriving the
+	// authorization from "this poll changed the branch" therefore expired it
+	// mid-range, leaving the rest of the branch skipped with nothing to replay it.
+	//
+	// It is cleared the moment the root's cursor reaches its head, and that
+	// promptness is load-bearing in the other direction: while it stands, a
+	// cursor-recovery batch would be folded into live state, re-applying hunks
+	// that are already in the ledger. Both directions are pinned by tests.
+	//
+	// Additive, same as Seeded — an older ledger reads it as nil.
+	Adopting map[string]bool `json:"adopting,omitempty"`
 }
 
 // tombstoneReworkSeededPath records the AI-write stamp already consumed for a
@@ -232,11 +251,15 @@ func dropReworkRoot(led *reworkLedger, rootKey string) {
 	delete(led.Roots, rootKey)
 	delete(led.Seeded, rootKey)
 	delete(led.Branches, rootKey)
+	delete(led.Adopting, rootKey)
 	if len(led.Seeded) == 0 {
 		led.Seeded = nil
 	}
 	if len(led.Branches) == 0 {
 		led.Branches = nil
+	}
+	if len(led.Adopting) == 0 {
+		led.Adopting = nil
 	}
 }
 
@@ -262,14 +285,36 @@ func reworkLedgerHasRoot(rootKey string) bool {
 	if _, ok := led.Seeded[rootKey]; ok {
 		return true
 	}
+	if _, ok := led.Adopting[rootKey]; ok {
+		return true
+	}
 	_, ok := led.Branches[rootKey]
 	return ok
 }
 
-// reworkLedgerBranch returns the branch a root's rework state describes ("" when
-// the root has none yet).
-func reworkLedgerBranch(rootKey string) string {
-	return loadReworkLedger().Branches[rootKey]
+// reworkLedgerBranchState returns the branch a root's rework state describes and
+// whether that root still owes an adoption replay, from ONE ledger read — the
+// poll loop needs both together on every pre-merge root and reading them
+// separately would double the locked reads per poll.
+func reworkLedgerBranchState(rootKey string) (branch string, adopting bool) {
+	led := loadReworkLedger()
+	return led.Branches[rootKey], led.Adopting[rootKey]
+}
+
+// finishReworkAdoption clears the replay marker, which is what returns the root
+// to the ordinary rule that a detected-but-already-attributed commit is skipped
+// outright. Called only once the root's cursor has reached its head, so no
+// commit of the adopted branch is still owed a fold.
+func finishReworkAdoption(rootKey string) {
+	mutateReworkLedger(func(led *reworkLedger) {
+		if _, ok := led.Adopting[rootKey]; !ok {
+			return
+		}
+		delete(led.Adopting, rootKey)
+		if len(led.Adopting) == 0 {
+			led.Adopting = nil
+		}
+	})
 }
 
 // adoptReworkBranch binds a root's rework state to branch, dropping whatever it
@@ -277,6 +322,10 @@ func reworkLedgerBranch(rootKey string) string {
 // state expires when the branch it describes stops being checked out, which is
 // the event that invalidates it, rather than when someone happens to stand on the
 // default branch (the trigger the old bound assumed and `git switch -c` skips).
+//
+// It also raises the replay marker, because the drop it just performed is
+// exactly what makes the replay necessary. The marker is what carries that
+// obligation past this poll — see reworkLedger.Adopting.
 func adoptReworkBranch(rootKey, branch string) {
 	mutateReworkLedger(func(led *reworkLedger) {
 		if led.Branches[rootKey] == branch {
@@ -287,6 +336,10 @@ func adoptReworkBranch(rootKey, branch string) {
 			led.Branches = map[string]string{}
 		}
 		led.Branches[rootKey] = branch
+		if led.Adopting == nil {
+			led.Adopting = map[string]bool{}
+		}
+		led.Adopting[rootKey] = true
 	})
 }
 
@@ -323,7 +376,14 @@ func applyReworkRenames(led *reworkLedger, rootKey string, tracked map[string][]
 			// The mark follows the content: the destination inherits the evidence
 			// already spent, so a churned-then-renamed path cannot be re-seeded from
 			// stale presence under its new name.
-			tombstoneReworkSeededPath(led, rootKey, to, consumed)
+			//
+			// The DESTINATION's own evidence is spent by the same act, and taking the
+			// later of the two is what makes the carry mean anything: stamps are
+			// per-path, so a mark holding only the source's stamp is compared against a
+			// different path's clock, and the agent that renamed the file has usually
+			// recorded the new name too — which would clear the very gate it was just
+			// handed. Only a write NEWER than the rename re-authorizes.
+			tombstoneReworkSeededPath(led, rootKey, to, max(consumed, evidence.writeStampFor(to)))
 		}
 		spans := tracked[from]
 		if len(spans) == 0 {
@@ -334,7 +394,8 @@ func applyReworkRenames(led *reworkLedger, rootKey string, tracked map[string][]
 		// The source is tombstoned with the evidence current NOW, not with an empty
 		// token: a file later recreated at this path is a different file, and an
 		// empty mark would let the departed file's still-live path evidence seed it.
-		tombstoneReworkSeededPath(led, rootKey, from, evidence.writeStampFor(from))
+		// Never BELOW a mark it already carried, or the move would loosen the gate.
+		tombstoneReworkSeededPath(led, rootKey, from, max(consumed, evidence.writeStampFor(from)))
 	}
 	for _, m := range moves {
 		existing := tracked[m.to]
@@ -499,12 +560,20 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 // commit really was accounted for. Only the ledger state a later commit needs in
 // order to recognise its own churn is rebuilt, and only silently.
 //
-// It is called ONLY on a poll that adopted the branch, which is what makes it
-// safe to fold a commit the ledger may have seen before: adoption has just
-// emptied this root's state, so there is nothing to apply twice. Without that
-// guard, gitNewCommits' cursor-recovery path — which re-surfaces the newest
-// commits wholesale after a history rewrite — would re-fold commits whose spans
-// are already tracked and remap surviving ranges a second time.
+// It is called ONLY while the root OWES an adoption replay (reworkLedger.
+// Adopting), which is what makes it safe to fold a commit the ledger may have
+// seen before: adoption emptied this root's state, and the range being replayed
+// runs forward from that empty ledger to the root's head, so nothing is applied
+// twice. Without that guard, gitNewCommits' cursor-recovery path — which
+// re-surfaces the newest commits wholesale after a history rewrite — would
+// re-fold commits whose spans are already tracked and remap surviving ranges a
+// second time.
+//
+// The marker outlives the adopting poll deliberately: the budget and burst caps
+// hand an adopted branch's commits over several polls, and an authorization that
+// died with the first poll left the remainder skipped — the branch either
+// silently empty, or worse, holding spans positioned mid-branch for the next
+// live commit to remap into lines nobody wrote.
 //
 // Costs one `git show` per replayed commit, on adoption polls only; a steady-state
 // poll on an unchanged branch replays nothing.

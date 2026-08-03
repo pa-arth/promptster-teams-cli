@@ -154,14 +154,18 @@ func TestDurabilityHarvestedPathDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	}
 }
 
-// TestDurabilitySeedTombstoneExpiresWhenThePathGoesQuiet pins the tombstone's
-// LIFETIME, which is the whole design question the fix turns on. A permanent
-// tombstone would grow the ledger without bound; too short a one re-opens the
-// hole. The tombstone lives durabilitySeedTombstoneTTLms past the LAST commit to
-// the path, so an actively-worked path is protected forever while a path nobody
-// has touched for a full window drops out — by which time the 7-day AI path
-// evidence that could re-fire the seed is long dead anyway.
-func TestDurabilitySeedTombstoneExpiresWhenThePathGoesQuiet(t *testing.T) {
+// TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite pins BOTH
+// directions of the tombstone's boundary, which is the whole design question the
+// fix turns on and is the rule the sibling rework ledger already states.
+//
+// Too permissive fabricates: a human commit to a path the AI-paths ledger still
+// carries is not a write, and re-seeding on that presence relabels the human's
+// lines AI. Too restrictive silences the agent loop: the file the AI keeps
+// rewriting is exactly the one that churns out, and blocking it outright made
+// every iteration after the first invisible for good. Only forward motion of the
+// per-path write stamp separates the two, and it must be paid for once — the
+// same write cannot re-authorize a second re-entry.
+func TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	ws, git, gitOut := gitRepo(t)
 	writeCommitFile(t, ws, "base.txt", "base\n")
@@ -173,7 +177,7 @@ func TestDurabilitySeedTombstoneExpiresWhenThePathGoesQuiet(t *testing.T) {
 	sess := Session{DeviceID: "dev", TaskRoot: ws}
 	const t0 int64 = 1_000_000_000_000
 
-	recordAiTouchedPath("sess-ttl", key, "app.go")
+	recordAiTouchedPath("sess-ev", key, "app.go")
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
@@ -183,25 +187,102 @@ func TestDurabilitySeedTombstoneExpiresWhenThePathGoesQuiet(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "human rewrites all of app.go")
 	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
-
-	// A commit inside the window is blocked (defect 1) and REFRESHES the stamp.
-	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\n")
-	git("add", "-A")
-	git("commit", "-m", "human appends inside the window")
-	inWindow := t0 + dayMs + durabilitySeedTombstoneTTLms - dayMs
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), inWindow)
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
-		t.Fatalf("inside the tombstone window the seed must stay blocked, got %d lines", got)
+		t.Fatalf("setup: the full churn must empty the path, got %d lines", got)
 	}
 
-	// One full TTL after the LAST touch the path is quiet enough to be treated as
-	// unseen again. (This is the deliberate ceiling on tombstone growth.)
-	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nh5\n")
+	// A human commit with the path still sitting in the 7-day presence cache. No
+	// agent has written it since the seed we already spent, so nothing re-enters —
+	// however many such commits land, and however long the path stays present.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\n")
 	git("add", "-A")
-	git("commit", "-m", "much later")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), inWindow+durabilitySeedTombstoneTTLms+dayMs)
+	git("commit", "-m", "human appends")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	if got := trackedLineCount(t, key, "app.go"); got != 0 {
+		t.Fatalf("path presence re-seeded human code as AI: %d lines tracked", got)
+	}
+
+	// The agent writes the file again. That is direct per-path evidence, strictly
+	// newer than the stamp already spent, so the path re-enters — with a FRESH
+	// lineage and a FRESH birth stamp, because this is new work and not a
+	// continuation of the span that churned out.
+	recordAiTouchedPath("sess-ev", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nb1\nb2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai writes app.go again")
+	sha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs)
+	spans := ledgerRanges(t, key, "app.go")
+	if len(spans) == 0 {
+		t.Fatal("a fresh agent write was silenced: the path must re-enter the ledger")
+	}
+	if got, want := spans[0].LineageID, durLineageID(sha, "app.go"); got != want {
+		t.Errorf("lineage = %q, want a FRESH lineage %q", got, want)
+	}
+	if got := spans[0].BornTsMs; got != t0+3*dayMs {
+		t.Errorf("BornTsMs = %d, want a FRESH stamp %d", got, t0+3*dayMs)
+	}
+
+	// That write is now spent. Churn the re-entered spans back out and commit
+	// human lines again: the SAME stamp must not buy a second re-entry.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nc1\nc2\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites the new AI lines")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+4*dayMs)
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nc1\nc2\nc3\n")
+	git("add", "-A")
+	git("commit", "-m", "human appends again")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+5*dayMs)
+	if got := trackedLineCount(t, key, "app.go"); got != 0 {
+		t.Errorf("a spent write authorized a second re-entry: %d lines tracked, want 0", got)
+	}
+}
+
+// TestDurabilityHarvestedPathStaysVisibleToLaterAiWork is the concrete sequence
+// the tombstone's first shape got wrong, and it is the common one rather than an
+// edge: the AI creates a file, it seeds, thirty days later harvestDurable emits
+// `durable` and drops the path, and the AI goes on working in that same file.
+//
+// Every rail is gone by then except the path fallback — the fingerprints from the
+// original commit expired at 14 days, well short of the 30-day maturation — and
+// that fallback was blocked, while refreshing its own mark on every blocked
+// attempt. Live AI work was therefore the thing keeping the file buried, so the
+// ledger reported nothing further from a file the agent never stopped writing.
+func TestDurabilityHarvestedPathStaysVisibleToLaterAiWork(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	const t0 int64 = 1_000_000_000_000
+
+	recordAiTouchedPath("sess-mature", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds app.go")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+
+	if v := harvestDurable(sess, ws, key, t0+31*dayMs); len(v) == 0 {
+		t.Fatal("setup: expected a durable harvest at 31d")
+	}
+	if got := trackedLineCount(t, key, "app.go"); got != 0 {
+		t.Fatalf("setup: harvest must drop matured spans, %d still tracked", got)
+	}
+
+	// The agent writes the same file again, a month into its life.
+	recordAiTouchedPath("sess-mature", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\nb1\nb2\n")
+	git("add", "-A")
+	git("commit", "-m", "ai extends app.go a month later")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+32*dayMs)
+
 	if got := trackedLineCount(t, key, "app.go"); got == 0 {
-		t.Error("the tombstone never expires — the seeded-path set grows without bound")
+		t.Errorf("AI work on a harvested path is invisible: 0 lines tracked, want the new lines (ranges %+v)",
+			ledgerRanges(t, key, "app.go"))
 	}
 }
 
@@ -479,13 +560,17 @@ func TestParseUnifiedDiffRenames(t *testing.T) {
 }
 
 // TestDurabilityTombstonesPrunedOnAQuietRoot pins the tombstone set's growth
-// bound, which the TTL alone does not give: an expired mark only leaves the
-// ledger when something walks it. Pruning from the commit loop is not enough,
-// because a root whose default branch stops advancing (a repo-wide reformat
-// churns every tracked path, then the work moves elsewhere) processes no further
-// commits — its marks would sit in durability.json forever. The per-poll harvest
-// prunes BEFORE its empty-root early return, which is exactly the state that root
-// is left in.
+// bound, which the block alone does not give: a mark only leaves the ledger when
+// something walks it. Pruning from the commit loop is not enough, because a root
+// whose default branch stops advancing (a repo-wide reformat churns every tracked
+// path, then the work moves elsewhere) processes no further commits — its marks
+// would sit in durability.json forever. The per-poll harvest prunes BEFORE its
+// empty-root early return, which is exactly the state that root is left in.
+//
+// What makes dropping the mark safe is that it is bounded by EVIDENCE, not by
+// time: the path fallback cannot fire for a path with no live per-path write
+// stamp, and a stamp that reappears later is by definition a newer write, which
+// the gate would authorize with or without the mark.
 func TestDurabilityTombstonesPrunedOnAQuietRoot(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	ws, git, gitOut := gitRepo(t)
@@ -517,14 +602,19 @@ func TestDurabilityTombstonesPrunedOnAQuietRoot(t *testing.T) {
 		t.Fatal("a fully churned root should have no tracked paths left")
 	}
 
+	// The AI evidence for the path ages out of the 7-day ai-paths ledger, which is
+	// what makes the mark inert: nothing can seed this path from presence again.
+	if err := os.Remove(aiPathsLedgerPath()); err != nil {
+		t.Fatalf("expire the ai-paths evidence: %v", err)
+	}
+
 	// The default branch never moves again, so no commit is ever processed for
 	// this root. Only the per-poll harvest runs — and it must still collect the
-	// expired mark.
-	quiet := t0 + dayMs + durabilitySeedTombstoneTTLms + dayMs
-	harvestDurable(sess, ws, key, quiet)
+	// inert mark.
+	harvestDurable(sess, ws, key, t0+2*dayMs)
 
 	if got := loadDurabilityLedger().Seeded[key]; len(got) != 0 {
-		t.Errorf("expired tombstones survive on a root whose branch stopped advancing: %+v", got)
+		t.Errorf("inert tombstones survive on a root whose branch stopped advancing: %+v", got)
 	}
 }
 

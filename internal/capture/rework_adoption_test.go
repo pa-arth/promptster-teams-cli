@@ -2,6 +2,7 @@ package capture
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,6 +176,11 @@ func TestReworkReplayOnlyRunsOnAdoption(t *testing.T) {
 	if len(before) != 1 || before[0].Start != 1 || before[0].End != 3 {
 		t.Fatalf("setup: want a single 1..3 span, got %+v", before)
 	}
+	// The authorization must not simply become permanent to survive a multi-poll
+	// range: this root drained in the poll that adopted it, so it owes nothing.
+	if loadReworkLedger().Adopting[key] {
+		t.Fatal("setup: a drained root still owes a replay")
+	}
 
 	// Point the cursor at an object that is not in the repo — what a rebase or a
 	// pruned worktree leaves behind — so the commit re-surfaces and is skipped
@@ -236,5 +242,145 @@ func TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree(t *testing.T) {
 	// for state must not emit a second one.
 	if n := countSha(attributedShas(t, state.OutboxPath()), sha1); n != 0 {
 		t.Errorf("commit %s attributed %d times by this root, want 0 — the other worktree owns it", sha1, n)
+	}
+}
+
+// ── The replay outlives the poll that authorized it ──────────────────────────
+//
+// Adoption empties the root, but the commits that rebuild it are handed over by
+// pollGitWatch under two caps — a per-poll budget shared across roots, and a
+// per-root burst clamp — so an adopted branch's range routinely spans several
+// polls. Every poll after the first sees an UNCHANGED branch, so an
+// authorization derived from "this poll changed the branch" expires with the
+// range still half-replayed. The two tests below are the two ways that happens,
+// and they fail differently: one loses the branch outright, the other leaves
+// spans stranded mid-branch for a later commit to churn into a verdict about
+// lines nobody wrote.
+
+// TestReworkAdoptionReplaysAfterABudgetDeferredPoll is the LOSS shape. The
+// adopting poll reaches this root with the shared budget already spent, so the
+// root is deferred WHOLE: its cursor does not move and it surfaces no commits at
+// all — after adoption has already dropped its state. Every later poll sees the
+// branch it already recorded, so nothing ever replays and the branch keeps an
+// empty ledger permanently.
+func TestReworkAdoptionReplaysAfterABudgetDeferredPoll(t *testing.T) {
+	ws, git, gitOut, key, sess := adoptionRepo(t)
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-defer", key, "a.go")
+	writeCommitFile(t, ws, "a.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds a.go")
+	sha1 := gitOut("rev-parse", "HEAD")
+
+	// Another worktree already attributed it, so this root will skip it.
+	recordAttributedCommits([]string{sha1}, time.Now().UnixMilli())
+
+	// The adopting poll: the budget is gone before this root is reached, so
+	// pollGitWatch defers it untouched and the loop never sees a commit for it.
+	orig := gitWatchMaxCommitsPerPollTotal
+	defer func() { gitWatchMaxCommitsPerPollTotal = orig }()
+	gitWatchMaxCommitsPerPollTotal = 0
+	pollGitWatchWorkspace(sess)
+	gitWatchMaxCommitsPerPollTotal = orig
+
+	if c := reworkCovered(key, "a.go"); len(c) != 0 {
+		t.Fatalf("setup: a deferred root cannot have folded anything yet, got %+v", c)
+	}
+
+	// The deferred commit drains on the next poll — with the branch unchanged.
+	pollGitWatchWorkspace(sess)
+	if c := reworkCovered(key, "a.go"); len(c) != 3 {
+		t.Fatalf("the deferred range never replayed, so the branch holds no AI spans: covered=%+v", c)
+	}
+
+	// The loss that reaches the product: rewriting those AI lines.
+	writeCommitFile(t, ws, "a.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "rewrite a.go")
+	pollGitWatchWorkspace(sess)
+	if got := reworkVerdictPaths(t); len(got) != 1 || got[0] != "a.go" {
+		t.Fatalf("rework_verdicts = %v, want exactly one for a.go", got)
+	}
+}
+
+// TestReworkAdoptionClampedBurstDoesNotStrandSpansMidBranch is the FABRICATION
+// shape, and it is worse than the loss: the adopting poll replays only the
+// OLDEST slice of the branch (clampCommitBurst keeps the tail and advances the
+// cursor to it), so the ledger ends up holding spans positioned as of the middle
+// of the branch while the working tree stands at its head. Those coordinates
+// address whatever happens to live there now — human lines — and the next commit
+// that rewrites them emits a rework_verdict about code the AI never wrote.
+//
+// The geometry is built so the two states are distinguishable and only one of
+// them is right: the AI span sits at 21..23 after the first commit and at 31..33
+// after the second, and the final commit rewrites head lines 21..23, which are
+// human filler. A correct ledger reports NOTHING for it. Asserting absence is
+// the point — a wrong count and a missing count must not pass the same check.
+func TestReworkAdoptionClampedBurstDoesNotStrandSpansMidBranch(t *testing.T) {
+	origPerRoot := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1 // one commit per poll: the branch drains over two
+	defer func() { gitWatchMaxCommitsPerPoll = origPerRoot }()
+
+	ws, git, gitOut, key, sess := adoptionRepo(t)
+
+	// 20 human filler lines land on the default branch, so they are never part of
+	// the range the adoption replays.
+	var filler strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&filler, "f%d\n", i)
+	}
+	writeCommitFile(t, ws, "a.go", filler.String())
+	git("add", "-A")
+	git("commit", "-m", "human writes a.go")
+	pollGitWatchWorkspace(sess)
+
+	git("checkout", "-b", "feature")
+
+	// c1: the AI appends three lines, far below the top of the file → span 21..23.
+	recordAiTouchedPath("sess-clamp", key, "a.go")
+	writeCommitFile(t, ws, "a.go", filler.String()+"a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai appends to a.go")
+	sha1 := gitOut("rev-parse", "HEAD")
+
+	// c2: a human prepends ten lines. That hunk is nowhere near the AI span, so it
+	// SHIFTS it rather than churning it → 31..33.
+	var head strings.Builder
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&head, "h%d\n", i)
+	}
+	writeCommitFile(t, ws, "a.go", head.String()+filler.String()+"a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "human prepends to a.go")
+	sha2 := gitOut("rev-parse", "HEAD")
+
+	recordAttributedCommits([]string{sha1, sha2}, time.Now().UnixMilli())
+
+	pollGitWatchWorkspace(sess) // adopts, replays only the oldest commit (c1)
+	pollGitWatchWorkspace(sess) // c2 drains here, with the branch unchanged
+
+	spans := loadReworkLedger().Roots[key]["a.go"]
+	if len(spans) != 1 || spans[0].Start != 31 || spans[0].End != 33 {
+		t.Errorf("the adopted branch's spans are not where its head put them: %+v", spans)
+	}
+
+	// Rewrite head lines 21..23 — human filler, and exactly where the stranded
+	// spans would have been.
+	var reworked strings.Builder
+	for i := 1; i <= 20; i++ {
+		if i >= 11 && i <= 13 {
+			fmt.Fprintf(&reworked, "x%d\n", i)
+			continue
+		}
+		fmt.Fprintf(&reworked, "f%d\n", i)
+	}
+	writeCommitFile(t, ws, "a.go", head.String()+reworked.String()+"a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites its own lines")
+	pollGitWatchWorkspace(sess)
+
+	if got := reworkVerdictPaths(t); len(got) != 0 {
+		t.Fatalf("rework_verdict emitted over lines the AI never wrote: %v", got)
 	}
 }
