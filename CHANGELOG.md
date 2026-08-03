@@ -114,6 +114,43 @@ follows [Semantic Versioning](https://semver.org/).
   wrote. Reports move for existing branches: spans reappear, and rewrites that
   previously emitted nothing now emit the verdict they always should have.
 
+- **A new local copy of a repository showed none of the branch's existing AI
+  history.** A fresh `git worktree add` is a new absolute path, which is a new
+  watcher root, which cold-starts: the cursor is baselined straight to the
+  branch's head and none of its existing commits are ever surfaced. The branch
+  adoption that PR #128 added still fired — a new root has no recorded branch —
+  so the root declared it owed a rebuild and then finished it in the same poll
+  having rebuilt nothing. The copy read as though the branch held no AI work at
+  all, and every later rewrite of its AI lines emitted no `rework_verdict`. It is
+  the same silent under-report as the adopted-branch loss above, reached through
+  cold start instead of through the already-attributed skip, and running several
+  worktrees against one repository is the ordinary move that hits it.
+
+  A cold-started root now re-folds its branch's own commits (`default..HEAD`) for
+  their STATE alone, on the same terms as the adoption rebuild: nothing is
+  re-attributed, no fingerprints are re-recorded, and no verdict is re-emitted.
+  It is gated on this device *already holding attribution* for at least one
+  commit in the range, which is what leaves a genuinely fresh install untouched —
+  a new machine has nothing attributed, so the range is dropped without a single
+  `git show` and cold start stays the silent baseline it has always been. This
+  recovers history the device measured through another copy; it does not import
+  history it never saw.
+
+  The range is taken whole or not at all. A branch further past its default
+  branch than the per-root cap allows is refused rather than replayed in part,
+  because a partial rebuild has to start mid-branch and both ends of that cut
+  invent rather than lose: the older end leaves spans positioned a commit behind
+  head, where they address whatever lives there now, and the newer end makes the
+  first commit replayed look like a first touch, so a human's added lines on an
+  AI-touched path are seeded as AI. Those branches keep the old behaviour and
+  under-report, which is the direction these ledgers always resolve toward.
+
+  **Reported figures will move for anyone who cuts a fresh worktree.** A copy
+  that previously showed no pre-merge AI spans now shows the branch's, and
+  rewrites in it that emitted nothing now emit the verdict they always should
+  have. Nothing is re-sent for commits already accounted for, so totals rise from
+  work that was being dropped, not from double counting.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for

@@ -395,6 +395,59 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 	return shas, true
 }
 
+// gitBranchCommitsSinceDefault lists the commits a root's checked-out branch
+// holds that the default branch does not — the branch's own pre-merge range,
+// newest-first. It is the replay range for a cold-started root (see
+// replayReworkForColdStartBranch); nothing else calls it, and it never advances
+// a cursor.
+//
+// It returns NOTHING when that range exceeds gitWatchMaxCommitsPerPoll, and the
+// refusal — rather than a clamp — is the point.
+//
+// The range is replayed ONCE, from the empty ledger adoption just left, because
+// a cold-start cursor is already at head and no later poll re-surfaces any of
+// it. So a partial replay is not "the remainder drains next poll", which is what
+// clampCommitBurst's clamp means; it is a replay that STARTS MID-BRANCH, from a
+// state live tracking would never have been in. Both ends go wrong there, and
+// both go wrong toward FABRICATION rather than loss:
+//
+//   - keeping the OLDEST slice (clampCommitBurst's direction) leaves the rebuilt
+//     spans positioned as of the middle of the branch while the working tree
+//     stands at its head, so the next commit to rewrite those coordinates emits a
+//     verdict about lines nobody wrote — the shape
+//     TestReworkAdoptionClampedBurstDoesNotStrandSpansMidBranch pins;
+//   - keeping the NEWEST slice ends at head, but makes the first replayed commit
+//     look like a FIRST TOUCH of every path it edits. The path-presence inference
+//     that is correct at a branch's real base then seeds that commit's added
+//     lines on an AI-touched path as AI — including a human's. Measured, not
+//     reasoned: a two-commit branch replayed under a cap of one seeded the ten
+//     lines a human prepended.
+//
+// So a branch more than gitWatchMaxCommitsPerPoll commits past its default
+// branch keeps the pre-fix behaviour and that copy under-reports it — the
+// direction these ledgers always resolve toward, and the reason this returns a
+// whole range or none of it.
+//
+// One read-only spawn (the default ref itself is cached).
+func gitBranchCommitsSinceDefault(root string) []string {
+	defRef := durabilityDefaultRef(root)
+	if defRef == "" {
+		return nil // no resolvable default branch — no pre-merge range to speak of
+	}
+	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and defRef is a ref name resolved by git itself, not user input. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", defRef+"..HEAD").Output()
+	if err != nil {
+		return nil
+	}
+	shas := parseRevListShas(out)
+	if len(shas) > gitWatchMaxCommitsPerPoll {
+		state.HookDebugf("git-watch: cold-start branch on %s holds %d commit(s) past the default branch, over the per-root cap %d; replaying none of it rather than starting mid-branch",
+			gitWatchRootKey(root), len(shas), gitWatchMaxCommitsPerPoll)
+		return nil
+	}
+	return shas
+}
+
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
 // keeping the OLDEST cap commits (rev-list is newest-first, so the tail). The
 // caller advances the cursor only to the newest returned SHA, so the remainder
@@ -481,11 +534,20 @@ func saveGitWatchCursors(heads map[string]string) {
 // act on that, and it must: state it drops on the strength of "this root's
 // commits are being processed now" (branch adoption) stays owed for exactly as
 // long as this flag is false.
-func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
+//
+// The third return names the roots that COLD-STARTED here — baselined with no
+// prior cursor at all. It is reported rather than acted on, because the cursor
+// discipline must not change: a cold-start root still reports nothing and still
+// emits nothing. What the flag buys the caller is the ability to tell "this root
+// has never been seen" apart from "this root has nothing new", which are
+// identical from here (both baseline to head and drain) and mean opposite things
+// to branch adoption — see replayReworkForColdStartBranch.
+func pollGitWatch(roots []string) (map[string][]string, map[string]bool, map[string]bool) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
 	drained := map[string]bool{}
+	coldStart := map[string]bool{}
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -504,8 +566,19 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
-		if !hadCursor || lastSeen == head {
-			newHeads[key] = head // cold start (baseline only) or nothing moved
+		if !hadCursor {
+			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
+			// and it is the whole reason this case is no longer folded in with
+			// "nothing moved" below — the two are indistinguishable from here and a
+			// root that has never been seen is precisely the one whose branch may hold
+			// AI history this device recorded through another copy of the repo.
+			newHeads[key] = head
+			drained[key] = true
+			coldStart[key] = true
+			continue
+		}
+		if lastSeen == head {
+			newHeads[key] = head // nothing moved
 			drained[key] = true
 			continue
 		}
@@ -549,7 +622,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 	}
 
 	saveGitWatchCursors(newHeads)
-	return detected, drained
+	return detected, drained, coldStart
 }
 
 // pollGitWatchWorkspace enumerates the workspace's roots (workspace + its git
@@ -574,7 +647,7 @@ func pollGitWatchWorkspace(session Session) {
 		aiRoots,
 		loadDiscoveredRepos(nowMs),
 	))
-	detected, drained := pollGitWatch(roots)
+	detected, drained, coldStart := pollGitWatch(roots)
 
 	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
 	// detected this poll. A merely-idle repo is left to age out after the horizon.
@@ -650,6 +723,18 @@ func pollGitWatchWorkspace(session Session) {
 				pending = true
 			}
 			adopting = pending
+		}
+
+		// A root that has never been polled before — the ordinary `git worktree add`
+		// — is a NEW rootKey, so pollGitWatch cold-started it: the cursor went
+		// straight to head and none of the branch's existing commits were surfaced.
+		// The adoption above still fires (a new key has no recorded branch), so
+		// without this the root declares its replay owed and finishes it below having
+		// replayed nothing, leaving that copy of the branch with no AI spans at all.
+		// The replay is one-shot by construction and takes its own range from git,
+		// because there is no cursor for a later poll to drain against.
+		if adopting && coldStart[rootKey] {
+			replayReworkForColdStartBranch(session, root, attributed, nowMs)
 		}
 
 		commits := detected[rootKey]

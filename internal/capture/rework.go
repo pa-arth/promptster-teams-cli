@@ -593,6 +593,75 @@ func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64
 	foldReworkCommit(session, root, sha, diff, files, nowMs)
 }
 
+// replayReworkForColdStartBranch rebuilds the rework state a BRAND-NEW root — an
+// ordinary `git worktree add` — would otherwise never see, emitting nothing.
+//
+// Why it has to exist. A new worktree is a new gitWatchRootKey, so pollGitWatch
+// COLD-STARTS it: the cursor is baselined straight to head and the branch's
+// existing commits are never surfaced. adoptReworkBranch fires all the same (a
+// new key has no recorded branch), so the root correctly declares it OWES a
+// replay — and there is nothing for the replay to run against. It is the same
+// silent under-report as replayReworkForAdoptedCommit's, reached through cold
+// start instead of through the attributed-commits skip, and the captain's normal
+// case reaches it: several worktrees against one repository.
+//
+// THE RANGE is the branch's own commits, default..HEAD — exactly the scope
+// rework covers — folded oldest-first into the empty ledger adoption just left,
+// so nothing is applied twice and the last commit folded IS head. Spans are
+// therefore addressed in head's line space, which is the only position that is
+// not a fabrication waiting for the next commit to remap it.
+//
+// THE GATE is that this device already holds attribution for at least one commit
+// in the range. That is what keeps a genuinely fresh install unchanged: a new
+// machine's attributed-commits ledger is empty, so the range is dropped without a
+// single `git show` and cold start stays the silent baseline it has always been.
+// This recovers history the device measured through another copy of the repo; it
+// does not import history it never saw.
+//
+// EVERY commit in the range is folded, not only the attributed ones. A fold that
+// skipped the gaps would leave the spans it did rebuild un-shifted by the hunks
+// the skipped commits inserted — coordinates pointing at lines nobody wrote,
+// which is the fabrication this ledger refuses ahead of any coverage. Emission is
+// unaffected either way: replayReworkForAdoptedCommit emits nothing, so no
+// commit_attribution and no rework_verdict is shipped for a range this device
+// already accounted for, and an unattributed commit inside the range stays as
+// unreported as cold start always left it.
+//
+// THE WHOLE RANGE OR NONE OF IT. gitBranchCommitsSinceDefault refuses a branch
+// longer than gitWatchMaxCommitsPerPoll outright rather than clamping it, because
+// a replay that starts mid-branch fabricates at either end — see the two measured
+// failure modes documented there. That is also what bounds the cost: at most
+// gitWatchMaxCommitsPerPoll `git show` spawns, once per root for the life of that
+// root's cursor.
+//
+// The poll-wide budget (gitWatchMaxCommitsPerPollTotal) deliberately does not
+// gate it: that budget bounds INGEST EMISSION, of which this path produces none,
+// and deferring a cold-start replay would defer it forever — the cursor is
+// already at head, so a replay skipped here never comes back. Bounding it twice
+// would buy one poll's worth of git spawns at the price of the permanent silent
+// loss this exists to close.
+func replayReworkForColdStartBranch(session Session, root string, attributed map[string]struct{}, nowMs int64) {
+	shas := gitBranchCommitsSinceDefault(root)
+	if len(shas) == 0 {
+		return
+	}
+	known := false
+	for _, sha := range shas {
+		if _, ok := attributed[sha]; ok {
+			known = true
+			break
+		}
+	}
+	if !known {
+		return // nothing this device has ever measured — cold start stays cold
+	}
+	state.HookDebugf("git-watch: cold-start root %s adopted a branch this device already attributed; replaying %d commit(s) for rework state",
+		gitWatchRootKey(root), len(shas))
+	for i := len(shas) - 1; i >= 0; i-- { // oldest-first: rework is stateful
+		replayReworkForAdoptedCommit(session, root, shas[i], nowMs)
+	}
+}
+
 // reworkVerdictData is the CLOSED payload of a rework_verdict event: the commit
 // that did the rework, the path, and the AI ranges it churned (old-side line
 // numbers, with the age each AI span lived before being reworked). Scalars only.

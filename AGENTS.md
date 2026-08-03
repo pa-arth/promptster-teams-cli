@@ -698,10 +698,35 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   mid-branch: the next live commit remapped those into a verdict about lines
   nobody wrote. `pollGitWatch`'s second return is what says a root drained.
 
+- **A NEW ROOT is a third way into that same loss, and it is one-shot.** A fresh
+  `git worktree add` is a new `gitWatchRootKey`, so `pollGitWatch` cold-starts it:
+  the cursor goes straight to head and the branch's commits are never surfaced,
+  while adoption fires anyway and immediately finishes a rebuild that rebuilt
+  nothing. `replayReworkForColdStartBranch` folds `default..HEAD` for state,
+  gated on this device ALREADY holding attribution for a commit in the range —
+  that gate, not the cold-start cursor, is what keeps a fresh install from
+  importing history it never measured. It takes the range WHOLE or not at all
+  (`gitBranchCommitsSinceDefault`): unlike `clampCommitBurst`, there is no later
+  poll to drain a remainder, so a partial replay starts mid-branch and both cut
+  ends FABRICATE — the older leaves spans a commit behind head, the newer makes
+  the first replayed commit look like a first touch and seeds a human's added
+  lines on an AI-touched path as AI (measured, not predicted).
+
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
 and the commit would never reach `pollReworkCommit` at all. It returns the raw
 diff on that path specifically so renames still land.
+
+**Known gap, unfixed: AI-path evidence is keyed PER WORKTREE, so a second
+worktree reconciles the same commit as `unknown`.** `resolveLedgerScope` looks
+evidence up under `rel(taskRoot, root)/<path>`, but capture recorded it under the
+path of whichever worktree the agent actually edited in. Verified on one commit:
+`likely_ai` from the original checkout, `unknown` from a `git worktree add` copy
+of the same branch. This bounds every cross-worktree recovery path above — they
+replay the right commits and find no AI ranges to seed — and it is upstream of
+rework, so it affects `commit_attribution` itself.
+`TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` does not catch it:
+it simulates the second worktree inside ONE directory.
 
 ## Maintaining this file
 
