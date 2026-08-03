@@ -411,10 +411,16 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) (recordable bool) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
-		// Nothing to ATTRIBUTE, and nothing a retry would change — but a pure rename
-		// is precisely this shape, and rework still has to carry the renamed file's
-		// tracked spans across. It gets no attributable files, so it can only move
-		// spans, never seed: a rename is not evidence that anyone wrote anything.
+		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
+		// shapes land here that rework still has to see. A pure RENAME: its tracked
+		// spans must be carried to the new path or they strand at a dead one. A
+		// DELETE-only commit: parseUnifiedDiffHunks keys those hunks under the old
+		// path, so rework churns the deleted spans and EMITS a rework_verdict, which
+		// is correct — deleting AI lines pre-merge is discarded AI work, and the
+		// early return used to strand them until merge.
+		//
+		// Passing no attributable files means neither shape can SEED: removing a file
+		// is not evidence that anyone wrote anything.
 		if preMerge && diff != "" {
 			pollReworkCommit(session, root, sha, diff, nil, nowMs)
 		}

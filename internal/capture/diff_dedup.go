@@ -174,21 +174,43 @@ func readAiTouchedPaths(rootKey string) map[string]string {
 	return out
 }
 
-// aiPathMark is one path's AI-write evidence: which session wrote it and WHEN
-// that path was last written. WriteMs is per-path (aiPathsEntry.PathTs), falling
-// back to the session's activity stamp for a ledger written before PathTs
-// existed.
+// aiPathMark is one path's AI-write evidence: which session owns it, and WHEN an
+// agent last WROTE that path.
+//
+// The two fields answer different questions and are deliberately derived
+// differently. SessionID is a per-SESSION choice (who to attribute to). WriteMs
+// is per-PATH evidence and must be exactly that: a value that can move without an
+// agent having written this path is not evidence, and a consumer that reads it as
+// "has the agent written this again" would be re-authorized by nothing. WriteMs
+// is therefore 0 whenever no live session carries a per-path stamp — never the
+// session's activity stamp, which any write to any other file bumps.
 type aiPathMark struct {
 	SessionID string
 	WriteMs   int64
 }
 
 // readAiPathMarks is readAiTouchedPaths' full-fidelity form: it keeps the write
-// stamp that readAiTouchedPaths throws away. Selection between sessions is
-// IDENTICAL (newest session wins, lexicographic sessionId breaks an exact tie),
-// so the two readers can never disagree about which session owns a path.
+// stamp that readAiTouchedPaths throws away. SessionID selection is IDENTICAL
+// (newest session wins, lexicographic sessionId breaks an exact tie), so the two
+// readers can never disagree about which session owns a path and attribution's
+// primarySession is unaffected.
+//
+// WriteMs is accumulated INDEPENDENTLY of that selection, as the max per-path
+// stamp across every live in-scope session. Tying it to the winner instead let it
+// move backwards with nobody touching the file: two sessions that both wrote a
+// path, the later one wins, and then the earlier one writing some UNRELATED file
+// overtakes it on session activity and hands back its own older per-path stamp. A
+// max over sessions cannot regress, so only a genuine new write advances it.
+//
+// A missing stamp stays 0 rather than borrowing entry.TsMs. That is the deployed
+// case, not an edge case: an ai-paths.json written before PathTs existed has
+// Paths populated and no stamps at all, and the ledger version is deliberately
+// NOT bumped (that would discard the whole cache), so those entries are read for
+// their full TTL. 0 reads downstream as "no per-write evidence", which is the
+// undercount-never-inflation direction.
 func readAiPathMarks(rootKey string) map[string]aiPathMark {
-	out := map[string]aiPathMark{}
+	sessionFor := map[string]string{}
+	writeMs := map[string]int64{}
 	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(aiPathsLedgerPath())
 		if err != nil {
@@ -211,18 +233,21 @@ func readAiPathMarks(rootKey string) map[string]aiPathMark {
 			for p := range entry.Paths {
 				// Newer session wins; on an exact-ts tie, the lexicographically
 				// smaller sessionId wins so repeated reads are deterministic.
-				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts || (entry.TsMs == ts && sid < out[p].SessionID) {
-					writeMs := entry.PathTs[p]
-					if writeMs == 0 {
-						writeMs = entry.TsMs
-					}
-					out[p] = aiPathMark{SessionID: sid, WriteMs: writeMs}
+				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts || (entry.TsMs == ts && sid < sessionFor[p]) {
+					sessionFor[p] = sid
 					bestTs[p] = entry.TsMs
+				}
+				if w := entry.PathTs[p]; w > writeMs[p] {
+					writeMs[p] = w
 				}
 			}
 		}
 		return nil
 	})
+	out := make(map[string]aiPathMark, len(sessionFor))
+	for p, sid := range sessionFor {
+		out[p] = aiPathMark{SessionID: sid, WriteMs: writeMs[p]}
+	}
 	return out
 }
 

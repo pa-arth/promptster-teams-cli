@@ -1,8 +1,11 @@
 package capture
 
 import (
+	"encoding/json"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 )
@@ -741,6 +744,195 @@ func TestReworkTombstoneBlocksInferenceWhileAgentWorksElsewhere(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("rewritten\n", 20))
 	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites their own lines", t0+3*dayMs); len(v) != 0 {
 		t.Errorf("fabricated rework_verdict over human-written lines: %+v", v)
+	}
+}
+
+// writeAiPathsLedger plants an ai-paths.json verbatim, so a test can build ledger
+// shapes recordAiTouchedPath no longer produces — notably an entry with Paths
+// populated and no per-path stamps, which is what every machine's ledger looks
+// like across a fleet upgrade (aiPathsLedgerVersion is deliberately not bumped).
+func writeAiPathsLedger(t *testing.T, led aiPathsLedger) {
+	t.Helper()
+	data, err := json.Marshal(led)
+	if err != nil {
+		t.Fatalf("marshal ai-paths ledger: %v", err)
+	}
+	if err := os.WriteFile(aiPathsLedgerPath(), data, 0o600); err != nil {
+		t.Fatalf("write ai-paths ledger: %v", err)
+	}
+}
+
+// TestReworkLegacyAiPathsGrantNoReEntry is mechanism (a). On a machine that was
+// capturing before per-path write stamps existed, every path in ai-paths.json has
+// presence and no stamp. Borrowing the SESSION's activity stamp to stand in for
+// the missing per-path one made the evidence move whenever the agent wrote ANY
+// file, so a tombstoned path was re-authorized by an agent editing something else
+// entirely — B3 again, reached through the migration window that covers the whole
+// deployed fleet.
+func TestReworkLegacyAiPathsGrantNoReEntry(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+	nowMs := time.Now().UnixMilli()
+
+	git("checkout", "-b", "feature")
+
+	// A pre-upgrade ledger: app.go is present, with NO per-path stamp anywhere.
+	writeAiPathsLedger(t, aiPathsLedger{
+		V: aiPathsLedgerVersion,
+		Sessions: map[string]aiPathsEntry{
+			"sess-legacy": {Paths: map[string]bool{"app.go": true}, TsMs: nowMs - 60_000, RootKey: key},
+		},
+	})
+
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	seedReworkCommit(t, ws, git, gitOut, "ai adds app.go", t0)
+	if c := reworkCovered(key, "app.go"); len(c) == 0 {
+		t.Fatalf("legacy path presence must still seed a FIRST touch, got %+v", c)
+	}
+
+	// A human rewrites every line: full churn, the path is tombstoned.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites app.go", t0+dayMs); len(v) == 0 {
+		t.Fatal("a full rewrite must emit a rework verdict")
+	}
+
+	// The agent writes an UNRELATED file. That bumps the session's activity stamp
+	// and nothing about app.go.
+	recordAiTouchedPath("sess-legacy", key, "other.go")
+	writeCommitFile(t, ws, "other.go", "o1\n")
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
+	seedReworkCommit(t, ws, git, gitOut, "agent writes other.go, human appends to app.go", t0+2*dayMs)
+
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("a legacy entry with no per-path stamp granted re-entry: %d human lines seeded as AI (%+v)", len(c), c)
+	}
+}
+
+// TestReworkWinnerFlipGrantsNoReEntry is mechanism (b), and unlike (a) it never
+// expires: concurrent agent sessions in one workspace are the normal case. The
+// owning session is chosen by SESSION activity while the stamp came from that
+// winner's own per-path record, so an older session overtaking a newer one on
+// activity — by writing a completely different file — handed back its own OLDER
+// stamp for this path. The evidence moved BACKWARDS with nobody touching the
+// file, and a `!=` comparison read that as a fresh write.
+func TestReworkWinnerFlipGrantsNoReEntry(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+	nowMs := time.Now().UnixMilli()
+
+	git("checkout", "-b", "feature")
+
+	// Two live sessions have both written app.go. s2 wrote it later, so s2 is the
+	// session app.go is read from and s2's stamp is the evidence.
+	writeAiPathsLedger(t, aiPathsLedger{
+		V: aiPathsLedgerVersion,
+		Sessions: map[string]aiPathsEntry{
+			"sess-a": {
+				Paths:   map[string]bool{"app.go": true},
+				PathTs:  map[string]int64{"app.go": nowMs - 30_000},
+				TsMs:    nowMs - 30_000,
+				RootKey: key,
+			},
+			"sess-b": {
+				Paths:   map[string]bool{"app.go": true},
+				PathTs:  map[string]int64{"app.go": nowMs - 10_000},
+				TsMs:    nowMs - 10_000,
+				RootKey: key,
+			},
+		},
+	})
+
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	seedReworkCommit(t, ws, git, gitOut, "ai adds app.go", t0)
+	if c := reworkCovered(key, "app.go"); len(c) == 0 {
+		t.Fatalf("expected app.go seeded, got %+v", c)
+	}
+
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites app.go", t0+dayMs); len(v) == 0 {
+		t.Fatal("a full rewrite must emit a rework verdict")
+	}
+
+	// The OLDER session writes a different file. Its activity stamp now leads, so
+	// it becomes the session app.go is read from — carrying its older app.go stamp.
+	recordAiTouchedPath("sess-a", key, "other.go")
+	writeCommitFile(t, ws, "other.go", "o1\n")
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
+	seedReworkCommit(t, ws, git, gitOut, "older session writes other.go, human appends to app.go", t0+2*dayMs)
+
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("a session winner flip granted re-entry: %d human lines seeded as AI (%+v)", len(c), c)
+	}
+}
+
+// TestReworkStaleEvidenceAfterTtlEvictionGrantsNoReEntry pins STRICTLY NEWER as
+// distinct from "changed". Reading the stamp as the max across live sessions
+// stops it flipping backwards on a winner change, but it can still legitimately
+// REGRESS: the session holding the newest write ages out of the 7-day ai-paths
+// TTL (or is evicted by the session cap) and an older session's stamp is all that
+// is left. That is a smaller number arriving with no new write behind it, so a
+// `!=` comparison would read the loss of evidence as fresh evidence.
+func TestReworkStaleEvidenceAfterTtlEvictionGrantsNoReEntry(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+	nowMs := time.Now().UnixMilli()
+	live := aiPathsEntry{
+		Paths:   map[string]bool{"app.go": true},
+		PathTs:  map[string]int64{"app.go": nowMs - 30_000},
+		TsMs:    nowMs - 30_000,
+		RootKey: key,
+	}
+
+	git("checkout", "-b", "feature")
+	writeAiPathsLedger(t, aiPathsLedger{V: aiPathsLedgerVersion, Sessions: map[string]aiPathsEntry{
+		"sess-old": live,
+		"sess-new": {
+			Paths:   map[string]bool{"app.go": true},
+			PathTs:  map[string]int64{"app.go": nowMs - 5_000},
+			TsMs:    nowMs - 5_000,
+			RootKey: key,
+		},
+	}})
+
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	seedReworkCommit(t, ws, git, gitOut, "ai adds app.go", t0)
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites app.go", t0+dayMs); len(v) == 0 {
+		t.Fatal("a full rewrite must emit a rework verdict")
+	}
+
+	// The session that held the newest write ages out; only the older one is left,
+	// so the evidence for app.go goes BACKWARDS without anyone writing it.
+	writeAiPathsLedger(t, aiPathsLedger{V: aiPathsLedgerVersion, Sessions: map[string]aiPathsEntry{
+		"sess-old": live,
+	}})
+
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
+	seedReworkCommit(t, ws, git, gitOut, "human appends after the newer session expired", t0+2*dayMs)
+
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("evidence going BACKWARDS granted re-entry: %d human lines seeded as AI (%+v)", len(c), c)
 	}
 }
 

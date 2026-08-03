@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
@@ -41,12 +40,12 @@ import (
 // the privacy rules forbid (unknown is NEVER promoted to AI).
 //
 // So a path that has left the ledger carries a SEED TOMBSTONE recording the
-// exact AI-write evidence that was already consumed for it, and re-seeding is
-// authorized ONLY by evidence that is not that (reworkSeedEvidence). Mere
-// presence — the same token again — never re-authorizes anything. An agent
-// actually writing the file again does, because that is per-write evidence and
-// is precisely the class of evidence that authorizes seeding an unseen path in
-// the first place.
+// AI-WRITE STAMP that was already consumed for it, and re-seeding is authorized
+// only by a STRICTLY NEWER stamp (reworkSeedAuthorized). Mere presence never
+// re-authorizes anything, and neither does a stamp that merely CHANGED — only
+// forward motion of a per-path write stamp is proof that an agent wrote the file
+// again, which is precisely the class of evidence that authorizes seeding an
+// unseen path in the first place.
 //
 // Both directions of getting that boundary wrong are failures, and they are not
 // symmetric in kind but are both disqualifying: too permissive fabricates (human
@@ -65,17 +64,17 @@ const reworkLedgerVersion = 1
 type reworkLedger struct {
 	V     int                                     `json:"v"`
 	Roots map[string]map[string][]durTrackedRange `json:"roots"`
-	// Seeded is rootKey → path → the AI-write evidence token that has ALREADY been
-	// consumed for that path: the SEED TOMBSTONES. An entry does not mean "this
-	// path is dead to us"; it means "presence alone proves nothing here anymore,
-	// because this is the evidence we already spent". Seeding is re-authorized by
-	// a DIFFERENT token — i.e. an agent actually wrote the file again — and never
-	// by the same one turning up a second time. See reworkSeedEvidence.
+	// Seeded is rootKey → path → the AI-WRITE STAMP that has ALREADY been consumed
+	// for that path: the SEED TOMBSTONES. An entry does not mean "this path is
+	// dead to us"; it means "presence alone proves nothing here anymore, because
+	// this is the evidence we already spent". Seeding is re-authorized only by a
+	// STRICTLY NEWER stamp — an agent demonstrably wrote the file again — never by
+	// a stamp that merely differs. See reworkSeedAuthorized.
 	//
 	// Additive — an older ledger reads it as nil, which every reader tolerates.
 	// Do NOT bump reworkLedgerVersion to add a field (same reasoning as the
 	// durability ledger's).
-	Seeded map[string]map[string]string `json:"seeded,omitempty"`
+	Seeded map[string]map[string]int64 `json:"seeded,omitempty"`
 	// Branches is rootKey → the branch this root's rework state describes, and it
 	// is what BOUNDS the whole ledger.
 	//
@@ -95,33 +94,41 @@ type reworkLedger struct {
 	Branches map[string]string `json:"branches,omitempty"`
 }
 
-// tombstoneReworkSeededPath records the AI-write evidence already consumed for a
-// path, so that same evidence turning up again cannot re-authorize seeding. An
-// empty token is meaningful: it records "there was no per-write AI evidence
-// here", which only inference could have seeded, and inference stays blocked.
-func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path, evidence string) {
+// tombstoneReworkSeededPath records the AI-write stamp already consumed for a
+// path, so no later read of that same write can re-authorize seeding. A zero
+// stamp is meaningful: it records "there was no per-write AI evidence here",
+// which only inference could have seeded, and inference stays blocked.
+func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path string, writeMs int64) {
 	if led.Seeded == nil {
-		led.Seeded = map[string]map[string]string{}
+		led.Seeded = map[string]map[string]int64{}
 	}
 	if led.Seeded[rootKey] == nil {
-		led.Seeded[rootKey] = map[string]string{}
+		led.Seeded[rootKey] = map[string]int64{}
 	}
-	led.Seeded[rootKey][path] = evidence
+	led.Seeded[rootKey][path] = writeMs
 }
 
 // reworkSeedAuthorized reports whether this commit may seed path, given the
-// AI-write evidence backing it right now.
+// AI-write stamp backing it right now.
 //
-// No tombstone → yes, this is a genuine first touch. Tombstone → yes ONLY if the
-// evidence differs from what was already consumed. That is the entire narrowing:
-// PATH-LEVEL INFERENCE (the same stale token, or none at all) can never seed a
-// tombstoned path, while a fresh agent write always can.
-func reworkSeedAuthorized(led *reworkLedger, rootKey, path, evidence string) bool {
+// No tombstone → yes, this is a genuine first touch. Tombstone → yes ONLY if an
+// agent has written the path since the stamp we already spent on it. That is the
+// entire narrowing: PATH-LEVEL INFERENCE can never seed a tombstoned path, while
+// a demonstrable fresh agent write always can.
+//
+// STRICTLY NEWER, not merely different, and the difference is the whole
+// invariant. A stamp that changed is not proof that anything was written — it can
+// change because the evidence for this path was never per-path to begin with, or
+// because a different session became the one we read it from. Only forward motion
+// of a per-path write stamp is a write. So a backwards move, a tie, a TTL
+// eviction, and "no per-write evidence at all" (0) every one read as blocked,
+// which is the undercount-never-inflation direction this file commits to.
+func reworkSeedAuthorized(led *reworkLedger, rootKey, path string, writeMs int64) bool {
 	consumed, tombstoned := led.Seeded[rootKey][path]
 	if !tombstoned {
 		return true
 	}
-	return evidence != "" && evidence != consumed
+	return writeMs != 0 && writeMs > consumed
 }
 
 // reworkSeedEvidence is this poll's view of per-path AI-WRITE evidence — as
@@ -146,20 +153,17 @@ func newReworkSeedEvidence(root, taskRoot string) reworkSeedEvidence {
 	return reworkSeedEvidence{scope: scope, marks: readAiPathMarks(scope.aiKey)}
 }
 
-// tokenFor identifies the last AI write to path: the writing session paired with
-// that path's own write stamp, so the token changes when — and only when — an
-// agent writes the file again. "" means no per-write evidence exists for the
-// path at all, which reads as inference and is refused on a tombstoned path.
+// writeStampFor is when an agent last WROTE path — a value that advances when,
+// and only when, the file is written again. 0 means no per-write evidence exists
+// for the path at all (never recorded, recorded before per-path stamps existed,
+// or aged out of the ai-paths TTL), which reads as inference and is refused on a
+// tombstoned path.
 //
 // The path is translated through the ledger scope, exactly as attribution does,
 // so a repo discovered under the daemon's HOME workspace looks its evidence up
 // under the same key it was recorded with.
-func (e reworkSeedEvidence) tokenFor(path string) string {
-	m, ok := e.marks[e.scope.ledgerPath(path)]
-	if !ok {
-		return ""
-	}
-	return m.SessionID + "@" + strconv.FormatInt(m.WriteMs, 10)
+func (e reworkSeedEvidence) writeStampFor(path string) int64 {
+	return e.marks[e.scope.ledgerPath(path)].WriteMs
 }
 
 func reworkLedgerPath() string {
@@ -330,7 +334,7 @@ func applyReworkRenames(led *reworkLedger, rootKey string, tracked map[string][]
 		// The source is tombstoned with the evidence current NOW, not with an empty
 		// token: a file later recreated at this path is a different file, and an
 		// empty mark would let the departed file's still-live path evidence seed it.
-		tombstoneReworkSeededPath(led, rootKey, from, evidence.tokenFor(from))
+		tombstoneReworkSeededPath(led, rootKey, from, evidence.writeStampFor(from))
 	}
 	for _, m := range moves {
 		existing := tracked[m.to]
@@ -412,7 +416,7 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 				// only guards the same commit — and the next purely-human commit to
 				// this path is seeded as fresh AI off the stale path evidence.
 				delete(tracked, path)
-				tombstoneReworkSeededPath(led, rootKey, path, evidence.tokenFor(path))
+				tombstoneReworkSeededPath(led, rootKey, path, evidence.writeStampFor(path))
 			}
 			if len(churned) > 0 {
 				verdicts = append(verdicts, buildReworkVerdict(session, root, sha, path, churned, nowMs))
@@ -424,7 +428,7 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 			if remapped[path] || len(tracked[path]) > 0 {
 				continue
 			}
-			if !reworkSeedAuthorized(led, rootKey, path, evidence.tokenFor(path)) {
+			if !reworkSeedAuthorized(led, rootKey, path, evidence.writeStampFor(path)) {
 				continue
 			}
 			lineage := durLineageID(sha, path)
@@ -439,7 +443,7 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 				// Spend the evidence: the same token must not authorize a second
 				// re-entry once these spans churn back out.
 				if _, tombstoned := led.Seeded[rootKey][path]; tombstoned {
-					tombstoneReworkSeededPath(led, rootKey, path, evidence.tokenFor(path))
+					tombstoneReworkSeededPath(led, rootKey, path, evidence.writeStampFor(path))
 				}
 			}
 		}
