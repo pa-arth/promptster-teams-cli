@@ -56,9 +56,20 @@ type aiPathsLedger struct {
 }
 
 type aiPathsEntry struct {
-	Paths   map[string]bool `json:"paths"`
-	TsMs    int64           `json:"tsMs"`
-	RootKey string          `json:"rootKey"`
+	Paths map[string]bool `json:"paths"`
+	// PathTs is relPath → when an AI channel last WROTE that path, as opposed to
+	// TsMs below, which is when the SESSION was last active on any path. The
+	// difference is the whole point: TsMs answers "is this session live", which
+	// every path of that session shares, while PathTs answers "did an agent write
+	// THIS file again", which is per-write evidence and is what
+	// reworkSeedEvidence needs to tell a fresh agent write apart from the mere
+	// lingering presence of an old one.
+	//
+	// Additive: an older ledger reads it as nil and readAiPathMarks falls back to
+	// TsMs, so no version bump (which would discard the whole heuristic cache).
+	PathTs  map[string]int64 `json:"pathTs,omitempty"`
+	TsMs    int64            `json:"tsMs"`
+	RootKey string           `json:"rootKey"`
 }
 
 const (
@@ -108,7 +119,19 @@ func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 		if !ok || entry.Paths == nil {
 			entry = aiPathsEntry{Paths: map[string]bool{}}
 		}
+		if entry.PathTs == nil {
+			entry.PathTs = map[string]int64{}
+		}
 		entry.Paths[relPath] = true
+		// Strictly monotonic per path. Two writes inside one millisecond, or a
+		// backwards host clock, would otherwise mint the SAME stamp twice, and a
+		// consumer that reads the stamp as "has the agent written this again"
+		// (reworkSeedEvidence) would read a real second write as no write at all.
+		writeMs := nowMs
+		if prev, seen := entry.PathTs[relPath]; seen && writeMs <= prev {
+			writeMs = prev + 1
+		}
+		entry.PathTs[relPath] = writeMs
 		entry.TsMs = nowMs
 		entry.RootKey = rootKey
 		ledger.Sessions[sessionID] = entry
@@ -143,7 +166,29 @@ func recordAiTouchedPath(sessionID, rootKey, relPath string) {
 // rootKey and the requested rootKey are known AND differ; an unknown on either
 // side (empty rootKey) falls through as a match.
 func readAiTouchedPaths(rootKey string) map[string]string {
-	out := map[string]string{}
+	marks := readAiPathMarks(rootKey)
+	out := make(map[string]string, len(marks))
+	for p, m := range marks {
+		out[p] = m.SessionID
+	}
+	return out
+}
+
+// aiPathMark is one path's AI-write evidence: which session wrote it and WHEN
+// that path was last written. WriteMs is per-path (aiPathsEntry.PathTs), falling
+// back to the session's activity stamp for a ledger written before PathTs
+// existed.
+type aiPathMark struct {
+	SessionID string
+	WriteMs   int64
+}
+
+// readAiPathMarks is readAiTouchedPaths' full-fidelity form: it keeps the write
+// stamp that readAiTouchedPaths throws away. Selection between sessions is
+// IDENTICAL (newest session wins, lexicographic sessionId breaks an exact tie),
+// so the two readers can never disagree about which session owns a path.
+func readAiPathMarks(rootKey string) map[string]aiPathMark {
+	out := map[string]aiPathMark{}
 	_ = sign.WithBufferLock(aiPathsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(aiPathsLedgerPath())
 		if err != nil {
@@ -166,8 +211,12 @@ func readAiTouchedPaths(rootKey string) map[string]string {
 			for p := range entry.Paths {
 				// Newer session wins; on an exact-ts tie, the lexicographically
 				// smaller sessionId wins so repeated reads are deterministic.
-				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts || (entry.TsMs == ts && sid < out[p]) {
-					out[p] = sid
+				if ts, ok := bestTs[p]; !ok || entry.TsMs > ts || (entry.TsMs == ts && sid < out[p].SessionID) {
+					writeMs := entry.PathTs[p]
+					if writeMs == 0 {
+						writeMs = entry.TsMs
+					}
+					out[p] = aiPathMark{SessionID: sid, WriteMs: writeMs}
 					bestTs[p] = entry.TsMs
 				}
 			}

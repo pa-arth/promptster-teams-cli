@@ -3,6 +3,8 @@ package capture
 import (
 	"strings"
 	"testing"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 )
 
 // Regression tests for the two ways the durability ledger could FABRICATE data
@@ -591,6 +593,298 @@ func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	diff4, files4 := commitDiffFiles(t, ws, sha4)
 	if v := pollReworkCommit(sess, ws, sha4, diff4, files4, t0+3*dayMs); len(v) != 0 {
 		t.Errorf("fabricated rework_verdict over human-written lines: %+v", v)
+	}
+}
+
+// reworkLineage returns the lineage id recorded for a path's first tracked span.
+func reworkLineage(t *testing.T, rootKey, path string) string {
+	t.Helper()
+	rs := loadReworkLedger().Roots[rootKey][path]
+	if len(rs) == 0 {
+		t.Fatalf("no tracked rework spans at %s", path)
+	}
+	return rs[0].LineageID
+}
+
+// reworkBorn returns the birth stamp recorded for a path's first tracked span.
+func reworkBorn(t *testing.T, rootKey, path string) int64 {
+	t.Helper()
+	rs := loadReworkLedger().Roots[rootKey][path]
+	if len(rs) == 0 {
+		t.Fatalf("no tracked rework spans at %s", path)
+	}
+	return rs[0].BornTsMs
+}
+
+// seedReworkCommit stages the worktree, commits, and folds the commit into the
+// rework ledger through the real attribution path (same diff, same reconciled
+// files as the watcher feeds it).
+func seedReworkCommit(t *testing.T, ws string, git func(...string), gitOut func(...string) string, msg string, nowMs int64) (string, []event.Event) {
+	t.Helper()
+	git("add", "-A")
+	git("commit", "-m", msg)
+	sha := gitOut("rev-parse", "HEAD")
+	// Mirrors attributeAndReworkCommit, including its !ok branch: a pure rename
+	// has a real diff but no attributable files, and rework must still see it.
+	diff, files, _, ok := commitAttributionFromDiff(ws, ws, sha)
+	if diff == "" {
+		t.Fatalf("no diff for %s", sha)
+	}
+	if !ok {
+		files = nil
+	}
+	return sha, pollReworkCommit(Session{DeviceID: "dev", TaskRoot: ws}, ws, sha, diff, files, nowMs)
+}
+
+// TestReworkRepeatIterationStaysObserved is the TOO-RESTRICTIVE direction, and
+// it is a failure mode in its own right: under-reporting presented as
+// measurement. The canonical agent loop is write, rewrite, rewrite again on one
+// branch, and repeat iteration on a single file is the core thing rework exists
+// to measure. A tombstone that blocked re-seeding outright made every iteration
+// after the first invisible for the rest of the branch.
+func TestReworkRepeatIterationStaysObserved(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+
+	git("checkout", "-b", "feature")
+
+	// Iteration 1: the agent writes helper.go.
+	recordAiTouchedPath("sess-loop", key, "helper.go")
+	writeCommitFile(t, ws, "helper.go", "a1\na2\na3\n")
+	seedReworkCommit(t, ws, git, gitOut, "ai writes helper.go", t0)
+	if c := reworkCovered(key, "helper.go"); !c[1] || !c[2] || !c[3] {
+		t.Fatalf("rework ledger = %+v, want 1..3 seeded", c)
+	}
+
+	// Iteration 2: the agent rewrites it in full. Churn fires and the path leaves.
+	recordAiTouchedPath("sess-loop", key, "helper.go")
+	writeCommitFile(t, ws, "helper.go", "b1\nb2\nb3\n")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "ai rewrites helper.go", t0+dayMs); len(v) == 0 {
+		t.Fatal("the first full rewrite must emit a rework verdict")
+	}
+
+	// Iteration 3: the agent writes it AGAIN. This is a genuine agent write, so it
+	// must re-enter the ledger — with a fresh lineage and a fresh birth stamp.
+	recordAiTouchedPath("sess-loop", key, "helper.go")
+	writeCommitFile(t, ws, "helper.go", "c1\nc2\nc3\n")
+	sha3, _ := seedReworkCommit(t, ws, git, gitOut, "ai rewrites helper.go again", t0+2*dayMs)
+	if c := reworkCovered(key, "helper.go"); len(c) == 0 {
+		t.Fatal("iteration 3 was silenced: a fresh agent write must re-enter the ledger")
+	}
+	if got, want := reworkLineage(t, key, "helper.go"), durLineageID(sha3, "helper.go"); got != want {
+		t.Errorf("lineage = %q, want a FRESH lineage %q", got, want)
+	}
+	if got := reworkBorn(t, key, "helper.go"); got != t0+2*dayMs {
+		t.Errorf("BornTsMs = %d, want a FRESH stamp %d", got, t0+2*dayMs)
+	}
+
+	// Iteration 4: rewriting it once more is therefore still observed.
+	recordAiTouchedPath("sess-loop", key, "helper.go")
+	writeCommitFile(t, ws, "helper.go", "d1\nd2\nd3\n")
+	_, v := seedReworkCommit(t, ws, git, gitOut, "ai rewrites helper.go a third time", t0+3*dayMs)
+	if len(v) == 0 {
+		t.Fatal("iteration 4 emitted nothing — repeat iteration is still being dropped")
+	}
+	if reworked := rangeSet(t, reworkVerdictFor(t, v, "helper.go"), "reworkedRanges"); !reworked["1..3"] {
+		t.Errorf("reworkedRanges = %+v, want 1..3", reworked)
+	}
+}
+
+// TestReworkTombstoneBlocksInferenceWhileAgentWorksElsewhere is the
+// TOO-PERMISSIVE direction, and it is the one that must remain impossible.
+// Re-entry is authorized by evidence that an agent wrote THIS path again — not
+// by the agent merely being alive. An agent busy in the same repo, on other
+// files, while a human edits a churned-out path proves nothing about that path,
+// and treating session liveness as evidence would relabel the human's lines AI.
+func TestReworkTombstoneBlocksInferenceWhileAgentWorksElsewhere(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+
+	git("checkout", "-b", "feature")
+
+	recordAiTouchedPath("sess-else", key, "app.go")
+	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
+	seedReworkCommit(t, ws, git, gitOut, "ai adds app.go", t0)
+
+	// A human rewrites every AI line: full churn, the path is tombstoned.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites app.go", t0+dayMs); len(v) == 0 {
+		t.Fatal("a full rewrite must emit a rework verdict")
+	}
+
+	// The agent keeps working — on a DIFFERENT file. That refreshes the session's
+	// activity, but says nothing about app.go.
+	recordAiTouchedPath("sess-else", key, "other.go")
+	writeCommitFile(t, ws, "other.go", "o1\n")
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
+	seedReworkCommit(t, ws, git, gitOut, "agent edits other.go, human appends to app.go", t0+2*dayMs)
+
+	if c := reworkCovered(key, "app.go"); len(c) != 0 {
+		t.Fatalf("session liveness was taken as evidence: %d human lines seeded as AI at app.go (%+v)", len(c), c)
+	}
+
+	// And so rewriting those human lines reports no rework at all.
+	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("rewritten\n", 20))
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "human rewrites their own lines", t0+3*dayMs); len(v) != 0 {
+		t.Errorf("fabricated rework_verdict over human-written lines: %+v", v)
+	}
+}
+
+// TestReworkPureRenameCarriesTheSpan is defect 2 (B4) against the rework ledger:
+// a pure rename emits no `@@` hunks under the tracked path, so without the
+// rename parser the spans stayed at a path that no longer existed.
+func TestReworkPureRenameCarriesTheSpan(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-rwmv", key, "old.go")
+	writeCommitFile(t, ws, "old.go", "l1\nl2\nl3\nl4\nl5\nl6\n")
+	sha1, _ := seedReworkCommit(t, ws, git, gitOut, "ai adds old.go", t0)
+
+	git("mv", "old.go", "new.go")
+	if _, v := seedReworkCommit(t, ws, git, gitOut, "rename old.go -> new.go", t0+dayMs); len(v) != 0 {
+		t.Errorf("a pure rename reworks nothing, got %+v", v)
+	}
+
+	if c := reworkCovered(key, "old.go"); len(c) != 0 {
+		t.Errorf("%d lines still tracked at the dead path old.go, want 0", len(c))
+	}
+	moved := loadReworkLedger().Roots[key]["new.go"]
+	if len(moved) != 1 || moved[0].Start != 1 || moved[0].End != 6 {
+		t.Fatalf("new.go ranges = %+v, want a single 1..6 span", moved)
+	}
+	if moved[0].BornTsMs != t0 {
+		t.Errorf("BornTsMs = %d, want %d — a rename is not a rewrite", moved[0].BornTsMs, t0)
+	}
+	if got, want := moved[0].LineageID, durLineageID(sha1, "old.go"); got != want {
+		t.Errorf("lineage = %q, want the ORIGINAL %q carried across the rename", got, want)
+	}
+
+	// Rework of the moved lines is now reported at the path that exists.
+	recordAiTouchedPath("sess-rwmv", key, "new.go")
+	writeCommitFile(t, ws, "new.go", "x1\nx2\nx3\nx4\nx5\nx6\n")
+	_, v := seedReworkCommit(t, ws, git, gitOut, "rewrite the moved file", t0+2*dayMs)
+	if reworked := rangeSet(t, reworkVerdictFor(t, v, "new.go"), "reworkedRanges"); !reworked["1..6"] {
+		t.Errorf("reworkedRanges = %+v, want 1..6 at new.go", reworked)
+	}
+}
+
+// TestReworkRenameThenRecreateEmitsNoPhantomVerdict is the FABRICATION half of
+// defect 2 in rework, reachable through an ordinary split-a-file refactor. A
+// stranded span at a dead path is not merely lost: recreating a file at that path
+// is a pure insertion, `churnedByHunk` does not churn on OldLen==0, so the stale
+// span survives into the NEW file's line space and the next edit reports it as
+// reworked AI in a file the agent never touched.
+func TestReworkRenameThenRecreateEmitsNoPhantomVerdict(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	const t0 int64 = 1_000_000_000_000
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-split", key, "config.go")
+	writeCommitFile(t, ws, "config.go", strings.Repeat("ai\n", 10))
+	seedReworkCommit(t, ws, git, gitOut, "ai adds config.go", t0)
+
+	git("mv", "config.go", "config_legacy.go")
+	seedReworkCommit(t, ws, git, gitOut, "move config.go aside", t0+dayMs)
+	if c := reworkCovered(key, "config_legacy.go"); len(c) != 10 {
+		t.Fatalf("the rename must carry all 10 spans, got %+v", c)
+	}
+
+	// A brand-new, human-written config.go appears at the freed path.
+	writeCommitFile(t, ws, "config.go", strings.Repeat("human\n", 30))
+	seedReworkCommit(t, ws, git, gitOut, "new human config.go", t0+2*dayMs)
+	if c := reworkCovered(key, "config.go"); len(c) != 0 {
+		t.Fatalf("a recreated human file was seeded as AI: %+v", c)
+	}
+
+	// Rewriting that human file must report nothing about config.go.
+	writeCommitFile(t, ws, "config.go", strings.Repeat("edited\n", 30))
+	_, v := seedReworkCommit(t, ws, git, gitOut, "rewrite the human config.go", t0+3*dayMs)
+	for _, ev := range v {
+		if data, _ := ev.Data.(map[string]interface{}); data["path"] == "config.go" {
+			t.Errorf("phantom rework_verdict over a file the AI never wrote: %+v", data)
+		}
+	}
+}
+
+// TestReworkStateClearedWhenTheBranchChanges pins the ledger's actual bound. The
+// state describes ONE branch, and the clear used to fire only on standing on the
+// default branch — which `git switch -c next-thing` straight off a feature branch
+// never does, so the previous branch's ranges and tombstones carried over
+// silently into unrelated work.
+func TestReworkStateClearedWhenTheBranchChanges(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, _ := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	pollGitWatchWorkspace(sess) // baseline on main
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-branch", key, "feature.go")
+	writeCommitFile(t, ws, "feature.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "ai adds feature.go")
+	pollGitWatchWorkspace(sess)
+	if c := reworkCovered(key, "feature.go"); len(c) == 0 {
+		t.Fatalf("expected feature.go seeded on the feature branch, got %+v", c)
+	}
+	// A full churn leaves a tombstone behind as well as emptying the tracked map.
+	writeCommitFile(t, ws, "feature.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human rewrites feature.go")
+	pollGitWatchWorkspace(sess)
+	if len(loadReworkLedger().Seeded[key]) == 0 {
+		t.Fatal("a full churn must leave a tombstone")
+	}
+
+	// Branch straight off the feature branch. main is never checked out, so the
+	// scopeDefault clear never runs — the branch change itself must expire it.
+	git("checkout", "-b", "next-thing")
+	pollGitWatchWorkspace(sess)
+
+	led := loadReworkLedger()
+	if len(led.Roots[key]) != 0 {
+		t.Errorf("tracked ranges outlived the branch they belong to: %+v", led.Roots[key])
+	}
+	if len(led.Seeded[key]) != 0 {
+		t.Errorf("seed tombstones outlived the branch they belong to: %+v", led.Seeded[key])
+	}
+	if got := led.Branches[key]; got != "next-thing" {
+		t.Errorf("recorded branch = %q, want next-thing", got)
 	}
 }
 

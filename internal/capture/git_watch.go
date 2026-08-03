@@ -595,17 +595,26 @@ func pollGitWatchWorkspace(session Session) {
 		// no-new-commits guard so that returning to the default branch clears stale
 		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
 		// `git checkout main` after a feature branch merged).
-		scope := reworkScope(root)
-		if scope == scopeDefault {
+		scope, branch := reworkScope(root)
+		switch scope {
+		case scopeDefault:
 			// On (or merged back to) the default branch: surviving AI lines are now the
 			// durability engine's and reworked ones already emitted, so drop the root's
 			// rework tracking before a future branch could remap against stale ranges.
 			// Guarded on presence to avoid a needless ledger write on every poll. The
-			// guard must consider the seed tombstones too: they outlive the tracked
-			// map, so a Roots-only check would strand them past the merge and block
-			// seeding on every future branch.
+			// guard must consider the seed tombstones and the recorded branch too: both
+			// outlive the tracked map, so a Roots-only check would strand them.
 			if reworkLedgerHasRoot(rootKey) {
 				clearReworkLedger(rootKey)
+			}
+		case scopePreMerge:
+			// Rework state belongs to ONE branch. Binding it to the checked-out branch
+			// here is what expires it: `git switch -c next-thing` straight off a feature
+			// branch, and a per-branch worktree that never visits the default branch,
+			// both skip the scopeDefault clear above entirely, and the previous branch's
+			// ranges and tombstones would otherwise carry over silently.
+			if branch != "" && reworkLedgerBranch(rootKey) != branch {
+				adoptReworkBranch(rootKey, branch)
 			}
 		}
 
@@ -676,19 +685,24 @@ const (
 // checked-out branch name to the default branch name is push-state independent.
 // Two constant-time read-only spawns per root per poll (symbolic-ref HEAD + the
 // cached default ref).
-func reworkScope(root string) branchScope {
+//
+// It also RETURNS the checked-out branch name, which the rework ledger records
+// as the identity of the state it holds. Returning it from here rather than
+// re-resolving it at the call site keeps the spawn budget where the comment above
+// says it is — the name has already been read to classify the scope.
+func reworkScope(root string) (branchScope, string) {
 	defRef := durabilityDefaultRef(root)
 	if defRef == "" {
-		return scopeUnknown
+		return scopeUnknown, ""
 	}
 	head := gitSymbolicRef(root, "HEAD")
 	if head == "" {
-		return scopeUnknown // detached or unborn — no branch name to compare
+		return scopeUnknown, "" // detached or unborn — no branch name to compare
 	}
 	if shortBranchName(head) == shortBranchName(defRef) {
-		return scopeDefault
+		return scopeDefault, shortBranchName(head)
 	}
-	return scopePreMerge
+	return scopePreMerge, shortBranchName(head)
 }
 
 // shortBranchName reduces a full ref name to its branch short name:

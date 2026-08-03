@@ -648,11 +648,28 @@ reachable through ordinary git usage, so treat any new path that removes or
 relocates a ledger entry as suspect until it has a test.
 
 **The pre-merge rework ledger (`rework.go`) is a SECOND ledger holding the SAME
-first-touch invariant**, and the first-touch hole was reachable through both. Fix
-them together or the fix is half a fix. They differ only in tombstone lifetime:
-durability's expire on a TTL refreshed by activity, rework's carry none because
-`clearReworkLedger` drops them when the branch merges — so the guard on that
-clear must consider the tombstones, which outlive the tracked map.
+invariants**, and both fabrication classes were reachable through both. Fix them
+together or the fix is half a fix.
+
+Two things about it that are easy to get wrong, both learned the expensive way:
+
+- **A seed tombstone blocks INFERENCE, not seeding.** The unsafe act was never
+  "seeding a path twice" — it was seeding a path as AI because we had merely seen
+  it before. So a tombstone stores the AI-write evidence already spent on that
+  path, and only *different* evidence (an agent actually writing the file again)
+  re-authorizes it. Blocking outright silences the canonical agent loop — write,
+  rewrite, rewrite again — which is the very thing rework measures. Both failure
+  directions are pinned by tests; do not "simplify" the token comparison back into
+  a boolean.
+- **Its state is scoped to a BRANCH, and `reworkLedger.Branches` is what enforces
+  that.** The clear on `scope == scopeDefault` alone is not a bound: `git switch
+  -c` off a feature branch and a per-branch worktree never stand on the default
+  branch at all.
+
+Rename handling has an extra trap rework does not share with durability: a pure
+rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
+and the commit would never reach `pollReworkCommit` at all. It returns the raw
+diff on that path specifically so renames still land.
 
 ## Maintaining this file
 

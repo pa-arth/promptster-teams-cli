@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
@@ -20,18 +21,38 @@ import (
 // backend joins against GitHub review metadata (§7.1).
 //
 // It reuses §2's interval machinery wholesale: the same `remapTrackedRanges`
-// churn/shift math, the same first-touch-only seeding discipline (re-seeding
-// would re-attribute a human's rewrite of an AI line as fresh AI — inflation the
-// privacy rules forbid) enforced by the same SEED TOMBSTONES (see
-// reworkLedger.Seeded — first touch is a property of the ROOT, not of the
-// ledger's current contents), and the same single-locked read-modify-write
-// ledger. The ONLY differences from durability are:
+// churn/shift math, the same seeding discipline, and the same single-locked
+// read-modify-write ledger. The ONLY differences from durability are:
 //   - it advances on WORKING HEAD, gated to commits made while the branch is
 //     ahead of the default branch (pre-merge) — see pollGitWatchWorkspace;
 //   - a churned tracked range emits a rework_verdict immediately (there is no
 //     maturity window — a rewrite IS the event);
 //   - it reuses the attribution watcher's ALREADY-fetched `git show` diff + files
-//     (no extra spawn), so a pre-merge commit stays one `git show`.
+//     (no extra spawn), so a pre-merge commit stays one `git show`;
+//   - it carries branch identity, because it is branch-scoped state (see
+//     reworkLedger.Branches).
+//
+// SEEDING: INFERENCE IS BLOCKED, EVIDENCE IS NOT. The unsafe thing was never
+// "seeding a path twice" — it was seeding a path as AI merely BECAUSE WE HAD
+// SEEN IT BEFORE. The AI-paths ledger is path-scoped with a 7-day TTL, so once a
+// path has been seeded and churned out, its lingering presence in that ledger
+// says nothing about who wrote the NEXT commit to it: taking presence as
+// authority re-attributes a human's rewrite as fresh AI, which is the inflation
+// the privacy rules forbid (unknown is NEVER promoted to AI).
+//
+// So a path that has left the ledger carries a SEED TOMBSTONE recording the
+// exact AI-write evidence that was already consumed for it, and re-seeding is
+// authorized ONLY by evidence that is not that (reworkSeedEvidence). Mere
+// presence — the same token again — never re-authorizes anything. An agent
+// actually writing the file again does, because that is per-write evidence and
+// is precisely the class of evidence that authorizes seeding an unseen path in
+// the first place.
+//
+// Both directions of getting that boundary wrong are failures, and they are not
+// symmetric in kind but are both disqualifying: too permissive fabricates (human
+// code reported as AI), too restrictive silences the canonical agent loop (write,
+// rewrite, rewrite again — every iteration after the first invisible), which
+// presents under-reporting as measurement. Both are pinned by tests.
 //
 // PRIVACY: identical to durability — only integer ranges, an age, and a
 // `sha:path` lineage handle leave; never bytes, diffs, or content.
@@ -40,49 +61,105 @@ const reworkLedgerVersion = 1
 
 // reworkLedger is the on-disk pre-merge rework state: rootKey → path → the AI
 // spans currently tracked on the working branch. It needs no cursor of its own —
-// it piggybacks on the attribution watcher's working-HEAD detection — and no TTL,
-// because it is cleared the moment the branch merges back to the default branch.
+// it piggybacks on the attribution watcher's working-HEAD detection.
 type reworkLedger struct {
 	V     int                                     `json:"v"`
 	Roots map[string]map[string][]durTrackedRange `json:"roots"`
-	// Seeded is rootKey → path → true: the SEED TOMBSTONES, carrying durability's
-	// invariant that FIRST TOUCH IS A PROPERTY OF THE ROOT, NOT OF THE LEDGER'S
-	// CURRENT CONTENTS. A path leaves this ledger by exactly one route — every
-	// tracked span churned — and that deletion used to re-arm the first-touch
-	// branch, so the next commit to the path re-seeded from the path-granular
-	// 7-day AI evidence, which cannot tell "the AI rewrote its own line" from "a
-	// human rewrote an AI line". Human lines then entered as fresh AI and any
-	// later rewrite of them emitted a rework_verdict about AI code that was never
-	// AI — the inflation the header above forbids.
-	//
-	// No TTL and no pruner, unlike durability's: this ledger is wholesale cleared
-	// when the branch merges back (clearReworkLedger), so a tombstone lives at
-	// most one branch and the set cannot grow without bound.
+	// Seeded is rootKey → path → the AI-write evidence token that has ALREADY been
+	// consumed for that path: the SEED TOMBSTONES. An entry does not mean "this
+	// path is dead to us"; it means "presence alone proves nothing here anymore,
+	// because this is the evidence we already spent". Seeding is re-authorized by
+	// a DIFFERENT token — i.e. an agent actually wrote the file again — and never
+	// by the same one turning up a second time. See reworkSeedEvidence.
 	//
 	// Additive — an older ledger reads it as nil, which every reader tolerates.
 	// Do NOT bump reworkLedgerVersion to add a field (same reasoning as the
 	// durability ledger's).
-	Seeded map[string]map[string]bool `json:"seeded,omitempty"`
+	Seeded map[string]map[string]string `json:"seeded,omitempty"`
+	// Branches is rootKey → the branch this root's rework state describes, and it
+	// is what BOUNDS the whole ledger.
+	//
+	// The bound used to be stated as "clearReworkLedger wipes it when the branch
+	// merges back", which the code did not provide: that clear fires only on
+	// scope == scopeDefault (pollGitWatchWorkspace), so `git switch -c next-thing`
+	// straight off a feature branch, or a per-branch worktree that never checks
+	// out the default branch, never reached it — and the state silently outlived
+	// the branch it belonged to. Recording the branch makes the clear fire on the
+	// event that actually invalidates the state (the branch changing), not on the
+	// hope that someone eventually stands on the default branch.
+	//
+	// What that buys, stated honestly: state lives at most one branch, so it is
+	// bounded by the paths one branch touches rather than by repo lifetime. A
+	// worktree parked on one long-lived branch keeps that branch's marks for as
+	// long as the branch exists, which is correct — they ARE that branch's state.
+	Branches map[string]string `json:"branches,omitempty"`
 }
 
-// tombstoneReworkSeededPath records that this root has already first-touched
-// path, so the seeding branch cannot re-fire for it.
-func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path string) {
+// tombstoneReworkSeededPath records the AI-write evidence already consumed for a
+// path, so that same evidence turning up again cannot re-authorize seeding. An
+// empty token is meaningful: it records "there was no per-write AI evidence
+// here", which only inference could have seeded, and inference stays blocked.
+func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path, evidence string) {
 	if led.Seeded == nil {
-		led.Seeded = map[string]map[string]bool{}
+		led.Seeded = map[string]map[string]string{}
 	}
 	if led.Seeded[rootKey] == nil {
-		led.Seeded[rootKey] = map[string]bool{}
+		led.Seeded[rootKey] = map[string]string{}
 	}
-	led.Seeded[rootKey][path] = true
+	led.Seeded[rootKey][path] = evidence
 }
 
-// reworkSeededPathTombstoned reports whether a tombstone blocks seeding path.
-// Unlike durability's equivalent this gates the ONLY seeding path there is —
-// rework has no line-precise fingerprint carrier to preserve, and it never spans
-// a squash-merge, because merging is what clears it.
-func reworkSeededPathTombstoned(led *reworkLedger, rootKey, path string) bool {
-	return led.Seeded[rootKey][path]
+// reworkSeedAuthorized reports whether this commit may seed path, given the
+// AI-write evidence backing it right now.
+//
+// No tombstone → yes, this is a genuine first touch. Tombstone → yes ONLY if the
+// evidence differs from what was already consumed. That is the entire narrowing:
+// PATH-LEVEL INFERENCE (the same stale token, or none at all) can never seed a
+// tombstoned path, while a fresh agent write always can.
+func reworkSeedAuthorized(led *reworkLedger, rootKey, path, evidence string) bool {
+	consumed, tombstoned := led.Seeded[rootKey][path]
+	if !tombstoned {
+		return true
+	}
+	return evidence != "" && evidence != consumed
+}
+
+// reworkSeedEvidence is this poll's view of per-path AI-WRITE evidence — as
+// opposed to the mere path-presence that reconcileCommitAttribution uses to stamp
+// likely_ai.
+//
+// The distinction is the point, and it has to live here because attrFile does
+// not carry it: reconcileCommitAttribution marks a file likely_ai from path
+// presence OR from a bash-mtime window, and BOTH are inference — neither says an
+// agent wrote these particular lines in this particular commit.
+//
+// It is a snapshot taken once per commit rather than a per-path lookup because
+// the ai-paths ledger has its OWN lock: reading it lazily from inside the rework
+// ledger's read-modify-write would nest two locks.
+type reworkSeedEvidence struct {
+	scope ledgerScope
+	marks map[string]aiPathMark
+}
+
+func newReworkSeedEvidence(root, taskRoot string) reworkSeedEvidence {
+	scope := resolveLedgerScope(root, taskRoot)
+	return reworkSeedEvidence{scope: scope, marks: readAiPathMarks(scope.aiKey)}
+}
+
+// tokenFor identifies the last AI write to path: the writing session paired with
+// that path's own write stamp, so the token changes when — and only when — an
+// agent writes the file again. "" means no per-write evidence exists for the
+// path at all, which reads as inference and is refused on a tombstoned path.
+//
+// The path is translated through the ledger scope, exactly as attribution does,
+// so a repo discovered under the daemon's HOME workspace looks its evidence up
+// under the same key it was recorded with.
+func (e reworkSeedEvidence) tokenFor(path string) string {
+	m, ok := e.marks[e.scope.ledgerPath(path)]
+	if !ok {
+		return ""
+	}
+	return m.SessionID + "@" + strconv.FormatInt(m.WriteMs, 10)
 }
 
 func reworkLedgerPath() string {
@@ -142,35 +219,135 @@ func mutateReworkLedger(fn func(led *reworkLedger)) {
 	})
 }
 
+// dropReworkRoot removes every trace of a root from an already-open ledger:
+// tracked spans, seed tombstones, and the recorded branch. All three are that
+// branch's state and expire together — leaving the tombstones behind would block
+// seeding on the next branch, and leaving the branch behind would suppress the
+// change detection that clears it.
+func dropReworkRoot(led *reworkLedger, rootKey string) {
+	delete(led.Roots, rootKey)
+	delete(led.Seeded, rootKey)
+	delete(led.Branches, rootKey)
+	if len(led.Seeded) == 0 {
+		led.Seeded = nil
+	}
+	if len(led.Branches) == 0 {
+		led.Branches = nil
+	}
+}
+
 // clearReworkLedger drops a root's entire rework tracking — called once the
 // branch has merged back to the default branch, so surviving AI lines pass to the
 // durability engine and a future branch never remaps against stale ranges.
-//
-// The seed tombstones go with it, and that is what bounds them: they exist to
-// keep first touch a property of the ROOT for the life of ONE branch, so keeping
-// them past the merge would block seeding on every future branch forever.
 func clearReworkLedger(rootKey string) {
 	mutateReworkLedger(func(led *reworkLedger) {
-		delete(led.Roots, rootKey)
-		delete(led.Seeded, rootKey)
-		if len(led.Seeded) == 0 {
-			led.Seeded = nil
-		}
+		dropReworkRoot(led, rootKey)
 	})
 }
 
 // reworkLedgerHasRoot reports whether a root has any rework state left to clear —
-// tracked spans OR seed tombstones. Tombstones outlive the tracked map (a fully
-// churned root deletes its Roots entry but keeps its marks), so a Roots-only
-// check would leave them stranded past the merge and permanently block seeding on
-// the next branch.
+// tracked spans, seed tombstones, or a recorded branch. Tombstones outlive the
+// tracked map (a fully churned root deletes its Roots entry but keeps its marks),
+// so a Roots-only check would leave them stranded and permanently block seeding
+// on the next branch.
 func reworkLedgerHasRoot(rootKey string) bool {
 	led := loadReworkLedger()
 	if _, ok := led.Roots[rootKey]; ok {
 		return true
 	}
-	_, ok := led.Seeded[rootKey]
+	if _, ok := led.Seeded[rootKey]; ok {
+		return true
+	}
+	_, ok := led.Branches[rootKey]
 	return ok
+}
+
+// reworkLedgerBranch returns the branch a root's rework state describes ("" when
+// the root has none yet).
+func reworkLedgerBranch(rootKey string) string {
+	return loadReworkLedger().Branches[rootKey]
+}
+
+// adoptReworkBranch binds a root's rework state to branch, dropping whatever it
+// held for a DIFFERENT branch first. This is what actually bounds the ledger: the
+// state expires when the branch it describes stops being checked out, which is
+// the event that invalidates it, rather than when someone happens to stand on the
+// default branch (the trigger the old bound assumed and `git switch -c` skips).
+func adoptReworkBranch(rootKey, branch string) {
+	mutateReworkLedger(func(led *reworkLedger) {
+		if led.Branches[rootKey] == branch {
+			return
+		}
+		dropReworkRoot(led, rootKey)
+		if led.Branches == nil {
+			led.Branches = map[string]string{}
+		}
+		led.Branches[rootKey] = branch
+	})
+}
+
+// applyReworkRenames carries a commit's renamed paths across the ledger, mutating
+// tracked in place, BEFORE the hunk remap — the same ordering and the same reason
+// as applyDurabilityRenames: git keys a rename's hunks under the NEW path while
+// their old-side line numbers still address the OLD file, so a span carried first
+// lands already in the right line space and rename+edit needs no special math.
+//
+// Stranding a span was never merely a loss here. A pure rename emits no hunks
+// under the tracked path, so the span sat at a dead path; recreating a file at
+// that path (an ordinary split-a-file refactor) let a pure INSERTION shift the
+// stale span into the new file's line space, and the next edit churned it into a
+// rework_verdict over lines the AI never wrote.
+//
+// LineageID and BornTsMs ride along untouched — a rename is not a rewrite — and
+// the seed tombstone follows the file, or renaming a churned path would hand the
+// same content a fresh unmarked name.
+func applyReworkRenames(led *reworkLedger, rootKey string, tracked map[string][]durTrackedRange, renames map[string]string, evidence reworkSeedEvidence) {
+	if len(renames) == 0 {
+		return
+	}
+	type move struct {
+		to    string
+		spans []durTrackedRange
+	}
+	// Every source is read (and removed) before any destination is written, so a
+	// chain landing in one commit (a→b, b→c) cannot clobber itself on Go's random
+	// map order.
+	var moves []move
+	for from, to := range renames {
+		consumed, wasTombstoned := led.Seeded[rootKey][from]
+		if wasTombstoned {
+			// The mark follows the content: the destination inherits the evidence
+			// already spent, so a churned-then-renamed path cannot be re-seeded from
+			// stale presence under its new name.
+			tombstoneReworkSeededPath(led, rootKey, to, consumed)
+		}
+		spans := tracked[from]
+		if len(spans) == 0 {
+			continue
+		}
+		moves = append(moves, move{to: to, spans: spans})
+		delete(tracked, from)
+		// The source is tombstoned with the evidence current NOW, not with an empty
+		// token: a file later recreated at this path is a different file, and an
+		// empty mark would let the departed file's still-live path evidence seed it.
+		tombstoneReworkSeededPath(led, rootKey, from, evidence.tokenFor(from))
+	}
+	for _, m := range moves {
+		existing := tracked[m.to]
+		if len(existing) == 0 {
+			tracked[m.to] = m.spans
+			continue
+		}
+		// Real git emits modify+delete rather than a rename when the destination
+		// already exists, so this is unreachable through its output; it merges
+		// rather than drops because a dropped span is the stranded-lineage
+		// fabrication all over again. The destination wins any overlapping line.
+		merged := expandRanges(m.spans)
+		for ln, meta := range expandRanges(existing) {
+			merged[ln] = meta
+		}
+		tracked[m.to] = coalesceLines(merged)
+	}
 }
 
 // aiRangesForSeeding pulls the likely_ai new-side spans (content-free) out of the
@@ -190,13 +367,22 @@ func aiRangesForSeeding(files []attrFile) map[string][]durTrackedRange {
 
 // pollReworkCommit folds ONE pre-merge working-HEAD commit into the rework
 // ledger, reusing the attribution watcher's already-fetched diff + files (no
-// extra git spawn): (1) remap every tracked path this commit touched — a churned
-// AI span is emitted as a rework_verdict and dropped; (2) FIRST-TOUCH seed the
-// AI-authored paths this commit introduces. Returns (and emits) one verdict per
+// extra git spawn): (0) carry renamed paths across; (1) remap every tracked path
+// this commit touched — a churned AI span is emitted as a rework_verdict and
+// dropped; (2) seed the AI-authored paths this commit introduces, subject to the
+// evidence rule in the file header. Returns (and emits) one verdict per
 // (commit, path) that had a churn.
 func pollReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64) []event.Event {
 	hunks := parseUnifiedDiffHunks(diff)
+	renames := parseUnifiedDiffRenames(diff)
 	seedable := aiRangesForSeeding(files)
+	if len(hunks) == 0 && len(renames) == 0 && len(seedable) == 0 {
+		return nil // nothing to remap, move or seed — don't take the ledger lock
+	}
+	// Resolved BEFORE the ledger lock, matching pollDurabilityCommit: the ai-paths
+	// ledger has its own lock and the rework ledger's read-modify-write must never
+	// nest another one.
+	evidence := newReworkSeedEvidence(root, session.TaskRoot)
 	rootKey := gitWatchRootKey(root)
 
 	var verdicts []event.Event
@@ -205,9 +391,11 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 		if tracked == nil {
 			tracked = map[string][]durTrackedRange{}
 		}
+		// (0) Renames first — see applyReworkRenames for why the order is load-bearing.
+		applyReworkRenames(led, rootKey, tracked, renames, evidence)
 		// (1) Remap/churn every already-tracked path this commit rewrote. `remapped`
 		// records paths that were tracked BEFORE this commit so step (2) never
-		// re-seeds one whose ranges this commit just churned to empty (first-touch).
+		// re-seeds one whose ranges this commit just churned to empty.
 		remapped := map[string]bool{}
 		for path, hs := range hunks {
 			existing := tracked[path]
@@ -219,20 +407,25 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 			if len(surv) > 0 {
 				tracked[path] = surv
 			} else {
-				// The path leaves the ledger. Tombstone it, or step (2) re-arms on a
-				// LATER commit — `remapped` only guards the same commit — and the next
-				// purely-human commit to this path is seeded as fresh AI.
+				// The path leaves the ledger, so record which evidence has been spent
+				// on it. Without that, step (2) re-arms on a LATER commit — `remapped`
+				// only guards the same commit — and the next purely-human commit to
+				// this path is seeded as fresh AI off the stale path evidence.
 				delete(tracked, path)
-				tombstoneReworkSeededPath(led, rootKey, path)
+				tombstoneReworkSeededPath(led, rootKey, path, evidence.tokenFor(path))
 			}
 			if len(churned) > 0 {
 				verdicts = append(verdicts, buildReworkVerdict(session, root, sha, path, churned, nowMs))
 			}
 		}
-		// (2) First-touch seed newly-introduced AI paths.
+		// (2) Seed the AI paths this commit introduces. A tombstoned path is seeded
+		// only on evidence of a fresh agent write, never on path presence alone.
 		for path, rs := range seedable {
-			if remapped[path] || len(tracked[path]) > 0 || reworkSeededPathTombstoned(led, rootKey, path) {
-				continue // already tracked / just churned / churned earlier — first-touch only
+			if remapped[path] || len(tracked[path]) > 0 {
+				continue
+			}
+			if !reworkSeedAuthorized(led, rootKey, path, evidence.tokenFor(path)) {
+				continue
 			}
 			lineage := durLineageID(sha, path)
 			var seeded []durTrackedRange
@@ -243,6 +436,11 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 			}
 			if len(seeded) > 0 {
 				tracked[path] = seeded
+				// Spend the evidence: the same token must not authorize a second
+				// re-entry once these spans churn back out.
+				if _, tombstoned := led.Seeded[rootKey][path]; tombstoned {
+					tombstoneReworkSeededPath(led, rootKey, path, evidence.tokenFor(path))
+				}
 			}
 		}
 

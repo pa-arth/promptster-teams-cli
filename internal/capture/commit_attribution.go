@@ -84,6 +84,12 @@ var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // false when nothing changed (empty diff / no new-side ranges), which suppresses
 // emission. `--unified=0`/`--format=`/`--root` keep the diff tight and header-free
 // (message/author never enter the buffer).
+//
+// A false ok still returns the RAW DIFF whenever git produced one, because "no
+// new-side ranges" is not the same as "nothing happened": a pure rename has that
+// exact shape — a real diff with `rename from`/`rename to` and not one `@@` — and
+// the rework ledger has to see it or the renamed file's tracked spans strand at a
+// path that no longer exists. Only a failed `git show` yields an empty diff.
 func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
 	diff, ok = gitCommitRawDiff(root, sha)
 	if !ok || diff == "" {
@@ -91,7 +97,7 @@ func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files [
 	}
 	fileRanges := parseUnifiedDiffNewRanges(diff)
 	if len(fileRanges) == 0 {
-		return "", nil, "", false
+		return diff, nil, "", false
 	}
 	// The ledgers are anchored to the workspace (taskRoot), not to each polled
 	// repo — in the daemon taskRoot is HOME and root is a repo discovered under it.
@@ -405,7 +411,14 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 func attributeAndReworkCommit(session Session, root, sha string, preMerge bool, nowMs int64) (recordable bool) {
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
 	if !ok {
-		return true // nothing to send, and nothing a retry would change
+		// Nothing to ATTRIBUTE, and nothing a retry would change — but a pure rename
+		// is precisely this shape, and rework still has to carry the renamed file's
+		// tracked spans across. It gets no attributable files, so it can only move
+		// spans, never seed: a rename is not evidence that anyone wrote anything.
+		if preMerge && diff != "" {
+			pollReworkCommit(session, root, sha, diff, nil, nowMs)
+		}
+		return true
 	}
 	if !emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files))) {
 		// Never durably queued. Do NOT let the caller remember this SHA, or the
