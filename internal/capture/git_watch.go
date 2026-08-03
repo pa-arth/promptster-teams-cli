@@ -369,17 +369,49 @@ func gitHead(root string) (string, bool) {
 //     rewrite): `rev-list lastSeen..head` ERRORS. We fall back to a bounded
 //     recovery window, `rev-list -n <cap> head`, so the tip region is still
 //     attributed instead of the commits being skipped forever, ok=true.
-//   - Failure (even the recovery rev-list errors — not a repo / bad head): ok=false,
-//     so the caller KEEPS the old cursor and retries next poll rather than
-//     advancing past an undetermined window.
+//   - Failure (the recovery rev-list errors — not a repo / bad head — or the
+//     first-parent probe below could not run): ok=false, so the caller KEEPS the
+//     old cursor and retries next poll rather than advancing past an undetermined
+//     window.
 //
-// Spawn budget stays sane: the normal path is one `rev-list`; the fallback adds
-// at most one more, only in the rare gc'd case. No merge-base spawn.
-func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
+// THE RANGE IS DELIBERATELY SPLIT BETWEEN ITS TWO CONSUMERS, and the second
+// return is that split. `commits` is what ATTRIBUTION EMISSION walks and it is
+// unnarrowed: whatever commit_attribution reports today it reports after this
+// split, including a commit that is reachable only through a merge's SECOND
+// parent. Whether work that arrived through a merge counts as AI-written is a
+// product question and is not answered here.
+//
+// `foldable` is the subset the REWORK FOLD may apply, and it is the first-parent
+// chain of the same range. The fold has no choice: gitCommitRawDiff reads every
+// commit with `-m --first-parent`, so a merge's own diff ALREADY carries
+// everything the second-parent side brought in. Folding that side's commits as
+// well applies the same hunks twice — once in the sibling branch's coordinate
+// space and once in the merge's — which slides every tracked AI span by an offset
+// already applied and makes the next rewrite report over lines nobody wrote. The
+// first-parent chain is the one sequence of diffs that composes to head's tree.
+//
+// That narrowing is a definitive ANSWER about a commit — it is on the chain or
+// it is not — and it can only LOSE rework state, never invent it: a second-parent
+// commit no longer seeds its own AI ranges, and where it was the only attributed
+// commit backing a replay, that replay is declined. Both are undercounts, which
+// is the direction these ledgers always resolve toward, and the same narrowing
+// already reaches the cold-start replay through gitBranchCommitsSinceDefault.
+//
+// A chain probe that could not RUN is not that answer, and it is reported as
+// ok=false rather than as a commit list with nothing foldable in it. The two were
+// once collapsed: an empty subset leaves every commit unfoldable while the caller
+// still attributes and records each one, so the tracked spans keep coordinates
+// the unfolded hunks have already moved, and the next rewrite reports over lines
+// nobody wrote. That INFLATES. commitsWithFoldableChain is what keeps them apart.
+//
+// Spawn budget stays sane: the normal path is one `rev-list`, plus a second only
+// when it actually returned commits; the fallback adds at most one more, in the
+// rare gc'd case. No merge-base spawn.
+func gitNewCommits(root, lastSeen, head string) (commits []string, foldable map[string]struct{}, ok bool) {
 	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", lastSeen+".."+head).Output()
 	if err == nil {
-		return clampCommitBurst(parseRevListShas(out), root), true
+		return commitsWithFoldableChain(root, clampCommitBurst(parseRevListShas(out), root), lastSeen+".."+head)
 	}
 	// lastSeen is unreachable (gc'd/pruned, or a corrupt cursor): recover the tip
 	// region rather than skip it. If even that errors, keep the cursor and retry.
@@ -387,12 +419,144 @@ func gitNewCommits(root, lastSeen, head string) (commits []string, ok bool) {
 	out, rerr := exec.Command("git", "-C", root, "rev-list",
 		"-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), head).Output()
 	if rerr != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	shas := parseRevListShas(out)
 	state.HookDebugf("git-watch: cursor %s unreachable on %s; recovered newest %d commit(s) from head",
 		lastSeen, gitWatchRootKey(root), len(shas))
-	return shas, true
+	return commitsWithFoldableChain(root, shas, head)
+}
+
+// commitsWithFoldableChain pairs a detected commit list with its fold-eligible
+// subset, and it is the ONLY way gitNewCommits hands either one out — so a caller
+// cannot receive commits whose fold status was never established.
+//
+// rev is a single revision argument, deliberately not a set of rev-list flags,
+// because the probe's walk must COVER every commit in shas: the whole range on
+// the normal path, and unbounded head on the gc'd-cursor recovery path, whose own
+// list is bounded by `-n` instead. Bounding the probe the same way would make the
+// two windows different sets — a deep first-parent commit could fall inside the
+// all-parents window and outside the chain window under a skewed committer clock
+// — and "absent from the set" would then mean either "not on the chain" or "past
+// the probe's bound", which is exactly the collapse below. There is no parameter
+// left to reintroduce it with.
+//
+// A probe that FAILS is inconclusive, not empty. ok=false leaves the caller's
+// cursor untouched and the whole poll — attribution and fold alike — retries;
+// a commit is never recorded as attributed on the strength of a fold that was
+// silently skipped.
+func commitsWithFoldableChain(root string, shas []string, rev string) ([]string, map[string]struct{}, bool) {
+	if len(shas) == 0 {
+		return shas, map[string]struct{}{}, true // nothing detected, so nothing to fold and nothing to disagree about
+	}
+	chain, ok := gitFirstParentProbe(root, rev)
+	if !ok {
+		return nil, nil, false
+	}
+	return shas, chain, true
+}
+
+// gitFirstParentProbe is the chain probe commitsWithFoldableChain runs. It is a
+// variable so tests can drive the failing-probe path; production never reassigns it.
+var gitFirstParentProbe = gitFirstParentSet
+
+// gitFirstParentSet enumerates the commits of rev that sit on head's first-parent
+// chain — the fold-eligible subset described on gitNewCommits. The bool separates
+// an empty chain from a probe that could not run.
+func gitFirstParentSet(root, rev string) (map[string]struct{}, bool) {
+	// #nosec G204 -- constant argv plus the caller's own revision, whose SHAs come from git rev-parse output. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent", rev).Output()
+	if err != nil {
+		state.HookDebugf("git-watch: first-parent chain unresolvable on %s; deferring the whole poll for this root", gitWatchRootKey(root))
+		return nil, false
+	}
+	set := map[string]struct{}{}
+	for _, sha := range parseRevListShas(out) {
+		set[sha] = struct{}{}
+	}
+	return set, true
+}
+
+// gitBranchCommitsSinceDefault lists the commits a root's checked-out branch
+// holds that the default branch does not — the branch's own pre-merge range,
+// newest-first. It is the replay range for a cold-started root (see
+// replayReworkForColdStartBranch); nothing else calls it, and it never advances
+// a cursor.
+//
+// head is the SHA pollGitWatch BASELINED THE CURSOR TO, and the range is built
+// against that SHA rather than against a second read of `HEAD`. The two reads are
+// separated by a whole poll's worth of git spawns (pollDurability over every
+// root, then loadAttributedCommits), so a commit landing in that window would be
+// folded here while the cursor still sits behind it — and the next poll, seeing
+// it as new, would fold its hunks a SECOND time and slide every recovered span
+// by an offset already applied. Resolving a moving reference twice is the defect;
+// there is nothing to re-check.
+//
+// --first-parent and --topo-order are what make the returned list foldable, and
+// neither is cosmetic:
+//
+//   - --first-parent, because gitCommitRawDiff reads every commit with
+//     `-m --first-parent`. A merge's diff therefore ALREADY carries everything
+//     the second-parent side brought in, so folding that side's own commits too
+//     applies the same hunks twice, and applies them in the merged-away
+//     coordinate space of a sibling branch. The first-parent chain is the one
+//     sequence of diffs that composes exactly to head's tree.
+//   - --topo-order, because rev-list's default is reverse COMMIT-DATE order,
+//     which git does not promise is topological. A commit whose committer clock
+//     runs ahead sorts past its own descendants, and reversed that folds a parent
+//     after its child — spans addressed in a line space no checkout ever had.
+//     TestReworkColdStartSkewedClockFoldsTheBranchInHeadsLineSpace builds that
+//     shape from real committer dates.
+//
+// It returns NOTHING when that range exceeds gitWatchMaxCommitsPerPoll, and the
+// refusal — rather than a clamp — is the point.
+//
+// The range is replayed ONCE, from the empty ledger adoption just left, because
+// a cold-start cursor is already at head and no later poll re-surfaces any of
+// it. So a partial replay is not "the remainder drains next poll", which is what
+// clampCommitBurst's clamp means; it is a replay that STARTS MID-BRANCH, from a
+// state live tracking would never have been in. Both ends go wrong there, and
+// both go wrong toward FABRICATION rather than loss:
+//
+//   - keeping the OLDEST slice (clampCommitBurst's direction) leaves the rebuilt
+//     spans positioned as of the middle of the branch while the working tree
+//     stands at its head, so the next commit to rewrite those coordinates emits a
+//     verdict about lines nobody wrote — the shape
+//     TestReworkAdoptionClampedBurstDoesNotStrandSpansMidBranch pins;
+//   - keeping the NEWEST slice ends at head, but makes the first replayed commit
+//     look like a FIRST TOUCH of every path it edits. The path-presence inference
+//     that is correct at a branch's real base then seeds that commit's added
+//     lines on an AI-touched path as AI — including a human's. Measured, not
+//     reasoned: a two-commit branch replayed under a cap of one seeded the ten
+//     lines a human prepended.
+//
+// So a branch more than gitWatchMaxCommitsPerPoll commits past its default
+// branch keeps the pre-fix behaviour and that copy under-reports it — the
+// direction these ledgers always resolve toward, and the reason this returns a
+// whole range or none of it.
+//
+// One read-only spawn (the default ref itself is cached).
+func gitBranchCommitsSinceDefault(root, head string) []string {
+	if head == "" {
+		return nil
+	}
+	defRef := durabilityDefaultRef(root)
+	if defRef == "" {
+		return nil // no resolvable default branch — no pre-merge range to speak of
+	}
+	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir, defRef is a ref name resolved by git itself and head came from git rev-parse. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", defRef+".."+head).Output()
+	if err != nil {
+		return nil
+	}
+	shas := parseRevListShas(out)
+	if len(shas) > gitWatchMaxCommitsPerPoll {
+		state.HookDebugf("git-watch: cold-start branch on %s holds %d commit(s) past the default branch, over the per-root cap %d; replaying none of it rather than starting mid-branch",
+			gitWatchRootKey(root), len(shas), gitWatchMaxCommitsPerPoll)
+		return nil
+	}
+	return shas
 }
 
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
@@ -473,7 +637,12 @@ func saveGitWatchCursors(heads map[string]string) {
 // attribution PR consumes); a cold-start root (no prior cursor) is baselined
 // WITHOUT reporting, matching git-ai's cold-start discipline.
 //
-// The second return says, per root, whether this poll left that root's cursor AT
+// The second return carries gitNewCommits' foldable subset per root — the
+// first-parent chain of what was detected. It rides alongside the detected list
+// rather than replacing it because the two have different consumers on purpose;
+// gitNewCommits documents the split and why only the rework fold is narrowed.
+//
+// The third return says, per root, whether this poll left that root's cursor AT
 // ITS HEAD — i.e. whether the root DRAINED. A root is not drained when the
 // shared budget deferred it whole, when a burst was clamped to a partial batch,
 // or when the comparison was inconclusive; in each of those cases commits this
@@ -481,11 +650,28 @@ func saveGitWatchCursors(heads map[string]string) {
 // act on that, and it must: state it drops on the strength of "this root's
 // commits are being processed now" (branch adoption) stays owed for exactly as
 // long as this flag is false.
-func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
+//
+// The fourth return names the roots that COLD-STARTED here — baselined with no
+// prior cursor at all — and maps each to THE EXACT SHA ITS CURSOR WAS BASELINED
+// TO. It is reported rather than acted on, because the cursor discipline must not
+// change: a cold-start root still reports nothing and still emits nothing. What
+// it buys the caller is the ability to tell "this root has never been seen" apart
+// from "this root has nothing new", which are identical from here (both baseline
+// to head and drain) and mean opposite things to branch adoption — see
+// replayReworkForColdStartBranch.
+//
+// The SHA, not just the fact, is returned because the caller runs much later in
+// the same poll and must resolve its replay range against the same commit this
+// cursor now claims. Re-reading `HEAD` there would let a commit made in between
+// be folded by the replay AND detected as new by the next poll, which folds its
+// hunks twice.
+func pollGitWatch(roots []string) (map[string][]string, map[string]map[string]struct{}, map[string]bool, map[string]string) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
+	foldable := map[string]map[string]struct{}{}
 	drained := map[string]bool{}
+	coldStart := map[string]string{}
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -504,12 +690,23 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
-		if !hadCursor || lastSeen == head {
-			newHeads[key] = head // cold start (baseline only) or nothing moved
+		if !hadCursor {
+			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
+			// and it is the whole reason this case is no longer folded in with
+			// "nothing moved" below — the two are indistinguishable from here and a
+			// root that has never been seen is precisely the one whose branch may hold
+			// AI history this device recorded through another copy of the repo.
+			newHeads[key] = head
+			drained[key] = true
+			coldStart[key] = head
+			continue
+		}
+		if lastSeen == head {
+			newHeads[key] = head // nothing moved
 			drained[key] = true
 			continue
 		}
-		commits, ok := gitNewCommits(root, lastSeen, head)
+		commits, onFirstParent, ok := gitNewCommits(root, lastSeen, head)
 		if !ok {
 			continue // comparison inconclusive — keep the old cursor, retry next poll
 		}
@@ -533,6 +730,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 			commits = commits[len(commits)-budget:]
 		}
 		detected[key] = commits
+		foldable[key] = onFirstParent
 		// Advance only to the newest commit we actually returned. commits[0] is
 		// newest-first: it equals head on a normal or gc'd-recovery poll that fit the
 		// budget, but on a clamped burst (per-root OR global) it is the newest of the
@@ -549,7 +747,7 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]bool) {
 	}
 
 	saveGitWatchCursors(newHeads)
-	return detected, drained
+	return detected, foldable, drained, coldStart
 }
 
 // pollGitWatchWorkspace enumerates the workspace's roots (workspace + its git
@@ -574,7 +772,7 @@ func pollGitWatchWorkspace(session Session) {
 		aiRoots,
 		loadDiscoveredRepos(nowMs),
 	))
-	detected, drained := pollGitWatch(roots)
+	detected, foldable, drained, coldStart := pollGitWatch(roots)
 
 	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
 	// detected this poll. A merely-idle repo is left to age out after the horizon.
@@ -627,6 +825,11 @@ func pollGitWatchWorkspace(session Session) {
 		// recovery re-surfaces skipped commits with no branch change, and folding
 		// one of those into live state re-applies its hunks.
 		adopting := false
+		// Set only where adoptReworkBranch actually FIRED this poll — i.e. where the
+		// root's rework state was emptied a few lines above. `adopting` cannot stand
+		// in for it: it is read from the ledger on purpose, so it stays true across
+		// later polls that adopt nothing.
+		justAdopted := false
 		switch scope {
 		case scopeDefault:
 			// On (or merged back to) the default branch: surviving AI lines are now the
@@ -648,8 +851,32 @@ func pollGitWatchWorkspace(session Session) {
 			if branch != "" && recorded != branch {
 				adoptReworkBranch(rootKey, branch)
 				pending = true
+				justAdopted = true
 			}
 			adopting = pending
+		}
+
+		// A root that has never been polled before — the ordinary `git worktree add`
+		// — is a NEW rootKey, so pollGitWatch cold-started it: the cursor went
+		// straight to head and none of the branch's existing commits were surfaced.
+		// The adoption above still fires (a new key has no recorded branch), so
+		// without this the root declares its replay owed and finishes it below having
+		// replayed nothing, leaving that copy of the branch with no AI spans at all.
+		// The replay is one-shot by construction and takes its own range from git,
+		// because there is no cursor for a later poll to drain against.
+		//
+		// THE SAME COMMIT'S HUNKS ARE NEVER FOLDED TWICE INTO THE SAME LEDGER, which
+		// is why the gate is justAdopted and not `adopting`. `adopting` is an
+		// obligation read from the ledger and deliberately outlives the poll that
+		// created it, so a root whose CURSOR is lost while its LEDGER survives —
+		// an unreadable or version-bumped cursors file, or a best-effort save that
+		// never landed — cold-starts on a branch it has already recorded, leaves the
+		// tracked spans in place, and would replay the whole range over them.
+		// justAdopted is true only where adoptReworkBranch just emptied this root's
+		// state, so the range is always folded into the empty ledger it assumes. A
+		// genuinely new root always takes that path: its recorded branch is "".
+		if justAdopted && coldStart[rootKey] != "" {
+			replayReworkForColdStartBranch(session, root, coldStart[rootKey], attributed, nowMs)
 		}
 
 		commits := detected[rootKey]
@@ -663,7 +890,8 @@ func pollGitWatchWorkspace(session Session) {
 			continue
 		}
 		preMerge := scope == scopePreMerge
-		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v)", len(commits), rootKey, preMerge)
+		onFirstParent := foldable[rootKey]
+		state.HookDebugf("git-watch: %d new commit(s) on %s (preMerge=%v, foldable=%d)", len(commits), rootKey, preMerge, len(onFirstParent))
 		// Oldest-first: rework is STATEFUL (seed then churn across commits), so it
 		// must see commits in commit order. Attribution is per-commit independent, so
 		// the reversed order is equally correct for it. commits is newest-first.
@@ -677,6 +905,8 @@ func pollGitWatchWorkspace(session Session) {
 		// would double-count its churn.
 		for i := len(commits) - 1; i >= 0; i-- {
 			sha := commits[i]
+			_, foldRework := onFirstParent[sha]
+			foldRework = foldRework && preMerge
 			if _, done := attributed[sha]; done {
 				reattempted++
 				// Attribution stays skipped — this commit really was accounted for,
@@ -684,12 +914,12 @@ func pollGitWatchWorkspace(session Session) {
 				// this SHA is also the only thing that can rebuild the rework state
 				// adoption emptied, and skipping it outright is what left an adopted
 				// branch looking like it held no AI work.
-				if preMerge && adopting {
+				if foldRework && adopting {
 					replayReworkForAdoptedCommit(session, root, sha, nowMs)
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, preMerge, nowMs) {
+			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs) {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

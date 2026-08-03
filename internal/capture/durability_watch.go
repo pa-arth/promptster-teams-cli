@@ -171,7 +171,14 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 		case lastSeen == "":
 			advanceDurabilityCursor(rootKey, tip) // baseline only
 		case lastSeen != tip:
-			commits, ok := gitNewCommits(root, lastSeen, tip)
+			// The foldable subset is DISCARDED here, so durability still folds the
+			// full range and double-counts a merge's edits — once in the merged-away
+			// branch's coordinate space, once in the merge's. The rework ledger no
+			// longer does (see gitNewCommits), so the two disagree on a history
+			// containing merges. Known and tracked, not intended: narrowing here needs
+			// an answer for where the cursor lands on a skipped commit, since
+			// pollDurabilityCommit advances it per commit inside its own transaction.
+			commits, _, ok := gitNewCommits(root, lastSeen, tip)
 			if !ok {
 				continue // inconclusive — keep the cursor, retry next poll
 			}

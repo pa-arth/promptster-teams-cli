@@ -146,6 +146,125 @@ follows [Semantic Versioning](https://semver.org/).
   wrote. Reports move for existing branches: spans reappear, and rewrites that
   previously emitted nothing now emit the verdict they always should have.
 
+- **A new local copy of a repository showed none of the branch's existing AI
+  history.** A fresh `git worktree add` is a new absolute path, which is a new
+  watcher root, which cold-starts: the cursor is baselined straight to the
+  branch's head and none of its existing commits are ever surfaced. The branch
+  adoption that PR #128 added still fired — a new root has no recorded branch —
+  so the root declared it owed a rebuild and then finished it in the same poll
+  having rebuilt nothing. The copy read as though the branch held no AI work at
+  all, and every later rewrite of its AI lines emitted no `rework_verdict`. It is
+  the same silent under-report as the adopted-branch loss above, reached through
+  cold start instead of through the already-attributed skip, and running several
+  worktrees against one repository is the ordinary move that hits it.
+
+  A cold-started root now re-folds its branch's own commits (`default..HEAD`) for
+  their STATE alone, on the same terms as the adoption rebuild: nothing is
+  re-attributed, no fingerprints are re-recorded, and no verdict is re-emitted.
+  It is gated on this device *already holding attribution* for at least one
+  commit in the range, which is what leaves a genuinely fresh install untouched —
+  a new machine has nothing attributed, so the range is dropped without a single
+  `git show` and cold start stays the silent baseline it has always been. This
+  recovers history the device measured through another copy; it does not import
+  history it never saw.
+
+  The range is taken whole or not at all. A branch further past its default
+  branch than the per-root cap allows is refused rather than replayed in part,
+  because a partial rebuild has to start mid-branch and both ends of that cut
+  invent rather than lose: the older end leaves spans positioned a commit behind
+  head, where they address whatever lives there now, and the newer end makes the
+  first commit replayed look like a first touch, so a human's added lines on an
+  AI-touched path are seeded as AI. Those branches keep the old behaviour and
+  under-report, which is the direction these ledgers always resolve toward.
+
+  **What this delivers is the route, not yet the number.** The cold-start path no
+  longer baselines past a branch's existing commits, so the rebuild now RUNS
+  where it previously did not, and it runs against the branch's head rather than
+  mid-history. Because AI-path evidence is still keyed per checkout, a genuine
+  second directory replays the right commits and finds no AI ranges to seed, so
+  those spans do not come back until that keying gap is closed — which is tracked
+  as its own task. Nothing is re-sent for commits already accounted for either
+  way, so no total can rise from double counting.
+
+- **An ordinary `git merge sidebranch` counted the merged-in edits twice, so
+  RECORDED REWORK FIGURES MOVE DOWN for anyone whose history contains merges.**
+  Every commit is read with `git show -m --first-parent`, so a merge's own diff
+  already carries everything the second-parent side brought in — while the range
+  the watcher walks (`rev-list <cursor>..HEAD`) returns the merge AND the side
+  branch's own commits. Each merged-in edit was therefore applied to the AI-line
+  ledger twice: once in the side branch's coordinate space and once in the
+  merge's. Tracked AI spans drifted by an offset that had already been applied,
+  and a later rewrite of the file reported churn over whatever now sat at those
+  coordinates. A number that drops after this lands was counting the same edits
+  more than once; it was never counting extra work.
+
+  Only the rework FOLD is narrowed, to the merge's first-parent chain. **What
+  gets attributed does not change**: a commit reachable only through a merge's
+  second parent is still reported exactly as before, because whether work that
+  arrived through a merge counts as AI-written is a product question and this is
+  not the change that answers it. Where the two ranges now disagree the ledger
+  can only lose state, never invent it — a second-parent commit no longer seeds
+  its own AI ranges, and a rebuild backed solely by such a commit is declined —
+  which is an under-report, the direction these ledgers always resolve toward.
+
+  **The two entries above move figures in OPPOSITE directions, and they are
+  independent.** The cold-start entry can only make a copy report MORE, by
+  running a rebuild that previously did not run at all; this entry makes any
+  history containing merges report LESS, by removing a double count. Neither
+  re-sends a commit already accounted for.
+
+  **The merge double-count is fixed in the rework ledger ONLY, and the two
+  ledgers therefore disagree on a history containing merges.** Stated plainly,
+  because a reader must not conclude from this release that merges are now
+  handled consistently:
+
+  - the **rework** ledger (`rework_verdict`, pre-merge iteration) folds the
+    first-parent chain, so a merge's edits are counted once;
+  - the **durability** ledger (`durability_verdict`, surviving AI lines on the
+    default branch) still folds the full range, so its figures still
+    double-count on a merge;
+  - so on such a history the two ledgers' numbers are not reconcilable with each
+    other, and that is a known, tracked gap rather than intended behaviour.
+
+  Fixing durability is a separate change, not an oversight in this one: it
+  advances its cursor per commit inside its own ledger transaction, so skipping
+  commits there needs a deliberate answer for where that cursor lands. It is
+  tracked as its own task.
+
+- **A failed internal `git rev-list` could strand tracked AI spans at stale
+  coordinates.** Resolving which commits sit on the merge's first-parent chain
+  is a second `rev-list`, and when it failed to run, the result was read as "no
+  commit is foldable" instead of "we do not know". The poll then attributed and
+  recorded every commit in the range while folding none of them, so the tracked
+  spans kept coordinates the recorded commits had already moved — and because a
+  recorded commit is never revisited, they stayed there. The next rewrite of
+  whatever now sat at those lines emitted a `rework_verdict` for code the AI
+  never wrote. That is FABRICATION, the failure mode these ledgers rank above
+  every other, and it was reachable from a plain fork/exec failure.
+
+  A probe that cannot run now makes the whole comparison inconclusive: the
+  cursor stays where it is and the entire poll — attribution and folding alike
+  — retries on the next one. A commit is never recorded as accounted for on the
+  strength of a fold that was silently skipped. The same rule closes a narrower
+  variant where the two `rev-list` calls were bounded differently, so a commit
+  outside one window read as though it were off the chain.
+
+  **That rule is NOT yet enforced everywhere, and the remaining hole is reached
+  by an ordinary `git rebase -i`.** While a repository's default branch cannot be
+  resolved, or while `HEAD` is detached — which is what a rebase does — the
+  watcher deliberately keeps the branch's tracked AI spans rather than wiping
+  them, but it folds nothing, while still attributing and recording every commit
+  it sees. Those commits are never revisited, so their hunks never move the spans
+  that were kept, and a later rewrite of the human lines that shifted into those
+  coordinates emits a `rework_verdict` for code the AI never wrote. **The watcher
+  polls every 60 seconds, so any rebase taking longer than that lands inside one,
+  and an interactive rebase blocks on your editor for far longer than a minute.
+  This is routine usage, not a corner case, and the wrong position is permanent
+  rather than transient.** It is pre-existing behaviour, unchanged by this
+  release, and it is tracked on the same task as the durability double-count
+  above — the two are one invariant, that recording a commit and folding its
+  hunks must never disagree — to be fixed together in a dedicated pass.
+
 - **`doctor` contradicted the updater it reports on.** Its auto-update line
   restated three facts that `internal/selfupdate` owns, and every one of them had
   since drifted: it promised an update "installs on the next **24h** check" for
