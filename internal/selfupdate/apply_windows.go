@@ -32,9 +32,24 @@ func applySwapAndReexec(self, staged string) error {
 		return fmt.Errorf("selfupdate: move staged binary into place: %w", err)
 	}
 
-	// #nosec G204 -- self is our own resolved install path; argv is this process's own os.Args.
-	cmd := exec.Command(self, os.Args[1:]...)
-	cmd.Env = os.Environ()
+	return reexecInto(self)
+}
+
+// reexecInto is the Windows stand-in for execve: spawn a detached process from
+// the binary at target and exit, so this image releases its file handles and
+// only the new one keeps capturing. On success it does not return.
+//
+// It marks the child with EnvHandoff. Windows has no execve, so unlike unix
+// there are momentarily TWO processes, and the new one races the old one for the
+// single-instance lock it is inheriting. Losing that race is not a harmless
+// retry — the child prints "capture already running" and exits, the parent is
+// already on its way out, and the machine captures nothing until the next login.
+// The marker tells the child this is a handoff and it should WAIT for the lock
+// rather than bow out (see capture.RunTeamsWatch).
+func reexecInto(target string) error {
+	// #nosec G204 -- target is our own resolved install path or the managed one; argv is this process's own os.Args.
+	cmd := exec.Command(target, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), EnvHandoff+"=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000008 | 0x00000200} // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("selfupdate: relaunch new binary: %w", err)

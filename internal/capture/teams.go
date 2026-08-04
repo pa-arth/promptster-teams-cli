@@ -114,9 +114,25 @@ func RunTeamsWatch(args []string) error {
 	// service). A second watcher would double-count presence + events and corrupt
 	// the seat-utilization metric, so bow out cleanly (exit 0 — launchd's
 	// KeepAlive{SuccessfulExit:false} then won't respawn a duplicate).
+	// Read and clear the handoff marker before anything else, so it cannot ride
+	// os.Environ() into a re-exec of our own and turn a later ordinary start into
+	// a silent waiter.
+	handoff := consumeHandoffMarker()
 	release, ok, err := acquireWatchLock()
 	if err != nil {
 		return fmt.Errorf("could not take capture lock: %w", err)
+	}
+	if !ok && handoff {
+		// We were spawned to REPLACE the watcher that holds this lock (a Windows
+		// self-update or on-disk catch-up, which cannot execve and so must exit a
+		// parent that is still holding it). Bowing out here is the one case where
+		// "already running" is wrong in a way that costs capture entirely: the
+		// parent is on its way out, nobody is left, and nothing tries again until
+		// the next login. So wait for the handle to drop.
+		release, ok, err = awaitWatchLock(handoffLockWait)
+		if err != nil {
+			return fmt.Errorf("could not take capture lock: %w", err)
+		}
 	}
 	if !ok {
 		// Bowing out must not mean this directory goes uncaptured: register it so
