@@ -101,8 +101,9 @@ type codexWatchProgress struct {
 	// runs a one-time migration when the stored V is behind codexProgressSchemaV.
 	V int `json:"v"`
 	// RootsFP fingerprints the match ROOT SET the cached decisions were made
-	// against; a change drops every cached "no" so a widened set reaches files
-	// already judged mismatches. Mirrors claudeWatchProgress.RootsFP.
+	// against; a change drops every cached decision so both a widened and a
+	// narrowed set are applied to files already classified. Mirrors
+	// claudeWatchProgress.RootsFP.
 	RootsFP string `json:"roots_fp"`
 }
 

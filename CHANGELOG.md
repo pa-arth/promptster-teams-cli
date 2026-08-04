@@ -59,6 +59,23 @@ follows [Semantic Versioning](https://semver.org/).
   neither a trustworthy session timestamp nor the token telemetry this view
   needs.
 
+- **Removing a capture root now actually stops that directory's sessions from
+  uploading.** 0.12.2 re-checked only the transcripts cached as mismatches, so
+  widening the roots took effect but narrowing them did not: a transcript
+  already accepted kept being tailed after its directory was no longer watched.
+  Any change to the effective root set now revalidates every cached
+  classification in both directions. Byte offsets are kept, so nothing already
+  consumed is uploaded twice.
+
+- **A single oversized transcript record no longer stalls a session's capture
+  indefinitely.** Records are read whole or deferred whole against the per-poll
+  byte budget, so a partial record is never half-consumed. A record larger than
+  the 8 MiB supported maximum — which no future poll could complete — is
+  discarded in bounded chunks and reported on stderr, rather than being re-read
+  from the same offset on every poll while the rest of the session goes
+  uncaptured. Classification measures against that same maximum, so it skips
+  such a record instead of restarting from byte zero forever.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added

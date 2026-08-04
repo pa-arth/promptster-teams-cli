@@ -167,10 +167,12 @@ type claudeWatchProgress struct {
 	// runs a one-time migration when the stored V is behind claudeProgressSchemaV.
 	V int `json:"v"`
 	// RootsFP fingerprints the match ROOT SET the cached decisions were made
-	// against. When it changes — a `start` registered another directory, or a
-	// git worktree appeared — every cached "no" is dropped so the widened set
-	// gets applied to files already judged mismatches. Without it, widening is
-	// invisible to any transcript classified before the change.
+	// against. When it changes — a `start` registered another directory, a git
+	// worktree appeared, or a root went away — every cached decision is dropped
+	// and reclassified against the current set. Without it, a root-set change is
+	// invisible to any transcript classified before it: widening would never
+	// reach a cached "no", and narrowing would keep tailing a cached "yes" whose
+	// directory is no longer watched.
 	RootsFP string `json:"roots_fp"`
 }
 

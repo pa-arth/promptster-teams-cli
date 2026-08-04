@@ -189,13 +189,21 @@ distinction does not exist at the transcript layer.
 
 ### The real gate is cwd, not surface
 
-`classifyClaudeTranscript` (`cmd_claude_watch.go:501`) ingests a transcript only
+`classifyClaudeTranscript` (`cmd_claude_watch.go`) ingests a transcript only
 if its recorded `cwd` sits inside the capture workspace or one of its registered
-git worktrees (`workspaceMatchRoots`, `cmd_claude_watch.go:477`). Codex applies
-the same test (`cmd_codex_watch.go:272`), and Cursor applies it to observed paths
-instead of a recorded cwd (`cursorClassify`, `cmd_cursor_watch.go`). The
+git worktrees (`workspaceMatchRoots`, same file). Codex applies the same test
+(`classifyCodexRollout`, `cmd_codex_watch.go`), and Cursor applies it to observed
+paths instead of a recorded cwd (`cursorClassify`, `cmd_cursor_watch.go`). The
 workspace defaults to `os.Getwd()` and is overridable with
-`PROMPTSTER_TEAMS_WATCH_DIR` (`teams.go:90`).
+`PROMPTSTER_TEAMS_WATCH_DIR` (`watchDirFromEnv`, `teams.go`).
+
+The Claude and Codex decisions are CACHED per file in the progress file, and that
+cache is keyed to the root set that produced them (`captureRootsFingerprint` /
+`syncMatchCacheToRoots`, `capture_roots.go`): any change to the effective roots
+drops every cached decision, in both directions — widening admits a prior
+mismatch, narrowing revokes a prior match so a removed workspace stops uploading.
+Byte offsets live in a separate map and survive, so revalidation never re-uploads
+consumed bytes.
 
 So a session is dropped when it runs outside the watched workspace — e.g. the
 desktop app opened on a different folder — no matter which surface produced it.
@@ -212,7 +220,7 @@ Cursor is excluded — no trustworthy timestamp.
 
 The hazard is not the reading, it is that replayed events go through
 `queueClaudeWatchEvent` / `emitCodexEvent`, the same funnel live events use — and
-parts of that funnel assumed "this just happened". Four rules, all pinned by
+parts of that funnel assumed "this just happened". Five rules, all pinned by
 `history_backfill_test.go` and all mutation-tested:
 
 - **The attribution ledgers are stamped from the EVENT, never the wall clock.**
@@ -250,7 +258,15 @@ parts of that funnel assumed "this just happened". Four rules, all pinned by
   the transcript IS the durable buffer and the offset has not moved — whereas an
   unbounded first pass blocks every shutdown for its full duration (the signal
   select sits after the poll) and races the outbox to `OutboxMaxBytes`, where
-  `Append` DROPS and takes live capture down with the backfill.
+  `Append` DROPS and takes live capture down with the backfill. The budget is a
+  RECORD boundary, not a byte one: both rails read through
+  `readTranscriptRecords` (`transcript_read.go`), which defers a record that
+  does not fit rather than half-reading it. The one read allowed past the budget
+  is a single per-poll probe establishing that a record exceeds
+  `transcriptMaxRecordBytes`, which is the only case a record is discarded
+  instead of deferred — read that file's header before touching either, and note
+  that classification measures against the SAME maximum so the two paths cannot
+  disagree about which record is unsupported.
 
 ## Uninstall (`uninstall`, `internal/cli/uninstall.go`)
 
