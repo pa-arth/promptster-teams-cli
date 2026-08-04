@@ -61,6 +61,16 @@ type CodexRolloutProcessor struct {
 	// session (see CodexConversationID) they must say so, or the fluency judge
 	// grades machine-authored text as the engineer's own prompting.
 	subagentThread bool
+	// subagentName is the delegated agent's NAME, from session_meta.source
+	// (see codexSubagentName). "" when the rollout names none — including every
+	// rollout of a build that predates the field.
+	//
+	// It rides subagent_usage as `attributionAgent`, which is the field the
+	// backend's spend row is NAMED from and the field its frequency board is
+	// KEYED on. Without it every delegated turn in an org collapses into one row
+	// literally called "subagent" and the frequency board drops all of them —
+	// measured at 0 of 731 on a live customer before this existed.
+	subagentName string
 	// threadID is this rollout's OWN thread id (session_meta.payload.id, which is
 	// also the uuid in the filename). It is no longer the session id — see
 	// CodexConversationID — but it is what tells one subagent's spend apart from
@@ -435,6 +445,42 @@ func codexIsSubagentThread(payload map[string]interface{}) bool {
 	return parent != "" && parent != stringField(payload, "id")
 }
 
+// codexSubagentName recovers the delegated agent's NAME from session_meta, or ""
+// when the rollout does not name one.
+//
+// Codex writes `source` as a tagged union: a bare string for an ordinary thread
+// ("cli", "exec") and an object for a delegated one —
+// `{"subagent":{"other":"guardian"}}`, captured live on codex-cli 0.146.0.
+//
+// THE INNER KEY IS AN OPEN SET. `other` is evidently the fallback variant for a
+// user-defined agent, which means named variants exist that this build has never
+// seen. So the value of whichever single string the object holds is the name; an
+// unrecognized key yields the name it carries rather than a rejection. Switching
+// on `other` would silently start dropping names the day Codex ships a second
+// variant, which is the failure this whole change exists to fix.
+//
+// A shape we cannot read yields "" — the field is then omitted downstream, never
+// defaulted to a placeholder. "We do not know which agent" and "an agent called
+// subagent" are opposite claims, and the second one is what the boards render.
+func codexSubagentName(payload map[string]interface{}) string {
+	source, ok := payload["source"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	inner, ok := source["subagent"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	for _, v := range inner {
+		if s, ok := v.(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
 func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, raw string) []event.Event {
 	// session_meta is line 1 of every rollout, so this runs before any event is
 	// minted — including on the replay-the-consumed-prefix path a restarted
@@ -455,6 +501,7 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 		p.sessionID = conv
 	}
 	p.subagentThread = codexIsSubagentThread(payload)
+	p.subagentName = codexSubagentName(payload)
 	p.threadID = stringField(payload, "id")
 	// Stash the home-collapsed cwd for prompt events: session_meta is the only
 	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
@@ -577,6 +624,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	case "patch_apply_end":
 		return p.patchApplyEnd(payload, ts, raw)
 
+	case "mcp_tool_call_end":
+		return p.mcpToolCall(payload, ts)
+
 	case "token_count":
 		// Stash the latest usage; attached to the next final assistant message.
 		if info, ok := payload["info"].(map[string]interface{}); ok {
@@ -616,9 +666,81 @@ func (p *CodexRolloutProcessor) subagentUsage(ts, raw string) []event.Event {
 	if p.threadID != "" {
 		data["agentId"] = p.threadID
 	}
+	// The agent's NAME, when session_meta gave one. Omitted (not blanked) when it
+	// did not: the backend reads absent as "unnamed" and names the span
+	// `attributionSkill ?? attributionAgent ?? "subagent"`, so an empty string
+	// here would be a name rather than the absence of one.
+	if p.subagentName != "" {
+		data["attributionAgent"] = p.subagentName
+	}
 	e.Data = data
 	e.RawPayload = "codex subagent usage"
 	return []event.Event{e}
+}
+
+// mcpToolCall emits an mcp_call from Codex's `mcp_tool_call_end` event_msg.
+//
+// THIS IS THE ONLY PLACE MCP IDENTITY APPEARS ON THE CODEX WIRE. The model
+// reaches an MCP tool through the `exec` JavaScript wrapper
+// (`ALL_TOOLS.find(x => x.name.includes("probe_echo"))`), so there is no
+// `server__tool` function name anywhere in the rollout — which is why the old
+// name-shaped detector (`strings.Contains(name, "__")`) could never fire and a
+// live customer showed exactly 0 mcp_call events over 30 days. Zero from a
+// detector that cannot fire is unmeasured, not unused.
+//
+// The server rides INSIDE the tool name as "<server>__<tool>". mcp_call's field
+// allowlist is {name, tool, status} on BOTH default-deny rails (the CLI's
+// redact/project.go and the backend's captureAllowlist.ts) — there is no
+// `server` field, and adding one means editing both lists or the value is
+// stripped silently. It does not need adding: the backend's mcpServerOf() already
+// splits an mcp_call's tool name on the first "__" and returns the left side as
+// the server, code the Claude rail already exercises.
+//
+// NOT READ, and this is the point of the function rather than an aside:
+// `invocation.arguments` is whatever the engineer passed the tool and
+// `result.content` is the tool's full output. Both are the same class as the
+// codex.tool_result arguments/output the OTel translator refuses whole. Only the
+// two names are read, and the record is never placed in RawPayload.
+func (p *CodexRolloutProcessor) mcpToolCall(payload map[string]interface{}, ts string) []event.Event {
+	invocation, ok := payload["invocation"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	server := strings.TrimSpace(stringField(invocation, "server"))
+	tool := strings.TrimSpace(stringField(invocation, "tool"))
+	if server == "" || tool == "" {
+		return nil
+	}
+	// call_id is the vendor's stable identity for this call; fall back to the
+	// line ts so a build that omits it still mints a deterministic id.
+	seed := stringField(payload, "call_id")
+	if seed == "" {
+		seed = ts
+	}
+	e := p.newCodexEvent("mcp_call", ts, seed)
+	e.Provenance = event.AIProvenance()
+	e.Data = map[string]interface{}{
+		"tool":   server + "__" + tool,
+		"status": codexMCPStatus(payload),
+	}
+	// RawPayload deliberately unset: the record holds both the call arguments and
+	// the tool's output.
+	return []event.Event{e}
+}
+
+// codexMCPStatus reads the call's outcome. Codex wraps the result in a Rust-style
+// tagged union — {"Ok":…} or {"Err":…} — so presence of `Ok` is the verdict.
+// An unreadable result yields "error": a call whose outcome we cannot establish
+// is not evidence that it worked.
+func codexMCPStatus(payload map[string]interface{}) string {
+	result, ok := payload["result"].(map[string]interface{})
+	if !ok {
+		return "error"
+	}
+	if _, ok := result["Ok"]; ok {
+		return "ok"
+	}
+	return "error"
 }
 
 // patchApplyEnd emits one file_diff per changed file. The payload carries a
@@ -773,7 +895,25 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, out
 			"stdout":   stdout,
 		}
 		e.RawPayload = raw
-		return []event.Event{e}
+		events := []event.Event{e}
+		// A Codex skill invocation IS this shell command: Codex has no skill tool
+		// and reaches for a skill by reading its own SKILL.md (verified live on
+		// 0.146.0 — `sed -n '1,240p' <root>/skills/<slug>/SKILL.md`). The sibling
+		// event carries the identity; the command event is emitted unchanged
+		// because other consumers count it.
+		if slug := codexSkillSlugFromCommand(cmd); slug != "" {
+			s := p.newCodexEvent("tool_use", ts, callID+"\x1fskill")
+			s.Provenance = event.AIProvenance()
+			s.Data = map[string]interface{}{
+				"tool":   "skill",
+				"skill":  slug,
+				"status": codexToolStatus(output),
+			}
+			// No RawPayload: the wrapper source and the file's contents both ride
+			// the command event's, and this event needs neither.
+			events = append(events, s)
+		}
+		return events
 
 	case call.name == "update_plan":
 		e := p.newCodexEvent("planning", ts, callID)
@@ -788,14 +928,13 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, out
 		e.RawPayload = raw
 		return []event.Event{e}
 
-	case isCodexMCPTool(call.name):
-		e := p.newCodexEvent("mcp_call", ts, callID)
-		e.Data = map[string]interface{}{
-			"tool":        call.name,
-			"argsPreview": jsonPreview(call.args, 100),
-		}
-		e.RawPayload = raw
-		return []event.Event{e}
+	// NO name-shaped MCP branch here, deliberately. It used to read
+	// `strings.Contains(call.name, "__")` on the theory that Codex namespaces MCP
+	// tools as `server__tool`. It does not: the model reaches MCP through the
+	// `exec` JS wrapper, so no MCP tool name ever appears in a function_call /
+	// custom_tool_call. The branch was unreachable and reported the same zero a
+	// customer with no MCP servers would — which is exactly how it was read.
+	// MCP now arrives on its own event_msg; see mcpToolCall.
 
 	default:
 		e := p.newCodexEvent("tool_use", ts, callID)
@@ -1199,9 +1338,45 @@ func (p *CodexRolloutProcessor) emitWrappedPatch(call codexPendingCall, callID, 
 	return events
 }
 
-func isCodexMCPTool(name string) bool {
-	// Codex namespaces MCP tools (e.g. "server__tool" or "mcp__server__tool").
-	return strings.Contains(name, "__")
+// codexSkillPathRe matches a read of a skill definition file, capturing the slug:
+// the directory that immediately contains SKILL.md, at any depth under a skills
+// root. Bundled Codex skills sit one level deeper
+// (skills/.system/<slug>/SKILL.md) and DO count — they are skills the engineer
+// reached for. `.` and `..` are rejected so a traversal cannot mint a slug.
+//
+// Both root spellings are accepted: Codex uses `skills/`, Cursor uses
+// `skills-cursor/`. A Codex session can read either — the roots are just
+// directories on the same machine — and Phase 2 wants the identical rule, so the
+// pattern is written once rather than forked per tool.
+var codexSkillPathRe = regexp.MustCompile(`/skills(?:-cursor)?/(?:[^/\s]+/)*([^/\s]+)/SKILL\.md\b`)
+
+// codexSkillReadRe bounds the detector to commands that READ. Codex's own skill
+// invocation uses `sed -n '1,240p' …`, but an engineer's session legitimately
+// cats, heads or greps a SKILL.md too — all of those are the model taking the
+// skill's text into context, which is the thing being counted. A command that
+// merely NAMES the path to a non-reading program (rm, git add, mv) is not.
+var codexSkillReadRe = regexp.MustCompile(`(^|[|;&]\s*|\s)(sed|cat|head|tail|less|more|bat|rg|grep|awk|nl)\b`)
+
+// codexSkillSlugFromCommand recovers the skill slug a shell command read, or "".
+//
+// This is deliberately a HEURISTIC and is scoped like one. A model can read a
+// SKILL.md without invoking the skill — while editing it, say. That is accepted:
+// the field feeds "skills the model reached for" (the backend's
+// modelInvokedSkills), which is what the board is titled, and the alternative on
+// this rail is no signal whatsoever. It is never used to claim a skill RAN.
+func codexSkillSlugFromCommand(cmd string) string {
+	if !codexSkillReadRe.MatchString(cmd) {
+		return ""
+	}
+	m := codexSkillPathRe.FindStringSubmatch(cmd)
+	if m == nil {
+		return ""
+	}
+	slug := m[1]
+	if slug == "." || slug == ".." {
+		return ""
+	}
+	return slug
 }
 
 // codexCommandString extracts a human-readable command from codex tool args,
