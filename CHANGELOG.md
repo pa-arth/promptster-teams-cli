@@ -6,6 +6,59 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-08-04
+
+**If you work in Codex or Cursor, this is the release where Promptster starts
+seeing your setup at all.** Until now the config census looked in `~/.claude`
+and nowhere else, so an engineer working in another agent was recorded as owning
+zero skills, zero MCP servers and zero subagents. That zero was never a
+measurement — it was the shape of a walk that never looked — but on the Skill &
+Asset Health board it was indistinguishable from someone who had genuinely
+configured nothing. On one real machine the new walk finds 39 skills where the
+old one found 13.
+
+Minor, not patch: this version READS two directories no previous version opened.
+Nothing more is uploaded from them than was already uploaded from `~/.claude` —
+config-identity names and token counts, never file contents — but "we now look
+in a new place on your disk" is a change an operator is entitled to see in the
+version number rather than discover in a diff.
+
+### Added
+
+- The config census walks **Codex** (`~/.codex`) and **Cursor** (`~/.cursor`)
+  alongside Claude Code, and stamps every skill, plugin and MCP server with the
+  tool it belongs to. The same name under two agents stays two assets — folding
+  them would price one tool's carry against the other's usage. Cursor's skills
+  live in `skills-cursor`, not `skills`, and its MCP servers are invoked as
+  `user-<name>` while `mcp.json` keys them bare; both are handled, and getting
+  either wrong returns a convincing zero rather than an error.
+- `toolsExamined` records which agent roots actually existed when the census
+  ran. Examined-and-empty and never-looked-at are different facts, and an empty
+  list cannot tell them apart — this is what stops the second being read as the
+  first.
+- Codex MCP servers are read from `config.toml` section headers only. No
+  key/value line is ever parsed, so commands, arguments, environment variables
+  and URLs stay on the machine by construction rather than by a filter applied
+  afterwards.
+- Cursor **subagent dispatches** and **MCP calls** are now captured. Cursor
+  records no token usage for them on any rail, so they arrive as activity with
+  no cost attached — deliberately, because a fabricated `$0` is a stronger claim
+  than we can support.
+
+### Fixed
+
+- Cursor sessions covered by the hooks integration were skipped whole by the
+  transcript watcher. Cursor exposes no hook for an MCP call or a subagent
+  dispatch, so on a hook-enrolled machine — the recommended setup — those two
+  were captured by neither rail. The watcher now reads exactly those two kinds
+  from a hook-covered session and nothing else, so nothing is captured twice.
+- A comment on a Codex `config.toml` table header (`[mcp_servers.db] # staging
+  creds in 1password`) was parsed as part of the server's NAME and uploaded with
+  it. Header parsing now stops at the closing bracket.
+- The census read `~/.codex` and `~/.cursor` literally while the watchers honor
+  `CODEX_HOME`. With that variable set, Promptster inventoried one location's
+  configuration and captured another location's sessions.
+
 ## [0.12.4] — 2026-08-04
 
 **If you are still on 0.12.2 or earlier, install this one BEFORE you next
@@ -1414,7 +1467,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.4...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.1...v0.12.2
