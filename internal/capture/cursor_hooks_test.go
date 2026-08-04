@@ -285,6 +285,9 @@ func TestClaimedTranscriptIsSkippedByTheWatcherButAdvancedToEOF(t *testing.T) {
 	)
 	recordCursorHookClaim(path, "a", "grok-4.5")
 
+	// A prompt and a shell command are both kinds the HOOK rail emits, so the
+	// watcher must stay silent on them. (It is no longer silent about
+	// everything — see the hook-blind kinds test below.)
 	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 0 {
 		t.Fatalf("watcher queued %d event(s) for a hook-claimed transcript — that is double capture", queued)
 	}
@@ -358,5 +361,55 @@ func TestCursorHookClaimPreservesModelWhenLaterStepHasNone(t *testing.T) {
 	recordCursorHookClaim(path, "a", "") // file edit / shell — no model on payload
 	if !cursorHookModelAlreadyReported(path, "a", "grok-4.5") {
 		t.Fatal("empty-model claim wiped the remembered model")
+	}
+}
+
+// The handoff used to be whole-transcript: a claimed session was seeked to EOF
+// unread. But Cursor exposes no hook for an MCP call or a subagent dispatch —
+// the seven steps we register carry neither — so on every hook-enrolled machine,
+// which is the recommended install, those two identities were captured by
+// NOTHING and the asset boards read a zero that was never a measurement.
+func TestClaimedTranscriptStillYieldsTheKindsHooksCannotSee(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws := resolvePath(t.TempDir())
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"}
+	cutoff := time.Now().Add(-time.Hour)
+	processors := map[string]*normalize.CursorTranscriptProcessor{}
+	pollCursorTranscripts(session, ws, cutoff, processors, true, false)
+
+	// One of each: a kind only this rail can see, and a prompt the hook rail
+	// already sent. Exactly one of them may be emitted.
+	path := writeCursorTranscript(t, root, "p/agent-transcripts/b/b.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>the hook rail already sent this</user_query>"}]}}`,
+		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"CallMcpTool","input":{"server":"user-clerk","toolName":"list_apps"}}]}}`,
+		// Also a `command`, which the hook rail sends: it both anchors the
+		// transcript to this workspace and proves the filter drops it.
+		cursorShellLine(ws),
+	)
+	recordCursorHookClaim(path, "b", "grok-4.5")
+
+	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 1 {
+		t.Fatalf("claimed transcript queued %d event(s), want exactly 1 (the mcp_call, not the prompt)", queued)
+	}
+}
+
+// The safety property that makes the narrowing sound rather than a partial
+// re-opening of the double-capture hole: every kind the watcher still emits on a
+// claimed transcript must be one the HOOK normalizer structurally cannot
+// produce. Widening the set without that argument is the regression.
+func TestHookBlindKindsAreDisjointFromWhatTheHookRailEmits(t *testing.T) {
+	// The kinds normalize_cursor_hook.go maps its seven registered steps onto.
+	hookEmits := map[string]bool{
+		"session_start": true, "session_end": true, "prompt": true,
+		"file_diff": true, "command": true, "tool_result": true, "ai_response": true,
+	}
+	for kind := range cursorHookBlindKinds {
+		if hookEmits[kind] {
+			t.Fatalf("%q is emitted by BOTH rails on a claimed transcript — double capture", kind)
+		}
+	}
+	if len(cursorHookBlindKinds) == 0 {
+		t.Fatal("the hook-blind set is empty — the narrowing does nothing")
 	}
 }

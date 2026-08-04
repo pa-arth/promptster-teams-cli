@@ -318,8 +318,15 @@ func TestCursorDelete(t *testing.T) {
 // Read/Grep/Glob are 782 of the corpus's 1,809 tool calls and say only that the
 // agent looked at something. They are deliberately unmapped — pinned here so
 // "we started shipping 780 no-signal events" cannot happen by accident.
+//
+// `Task` and `CallMcpTool` were removed from this list DELIBERATELY. They were
+// never no-signal calls — they are the delegation and MCP identity the asset
+// boards are built on, and they sat here only because their allowlist review was
+// outstanding. That review is done (see toolEvent), so they now emit
+// `task_dispatch` and `mcp_call`, covered by
+// normalize_cursor_asset_identity_test.go. The rest of this list stands.
 func TestCursorReadAndSearchToolsAreNotEmitted(t *testing.T) {
-	for _, name := range []string{"Read", "Grep", "Glob", "TodoWrite", "Task", "CallMcpTool", "WebSearch", "UpdateCurrentStep"} {
+	for _, name := range []string{"Read", "Grep", "Glob", "TodoWrite", "WebSearch", "UpdateCurrentStep"} {
 		line := []byte(`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"` + name + `","input":{"path":"/w/x.go","pattern":"foo"}}]}}`)
 		p := procWith("sess-1")
 		if evs := p.Process(line, 0); len(evs) != 0 {

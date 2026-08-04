@@ -216,25 +216,53 @@ func (p *CursorTranscriptProcessor) promptEvent(text string, offset int64, idx i
 	return e, true
 }
 
-// cursorEditInput is the union of the edit-tool inputs. old_string/new_string/
-// contents are read ONLY to be counted; see the package note.
+// cursorEditInput is the union of the MAPPED tools' inputs. old_string/
+// new_string/contents are read ONLY to be counted; see the package note.
+//
+// The key names below are verified against 89 real transcripts, not assumed —
+// the standing rule in this file's header. `Task` carries
+// {description, prompt, subagent_type} with optional {model, run_in_background,
+// resume}; `CallMcpTool` carries {server, toolName, arguments} with optional
+// {description}.
+//
+// `prompt` and `arguments` are deliberately NOT fields here. They are the full
+// delegated instruction and the full MCP call payload — free text that can
+// carry anything the human typed or the agent read. Leaving them unparsed means
+// no later edit can accidentally place them in Data.
 type cursorEditInput struct {
 	Path      string `json:"path"`
 	OldString string `json:"old_string"`
 	NewString string `json:"new_string"`
 	Contents  string `json:"contents"`
 	Command   string `json:"command"`
+
+	// Task
+	Description  string `json:"description"`
+	SubagentType string `json:"subagent_type"`
+	// CallMcpTool
+	Server   string `json:"server"`
+	ToolName string `json:"toolName"`
 }
 
 // toolEvent maps one assistant tool_use to a canonical event.
 //
 // SCOPE. Only the tools that describe WORK are mapped: edits, file creation,
-// deletion, and shell commands. Read/Grep/Glob are 782 of the corpus's 1,809
-// tool calls and say only that the agent looked at something — they are
-// deliberately unmapped rather than shipped as volume. Task/TodoWrite/
-// CreatePlan/CallMcpTool are real signals but need allowlist review on both
-// sides before they can carry anything, so they stay silent rather than
-// projecting to `{}`.
+// deletion, shell commands, delegation, and MCP calls. Read/Grep/Glob are 782 of
+// the corpus's 1,809 tool calls and say only that the agent looked at something
+// — they are deliberately unmapped rather than shipped as volume.
+//
+// Task and CallMcpTool were previously in that unmapped set, with the stated
+// reason that they "need allowlist review on both sides before they can carry
+// anything". That review is done: `task_dispatch` allowlists {name, status,
+// summary} and `mcp_call` allowlists {name, tool, status} in BOTH
+// internal/redact/project.go and the backend's eventFieldProjection.ts, so the
+// keys emitted below survive projection on both rails. This widens neither
+// allowlist — it gives two already-sanctioned shapes their first Cursor
+// producer. Without it a Cursor engineer's delegations and MCP usage are not
+// merely unpriced, they are INVISIBLE, and the asset boards read that absence as
+// "this engineer built and used nothing".
+//
+// TodoWrite/CreatePlan remain unmapped for the original reason.
 func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int64, idx int) (event.Event, bool) {
 	var in cursorEditInput
 	if len(item.Input) > 0 {
@@ -290,6 +318,56 @@ func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int
 		// and none to report either. exitCode is left ABSENT rather than
 		// fabricated as 0, which would report every failed command as a success.
 		e.Data = map[string]interface{}{"command": in.Command}
+		return e, true
+
+	case "Task":
+		// `task_dispatch`, NOT `subagent_usage`. The two are not
+		// interchangeable: subagent_usage is a SPEND event — its allowlist is
+		// projectUsageFields plus attribution — and Cursor's transcripts carry no
+		// token usage at ALL (no usage object, no tool_result records, nothing).
+		// Emitting one here would put a row on the spend boards whose token
+		// counts are absent, and an absent count reads downstream as a measured
+		// zero. task_dispatch is the "which agent was spun up" dimension, which
+		// is the question actually being asked, and it needs no numbers to answer.
+		//
+		// Keys match the Claude/Codex branch in normalize.go exactly, so Cursor
+		// delegations land in the same buckets as everyone else's rather than
+		// opening a parallel vocabulary.
+		e := p.newAIEvent("task_dispatch", offset, idx)
+		data := map[string]interface{}{
+			// Description only — never `prompt`, which is the full delegated
+			// instruction and can carry anything the human typed.
+			"summary": strPreview(in.Description, 100),
+		}
+		// Trim BEFORE testing: a whitespace-only subagent_type passes `!= ""`
+		// and then emits `name: ""`, which opens a nameless agent-type bucket
+		// instead of being skipped. One of the 27 real Task calls in the corpus
+		// carries no subagent_type at all, so the omit path is exercised in the
+		// field, not just in theory.
+		if st := strings.TrimSpace(in.SubagentType); st != "" {
+			data["name"] = st
+		}
+		e.Data = data
+		return e, true
+
+	case "CallMcpTool":
+		// Cursor names the server and the tool in SEPARATE fields, where Claude
+		// and Codex ship one `server__tool` string. Recompose it into the single
+		// name so `mcpServerOf` — which splits on the first `__` — resolves the
+		// server for all three tools with no per-tool branch.
+		if in.Server == "" || in.ToolName == "" {
+			// Half a name is worse than none: `__foo` or `bar__` would split into
+			// an empty server and open a nameless bucket on the MCP board.
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("mcp_call", offset, idx)
+		// NO `status`. Cursor records no tool results anywhere in the transcript,
+		// so there is no outcome to report — and stamping "ok" would report every
+		// failed MCP call as a success. Absent is the honest value, same reasoning
+		// as the missing exitCode on Shell above.
+		//
+		// NO `arguments`. It is the full call payload and is never parsed.
+		e.Data = map[string]interface{}{"tool": in.Server + "__" + in.ToolName}
 		return e, true
 	}
 
