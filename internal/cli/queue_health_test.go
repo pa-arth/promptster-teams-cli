@@ -482,3 +482,135 @@ func writeFileAt(t *testing.T, path, body string, mtime time.Time) {
 		t.Fatalf("chtimes %s: %v", path, err)
 	}
 }
+
+// --- both lanes -------------------------------------------------------------
+//
+// The queue is two lanes now, and doctor reading only the live one is a real
+// blind spot rather than a theoretical one: the backfill lane has its own file,
+// its own OutboxMaxBytes ceiling and its own cursor, so it can be at the cap and
+// dropping replayed events, or wedged for hours, entirely underneath a healthy
+// live lane. Every test below fails if the gather goes back to measuring live.
+
+// seedBackfill fills the backfill lane the way seedOutbox fills the live one.
+func seedBackfill(t *testing.T, n int) {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < n; i++ {
+		b.WriteString(`{"kind":"prompt","sessionId":"s1"}` + "\n")
+	}
+	if err := os.WriteFile(state.OutboxBackfillPath(), []byte(b.String()), 0o600); err != nil {
+		t.Fatalf("seed backfill outbox: %v", err)
+	}
+}
+
+// growTo pads a file to at least n bytes without building n bytes in memory.
+func growTo(t *testing.T, path string, n int64) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer f.Close()
+	if err := f.Truncate(n); err != nil {
+		t.Fatalf("truncate %s: %v", path, err)
+	}
+}
+
+// A backfill lane at the cap is DROPPING replayed events right now. Doctor must
+// say so even while the live lane is small and healthy.
+func TestGatherQueueInputsSeesAFullBackfillLane(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	seedOutbox(t, 3)
+	seedBackfill(t, 1)
+	growTo(t, state.OutboxBackfillPath(), outbox.OutboxMaxBytes)
+
+	in := gatherQueueInputs(time.Now(), liveSnapshot(time.Now().Add(-time.Minute)))
+	lines := checkQueueHealth(in)
+
+	if got := worstLevel(lines); got != queueErr {
+		t.Errorf("a full BACKFILL lane reported %s, want err\nlines:\n%s", levelName(got), allText(lines))
+	}
+	if text := allText(lines); !strings.Contains(text, "backfill") {
+		t.Errorf("the message must name which lane is full, or the engineer cannot act on it:\n%s", text)
+	}
+}
+
+// The same for readability: a backfill lane that cannot be opened makes its
+// depth unknowable, and PendingCount reports 0 for it exactly as for an empty
+// one — "every captured event has shipped" over the top of invisible work.
+func TestGatherQueueInputsSeesAnUnreadableBackfillLane(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod does not deny read access on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	seedOutbox(t, 3)
+	seedBackfill(t, 4210)
+
+	if err := os.Chmod(state.OutboxBackfillPath(), 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(state.OutboxBackfillPath(), 0o600) })
+
+	in := gatherQueueInputs(time.Now(), liveSnapshot(time.Now().Add(-time.Minute)))
+	if !in.unreadable {
+		t.Fatal("unreadable = false for a backfill lane that cannot be opened")
+	}
+	text := allText(checkQueueHealth(in))
+	if !strings.Contains(text, "unreadable") || !strings.Contains(text, "backfill") {
+		t.Errorf("an unreadable backfill lane must be reported, and named:\n%s", text)
+	}
+}
+
+// Progress takes the OLDEST lane that actually holds work. A live lane
+// delivering every second must not paper over a backfill lane that has not
+// advanced in an hour — that is precisely the stall the lane split exists to
+// make visible rather than hide.
+func TestGatherQueueInputsTakesTheStalestLaneHoldingWork(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	seedOutbox(t, 5)
+	seedBackfill(t, 5)
+
+	fresh := time.Now().Add(-2 * time.Second).Truncate(time.Second)
+	stale := time.Now().Add(-1 * time.Hour).Truncate(time.Second)
+	writeFileAt(t, state.OutboxCursorPath(), "0", fresh)
+	writeFileAt(t, state.OutboxCursorPathFor(state.OutboxBackfillPath()), "0", stale)
+
+	in := gatherQueueInputs(time.Now(), liveSnapshot(time.Now().Add(-2*time.Hour)))
+
+	if !in.lastProgress.Equal(stale) {
+		t.Errorf("lastProgress = %v, want the STALE backfill cursor %v — a healthy live lane must not hide a wedged backfill one",
+			in.lastProgress, stale)
+	}
+	text := allText(checkQueueHealth(in))
+	if !strings.Contains(text, "stuck") {
+		t.Errorf("a backfill lane with no progress in an hour must read as stuck:\n%s", text)
+	}
+	if !strings.Contains(text, "backfill") {
+		t.Errorf("the stuck message must name the lane:\n%s", text)
+	}
+}
+
+// The inverse, and the reason progress is filtered by pending: an EMPTY lane has
+// an old cursor for the honest reason that there was nothing to advance it.
+// Counting it would report every ordinary machine as stuck.
+func TestGatherQueueInputsIgnoresAnEmptyLanesOldCursor(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	seedOutbox(t, 5)
+	seedBackfill(t, 0)
+
+	fresh := time.Now().Add(-2 * time.Second).Truncate(time.Second)
+	ancient := time.Now().Add(-30 * 24 * time.Hour).Truncate(time.Second)
+	writeFileAt(t, state.OutboxCursorPath(), "0", fresh)
+	writeFileAt(t, state.OutboxCursorPathFor(state.OutboxBackfillPath()), "0", ancient)
+
+	in := gatherQueueInputs(time.Now(), liveSnapshot(time.Now().Add(-time.Hour)))
+	lines := checkQueueHealth(in)
+
+	if got := worstLevel(lines); got != queueOK {
+		t.Errorf("an empty backfill lane with a month-old cursor reported %s, want ok\nlines:\n%s",
+			levelName(got), allText(lines))
+	}
+}

@@ -323,6 +323,12 @@ func PendingCount() int {
 	return pendingCountIn(LaneLive()) + pendingCountIn(LaneBackfill())
 }
 
+// PendingIn reports one lane's undelivered depth. Exported for doctor, whose
+// stuck verdict is PER LANE — a live lane delivering every second must not paper
+// over a backfill lane that has not advanced in an hour. PendingCount answers
+// the device-level question and sums them; this answers "which lane".
+func PendingIn(lane Lane) int { return pendingCountIn(lane) }
+
 func pendingCountIn(lane Lane) int {
 	cursor := readCursor(lane)
 	// #nosec G304 -- lane.path() is StateDir()-derived, not user input.

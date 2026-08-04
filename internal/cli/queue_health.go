@@ -67,13 +67,31 @@ type queueInputs struct {
 	size       int64 // outbox bytes on disk
 	haveOutbox bool  // false on a machine that has never captured
 
-	// unreadable is set when the outbox exists but cannot be opened. It has to be
+	// lane names which queue the size/unreadable/progress fields describe, empty
+	// when it is the live one.
+	//
+	// The queue is two lanes now (live and backfill), and every scalar here is
+	// the WORST of them rather than live's. Reading live alone is the failure
+	// this field exists to prevent: a backfill lane at the cap is dropping
+	// replayed events right now, and a doctor that measured only live would print
+	// "delivery queue draining" over the top of it. Which lane is in trouble
+	// changes what the engineer does about it, so it is named in the message.
+	lane string
+
+	// unreadable is set when a lane exists but cannot be opened. It has to be
 	// tracked separately because PendingCount reports 0 for an unreadable queue
 	// exactly as it does for an empty one, and the two must not read the same.
 	unreadable bool
 
 	// lastProgress is when delivery last made progress: the cursor's mtime, or
 	// the newest live watcher's start time when no cursor exists at all.
+	//
+	// Across lanes this is the OLDEST such time among lanes that actually have
+	// pending work — a lane with an empty queue has an old cursor for the honest
+	// reason that there was nothing to advance it, and letting that decide the
+	// verdict would report every idle machine as stuck. Conversely, taking the
+	// NEWEST would let a healthy live lane paper over a backfill lane that has
+	// not moved in hours, which is the whole point of measuring both.
 	lastProgress time.Time
 	haveProgress bool
 
@@ -100,8 +118,8 @@ func checkQueueHealth(in queueInputs) []queueLine {
 	// here: when events are being lost right now, that is the only message.
 	if in.haveOutbox && in.size >= outbox.OutboxMaxBytes {
 		return []queueLine{{queueErr, fmt.Sprintf(
-			"delivery queue FULL (%s) — new events are being DROPPED. Delivery has failed long enough to fill the queue; see %s",
-			humanizeBytes(in.size), capture.DaemonLogPath())}}
+			"delivery queue%s FULL (%s) — new events are being DROPPED. Delivery has failed long enough to fill the queue; see %s",
+			laneSuffix(in.lane), humanizeBytes(in.size), capture.DaemonLogPath())}}
 	}
 
 	// An outbox we cannot read cannot be counted. PendingCount returns 0 on any
@@ -112,16 +130,16 @@ func checkQueueHealth(in queueInputs) []queueLine {
 	// number next to it would be a guess.
 	if in.haveOutbox && in.unreadable {
 		return []queueLine{{queueWarn, fmt.Sprintf(
-			"delivery queue unreadable (%s at %s) — cannot tell whether events are pending, and capture is likely failing to write; check permissions on the state dir, then see %s",
-			humanizeBytes(in.size), state.OutboxPath(), capture.DaemonLogPath())}}
+			"delivery queue%s unreadable (%s at %s) — cannot tell whether events are pending, and capture is likely failing to write; check permissions on the state dir, then see %s",
+			laneSuffix(in.lane), humanizeBytes(in.size), in.queuePath(), capture.DaemonLogPath())}}
 	}
 
 	// Approaching the cap: warn while there is still lead time to act. Nothing is
 	// being dropped yet, so this pairs cleanly with the depth line below.
 	if in.haveOutbox && in.size*100 >= outbox.OutboxMaxBytes*queueNearFullPercent {
 		lines = append(lines, queueLine{queueWarn, fmt.Sprintf(
-			"delivery queue %d%% full (%s of %s) — events get DROPPED at the cap; see %s",
-			in.size*100/outbox.OutboxMaxBytes, humanizeBytes(in.size),
+			"delivery queue%s %d%% full (%s of %s) — events get DROPPED at the cap; see %s",
+			laneSuffix(in.lane), in.size*100/outbox.OutboxMaxBytes, humanizeBytes(in.size),
 			humanizeBytes(outbox.OutboxMaxBytes), capture.DaemonLogPath())})
 	}
 
@@ -145,8 +163,9 @@ func checkQueueHealth(in queueInputs) []queueLine {
 
 	case in.now.Sub(in.lastProgress) > queueStuckAfter:
 		lines = append(lines, queueLine{queueWarn, fmt.Sprintf(
-			"delivery queue stuck — %s pending, no delivery progress in %s. Likely a revoked key (ingest 401), an unreachable ingest endpoint, or a full or unwritable state dir; see %s",
-			eventCount(in.pending), humanizeDuration(in.now.Sub(in.lastProgress)), capture.DaemonLogPath())})
+			"delivery queue%s stuck — %s pending, no delivery progress in %s. Likely a revoked key (ingest 401), an unreachable ingest endpoint, or a full or unwritable state dir; see %s",
+			laneSuffix(in.lane), eventCount(in.pending), humanizeDuration(in.now.Sub(in.lastProgress)),
+			capture.DaemonLogPath())})
 
 	default:
 		lines = append(lines, queueLine{queueOK, fmt.Sprintf(
@@ -156,37 +175,120 @@ func checkQueueHealth(in queueInputs) []queueLine {
 	return lines
 }
 
+// laneSuffix renders a lane name for a doctor line, empty for the live lane.
+// Live is unqualified because it is what an engineer means by "the queue"; the
+// backfill lane is named because knowing WHICH one is stuck is most of the
+// diagnosis.
+func laneSuffix(lane string) string {
+	if lane == "" || lane == outbox.LaneLive().Name {
+		return ""
+	}
+	return " (" + lane + ")"
+}
+
+// queuePath is the file the reported lane lives in, for the unreadable message.
+func (in queueInputs) queuePath() string {
+	if in.lane == outbox.LaneBackfill().Name {
+		return state.OutboxBackfillPath()
+	}
+	return state.OutboxPath()
+}
+
+// queueLaneProbe is one lane's on-disk state, before the lanes are reduced to
+// the single worst reading checkQueueHealth judges.
+type queueLaneProbe struct {
+	lane         outbox.Lane
+	name         string
+	path         string
+	cursor       string
+	pending      int
+	size         int64
+	exists       bool
+	unreadable   bool
+	lastProgress time.Time
+	haveProgress bool
+}
+
 // gatherQueueInputs reads the queue's state. Strictly read-only: doctor is a
 // diagnostic and must never advance the cursor, compact the outbox, or POST.
+//
+// BOTH LANES, reduced to the worst reading. Measuring only live is a real blind
+// spot and not a theoretical one: the backfill lane has its own file, its own
+// OutboxMaxBytes ceiling and its own cursor, so it can be at the cap and
+// dropping replayed events, or wedged for hours, entirely underneath a healthy
+// live lane — and doctor would have printed "delivery queue draining" over the
+// top of it.
 func gatherQueueInputs(now time.Time, snap capture.CaptureSnapshot) queueInputs {
 	in := queueInputs{
+		// Already both lanes: outbox.PendingCount sums them.
 		pending:  countBufferedEvents(),
 		draining: watcherDraining(snap),
 		now:      now,
 	}
 
-	// A missing outbox is the fresh-install state, not a fault. Stat succeeds on a
-	// file the process cannot open, so readability is probed separately.
-	if fi, err := os.Stat(state.OutboxPath()); err == nil {
-		in.haveOutbox = true
-		in.size = fi.Size()
-		in.unreadable = !outboxReadable()
+	probes := []queueLaneProbe{
+		{
+			lane:   outbox.LaneLive(),
+			name:   outbox.LaneLive().Name,
+			path:   state.OutboxPath(),
+			cursor: state.OutboxCursorPath(),
+		},
+		{
+			lane:   outbox.LaneBackfill(),
+			name:   outbox.LaneBackfill().Name,
+			path:   state.OutboxBackfillPath(),
+			cursor: state.OutboxCursorPathFor(state.OutboxBackfillPath()),
+		},
+	}
+	for i := range probes {
+		probeLane(&probes[i])
 	}
 
-	// The cursor's mtime is the progress probe: it is rewritten (temp+rename)
-	// every time delivery advances. Doctor is one-shot, so a rate is not
-	// observable without sleeping and sampling twice — which would make doctor
-	// slow for no real gain.
-	if fi, err := os.Stat(state.OutboxCursorPath()); err == nil {
-		in.lastProgress = fi.ModTime()
-		in.haveProgress = true
+	// SIZE and UNREADABLE take the worse lane. Both drive "events are being lost
+	// right now" verdicts, and a problem on either lane is a problem.
+	for _, pr := range probes {
+		if !pr.exists {
+			continue
+		}
+		in.haveOutbox = true
+		if pr.unreadable && !in.unreadable {
+			// Unreadable outranks size: a lane whose contents are invisible makes
+			// every other number about it a guess.
+			in.unreadable = true
+			in.size = pr.size
+			in.lane = pr.name
+			continue
+		}
+		if !in.unreadable && pr.size > in.size {
+			in.size = pr.size
+			in.lane = pr.name
+		}
+	}
+
+	// PROGRESS takes the OLDEST among lanes that actually have pending work. A
+	// lane with an empty queue has an old cursor for the honest reason that there
+	// was nothing to advance it, and letting that decide would report every idle
+	// machine as stuck.
+	for _, pr := range probes {
+		if !pr.haveProgress || pr.pending == 0 {
+			continue
+		}
+		if !in.haveProgress || pr.lastProgress.Before(in.lastProgress) {
+			in.lastProgress = pr.lastProgress
+			in.haveProgress = true
+			if !in.unreadable {
+				in.lane = pr.name
+			}
+		}
+	}
+	if in.haveProgress {
 		return in
 	}
 
-	// No cursor at all means delivery has NEVER succeeded — which is exactly what
-	// a revoked key looks like on a machine that has only ever 401'd. Fall back to
-	// the watcher's start time: delivery has had that long to write a cursor and
-	// has not.
+	// No usable cursor on any lane holding work means delivery has NEVER
+	// succeeded — which is exactly what a revoked key looks like on a machine
+	// that has only ever 401'd. Fall back to the watcher's start time: delivery
+	// has had that long to write a cursor and has not.
 	if t := latestWatcherStart(snap); !t.IsZero() {
 		in.lastProgress = t
 		in.haveProgress = true
@@ -194,12 +296,37 @@ func gatherQueueInputs(now time.Time, snap capture.CaptureSnapshot) queueInputs 
 	return in
 }
 
-// outboxReadable reports whether the queue can actually be opened for reading.
+// probeLane fills one lane's on-disk readings. A missing queue is the
+// fresh-install state, not a fault. Stat succeeds on a file the process cannot
+// open, so readability is probed separately.
+func probeLane(pr *queueLaneProbe) {
+	fi, err := os.Stat(pr.path)
+	if err != nil {
+		return
+	}
+	pr.exists = true
+	pr.size = fi.Size()
+	pr.unreadable = !queueReadable(pr.path)
+	if !pr.unreadable {
+		pr.pending = outbox.PendingIn(pr.lane)
+	}
+
+	// The cursor's mtime is the progress probe: it is rewritten (temp+rename)
+	// every time delivery advances. Doctor is one-shot, so a rate is not
+	// observable without sleeping and sampling twice — which would make doctor
+	// slow for no real gain.
+	if cfi, err := os.Stat(pr.cursor); err == nil {
+		pr.lastProgress = cfi.ModTime()
+		pr.haveProgress = true
+	}
+}
+
+// queueReadable reports whether a lane can actually be opened for reading.
 // Opening and immediately closing is the same access PendingCount performs, so
 // this answers "would the count be trustworthy?" without duplicating the scan.
-func outboxReadable() bool {
-	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
-	f, err := os.Open(state.OutboxPath())
+func queueReadable(path string) bool {
+	// #nosec G304 -- path comes from state.Outbox*Path(), StateDir()-derived, not user input.
+	f, err := os.Open(path)
 	if err != nil {
 		return false
 	}
