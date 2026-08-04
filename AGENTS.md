@@ -784,13 +784,13 @@ Two things about it that are easy to get wrong, both learned the expensive way:
     having surfaced commits at all — a bare `git checkout --detach` and a bisect
     walking ancestors of the cursor keep their tracking BECAUSE their range is
     empty; detaching onto a ref off that cursor's ancestry releases anyway, an
-    undercount and never a fabrication. It is
-    `default:` rather than `case scopeUnknown:` so a fourth `branchScope` added
-    later cannot silently reopen the hole. `releaseReworkSpans` deliberately is
-    NOT `clearReworkLedger`: it keeps the seed tombstones and tombstones every
-    path it releases, because dropping them makes an already-churned path a
-    FIRST TOUCH again and its lingering ai-paths presence would seed a human's
-    commit as fresh AI — trading this fabrication for the one PR #128 closed.
+    undercount and never a fabrication. It is `default:` rather than
+    `case scopeUnknown:` so a fourth `branchScope` added later cannot silently
+    reopen the hole. `releaseReworkSpans` deliberately is NOT
+    `clearReworkLedger`: it keeps the seed tombstones and tombstones every path
+    it releases, because dropping them makes an already-churned path a FIRST
+    TOUCH again and its lingering ai-paths presence would seed a human's commit
+    as fresh AI — trading this fabrication for the one PR #128 closed.
   - **EMISSION is untouched by both.** A commit reachable only through a merge's
     second parent is still attributed exactly once; whether merged-in work counts
     as AI-written stays a product question nobody has answered.
