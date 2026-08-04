@@ -157,6 +157,16 @@ func claudeWatcherLogPath() string   { return filepath.Join(state.StateDir(), "c
 // syscalls, works on Windows.
 type claudeWatchProgress struct {
 	Offsets map[string]int64 `json:"offsets"`
+	// Discarding marks offsets that are inside an unsupported oversized record.
+	// It is durable so a restart cannot feed the remaining malformed suffix to
+	// the parser and falsely trip degraded mode.
+	Discarding map[string]bool `json:"discarding,omitempty"`
+	// Classification uses separate durable cursors because a successful replay
+	// still tails from byte zero. They bound oversized-prefix scans across polls
+	// without losing the backfill offset.
+	ClassifyOffsets    map[string]int64 `json:"classify_offsets,omitempty"`
+	ClassifyDiscarding map[string]bool  `json:"classify_discarding,omitempty"`
+	ClassifyScanned    map[string]int   `json:"classify_scanned,omitempty"`
 	// Match: key -> "yes"|"no". Unlike codex rollouts (whose first line is
 	// always session_meta), a transcript's early lines may not carry cwd yet,
 	// so absence of a cached decision means "retry next poll" — only a
@@ -218,15 +228,34 @@ func claudeProgressKey(path string) string {
 // few never-parsed lines are skipped, which is the strictly safer error.
 func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 	out := claudeWatchProgress{
-		Offsets: make(map[string]int64, len(p.Offsets)),
-		Match:   make(map[string]string, len(p.Match)),
-		V:       p.V,
-		RootsFP: p.RootsFP,
+		Offsets:            make(map[string]int64, len(p.Offsets)),
+		Discarding:         make(map[string]bool, len(p.Discarding)),
+		ClassifyOffsets:    make(map[string]int64, len(p.ClassifyOffsets)),
+		ClassifyDiscarding: make(map[string]bool, len(p.ClassifyDiscarding)),
+		ClassifyScanned:    make(map[string]int, len(p.ClassifyScanned)),
+		Match:              make(map[string]string, len(p.Match)),
+		V:                  p.V,
+		RootsFP:            p.RootsFP,
+	}
+	for k, v := range p.ClassifyOffsets {
+		nk := claudeProgressKey(k)
+		if cur, ok := out.ClassifyOffsets[nk]; !ok || v > cur {
+			out.ClassifyOffsets[nk] = v
+			out.ClassifyDiscarding[nk] = p.ClassifyDiscarding[k]
+			out.ClassifyScanned[nk] = p.ClassifyScanned[k]
+		}
+	}
+	for k, v := range p.ClassifyScanned {
+		nk := claudeProgressKey(k)
+		if v > out.ClassifyScanned[nk] {
+			out.ClassifyScanned[nk] = v
+		}
 	}
 	for k, v := range p.Offsets {
 		nk := claudeProgressKey(k)
 		if cur, ok := out.Offsets[nk]; !ok || v > cur {
 			out.Offsets[nk] = v
+			out.Discarding[nk] = p.Discarding[k]
 		}
 	}
 	for k, v := range p.Match {
@@ -245,7 +274,10 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 }
 
 func loadClaudeWatchProgress() claudeWatchProgress {
-	p := claudeWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{}}
+	p := claudeWatchProgress{
+		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{},
+		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
+	}
 	data, err := os.ReadFile(claudeWatchProgressPath())
 	if err != nil {
 		// Nothing on disk means nothing to migrate: stamp the CURRENT schema so
@@ -262,6 +294,18 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	}
 	if p.Match == nil {
 		p.Match = map[string]string{}
+	}
+	if p.Discarding == nil {
+		p.Discarding = map[string]bool{}
+	}
+	if p.ClassifyOffsets == nil {
+		p.ClassifyOffsets = map[string]int64{}
+	}
+	if p.ClassifyDiscarding == nil {
+		p.ClassifyDiscarding = map[string]bool{}
+	}
+	if p.ClassifyScanned == nil {
+		p.ClassifyScanned = map[string]int{}
 	}
 	// Idempotent: already-relative keys map to themselves, so this runs
 	// harmlessly on every load and needs no version flag.
@@ -282,6 +326,10 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	// decisions because they are genuine cwd mismatches.
 	if migrated.V < 2 {
 		migrated.Offsets = map[string]int64{}
+		migrated.Discarding = map[string]bool{}
+		migrated.ClassifyOffsets = map[string]int64{}
+		migrated.ClassifyDiscarding = map[string]bool{}
+		migrated.ClassifyScanned = map[string]int{}
 		for k, v := range migrated.Match {
 			if v == "yes" {
 				delete(migrated.Match, k)
@@ -643,7 +691,35 @@ func pollClaudeTranscripts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyClaudeTranscript(path, roots, historyCutoff) {
+			if budget <= 0 {
+				deferredWork = true
+				continue
+			}
+			remaining := budget
+			classifyBudget := budget
+			if oversizeProbe && classifyBudget < transcriptMaxRecordBytes {
+				classifyBudget = transcriptMaxRecordBytes
+			}
+			match, res, scanned := classifyClaudeTranscriptBounded(
+				path, roots, historyCutoff,
+				progress.ClassifyOffsets[key], progress.ClassifyScanned[key], classifyBudget,
+				oversizeProbe, progress.ClassifyDiscarding[key],
+			)
+			progress.ClassifyOffsets[key] += res.consumed
+			progress.ClassifyScanned[key] = scanned
+			if res.discardingOversize {
+				progress.ClassifyDiscarding[key] = true
+			} else {
+				delete(progress.ClassifyDiscarding, key)
+			}
+			budget -= res.consumed
+			if res.probedOversize || res.consumed > remaining {
+				oversizeProbe = false
+			}
+			if res.consumed > 0 {
+				saveClaudeWatchProgress(progress)
+			}
+			switch match {
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
 			case claudeMatchYesPreexisting:
@@ -663,8 +739,13 @@ func pollClaudeTranscripts(
 				progress.Match[key] = "yes"
 			case claudeMatchNo:
 				progress.Match[key] = "no"
-				continue
 			default: // undecided — no cwd line yet; retry next poll
+				continue
+			}
+			delete(progress.ClassifyOffsets, key)
+			delete(progress.ClassifyDiscarding, key)
+			delete(progress.ClassifyScanned, key)
+			if match == claudeMatchNo {
 				continue
 			}
 		}
@@ -937,6 +1018,71 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 	return claudeMatchUndecided
 }
 
+// classifyClaudeTranscriptBounded is the poll-path classifier. Unlike the
+// convenience classifier above, it advances a separate durable cursor through
+// at most budget bytes and records whether that cursor ends inside an
+// unsupported record. Replay offsets remain untouched, so a successful match
+// still backfills from byte zero.
+func classifyClaudeTranscriptBounded(
+	path string,
+	roots []string,
+	historyCutoff time.Time,
+	offset int64,
+	scanned int,
+	budget int64,
+	oversizeProbe bool,
+	discarding bool,
+) (claudeMatchResult, transcriptReadOutcome, int) {
+	// #nosec G304 -- candidate path discovered under the Claude projects dir.
+	f, err := os.Open(path)
+	if err != nil {
+		return claudeMatchUndecided, transcriptReadOutcome{}, scanned
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, 0); err != nil {
+		return claudeMatchUndecided, transcriptReadOutcome{}, scanned
+	}
+
+	result := claudeMatchUndecided
+	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
+		if result != claudeMatchUndecided {
+			return false
+		}
+		scanned++
+		if scanned > 50 {
+			result = claudeMatchNo
+			return false
+		}
+		var rec struct {
+			Cwd       string `json:"cwd"`
+			Timestamp string `json:"timestamp"`
+		}
+		if json.Unmarshal(line, &rec) != nil || rec.Cwd == "" {
+			return true
+		}
+		resolved := resolvePath(rec.Cwd)
+		matched := false
+		for _, root := range roots {
+			if pathWithin(resolved, root) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			result = claudeMatchNo
+			return false
+		}
+		t, err := time.Parse(time.RFC3339, rec.Timestamp)
+		if rec.Timestamp == "" || err != nil || t.Before(historyCutoff) {
+			result = claudeMatchYesPreexisting
+			return false
+		}
+		result = claudeMatchYes
+		return false
+	})
+	return result, out, scanned
+}
+
 // fastForwardClaudeTranscripts sets every currently-matched transcript's
 // offset to its current size, so tailing resumes at content written from now
 // on. Used after a hook-takeover window.
@@ -1013,7 +1159,8 @@ func tailClaudeTranscript(
 	}
 
 	parsed := 0
-	res := readTranscriptRecords(f, budget, oversizeProbe, func(record []byte) {
+	wasDiscarding := progress.Discarding[key]
+	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte) bool {
 		// Scrub secrets BEFORE parsing and before anything is persisted or
 		// queued — transcript lines carry prompt text, command output, and file
 		// content. This ordering is load-bearing; do not move it.
@@ -1025,6 +1172,7 @@ func tailClaudeTranscript(
 			}
 			queueClaudeWatchEvent(ev, session, captureProse)
 		}
+		return true
 	})
 
 	if res.discarded > 0 {
@@ -1036,6 +1184,11 @@ func tailClaudeTranscript(
 		if parsed > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
+	}
+	if res.discardingOversize {
+		progress.Discarding[key] = true
+	} else {
+		delete(progress.Discarding, key)
 	}
 	return parsed, res
 }

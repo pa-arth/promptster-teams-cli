@@ -959,6 +959,12 @@ func TestPollClaudeDiscardsOversizedRecordAfterAnotherFileConsumed(t *testing.T)
 	}
 	stalledKey := claudeProgressKey(stalled)
 	stalledSize := int64(len(huge) + len(record("reachable after the discard")))
+	saveClaudeWatchProgress(claudeWatchProgress{
+		Offsets: map[string]int64{}, Discarding: map[string]bool{},
+		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
+		Match: map[string]string{claudeProgressKey(live): "yes", stalledKey: "yes"},
+		V:     claudeProgressSchemaV, RootsFP: captureRootsFingerprint(workspaceMatchRoots(ws)),
+	})
 
 	session := Session{DeviceID: "sess-oversized", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
 	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
@@ -1015,17 +1021,27 @@ func TestPollClaudeOversizedDiscardDoesNotDegradeParser(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	// Several chunks long: the regression only appeared on a later poll, when
+	// the malformed suffix was mistaken for a fresh record. Restart between
+	// chunks to prove the continuation bit is durable, not process-local.
+	huge := oversizedRecordLine(int(3*transcriptMaxRecordBytes) + 2048)
 	tail := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"after"}}`+"\n", ws, ts)
 	path := filepath.Join(dir, "oversized.jsonl")
 	if err := os.WriteFile(path, []byte(huge+tail), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	key := claudeProgressKey(path)
+	saveClaudeWatchProgress(claudeWatchProgress{
+		Offsets: map[string]int64{}, Discarding: map[string]bool{},
+		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
+		Match: map[string]string{key: "yes"}, V: claudeProgressSchemaV,
+		RootsFP: captureRootsFingerprint(workspaceMatchRoots(ws)),
+	})
 
 	session := Session{DeviceID: "sess-degrade", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
 	parsed, consumed := pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()),
 		map[string]*normalize.ClaudeTranscriptProcessor{}, true, false)
-	if got := loadClaudeWatchProgress().Offsets[claudeProgressKey(path)]; got != transcriptMaxRecordBytes {
+	if got := loadClaudeWatchProgress().Offsets[key]; got != transcriptMaxRecordBytes {
 		t.Fatalf("discard did not durably advance the offset: %d, want %d", got, transcriptMaxRecordBytes)
 	}
 	if consumed != 0 {
@@ -1033,6 +1049,18 @@ func TestPollClaudeOversizedDiscardDoesNotDegradeParser(t *testing.T) {
 	}
 	if degraded, _ := claudeDegradationStep(false, parsed, consumed, 0); degraded {
 		t.Fatal("a single unsupported record degraded the watcher and handed the window to hooks")
+	}
+
+	parsed, consumed = pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()),
+		map[string]*normalize.ClaudeTranscriptProcessor{}, true, false)
+	if parsed != 0 || consumed != 0 {
+		t.Fatalf("oversized suffix after restart reached the parser: parsed=%d consumed=%d", parsed, consumed)
+	}
+	if degraded, _ := claudeDegradationStep(false, parsed, consumed, 0); degraded {
+		t.Fatal("an oversized suffix after restart degraded the parser")
+	}
+	if !loadClaudeWatchProgress().Discarding[key] {
+		t.Fatal("oversized continuation was not preserved for the next bounded poll")
 	}
 }
 
@@ -1192,8 +1220,24 @@ func TestPollClaudeDrainsTranscriptLedByAnOversizedRecord(t *testing.T) {
 	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
 
 	pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+	first := loadClaudeWatchProgress()
+	if got := first.Match[key]; got != "" {
+		t.Fatalf("first bounded classification unexpectedly decided %q", got)
+	}
+	if got := first.ClassifyOffsets[key]; got != transcriptMaxRecordBytes || !first.ClassifyDiscarding[key] {
+		t.Fatalf("first bounded classification progress = (%d, %v), want (%d, true)",
+			got, first.ClassifyDiscarding[key], transcriptMaxRecordBytes)
+	}
+	for i := 0; i < 4 && loadClaudeWatchProgress().Match[key] == ""; i++ {
+		before := loadClaudeWatchProgress().ClassifyOffsets[key]
+		pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+		after := loadClaudeWatchProgress().ClassifyOffsets[key]
+		if after-before > transcriptMaxRecordBytes {
+			t.Fatalf("classification read %d bytes in one poll; max %d", after-before, transcriptMaxRecordBytes)
+		}
+	}
 	if got := loadClaudeWatchProgress().Match[key]; got != "yes" {
-		t.Fatalf("first poll cached match %q, want \"yes\" — an uncached decision re-reads the whole file every 3s forever", got)
+		t.Fatalf("bounded classification never cached match: %q", got)
 	}
 
 	parsed := 0
@@ -1275,8 +1319,24 @@ func TestPollCodexDrainsRolloutLedByAnOversizedRecord(t *testing.T) {
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 
 	sent := pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+	first := loadCodexWatchProgress()
+	if got := first.Match[stalled]; got != "" {
+		t.Fatalf("first bounded classification unexpectedly decided %q", got)
+	}
+	if got := first.ClassifyOffsets[stalled]; got != transcriptMaxRecordBytes || !first.ClassifyDiscarding[stalled] {
+		t.Fatalf("first bounded classification progress = (%d, %v), want (%d, true)",
+			got, first.ClassifyDiscarding[stalled], transcriptMaxRecordBytes)
+	}
+	for i := 0; i < 4 && loadCodexWatchProgress().Match[stalled] == ""; i++ {
+		before := loadCodexWatchProgress().ClassifyOffsets[stalled]
+		sent += pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+		after := loadCodexWatchProgress().ClassifyOffsets[stalled]
+		if after-before > transcriptMaxRecordBytes {
+			t.Fatalf("classification read %d bytes in one poll; max %d", after-before, transcriptMaxRecordBytes)
+		}
+	}
 	if got := loadCodexWatchProgress().Match[stalled]; got != "yes" {
-		t.Fatalf("first poll cached match %q, want \"yes\" — an uncached decision re-reads the whole file every 3s forever", got)
+		t.Fatalf("bounded classification never cached match: %q", got)
 	}
 
 	for i := 0; i < 10 && loadCodexWatchProgress().Offsets[stalled] < total; i++ {

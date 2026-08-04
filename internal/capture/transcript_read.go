@@ -24,6 +24,10 @@ type transcriptReadOutcome struct {
 	// probedOversize reports that this pass spent the poll's single
 	// oversized-record allowance (see readTranscriptRecords).
 	probedOversize bool
+	// discardingOversize reports that the durable offset still points inside an
+	// unsupported record. The caller persists this bit with the offset so the
+	// next poll discards the suffix instead of handing it to a parser.
+	discardingOversize bool
 }
 
 // readTranscriptRecords reads complete newline-terminated records from src,
@@ -49,8 +53,8 @@ type transcriptReadOutcome struct {
 // because the probe only ever DISCARDS — a record that terminates inside the
 // supported maximum is still deferred intact, so no complete record is ever
 // consumed past the shared budget.
-func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe bool, handle func(record []byte)) transcriptReadOutcome {
-	out := transcriptReadOutcome{}
+func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe, discardingOversize bool, handle func(record []byte) bool) transcriptReadOutcome {
+	out := transcriptReadOutcome{discardingOversize: discardingOversize}
 	if budget <= 0 {
 		out.truncated = true
 		return out
@@ -58,6 +62,23 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe bool, hand
 
 	limited := &io.LimitedReader{R: src, N: budget}
 	reader := bufio.NewReader(limited)
+	if out.discardingOversize {
+		for out.discardingOversize {
+			fragment, err := reader.ReadSlice('\n')
+			read := int64(len(fragment))
+			out.consumed += read
+			out.discarded += read
+			switch err {
+			case nil:
+				out.discardingOversize = false
+			case bufio.ErrBufferFull:
+				continue
+			default:
+				out.truncated = true
+				return out
+			}
+		}
+	}
 	for {
 		if out.consumed >= budget {
 			out.truncated = true
@@ -72,7 +93,7 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe bool, hand
 			}
 			out.truncated = true
 			if out.consumed == 0 && int64(len(line)) == budget {
-				out.consumed, out.discarded, out.probedOversize =
+				out.consumed, out.discarded, out.probedOversize, out.discardingOversize =
 					resolveOversizedRecord(reader, limited, budget, oversizeProbe)
 			}
 			break
@@ -82,7 +103,9 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe bool, hand
 		if len(record) == 0 {
 			continue
 		}
-		handle(record)
+		if !handle(record) {
+			break
+		}
 	}
 	return out
 }
@@ -176,28 +199,28 @@ func discardRecordToNewline(r *bufio.Reader) bool {
 //
 // It returns bytes to advance over, bytes discarded unparsed, and whether the
 // caller's single per-poll oversize allowance was spent.
-func resolveOversizedRecord(reader *bufio.Reader, limited *io.LimitedReader, scanned int64, oversizeProbe bool) (int64, int64, bool) {
+func resolveOversizedRecord(reader *bufio.Reader, limited *io.LimitedReader, scanned int64, oversizeProbe bool) (int64, int64, bool, bool) {
 	// The record already outran the supported maximum, so no further reading
 	// can change the answer and no allowance is spent.
 	if scanned >= transcriptMaxRecordBytes {
-		return transcriptMaxRecordBytes, transcriptMaxRecordBytes, false
+		return transcriptMaxRecordBytes, transcriptMaxRecordBytes, false, true
 	}
 	if !oversizeProbe {
 		// Another file already spent this poll's allowance. Defer intact; the
 		// record is still here next poll.
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	limited.N = transcriptMaxRecordBytes - scanned
 	if _, err := reader.ReadBytes('\n'); err == nil {
 		// Terminates within the supported maximum: an ordinary record that is
 		// merely bigger than this poll's leftover budget. Defer it intact.
-		return 0, 0, true
+		return 0, 0, true, false
 	} else if err != io.EOF || limited.N != 0 {
 		// Still growing on disk, or a read error — nothing to decide yet.
-		return 0, 0, true
+		return 0, 0, true, false
 	}
 	// No newline within the supported maximum. No future poll can complete this
 	// record however much budget it has, so advance over this bounded prefix and
 	// let subsequent polls discard the rest up to its newline.
-	return transcriptMaxRecordBytes, transcriptMaxRecordBytes, true
+	return transcriptMaxRecordBytes, transcriptMaxRecordBytes, true, true
 }

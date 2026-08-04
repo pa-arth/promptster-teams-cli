@@ -93,6 +93,12 @@ func codexWatcherLogPath() string   { return filepath.Join(state.StateDir(), "co
 // workspace-match decision so each line is processed exactly once across polls.
 type codexWatchProgress struct {
 	Offsets map[string]int64 `json:"offsets"`
+	// Discarding marks offsets that are inside an unsupported oversized record.
+	// Persisting it prevents a restart from parsing the malformed suffix.
+	Discarding         map[string]bool  `json:"discarding,omitempty"`
+	ClassifyOffsets    map[string]int64 `json:"classify_offsets,omitempty"`
+	ClassifyDiscarding map[string]bool  `json:"classify_discarding,omitempty"`
+	ClassifyScanned    map[string]int   `json:"classify_scanned,omitempty"`
 	// Match: path -> "yes"|"no" classification cache so we only read+parse a
 	// file's session_meta header once.
 	Match map[string]string `json:"match"`
@@ -118,7 +124,10 @@ func codexWatchProgressPath() string {
 }
 
 func loadCodexWatchProgress() codexWatchProgress {
-	p := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{}}
+	p := codexWatchProgress{
+		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{},
+		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
+	}
 	data, err := os.ReadFile(codexWatchProgressPath())
 	if err != nil {
 		// Nothing on disk means nothing to migrate: stamp the CURRENT schema so
@@ -136,6 +145,18 @@ func loadCodexWatchProgress() codexWatchProgress {
 	if p.Match == nil {
 		p.Match = map[string]string{}
 	}
+	if p.Discarding == nil {
+		p.Discarding = map[string]bool{}
+	}
+	if p.ClassifyOffsets == nil {
+		p.ClassifyOffsets = map[string]int64{}
+	}
+	if p.ClassifyDiscarding == nil {
+		p.ClassifyDiscarding = map[string]bool{}
+	}
+	if p.ClassifyScanned == nil {
+		p.ClassifyScanned = map[string]int{}
+	}
 	// v1: drop cached "no" decisions written by the old timestamp gate.
 	if p.V < 1 {
 		for k, v := range p.Match {
@@ -148,6 +169,10 @@ func loadCodexWatchProgress() codexWatchProgress {
 	// bounded window. Preserve genuine cwd mismatches from v1.
 	if p.V < 2 {
 		p.Offsets = map[string]int64{}
+		p.Discarding = map[string]bool{}
+		p.ClassifyOffsets = map[string]int64{}
+		p.ClassifyDiscarding = map[string]bool{}
+		p.ClassifyScanned = map[string]int{}
 		for k, v := range p.Match {
 			if v == "yes" {
 				delete(p.Match, k)
@@ -373,7 +398,35 @@ func pollCodexRollouts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyCodexRollout(path, roots, historyCutoff) {
+			if budget <= 0 {
+				deferredWork = true
+				return nil
+			}
+			remaining := budget
+			classifyBudget := budget
+			if oversizeProbe && classifyBudget < transcriptMaxRecordBytes {
+				classifyBudget = transcriptMaxRecordBytes
+			}
+			match, res, scanned := classifyCodexRolloutBounded(
+				path, roots, historyCutoff,
+				progress.ClassifyOffsets[path], progress.ClassifyScanned[path], classifyBudget,
+				oversizeProbe, progress.ClassifyDiscarding[path],
+			)
+			progress.ClassifyOffsets[path] += res.consumed
+			progress.ClassifyScanned[path] = scanned
+			if res.discardingOversize {
+				progress.ClassifyDiscarding[path] = true
+			} else {
+				delete(progress.ClassifyDiscarding, path)
+			}
+			budget -= res.consumed
+			if res.probedOversize || res.consumed > remaining {
+				oversizeProbe = false
+			}
+			if res.consumed > 0 {
+				saveCodexWatchProgress(progress)
+			}
+			switch match {
 			case codexMatchYes:
 				progress.Match[path] = "yes"
 			case codexMatchYesPreexisting:
@@ -394,8 +447,13 @@ func pollCodexRollouts(
 				progress.Match[path] = "yes"
 			case codexMatchNo:
 				progress.Match[path] = "no"
-				return nil
 			default: // undecided — line 1 not a readable session_meta yet; retry next poll
+				return nil
+			}
+			delete(progress.ClassifyOffsets, path)
+			delete(progress.ClassifyDiscarding, path)
+			delete(progress.ClassifyScanned, path)
+			if match == codexMatchNo {
 				return nil
 			}
 		}
@@ -552,6 +610,70 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 	return codexMatchYes
 }
 
+// classifyCodexRolloutBounded is the durable poll-path classifier. It keeps a
+// cursor distinct from the replay offset so an unsupported leading record can
+// be skipped over multiple bounded polls without forfeiting history.
+func classifyCodexRolloutBounded(
+	path string,
+	roots []string,
+	historyCutoff time.Time,
+	offset int64,
+	skipped int,
+	budget int64,
+	oversizeProbe bool,
+	discarding bool,
+) (codexMatchResult, transcriptReadOutcome, int) {
+	// #nosec G304 -- candidate path discovered under the Codex sessions dir.
+	f, err := os.Open(path)
+	if err != nil {
+		return codexMatchUndecided, transcriptReadOutcome{}, skipped
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, 0); err != nil {
+		return codexMatchUndecided, transcriptReadOutcome{}, skipped
+	}
+
+	result := codexMatchUndecided
+	seen := false
+	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
+		if result != codexMatchUndecided || seen {
+			return false
+		}
+		seen = true
+		skipped++
+		if skipped > codexClassifyMaxSkips+1 {
+			result = codexMatchNo
+			return false
+		}
+		var rec struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Payload   struct {
+				Cwd string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(line, &rec) != nil {
+			return false
+		}
+		if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
+			result = codexMatchNo
+			return false
+		}
+		if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
+			result = codexMatchNo
+			return false
+		}
+		t, err := time.Parse(time.RFC3339, rec.Timestamp)
+		if err != nil || t.Before(historyCutoff) {
+			result = codexMatchYesPreexisting
+			return false
+		}
+		result = codexMatchYes
+		return false
+	})
+	return result, out, skipped
+}
+
 // codexClassifyMaxSkips bounds how many unsupported (or blank) records one
 // classification pass skips before giving up on finding the session_meta
 // header. Classification has no durable cursor, so every skip is re-read next
@@ -649,7 +771,8 @@ func tailCodexRollout(
 
 	queued := 0
 	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
-	res := readTranscriptRecords(f, budget, oversizeProbe, func(record []byte) {
+	wasDiscarding := progress.Discarding[path]
+	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte) bool {
 		// Scrub secrets before parsing/ingest — same redaction the hook path
 		// applies. Rollout lines carry prompt text, command output, and file
 		// patches that may contain keys/tokens the candidate pasted or printed.
@@ -657,6 +780,7 @@ func tailCodexRollout(
 		for _, ev := range proc.Process(redacted) {
 			queued += emit(ev)
 		}
+		return true
 	})
 	if res.discarded > 0 {
 		fmt.Fprintf(os.Stderr, "codex-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
@@ -680,6 +804,11 @@ func tailCodexRollout(
 		if queued > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
+	}
+	if res.discardingOversize {
+		progress.Discarding[path] = true
+	} else {
+		delete(progress.Discarding, path)
 	}
 	return queued, res
 }
