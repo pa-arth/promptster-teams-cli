@@ -55,7 +55,7 @@ no model, no cwd, no timestamp, no tokens. Never write the project-local
 `<workspace>/.cursor/hooks.json`: it is a tracked file inside the customer's repo, and it
 enrolls every teammate who pulls it.
 
-Three facts settled empirically — **do not re-derive them from documentation**:
+Four facts settled empirically — **do not re-derive them from documentation**:
 
 - **Cursor `duration` is fractional MILLISECONDS.** Read as seconds, a 2-second `go build`
   reported as 33 minutes. Nothing downstream can tell a duration is implausible.
@@ -64,6 +64,20 @@ Three facts settled empirically — **do not re-derive them from documentation**
 - **Claude + Codex replay 28 days of history through the LIVE funnel.** Parts of that funnel
   assumed "this just happened"; the attribution ledgers must be stamped from the EVENT, never
   the wall clock. Cursor never backfills and passes a hard `false`.
+- **A progress-schema bump is a FLEET-WIDE replay event, and its cost is DECLARED, not
+  implied.** Bumping `claudeProgressSchemaV`/`codexProgressSchemaV` clears `Offsets`, so every
+  in-window transcript on every device is re-read from zero — one line of diff, the whole
+  28-day window back through the funnel. v0.12.3's v2 bump replayed **62,302 events on one
+  device** and left a 20,761-event backlog whose oldest entry was 15 days stale. It fires on
+  the first daemon start of the UPGRADED binary — which in practice **is** a restart, since
+  self-update re-execs, so that is the moment to look at. The distinction is *which* restart:
+  one on the SAME schema version rescans nothing (`clearCodexWatcherState` removes only
+  `codex-watcher.json` — pid, heartbeat — never the progress file holding the offsets), while
+  the new binary's loader clears them via its `p.V < N` migration. **Restart is the occasion,
+  the version bump is the cause — so ask what changed between the two binaries.** The cost
+  lands on every device at once, days later, and never on whoever bumped it. Declare the
+  window, the rough per-device event count, and why it is worth a replay. Read exposure from
+  `engineer_keys.latest_cli_version` — never infer it from release timing.
 
 ### Counts, never code
 
