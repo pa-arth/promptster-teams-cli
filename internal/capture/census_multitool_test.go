@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -272,5 +273,73 @@ func TestCensusUnchangedForAClaudeOnlyMachine(t *testing.T) {
 	}
 	if len(data.ToolsExamined) != 1 || data.ToolsExamined[0] != toolClaudeCode {
 		t.Errorf("toolsExamined = %v, want just claude-code", data.ToolsExamined)
+	}
+}
+
+// A TOML table header may carry a trailing comment, and a comment is arbitrary
+// local text an engineer wrote for themselves. It must not become a server NAME
+// and ride out on the census — `mcpServers[].name` is allowlisted, so the
+// projection cannot catch this. The parse is the only place it can be stopped.
+func TestCodexMCPHeaderCommentsNeverBecomeNames(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.toml")
+	body := "" +
+		"[mcp_servers.db] # staging creds live in 1password/eng-shared\n" +
+		"command = \"docker\"\n" +
+		"[mcp_servers.\"my server\"]   # internal only\n" +
+		"[mcp_servers.linear.env] # do not share\n" +
+		"[not_mcp.thing] # ignored entirely\n"
+	if err := os.WriteFile(cfg, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := censusCodexMCPServers(cfg)
+	names := make([]string, 0, len(got))
+	for _, s := range got {
+		names = append(names, s.Name)
+		if strings.ContainsAny(s.Name, "#]") {
+			t.Fatalf("comment or bracket leaked into a server name: %q", s.Name)
+		}
+		if strings.Contains(strings.ToLower(s.Name), "1password") ||
+			strings.Contains(strings.ToLower(s.Name), "do not share") {
+			t.Fatalf("local comment text egressed in a name: %q", s.Name)
+		}
+	}
+	want := []string{"db", "linear", "my server"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("names = %v, want %v", names, want)
+	}
+}
+
+// A server name may legitimately contain `]` inside quotes. Bounding the header
+// at the FIRST bracket would truncate it, so the scan tracks quote state.
+func TestCodexMCPQuotedNameKeepsBracket(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(cfg, []byte("[mcp_servers.\"a]b\"] # x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := censusCodexMCPServers(cfg)
+	if len(got) != 1 || got[0].Name != "a]b" {
+		t.Fatalf("got %#v, want one server named %q", got, "a]b")
+	}
+}
+
+// The WATCHERS honor CODEX_HOME and PROMPTSTER_CURSOR_HOME. A census that reads
+// a hardcoded ~/.codex inventories one machine's assets while the watcher
+// captures another's sessions — and reports `toolsExamined` for a directory
+// nobody is working in.
+func TestCensusEnvHonorsVendorHomeOverrides(t *testing.T) {
+	codex := t.TempDir()
+	cursor := t.TempDir()
+	t.Setenv("CODEX_HOME", codex)
+	t.Setenv("PROMPTSTER_CURSOR_HOME", cursor)
+
+	env := defaultCensusEnv("")
+	if env.codexDir != codex {
+		t.Fatalf("codexDir = %q, want CODEX_HOME %q", env.codexDir, codex)
+	}
+	if env.cursorDir != cursor {
+		t.Fatalf("cursorDir = %q, want PROMPTSTER_CURSOR_HOME %q", env.cursorDir, cursor)
 	}
 }

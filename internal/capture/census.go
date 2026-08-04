@@ -201,8 +201,12 @@ func defaultCensusEnv(workspace string) censusEnv {
 		claudeDir:      claudeConfigDir(),
 		claudeJSONPath: filepath.Join(home, ".claude.json"),
 		workspaceRoots: roots,
-		codexDir:       filepath.Join(home, ".codex"),
-		cursorDir:      filepath.Join(home, ".cursor"),
+		// codexHome()/cursorHome(), never a hardcoded join: the WATCHERS honor
+		// CODEX_HOME and PROMPTSTER_CURSOR_HOME, so a hardcoded census root would
+		// inventory one machine's assets while capturing another's sessions —
+		// and report `toolsExamined` for a directory nobody is working in.
+		codexDir:  codexHome(),
+		cursorDir: cursorHome(),
 	}
 }
 
@@ -984,9 +988,10 @@ func censusCodexMCPServers(configPath string) []censusMCPServer {
 		if !strings.HasPrefix(line, "[") {
 			continue
 		}
-		// Strip the brackets. `[[x]]` (array-of-tables) is not a shape Codex uses
-		// for mcp_servers; trimming both is harmless and keeps the parse total.
-		header := strings.TrimSpace(strings.Trim(line, "[]"))
+		header, ok := codexTOMLHeader(line)
+		if !ok {
+			continue
+		}
 		if !strings.HasPrefix(header, "mcp_servers.") {
 			continue
 		}
@@ -999,6 +1004,47 @@ func censusCodexMCPServers(configPath string) []censusMCPServer {
 	}
 	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
 	return servers
+}
+
+// codexTOMLHeader extracts the key path inside a TOML table header, bounded at
+// the CLOSING bracket.
+//
+// The bound is the point. `[mcp_servers.db] # staging creds in 1password` is a
+// valid header line, and anything after the `]` is a comment — arbitrary local
+// text an engineer wrote for themselves. Trimming the line's bracket characters
+// instead of bounding at the bracket carries that comment into the server NAME
+// and ships it, past an allowlist that correctly permits `mcpServers[].name`.
+// A field-level allowlist cannot catch this: the leak is INSIDE an allowed
+// field, so the parse is the only place it can be stopped.
+//
+// The scan tracks quote state so a name legitimately containing `]`
+// (`[mcp_servers."a]b"]`) is not truncated at the wrong bracket.
+func codexTOMLHeader(line string) (string, bool) {
+	if len(line) == 0 || line[0] != '[' {
+		return "", false
+	}
+	// `[[x]]` (array-of-tables) is not a shape Codex uses for mcp_servers, but
+	// skipping the second `[` keeps the parse total rather than special-casing it.
+	i := 1
+	if i < len(line) && line[i] == '[' {
+		i++
+	}
+	var quote byte
+	for j := i; j < len(line); j++ {
+		c := line[j]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == ']':
+			return strings.TrimSpace(line[i:j]), true
+		}
+	}
+	// Unterminated header (or an unclosed quote) — not a header we can trust.
+	return "", false
 }
 
 // codexTOMLFirstSegment takes the first dot-separated segment of a TOML key
