@@ -10,13 +10,15 @@ import (
 
 // THIS IS THE CHECK THAT WOULD HAVE CAUGHT #140.
 //
-// It parses the two progress loaders and finds every `p.V < N` migration block.
-// For each one it asks two questions the diff never answers:
+// It parses the two progress loaders and finds every `p.V < N` migration block,
+// then reconciles them against the declared table IN BOTH DIRECTIONS:
 //
-//  1. Is version N declared in the migration table at all?
-//  2. If the block CLEARS OFFSETS — i.e. it causes every in-window transcript on
-//     every device to be re-read from zero — does its row declare a
-//     ReplayHorizon?
+//  1. Every block has a row. A step nobody declared is a step nobody costed.
+//  2. Every row has a block. The version const is DERIVED from the table, so a
+//     row with no body raises the version and stamps every device as having
+//     applied a migration that never ran — unrecoverable without another bump.
+//  3. If a block CLEARS OFFSETS — i.e. it causes every in-window transcript on
+//     every device to be re-read from zero — its row declares a ReplayHorizon.
 //
 // A source check, not a table check, and that distinction is the whole point. A
 // test that only validated the table would be satisfied by a table nobody
@@ -58,6 +60,22 @@ func TestEveryOffsetClearingMigrationDeclaresItsReplayHorizon(t *testing.T) {
 				"nothing is worse than no check", ld.fn)
 			continue
 		}
+		// ROW -> BLOCK. Review caught this direction missing, and the hole it left
+		// is worse than the one the block->row direction closes: a row added with
+		// no loader block passes a block->row check, raises the DERIVED schema
+		// version, and both loaders then stamp `p.V = <new>` on every device — so
+		// every device is permanently marked as having applied a migration whose
+		// body never ran, and can never be made to run it. There is no recovery
+		// short of another version bump.
+		for _, m := range ld.migrations {
+			if !hasMigrationBlock(blocks, m.V) {
+				t.Errorf("%s declares v%d but %s has no `V < %d` block. The schema version is "+
+					"DERIVED from this table, so a row with no body silently stamps every device as "+
+					"having applied a migration that never ran — and nothing can re-run it.",
+					ld.label, m.V, ld.fn, m.V)
+			}
+		}
+
 		for _, b := range blocks {
 			m, ok := findMigration(ld.migrations, b.version)
 			if !ok {
@@ -112,6 +130,16 @@ func TestMigrationTablesAreGaplessAndOrdered(t *testing.T) {
 			}
 		}
 	}
+}
+
+// hasMigrationBlock reports whether the loader actually implements version v.
+func hasMigrationBlock(blocks []migrationBlock, v int) bool {
+	for _, b := range blocks {
+		if b.version == v {
+			return true
+		}
+	}
+	return false
 }
 
 // migrationBlock is one `if <recv>.V < N { ... }` statement in a loader.

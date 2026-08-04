@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -173,17 +174,49 @@ func humanizeReplayHorizon(d time.Duration) string {
 	}
 }
 
-// announceProgressReplay prints describeProgressReplay to stderr, once per load
-// that actually migrates.
+// announceProgressReplay prints describeProgressReplay to stderr, AT MOST ONCE
+// PER WATCHER PER PROCESS.
 //
 // Unconditional, not debug-gated. A replay that only a `PROMPTSTER_DEBUG=1`
-// operator can see is the silent one this whole file exists to end — and the
-// line is emitted at most once per schema bump per device, so it cannot become
-// noise anyone learns to ignore.
+// operator can see is the silent one this whole file exists to end.
+//
+// The once-per-process latch is NOT belt-and-braces, and review caught why. The
+// loader runs on every 3s poll and is normally quiet on the second one, because
+// the first save stamps the current version — but `saveClaudeWatchProgress`
+// swallows its write errors by design. On a read-only or full state dir the
+// version never persists, so every poll re-reads the OLD version, re-migrates,
+// and would re-print this line: a stderr flood every 3 seconds for as long as
+// the disk stays bad, burying the daemon log the message tells you to read.
+// Latching means the operator gets it once. That the migration is also failing
+// to persist is a different fault with its own report (§2.5), not something to
+// say 1,200 times an hour.
 func announceProgressReplay(watcher string, ms []progressMigration, from int) {
-	if line := describeProgressReplay(watcher, ms, from); line != "" {
-		fmt.Fprintln(progressReplayOut, line)
+	line := describeProgressReplay(watcher, ms, from)
+	if line == "" {
+		return
 	}
+	announcedMu.Lock()
+	if announced[watcher] {
+		announcedMu.Unlock()
+		return
+	}
+	announced[watcher] = true
+	announcedMu.Unlock()
+	fmt.Fprintln(progressReplayOut, line)
+}
+
+var (
+	announcedMu sync.Mutex
+	// announced latches per watcher name. Process-scoped on purpose: a restart
+	// SHOULD re-announce, because a restart is when the migration re-runs.
+	announced = map[string]bool{}
+)
+
+// resetProgressReplayAnnouncements clears the latch. Tests only.
+func resetProgressReplayAnnouncements() {
+	announcedMu.Lock()
+	defer announcedMu.Unlock()
+	announced = map[string]bool{}
 }
 
 // progressReplayOut is where announceProgressReplay writes. A var so tests can
