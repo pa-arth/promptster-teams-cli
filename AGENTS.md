@@ -290,6 +290,57 @@ so the detached child runs the normal watch startup check within a second. Same 
 
 Anything that never reaches `watch` never checks.
 
+### THE DAEMON IS A DIFFERENT BINARY FROM THE ONE YOU ARE TYPING TO
+
+Read this before answering any "is X captured / why is feature Y missing" question.
+It is the single most expensive confusion in this repo's support history.
+
+`doctor`, `status`, `version` and every nudge describe the **foreground process**.
+Capture is a **separate long-lived process** that may have started months ago from a
+different path, and the two are routinely different builds:
+
+- self-update swaps the file and re-execs, so a daemon that *cannot* update (unwritable
+  dir, a lockfile pin, a path npm deleted underneath it) stays on old code forever while
+  the foreground binary moves on;
+- autostart bakes an ABSOLUTE path, so launchd can be running a completely different file
+  from the one on PATH;
+- a running process holds its inode after its file is deleted, so it keeps capturing from
+  a build that no longer exists on disk;
+- `npx` makes the foreground binary the *newest* thing on the machine by definition.
+
+Every one of those machines LOOKS healthy — capture running, doctor green, ingest
+reachable — while features shipped weeks ago are silently absent. **Anything that
+installs itself at `watch` startup (the Cursor hook rail, most of all) never runs on a
+daemon that never restarted**, however current the binary on disk is. That is exactly how
+a customer ran 0.12.2 in the foreground with a pre-0.12.0 daemon and no Cursor rail, while
+`doctor` printed "up to date".
+
+`internal/capture/watch_runtime.go` closes it: the watcher stamps its own version + exe
+under the lock (and again after a self-update re-exec), and `RunningCapture()` reports it
+ONLY when the recorded PID is the live lock holder's — a record from a dead process is
+reported as **unknown**, never attributed to whatever holds the lock now. Consumers:
+
+- `doctor` — `captureProcessLines` (`internal/cli/capture_process_doctor.go`) splits four
+  outcomes that must not collapse into each other: not running / OLDER (error, names the
+  fix) / unknown build (warn — every daemon predating this record, the population most
+  likely to be stale) / NEWER (**not** an error: the foreground copy is the stale one, and
+  telling that engineer to restart capture would install an older build).
+- `start` — a live daemon on a strictly older recorded version is **restarted** instead of
+  getting the old "already running" no-op. Gated on `isOlderVersion`, which refuses to
+  compare unstamped builds (`dev`/`""` parse as 0.0.0, so without the guard a release
+  binary kills a developer's own watcher mid-test). It then **verifies the restart by
+  process IDENTITY** (`restartConfirmed`) and fails loudly if the same pid still holds
+  capture: `StopTeamsDaemon` prints a survivor on stderr but returns nil, so the follow-up
+  `StartDaemon` would otherwise find the stale process, print "already running" and exit 0
+  — announcing a restart it never performed. Identity, not version, because that stop also
+  clears the runtime record, so a survivor reads as "unknown build" and a version re-check
+  would call it fixed. A DIFFERENT pid is success (launchd may legitimately respawn the job
+  in between); an unreadable pid is a failure, since we deliberately stopped everything a
+  moment earlier. Caught by review on PR #137.
+
+**A recorded version is proof; an absent one is not evidence of health.** Never infer the
+daemon's build from the foreground version — that inference IS the bug.
+
 ### How the check resolves a version (NOT the JSON API)
 
 `fetchLatestTag` issues a **HEAD that does not follow redirects** against
@@ -402,6 +453,32 @@ different binaries on one box and PATH decides which one actually runs:
   human who acts; ours reaches a log nobody reads, so "ask the package manager to update"
   degrades to "never update" — the original bug this package exists to fix.
 
+**npm IS NOT A RELIABLE PLACE TO HANG INSTALL WORK — the launcher converges too.**
+Newer npm gates install scripts behind an approval (`npm warn allow-scripts 1 package has
+install scripts not yet covered by allowScripts`) and reports a **completely successful
+install** while running none of ours. Observed in the field on a customer machine, twice
+in a row, with `npm approve-scripts --allow-scripts-pending` answering "No packages with
+unreviewed install scripts" in between. `--ignore-scripts` lands in the same place. What
+silently does not happen is everything that matters: the managed binary is never written,
+and `autostart repair` never re-points a unit at it.
+
+So the install lives in `npm/lib/install.js` and BOTH `scripts/postinstall.js` and
+`bin/promptster-teams.js` call it — running the CLI at all converges the machine, whatever
+npm decided. Rules that keep that affordable and safe:
+
+- **The hot-path gate is a marker file** (`~/.promptster-teams/bin/.npm-installed`, the
+  bundled version last evaluated). One small read answers "nothing to do", which is the
+  answer approximately always; only a stale/missing marker buys the two `--version`
+  spawns. The marker is written even when the install is SKIPPED, or the gate stays open
+  and every command re-probes.
+- **The marker is a hint, never the decision.** The downgrade guard still compares BINARY
+  to BINARY, because the managed copy self-updates forward and is routinely newer than
+  what npm is installing.
+- **`uninstall` is excluded** (`shouldConvergeOnInvocation`). Reinstalling the binary
+  someone is in the middle of removing would defeat the only uninstall path that exists.
+- **`lib/install.js` is in `check-binaries.js`'s required-tarball list.** Losing it now
+  kills both routes to the managed binary at once.
+
 **GLOBAL installs only. A project-local install is pinned by its lockfile** and is left
 entirely alone — it keeps running its own copy out of `node_modules`. Two halves enforce
 this and BOTH are needed:
@@ -454,8 +531,33 @@ file. **Nothing fails loudly**: the running daemon holds its inode and capture l
 then at the next login launchd runs a path that is gone and capture never comes back — the
 precise failure autostart exists to prevent.
 
-`autostart repair` (`internal/cli/autostart.go`) is the migration, and npm's postinstall
-calls it after installing the managed binary. Rules:
+**Three things repair it now, because postinstall alone was not enough** (npm can decline
+to run it at all — see the allow-scripts note above):
+
+- `autostart repair` (`internal/cli/autostart.go`), called by npm's postinstall;
+- the npm **launcher**, via the same `installManagedBinary` path;
+- **`start` itself** — `rearmAutostart` (`internal/capture/daemon.go`) re-`Enable()`s a unit
+  that is `Installed && !Loaded`, which both re-arms the supervisor and re-renders the baked
+  path. It NEVER enrolls autostart for someone who has not enabled it: installed-and-
+  unloaded is the only state it touches, and that state is only reachable from our own
+  `stop`. Before this, every `stop && start` — the standard fix-it move — left capture
+  running unsupervised until the next login.
+
+`Manager.Status()` returns a `service.State{Installed, Loaded, Detail, ProgramPath}` rather
+than the old `(bool, string)`: **"installed" and "armed right now" are different facts**, and
+callers that could only see the first recovered the second by pattern-matching `Detail`,
+which is how doctor and the TUI both ended up painting an unloaded supervisor green.
+`ProgramPath` is the binary baked into the unit — parsed back out of our OWN rendered
+plist/unit, and **empty = unknown on Windows by design**: a naive schtasks unquote returns
+doubled separators, `os.Stat` calls it missing, and every healthy Windows machine prints the
+most alarming line doctor has. Callers must stay silent on unknown.
+
+One asymmetry worth not "fixing": an unloaded unit is **not** a warning while capture is
+running. A live watcher holds the single-instance lock, so the supervisor's own spawn exits
+0 and the job reads as not-running — the documented SUCCESS case, produced by every Linux
+`stop && start`. Warning there fires on healthy machines.
+
+Rules for `repair` itself:
 
 - **It must never exit non-zero.** It runs inside `npm install`, where a non-zero exit
   aborts the install and leaves the engineer with no CLI at all — far worse than a stale
@@ -535,8 +637,8 @@ unresolvable — `npm i` reported success and the CLI had no binary). Three defe
   daemon. Not worth it: rename is atomic so the file is always ONE whole valid binary
   (never corrupt), the only cost is running an older version, and the daemon re-updates
   forward within ≤30m. Raised by review on PR #64.
-- `--ignore-scripts` skips postinstall, so the launcher falls back to the bundled binary and
-  the old in-node_modules drift returns. Working-but-drifting beats not working.
+- ~~`--ignore-scripts` reverts to in-node_modules drift~~ — fixed: the launcher performs the
+  same converge (see above). It reverts only if BOTH paths fail.
 - **The node wrapper stays, and it is now load-bearing** — do not "optimise" it away.
   Claude Code's postinstall hardlinks the native binary over `bin/claude.exe` so npm's bin
   IS the binary and no node process is involved. Copying that would put `os.Executable()`

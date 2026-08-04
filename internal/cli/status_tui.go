@@ -75,17 +75,17 @@ func newStatusModel() statusModel {
 // "enabled (systemd --user, inactive)" or macOS "installed but not loaded")
 // gets a warn dot so a broken autostart never reads as healthy.
 func autostartLine() string {
-	installed, detail, err := service.New().Status()
-	if err != nil || !installed || detail == "" {
+	st, err := service.New().Status()
+	if err != nil || !st.Installed || st.Detail == "" {
 		return dotWarn.Render("○") + dimStyle.Render(" off — ") + bodyStyle.Render("promptster-teams autostart enable")
 	}
-	healthy := strings.HasPrefix(detail, "enabled") &&
-		!strings.Contains(detail, "inactive") &&
-		!strings.Contains(detail, "failed")
-	if healthy {
-		return dotOK.Render("●") + " " + detail
+	// Reads the fact instead of pattern-matching the sentence that describes it.
+	// The prose check this replaced ("enabled" && !"inactive" && !"failed") was one
+	// copy edit away from painting a dead supervisor green.
+	if st.Loaded {
+		return dotOK.Render("●") + " " + st.Detail
 	}
-	return dotWarn.Render("●") + " " + detail + dimStyle.Render(" — re-run ") + bodyStyle.Render("autostart enable")
+	return dotWarn.Render("●") + " " + st.Detail + dimStyle.Render(" — re-run ") + bodyStyle.Render("autostart enable")
 }
 
 func (m statusModel) Init() tea.Cmd { return statusTick() }

@@ -63,8 +63,8 @@ func cmdAutostart(args []string) int {
 // unit only exists because the engineer had a key when they enabled it, and a
 // transient key problem must not be a reason to leave the path broken.
 func autostartRepair(mgr service.Manager) int {
-	enabled, _, err := mgr.Status()
-	if err != nil || !enabled {
+	st, err := mgr.Status()
+	if err != nil || !st.Installed {
 		return 0 // not enabled, or unsupported host — nothing to repair
 	}
 	if err := mgr.Enable(); err != nil {
@@ -97,8 +97,8 @@ func autostartEnable(mgr service.Manager) int {
 	}
 
 	printlnIndent(fmt.Sprintf("%s autostart enabled — capture runs at every login and is kept alive across reboots.", okGlyph))
-	if _, detail, _ := mgr.Status(); detail != "" {
-		printlnIndent(dimStyle.Render(detail))
+	if st, _ := mgr.Status(); st.Detail != "" {
+		printlnIndent(dimStyle.Render(st.Detail))
 	}
 	fmt.Println()
 	return 0
@@ -122,7 +122,7 @@ func autostartDisable(mgr service.Manager) int {
 }
 
 func autostartStatus(mgr service.Manager) int {
-	installed, detail, err := mgr.Status()
+	st, err := mgr.Status()
 
 	fmt.Println()
 	fmt.Println(brandBar("autostart"))
@@ -134,12 +134,17 @@ func autostartStatus(mgr service.Manager) int {
 		return 1
 	}
 
+	// Installed is not health. An installed-but-unloaded unit printed a green
+	// check here and in doctor, which is the shape of a warning nobody reads.
 	glyph := warnGlyph
-	if installed {
+	if st.Installed && st.Loaded {
 		glyph = okGlyph
 	}
-	printlnIndent(fmt.Sprintf("%s %s", glyph, detail))
-	if !installed {
+	printlnIndent(fmt.Sprintf("%s %s", glyph, st.Detail))
+	if st.ProgramPath != "" {
+		printlnIndent(dimStyle.Render("runs " + st.ProgramPath + " at login"))
+	}
+	if !st.Installed {
 		printlnIndent(dimStyle.Render("Enable with `promptster-teams autostart enable`."))
 	}
 	fmt.Println()

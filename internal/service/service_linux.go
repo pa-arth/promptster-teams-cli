@@ -55,7 +55,7 @@ func (linuxManager) Enable() error {
 // --now`) also means Restart=on-failure won't revive it — a systemd-initiated
 // stop is never a failure, whatever exit status or signal follows.
 func (linuxManager) Stop() error {
-	if installed, _, _ := (linuxManager{}).Status(); !installed {
+	if st, _ := (linuxManager{}).Status(); !st.Installed {
 		return nil
 	}
 	// #nosec G204 -- constant subcommands + fixed unit name.
@@ -80,16 +80,18 @@ func (linuxManager) Disable() error {
 	return nil
 }
 
-func (linuxManager) Status() (bool, string, error) {
+func (linuxManager) Status() (State, error) {
 	p, err := unitPath()
 	if err != nil {
-		return false, "", err
+		return State{}, err
 	}
-	if _, err := os.Stat(p); err != nil {
+	// #nosec G304 -- p is unitPath() under the user's home, not user input.
+	data, err := os.ReadFile(p)
+	if err != nil {
 		if os.IsNotExist(err) {
-			return false, "not enabled", nil
+			return State{Detail: "not enabled"}, nil
 		}
-		return false, "", err
+		return State{}, err
 	}
 	active := "inactive"
 	// #nosec G204 -- constant subcommands + fixed unit name. is-active exits
@@ -97,5 +99,15 @@ func (linuxManager) Status() (bool, string, error) {
 	if out, _ := exec.Command("systemctl", "--user", "is-active", unitName).Output(); len(out) > 0 {
 		active = strings.TrimSpace(string(out))
 	}
-	return true, fmt.Sprintf("enabled (systemd --user, %s)", active), nil
+	// Loaded is "the supervisor has this job RIGHT NOW", the same question
+	// launchctl print answers on macOS — so is-active, not is-enabled. A
+	// `systemctl --user stop` (which is what our own Stop does) leaves the unit
+	// enabled and inactive: it returns at the next login, but nothing is
+	// supervising capture until then, and that gap is the thing worth reporting.
+	return State{
+		Installed:   true,
+		Loaded:      active == "active",
+		Detail:      fmt.Sprintf("enabled (systemd --user, %s)", active),
+		ProgramPath: programPathFromUnit(string(data)),
+	}, nil
 }

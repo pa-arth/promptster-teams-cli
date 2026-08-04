@@ -193,11 +193,12 @@ func isCursorWatcherRunning() (cursorWatcherState, bool) {
 // Cursor agent transcripts whose observed working paths sit inside the watched
 // workspace, normalizes each new line, redacts on-device, and queues events.
 //
-// It installs nothing. Cursor's documented hook surface writes
-// `<workspace>/.cursor/hooks.json` — a tracked file inside the customer's
-// repository, enrolled per-workspace — and this CLI does not write into
-// customer repos or ask an engineer to enroll a tool once per project. The
-// transcript rail needs neither. See normalize_cursor.go for the full argument.
+// It also enrolls the USER-SCOPE hook rail (~/.cursor/hooks.json) below, which
+// is the one file this CLI writes for Cursor. The scope is the whole point: the
+// project-local `<workspace>/.cursor/hooks.json` that Cursor's docs lead with is
+// a tracked file inside the customer's repository, enrolled per-workspace, and
+// this CLI does not write into customer repos or ask an engineer to enroll a
+// tool once per project. See CLAUDE.md and cursor_hooks.go.
 func RunCursorWatcher() error {
 	session, err := loadSession()
 	if err != nil {

@@ -73,7 +73,7 @@ func (darwinManager) Enable() error {
 // everything in ~/Library/LaunchAgents at the next login, so autostart survives
 // — this only ends the current session's capture.
 func (darwinManager) Stop() error {
-	if installed, _, _ := (darwinManager{}).Status(); !installed {
+	if st, _ := (darwinManager{}).Status(); !st.Installed {
 		return nil
 	}
 	// #nosec G204 -- constant subcommands; target is gui/<uid>/<label>, not user input.
@@ -100,20 +100,26 @@ func (darwinManager) Disable() error {
 	return nil
 }
 
-func (darwinManager) Status() (bool, string, error) {
+func (darwinManager) Status() (State, error) {
 	p, err := plistPath()
 	if err != nil {
-		return false, "", err
+		return State{}, err
 	}
-	if _, err := os.Stat(p); err != nil {
+	// #nosec G304 -- p is plistPath() under the user's home, not user input.
+	data, err := os.ReadFile(p)
+	if err != nil {
 		if os.IsNotExist(err) {
-			return false, "not enabled", nil
+			return State{Detail: "not enabled"}, nil
 		}
-		return false, "", err
+		return State{}, err
 	}
+	st := State{Installed: true, ProgramPath: programPathFromPlist(string(data))}
 	// #nosec G204 -- constant subcommands; target is uid/label-derived.
 	if err := exec.Command("launchctl", "print", guiTarget(true)).Run(); err != nil {
-		return true, "installed but not loaded (try re-running enable)", nil
+		st.Detail = "installed but not loaded (try re-running enable)"
+		return st, nil
 	}
-	return true, "enabled (launchd, runs at login)", nil
+	st.Loaded = true
+	st.Detail = "enabled (launchd, runs at login)"
+	return st, nil
 }

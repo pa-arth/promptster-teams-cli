@@ -41,7 +41,14 @@ console.log("✓ All binaries present");
 // rule between two files that both look authoritative, and trimming `files`
 // would break it with no other signal. Ask the packer what is actually in the
 // tarball rather than trusting either file.
-const REQUIRED_IN_TARBALL = ["scripts/postinstall.js", "lib/resolve.js"];
+// lib/install.js is on this list for a second reason: the LAUNCHER now requires
+// it to converge a machine whose npm declined to run install scripts at all. Lose
+// it and both paths to the managed binary are gone at once.
+const REQUIRED_IN_TARBALL = [
+  "scripts/postinstall.js",
+  "lib/resolve.js",
+  "lib/install.js",
+];
 
 let entries;
 try {
