@@ -334,10 +334,10 @@ func TestCommitsHeldByAnswersEachShaInAMixedRange(t *testing.T) {
 	held := commitsHeldBy(wt, []string{after1, base, after2, onFeat, shortBase})
 
 	want := map[string]bool{
-		base:    true,  // the branch point — the sibling holds it
-		onFeat:  true,  // the sibling's own commit
-		after1:  false, // landed on the default branch after it forked
-		after2:  false,
+		base:   true,  // the branch point — the sibling holds it
+		onFeat: true,  // the sibling's own commit
+		after1: false, // landed on the default branch after it forked
+		after2: false,
 		// shortBase is NOT expected: rev-list prints full names, so an
 		// abbreviation cannot be compared against the output it is judged by.
 	}
