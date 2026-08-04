@@ -69,12 +69,15 @@ Four facts settled empirically — **do not re-derive them from documentation**:
   in-window transcript on every device is re-read from zero — one line of diff, the whole
   28-day window back through the funnel. v0.12.3's v2 bump replayed **62,302 events on one
   device** and left a 20,761-event backlog whose oldest entry was 15 days stale. It fires on
-  the first daemon start after the upgrade, **not** on restart: `clearCodexWatcherState`
-  removes only `codex-watcher.json` (pid, heartbeat) and never the progress file holding the
-  offsets, so **hardening restart fixes nothing — an UPGRADE across a bump is what rescans.**
-  The cost lands on every device at once, days later, and never on whoever bumped it. Declare
-  the window, the rough per-device event count, and why it is worth a replay. Read exposure
-  from `engineer_keys.latest_cli_version` — never infer it from release timing.
+  the first daemon start of the UPGRADED binary — which in practice **is** a restart, since
+  self-update re-execs, so that is the moment to look at. The distinction is *which* restart:
+  one on the SAME schema version rescans nothing (`clearCodexWatcherState` removes only
+  `codex-watcher.json` — pid, heartbeat — never the progress file holding the offsets), while
+  the new binary's loader clears them via its `p.V < N` migration. **Restart is the occasion,
+  the version bump is the cause — so ask what changed between the two binaries.** The cost
+  lands on every device at once, days later, and never on whoever bumped it. Declare the
+  window, the rough per-device event count, and why it is worth a replay. Read exposure from
+  `engineer_keys.latest_cli_version` — never infer it from release timing.
 
 ### Counts, never code
 

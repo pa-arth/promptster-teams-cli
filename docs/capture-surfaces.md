@@ -289,12 +289,22 @@ ingest and start costing the presence beat its own delivery.
 
 Three facts that make this easy to get wrong:
 
-- **It fires on the first DAEMON START after the upgrade, not on restart.** A
-  restart rescans nothing: `clearCodexWatcherState` removes only
+- **It fires on the first daemon start of the UPGRADED binary — which in practice
+  IS a restart. Do not read this as "restarts are innocent."** Self-update
+  re-execs, so on a real device the restart and the upgrade are the same event,
+  and it is the moment to look at when a fleet suddenly replays.
+
+  The distinction that matters is *which* restart. A restart on the **same**
+  schema version rescans nothing — `clearCodexWatcherState` removes only
   `codex-watcher.json` (pid, heartbeat) and never `codex-watcher-progress.json`,
-  so the offsets survive. Reasoning from "why does a restart rescan?" leads to
-  hardening restart, which would have fixed nothing. **What rescans is an upgrade
-  across a schema bump.**
+  so the offsets survive it. What clears them is the **new binary's** progress
+  loader running its `p.V < N` migration. The restart is the occasion; the
+  version bump is the cause.
+
+  That is why the question this investigation opened with — "why does a RESTART
+  rescan?" — leads somewhere useless. Hardening restart would have fixed nothing,
+  because restart was never the variable. **Ask what changed between the two
+  binaries, not what the restart did.**
 - **The cost is not paid by whoever bumps it.** It lands on every enrolled device
   at once, days later, as ingest pressure — long after the PR that caused it is
   out of mind. The version transition is readable from
