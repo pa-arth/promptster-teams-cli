@@ -66,9 +66,16 @@ url = "https://SECRET-MCP-URL"
 		t.Fatal(err)
 	}
 
+	// Claude Code's own MCP config, so the Cursor prefix has something it could
+	// wrongly spread to. Without this the no-leak assertion is vacuous.
+	claudeJSON := filepath.Join(home, ".claude.json")
+	if err := os.WriteFile(claudeJSON, []byte(`{"mcpServers":{"github":{"command":"npx"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
 	return censusEnv{
 		claudeDir:      claude,
-		claudeJSONPath: filepath.Join(home, ".claude.json"),
+		claudeJSONPath: claudeJSON,
 		workspaceRoots: []string{t.TempDir()},
 		codexDir:       codex,
 		cursorDir:      cursor,
@@ -113,8 +120,10 @@ func TestCensusReadsMCPFromAllThreeTools(t *testing.T) {
 	for name, wantTool := range map[string]string{
 		"probeserver": toolCodex,
 		"spaced name": toolCodex, // quoted TOML key, unquoted
-		"supabase":    toolCursor,
-		"clerk":       toolCursor,
+		// Cursor's, under the name CURSOR ITSELF USES on the wire — see below.
+		"user-supabase": toolCursor,
+		"user-clerk":    toolCursor,
+		"github":        toolClaudeCode,
 	} {
 		if got[name] != wantTool {
 			t.Errorf("MCP %q tool = %q, want %q (all: %v)", name, got[name], wantTool, got)
@@ -124,6 +133,22 @@ func TestCensusReadsMCPFromAllThreeTools(t *testing.T) {
 	// called "probeserver.env".
 	if _, bad := got["probeserver.env"]; bad {
 		t.Errorf("a TOML sub-table was minted as its own MCP server: %v", got)
+	}
+
+	// A Cursor server censused under its BARE mcp.json key can never join its
+	// own invocations: across 89 real transcripts Cursor names user-scope
+	// servers `user-<key>` on the wire. Censusing `supabase` while the
+	// invocations say `user-supabase` matches zero rows — silently, and looking
+	// exactly like "this engineer never used their MCP servers".
+	for _, bare := range []string{"supabase", "clerk"} {
+		if _, bad := got[bare]; bad {
+			t.Errorf("cursor MCP %q censused under its bare config key; the wire name is %q, so this joins nothing: %v",
+				bare, cursorUserMCPPrefix+bare, got)
+		}
+	}
+	// Claude's own servers must NOT pick the prefix up.
+	if got["user-github"] != "" {
+		t.Errorf("the cursor prefix leaked onto a non-cursor server: %v", got)
 	}
 }
 

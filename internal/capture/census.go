@@ -61,6 +61,11 @@ const (
 	toolClaudeCode = "claude-code"
 	toolCodex      = "codex"
 	toolCursor     = "cursor"
+	// cursorUserMCPPrefix is how Cursor names a server configured in the USER
+	// scope when it invokes it. Observed on the wire, not assumed — see
+	// censusMCPServers for why the census adopts the wire name rather than the
+	// normalizer stripping it.
+	cursorUserMCPPrefix = "user-"
 )
 
 // censusSkill is one skill on disk — identity + listing cost only.
@@ -626,10 +631,13 @@ func buildConfigCensus(env censusEnv) configCensusData {
 	// MCP — Claude Code's ~/.claude.json + workspace .mcp.json, Cursor's
 	// ~/.cursor/mcp.json (identical `mcpServers` object shape, verified on disk),
 	// and Codex's config.toml, which is the one new parse.
-	data.MCPServers = censusMCPServers(env.claudeJSONPath, env.workspaceRoots, toolClaudeCode)
+	data.MCPServers = censusMCPServers(env.claudeJSONPath, env.workspaceRoots, toolClaudeCode, "")
 	if env.cursorDir != "" {
+		// cursorUserMCPPrefix, not "": see censusMCPServers. Cursor invokes a
+		// user-configured server as `user-<key>`, so the bare key would never
+		// join its own invocations.
 		data.MCPServers = append(data.MCPServers,
-			censusMCPServers(filepath.Join(env.cursorDir, "mcp.json"), nil, toolCursor)...)
+			censusMCPServers(filepath.Join(env.cursorDir, "mcp.json"), nil, toolCursor, cursorUserMCPPrefix)...)
 	}
 	if env.codexDir != "" {
 		data.MCPServers = append(data.MCPServers,
@@ -897,7 +905,24 @@ func pluginListingTokens(installPath string) int {
 // censusMCPServers collects MCP server NAMES from the global ~/.claude.json
 // `mcpServers` map plus each workspace root's .mcp.json. Only the keys are
 // read — commands, URLs, env, and headers stay on the machine.
-func censusMCPServers(claudeJSONPath string, workspaceRoots []string, tool string) []censusMCPServer {
+//
+// namePrefix is prepended to every key. It exists for exactly one reason:
+// Cursor does NOT invoke a user-configured server under the name it is
+// configured with. `~/.cursor/mcp.json` keys `supabase`; the invocation on the
+// wire names `user-supabase` — verified across 89 real transcripts, in which
+// every observed server was either `user-<key from mcp.json>` or a built-in
+// (`cursor-app-control`) present in no config file at all. Censusing the bare
+// key would have the asset board and the invocation board name one server two
+// different ways, so the backend's ROI join matches ZERO Cursor MCP servers.
+// That is this change's own bug one layer down, so it is fixed at the source
+// rather than papered over with a prefix-stripping rule in the backend.
+//
+// The prefix belongs HERE rather than in the normalizer because the wire name
+// is the truth: `user-` is Cursor's namespace marker separating configured
+// servers from built-ins, so stripping it at emission would collide a user
+// server with a built-in of the same name. We census only Cursor's USER scope,
+// which is exactly the scope carrying this prefix.
+func censusMCPServers(claudeJSONPath string, workspaceRoots []string, tool, namePrefix string) []censusMCPServer {
 	seen := map[string]bool{}
 	servers := []censusMCPServer{}
 	add := func(path string) {
@@ -913,6 +938,7 @@ func censusMCPServers(claudeJSONPath string, workspaceRoots []string, tool strin
 			return
 		}
 		for name := range cfg.MCPServers {
+			name = namePrefix + name
 			if seen[name] {
 				continue
 			}
