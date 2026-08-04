@@ -867,6 +867,10 @@ func pollGitWatchWorkspace(session Session) {
 
 	for _, root := range roots {
 		rootKey := gitWatchRootKey(root)
+		// Read BEFORE the scope switch, because the switch's third arm needs it: the
+		// spans a scope that folds nothing must release are only at risk when commits
+		// actually landed. It is used again below, unchanged.
+		commits := detected[rootKey]
 		// Rework scope, resolved ONCE per root (never per commit). Resolved BEFORE the
 		// no-new-commits guard so that returning to the default branch clears stale
 		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
@@ -919,6 +923,36 @@ func pollGitWatchWorkspace(session Session) {
 				justAdopted = true
 			}
 			adopting = pending
+		default:
+			// EVERY OTHER SCOPE FOLDS NOTHING, AND THIS ARM IS WHAT KEEPS THAT FROM
+			// FABRICATING. `foldRework` below is gated on preMerge, so a commit
+			// reaching this root in any other scope is attributed and RECORDED —
+			// permanently, a recorded commit is never revisited — while its hunks
+			// never shift the spans the root is still holding. The next rewrite of the
+			// human lines that moved into those coordinates then emits a
+			// rework_verdict over code the AI never wrote.
+			//
+			// scopeUnknown is the one such scope today and an ordinary `git rebase -i`
+			// reaches it: HEAD is detached for the whole rebase, and this loop polls
+			// every gitWatchInterval (60s), which an interactive rebase spends waiting
+			// on the engineer's editor. It is `default:` rather than
+			// `case scopeUnknown:` so that a fourth branchScope added later lands here
+			// — releasing state it cannot maintain — instead of silently reopening
+			// this hole.
+			//
+			// Gated on commits having landed, which is the whole precision of it: a
+			// detached HEAD that commits nothing (a `git bisect`, a CI checkout, a
+			// read-only `git checkout --detach`) has moved no line space, so its
+			// branch keeps its tracking. And the release deliberately keeps the seed
+			// tombstones — see releaseReworkSpans for why dropping them would trade
+			// this fabrication for the one PR #128 closed.
+			//
+			// The cost is an undercount: a rebase drops the branch's rework tracking.
+			// That is the direction these ledgers always resolve toward, and a rebase
+			// rewrites the very history those coordinates were measured against.
+			if len(commits) > 0 {
+				releaseReworkSpans(session, root, rootKey)
+			}
 		}
 
 		// A root that has never been polled before — the ordinary `git worktree add`
@@ -944,7 +978,6 @@ func pollGitWatchWorkspace(session Session) {
 			replayReworkForColdStartBranch(session, root, coldStart[rootKey], attributed, nowMs)
 		}
 
-		commits := detected[rootKey]
 		if len(commits) == 0 {
 			// A root with no commits this poll either has nothing left to replay
 			// (drained) or was deferred with its whole range still owed. Only the
@@ -1015,9 +1048,13 @@ func pollGitWatchWorkspace(session Session) {
 type branchScope int
 
 const (
-	// scopeUnknown: no resolvable default branch, or a detached/unborn HEAD. Neither
-	// seed rework (we cannot tell it is a feature branch) nor clear it (a transient
-	// detach mid-rebase must not wipe a real branch's tracking).
+	// scopeUnknown: no resolvable default branch, or a detached/unborn HEAD —
+	// which is what a `git rebase` in progress looks like. Rework is never SEEDED
+	// here (we cannot tell it is a feature branch), and the root's whole ledger is
+	// never CLEARED either — the tombstones and the recorded branch survive a
+	// transient detach. But a poll that surfaces COMMITS here releases the tracked
+	// spans, because nothing in this scope folds them forward; see the switch's
+	// default arm in pollGitWatchWorkspace.
 	scopeUnknown branchScope = iota
 	// scopeDefault: checked out ON the default branch — durability territory. Any
 	// rework tracking for this root is stale and gets cleared.
