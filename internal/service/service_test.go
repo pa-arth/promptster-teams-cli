@@ -14,11 +14,11 @@ import (
 // the developer's own running capture to make.
 func TestStopIsNoOpWhenNotInstalled(t *testing.T) {
 	mgr := New()
-	installed, _, err := mgr.Status()
+	st, err := mgr.Status()
 	if err != nil {
 		t.Skipf("cannot read autostart status on this host: %v", err)
 	}
-	if installed {
+	if st.Installed {
 		t.Skip("autostart is enabled on this host; refusing to stop the real service in a test")
 	}
 	if err := mgr.Stop(); err != nil {

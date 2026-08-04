@@ -143,6 +143,13 @@ func RunTeamsWatch(args []string) error {
 	}
 	defer release()
 
+	// Stamp WHICH BUILD is capturing, now that this process owns the lock. A
+	// self-update re-execs into RunTeamsWatch again, so the record follows the
+	// binary rather than the start. See watch_runtime.go for why nothing else on
+	// the machine can answer this question.
+	recordWatchRuntime()
+	defer clearWatchRuntime()
+
 	// Resolve the credential up front (flag > env > stored) and export the
 	// result so the child watchers — which call loadSession() — and apiURL()
 	// all observe the same values, including a --key passed only to `watch`.
@@ -208,12 +215,16 @@ func RunTeamsWatch(args []string) error {
 	errCh := make(chan error, 3)
 	go func() { errCh <- RunClaudeWatcher() }()
 	go func() { errCh <- RunCodexWatcher() }()
-	// Cursor rides the same transcript-tailing rail as the other two — read-only,
-	// zero enrollment, nothing installed into the engineer's workspace. Cursor
-	// also exposes a project-local hooks.json, which this CLI deliberately does
-	// NOT use: it would mean writing a tracked file into the customer's repo and
-	// enrolling per-workspace, so every repo an engineer forgot would read as
-	// "captured nothing". See internal/normalize/normalize_cursor.go.
+	// Cursor runs TWO rails: the transcript tail this shares with the other two,
+	// plus a USER-SCOPE hook (~/.cursor/hooks.json) that RunCursorWatcher enrolls
+	// at startup. The project-local <workspace>/.cursor/hooks.json is the scope
+	// this CLI must never write — a tracked file inside the customer's repo,
+	// enrolled per-repo, so every repo an engineer forgot would read as "captured
+	// nothing". See CLAUDE.md and internal/capture/cursor_hooks.go.
+	//
+	// That enrollment living at watch startup is why a daemon that never restarts
+	// never gets the rail, however current the binary on disk is — the failure
+	// watch_runtime.go exists to make visible.
 	go func() { errCh <- RunCursorWatcher() }()
 	return <-errCh
 }

@@ -115,6 +115,29 @@ jobs:
           systemctl --user is-enabled promptster-teams.service                    # still registered
           /tmp/pt stop
 
+          # `start` re-arms AND re-points an autostart unit that is installed but
+          # not currently loaded. Both halves are migrations for a real customer
+          # machine: `stop` disarms the supervisor deliberately and nothing used
+          # to arm it again, and npm's install-script approval gate can stop
+          # postinstall (and therefore `autostart repair`) from ever running — so
+          # the unit keeps naming a binary the upgrade deleted while the daemon
+          # holds its inode and everything looks healthy until the next login.
+          #
+          # Reproduce it exactly: enable from a binary, delete that binary out
+          # from under the running watcher, stop, then plain `start`.
+          cp /tmp/pt /tmp/pt-old2
+          /tmp/pt-old2 autostart enable
+          grep -q "/tmp/pt-old2" ~/.config/systemd/user/promptster-teams.service
+          rm -f /tmp/pt-old2                                       # the running watcher keeps its inode
+          /tmp/pt stop
+          ! systemctl --user is-active --quiet promptster-teams.service   # unloaded
+          grep -q "/tmp/pt-old2" ~/.config/systemd/user/promptster-teams.service  # still stale
+          /tmp/pt start
+          grep -q '^ExecStart="/tmp/pt" watch' ~/.config/systemd/user/promptster-teams.service
+          ! grep -q "pt-old2" ~/.config/systemd/user/promptster-teams.service
+          systemctl --user is-enabled promptster-teams.service
+          /tmp/pt stop
+
           /tmp/pt autostart disable
           /tmp/pt autostart status | tee /tmp/s3
           grep -qi "not enabled" /tmp/s3                           # deregistered
@@ -219,11 +242,19 @@ jobs:
       - name: npm scripts parse
         working-directory: npm
         run: |
-          for f in lib/resolve.js bin/promptster-teams.js scripts/postinstall.js \
+          for f in lib/resolve.js lib/install.js bin/promptster-teams.js scripts/postinstall.js \
                    scripts/build.js scripts/check-binaries.js scripts/check-platform-lists.js; do
             node --check "$f" || exit 1
           done
           echo "✓ all npm scripts parse"
+      # The managed-binary install is no longer reachable only through npm's
+      # postinstall — npm can decline to run install scripts and still report a
+      # successful install — so the launcher performs the same converge and both
+      # paths share lib/install.js. These tests drive that module against a
+      # sandboxed HOME and fixture binaries; they are pure node, no Go build.
+      - name: npm install-module tests
+        working-directory: npm
+        run: node --test 'test/*.test.js'
 
   # Static application security testing. All findings (any severity) are
   # published to the GitHub Security tab as SARIF so reviewers can see them;

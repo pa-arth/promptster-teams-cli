@@ -31,6 +31,41 @@ function usable(p) {
   }
 }
 
+// Converge the managed binary before choosing which one to run.
+//
+// npm is not a reliable place to hang this work any more: its install-script
+// approval gate can decline to run our postinstall while reporting a completely
+// successful install, so the managed binary — the one the daemon executes and
+// autostart points at — is never written and `autostart repair` never runs. The
+// engineer sees "added 2 packages" and a working CLI, and only the parts that
+// matter are missing. Doing it here means running the CLI at all converges the
+// machine, whatever npm decided about our scripts.
+//
+// Cost when there is nothing to do (the overwhelming case): one readFileSync of
+// a tiny marker file. No spawns, no stat of the bundled binary.
+//
+// `uninstall` is excluded — reinstalling the binary a person is in the middle of
+// removing is the one thing this must never do.
+try {
+  const {
+    installManagedBinary,
+    mayNeedInstall,
+    shouldConvergeOnInvocation,
+  } = require("../lib/install");
+  if (shouldConvergeOnInvocation(process.argv[2])) {
+    if (mayNeedInstall(require("../package.json").version)) {
+      // stderr, never stdout: this must not corrupt the output of the command
+      // the engineer actually ran (`version`, `status --json`, …).
+      const say = (msg) => console.error(`promptster-teams: ${msg}`);
+      installManagedBinary({ log: say, warn: say });
+    }
+  }
+} catch (err) {
+  // Never block the command. The worst case is the pre-existing behaviour: run
+  // the bundled binary and let npm's metadata drift.
+  console.error(`promptster-teams: could not check the managed install: ${err && err.message}`);
+}
+
 const bundled = bundledBinPath();
 
 // A project-local install runs ITS OWN binary, never the shared managed one.

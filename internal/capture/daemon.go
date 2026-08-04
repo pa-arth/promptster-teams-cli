@@ -10,9 +10,26 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/pa-arth/promptster-teams-cli/internal/version"
 )
+
+// isOlderVersion reports whether running is a strictly older release than ours,
+// using the SAME predicate that authorizes a self-update swap (selfupdate.IsNewer)
+// — two answers to one question is how a diagnostic ends up arguing with the
+// daemon it is diagnosing.
+//
+// Unstamped builds ("dev", "") are never compared. They parse as 0.0.0, so a
+// release binary would read every locally-built daemon as ancient and restart a
+// developer's watcher out from under them mid-test.
+func isOlderVersion(running, ours string) bool {
+	if running == "" || running == "dev" || ours == "" || ours == "dev" {
+		return false
+	}
+	return selfupdate.IsNewer(running, ours)
+}
 
 // daemonState records the detached background-capture supervisor so `stop` and
 // `status` can find it. The supervisor is a single `promptster-teams watch`
@@ -111,12 +128,36 @@ type StartResult struct {
 	// failed registration that reads as success is the precise failure mode
 	// capture roots exist to remove.
 	RootErr error
+	// StaleVersion is the version of a live daemon that is running an OLDER build
+	// than this binary — empty when capture is current, was not running, or did
+	// not record a version. Set only on the AlreadyRunning path, where "nothing
+	// to do" was the wrong answer.
+	StaleVersion string
+}
+
+// staleCapture reports the version of a live daemon running an older build than
+// this binary, or "" when there is nothing to act on.
+//
+// Deliberately strict, in both directions. It answers "" when the daemon did not
+// record a version (any build older than watch_runtime.go), because acting on a
+// guess would restart working capture on every `start`. And it answers "" when
+// the daemon is NEWER than us — that is an ordinary consequence of a stale
+// foreground copy (an old `npx`, a second binary earlier in PATH), and killing a
+// newer daemon to install an older one is a downgrade with extra steps.
+func staleCapture(running string) string {
+	if running == "" || !isOlderVersion(running, version.Version) {
+		return ""
+	}
+	return running
 }
 
 func StartDaemon(args []string) (StartResult, error) {
 	if p, running := DaemonStatus(); running {
 		dir, rootErr := registerWatchDir()
-		return StartResult{PID: p, WatchDir: dir, AlreadyRunning: true, RootErr: rootErr}, nil
+		return StartResult{
+			PID: p, WatchDir: dir, AlreadyRunning: true, RootErr: rootErr,
+			StaleVersion: staleCapture(RunningCapture().Version),
+		}, nil
 	}
 	// A watcher launched some other way (foreground `watch` or the autostart
 	// service) holds the single-instance lock but never wrote supervisor.json —
@@ -125,7 +166,10 @@ func StartDaemon(args []string) (StartResult, error) {
 	// render their own UX.
 	if p, running := watchRunning(); running {
 		dir, rootErr := registerWatchDir()
-		return StartResult{PID: p, WatchDir: dir, AlreadyRunning: true, RootErr: rootErr}, nil
+		return StartResult{
+			PID: p, WatchDir: dir, AlreadyRunning: true, RootErr: rootErr,
+			StaleVersion: staleCapture(RunningCapture().Version),
+		}, nil
 	}
 
 	token, apiURL, watchDir, noAutoUpdate, err := resolveWatchEnv(args)
@@ -202,6 +246,34 @@ func StartTeamsDaemon(args []string) error {
 	if err != nil {
 		return err
 	}
+	// A live daemon on an OLDER build is the one case where "already running" was
+	// the wrong answer. It is not a hypothetical: capture keeps running, doctor
+	// stays green, and every feature that installs itself at watch startup (the
+	// Cursor hook rail, most obviously) is silently missing — so `start`, the
+	// command an engineer runs precisely because something is not working, used to
+	// print a reassuring line and change nothing.
+	//
+	// Restart it. This is the ONE mutation `start` performs on a running daemon,
+	// it is gated on a recorded version being strictly older than ours, and it is
+	// exactly what the engineer would do by hand next.
+	if res.AlreadyRunning && res.StaleVersion != "" {
+		fmt.Fprintf(os.Stderr, "promptster-teams: capture (pid %d) is running %s but this binary is %s — restarting it\n", res.PID, res.StaleVersion, version.Version)
+		if err := StopTeamsDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "promptster-teams: warning: could not stop the stale capture process: %v\n", err)
+		}
+		res, err = StartDaemon(args)
+		if err != nil {
+			return err
+		}
+	}
+	// Re-arm the OS supervisor if it is installed but not loaded. `stop` disarms
+	// it deliberately (otherwise launchd resurrects the watcher `stop` just
+	// killed) and nothing used to arm it again, so every stop/start cycle — the
+	// standard fix-it move, and the one the restart above performs — left capture
+	// running unsupervised until the next login. Enable() also re-renders the
+	// baked path, so this doubles as the `autostart repair` for anyone whose npm
+	// postinstall never ran.
+	rearmAutostart()
 	if res.AlreadyRunning {
 		if res.RootErr != nil {
 			// Never claim coverage we do not have. This is the one line that
@@ -222,6 +294,30 @@ func StartTeamsDaemon(args []string) error {
 	printWatchedRoots(os.Stderr)
 	fmt.Fprintf(os.Stderr, "promptster-teams: logs at %s · stop with `promptster-teams stop`\n", daemonLogPath())
 	return nil
+}
+
+// rearmAutostart re-registers an autostart unit that is installed but not
+// currently loaded, and does nothing at all otherwise.
+//
+// It NEVER installs autostart for someone who has not enabled it — that would
+// turn `start` into a consent-free enrollment in something that survives
+// reboots. Installed-and-unloaded is the only state it touches, and that state
+// is only reachable from our own `stop`.
+//
+// Best-effort by contract: capture is already running by the time this is
+// called, and a supervisor we cannot reach is not a reason to report a failed
+// start.
+func rearmAutostart() {
+	mgr := newServiceManager()
+	st, err := mgr.Status()
+	if err != nil || !st.Installed || st.Loaded {
+		return
+	}
+	if err := mgr.Enable(); err != nil {
+		fmt.Fprintf(os.Stderr, "promptster-teams: warning: autostart is installed but not loaded and could not be re-armed (%v) — run `promptster-teams autostart enable`\n", err)
+		return
+	}
+	fmt.Fprintf(os.Stderr, "promptster-teams: autostart re-armed at %s\n", state.SelfBin())
 }
 
 // registerWatchDir adds the directory this invocation would have watched to the
@@ -328,6 +424,7 @@ func StopTeamsDaemon() error {
 	clearDaemonState()
 	clearClaudeWatcherState()
 	clearCodexWatcherState()
+	clearWatchRuntime()
 	_ = os.Remove(claudeHookTakeoverPath())
 
 	// Report the outcome we can observe, not the one we intended — this command

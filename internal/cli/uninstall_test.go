@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/pa-arth/promptster-teams-cli/internal/service"
 )
 
 // sandboxHome points every home-relative path (~/.cursor, ~/.claude,
@@ -37,7 +38,7 @@ func noopDeps() uninstallDeps {
 	return uninstallDeps{
 		stopCapture:       func() error { return nil },
 		captureRunning:    func() bool { return false },
-		autostartStatus:   func() (bool, string, error) { return false, "not enabled", nil },
+		autostartStatus:   func() (service.State, error) { return service.State{Detail: "not enabled"}, nil },
 		autostartDisable:  func() error { return nil },
 		removeCursorHooks: func() (bool, error) { return false, nil },
 		statuslineWrapped: func() bool { return false },
@@ -96,7 +97,9 @@ func TestUninstallContinuesPastAFailedStep(t *testing.T) {
 	statuslineRestored := false
 
 	d := noopDeps()
-	d.autostartStatus = func() (bool, string, error) { return true, "installed", nil }
+	d.autostartStatus = func() (service.State, error) {
+		return service.State{Installed: true, Loaded: true, Detail: "installed"}, nil
+	}
 	d.autostartDisable = func() error { return errors.New("launchctl said no") }
 	d.stopCapture = func() error { return errors.New("could not signal") }
 	d.removeCursorHooks = func() (bool, error) { removed = true; return true, nil }
@@ -148,7 +151,7 @@ func TestUninstallStillDeregistersWhenTheStatusProbeFails(t *testing.T) {
 	sandboxHome(t)
 	disabled := false
 	d := noopDeps()
-	d.autostartStatus = func() (bool, string, error) { return false, "", errors.New("cannot stat the plist") }
+	d.autostartStatus = func() (service.State, error) { return service.State{}, errors.New("cannot stat the plist") }
 	d.autostartDisable = func() error { disabled = true; return nil }
 
 	var out bytes.Buffer

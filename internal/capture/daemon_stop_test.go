@@ -27,7 +27,9 @@ func (f fakeManager) Stop() error {
 	}
 	return nil
 }
-func (f fakeManager) Status() (bool, string, error) { return true, "fake", nil }
+func (f fakeManager) Status() (service.State, error) {
+	return service.State{Installed: true, Loaded: true, Detail: "fake"}, nil
+}
 
 // fakeWatcherPID starts a process pidLooksLikeOurs accepts. Identity is matched
 // on the command line, so the trick is a script whose *path* contains

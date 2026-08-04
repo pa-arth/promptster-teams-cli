@@ -97,7 +97,7 @@ func cmdUninstall(args []string) int {
 type uninstallDeps struct {
 	stopCapture       func() error
 	captureRunning    func() bool
-	autostartStatus   func() (bool, string, error)
+	autostartStatus   func() (service.State, error)
 	autostartDisable  func() error
 	removeCursorHooks func() (bool, error)
 	statuslineWrapped func() bool
@@ -163,9 +163,9 @@ func runUninstall(out io.Writer, d uninstallDeps, purge bool) int {
 	// can leave: a registered unit that brings capture back at the next login.
 	// "I don't know whether it's installed" is a reason to remove it, not a reason
 	// to stop.
-	installed, _, statusErr := d.autostartStatus()
+	autostartState, statusErr := d.autostartStatus()
 	switch {
-	case statusErr == nil && !installed:
+	case statusErr == nil && !autostartState.Installed:
 		skip("autostart was not enabled")
 	default:
 		if err := d.autostartDisable(); err != nil {

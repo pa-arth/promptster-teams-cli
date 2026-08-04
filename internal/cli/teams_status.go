@@ -11,6 +11,7 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	"github.com/pa-arth/promptster-teams-cli/internal/version"
 )
 
@@ -64,11 +65,17 @@ func printStatusStatic() {
 	daemon := "not running — `promptster-teams login` starts it, or `autostart enable` for reboots"
 	if snap.Live {
 		daemon = fmt.Sprintf("running (pid %d)", snap.DaemonPID)
+		// Name the build that is capturing, not the one printing this. They are
+		// different processes and routinely different versions; `doctor` explains
+		// the mismatch, this row just stops the number being assumed.
+		if v := capture.RunningCapture().Version; v != "" {
+			daemon = fmt.Sprintf("running (pid %d, %s)", snap.DaemonPID, v)
+		}
 	}
 
 	autostart := "not enabled — `promptster-teams autostart enable` (so capture survives reboots)"
-	if installed, detail, err := service.New().Status(); err == nil && installed && detail != "" {
-		autostart = detail
+	if st, err := service.New().Status(); err == nil && st.Installed && st.Detail != "" {
+		autostart = st.Detail
 	}
 
 	fmt.Println()
@@ -137,10 +144,22 @@ func cmdTeamsDoctor() {
 		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
 	}
 
-	if installed, detail, serr := service.New().Status(); serr == nil && installed {
-		printlnIndent(fmt.Sprintf("%s autostart %s", okGlyph, detail))
+	// Which build is actually capturing, and which one runs at the next login.
+	// These are the only two lines in doctor that describe a process other than
+	// this one — see capture_process_doctor.go for why that distinction is the
+	// whole point.
+	running := capture.RunningCapture()
+	for _, l := range captureProcessLines(running, version.Version) {
+		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.Text))
+	}
+
+	autostartState, serr := service.New().Status()
+	if serr != nil {
+		printlnIndent(fmt.Sprintf("%s could not read autostart status: %v", warnGlyph, serr))
 	} else {
-		printlnIndent(fmt.Sprintf("%s autostart not enabled — run `promptster-teams autostart enable` so capture survives reboots", warnGlyph))
+		for _, l := range autostartLines(autostartState, running.Running, state.SelfBin(), state.CanonicalInstallBin(), fileExists) {
+			printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.Text))
+		}
 	}
 
 	// Cursor hook rail. The state worth catching here is an entry naming a binary

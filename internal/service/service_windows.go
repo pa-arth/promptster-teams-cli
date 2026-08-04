@@ -32,7 +32,7 @@ func (windowsManager) Enable() error {
 // systemd do — this exists to keep the Manager contract uniform and to end the
 // instance Task Scheduler is tracking.
 func (windowsManager) Stop() error {
-	if installed, _, _ := (windowsManager{}).Status(); !installed {
+	if st, _ := (windowsManager{}).Status(); !st.Installed {
 		return nil
 	}
 	// /End exits non-zero when the task isn't currently running, which is the
@@ -43,7 +43,7 @@ func (windowsManager) Stop() error {
 }
 
 func (windowsManager) Disable() error {
-	if installed, _, _ := (windowsManager{}).Status(); !installed {
+	if st, _ := (windowsManager{}).Status(); !st.Installed {
 		return nil
 	}
 	// #nosec G204 -- constant subcommands + fixed task name.
@@ -53,11 +53,25 @@ func (windowsManager) Disable() error {
 	return nil
 }
 
-func (windowsManager) Status() (bool, string, error) {
+// Status reports the ONLOGON task. Loaded tracks Installed here because Task
+// Scheduler has no separate armed/unarmed state — a registered ONLOGON task runs
+// at the next logon, full stop.
+//
+// ProgramPath stays EMPTY (unknown) on purpose. /Query /XML would have to be
+// parsed back out of a schtasks document whose <Command> we wrote quoted, and
+// this is precisely the shape that produced the Cursor-hook false alarm: a naive
+// unquote returns a path with doubled separators, os.Stat calls it missing, and
+// every healthy Windows machine prints doctor's most alarming line. Silence beats
+// a confident wrong answer.
+func (windowsManager) Status() (State, error) {
 	// #nosec G204 -- constant subcommands + fixed task name. /Query exits
 	// non-zero when the task is absent.
 	if err := exec.Command("schtasks", "/Query", "/TN", taskName).Run(); err != nil {
-		return false, "not enabled", nil
+		return State{Detail: "not enabled"}, nil
 	}
-	return true, "enabled (Task Scheduler, runs at logon)", nil
+	return State{
+		Installed: true,
+		Loaded:    true,
+		Detail:    "enabled (Task Scheduler, runs at logon)",
+	}, nil
 }

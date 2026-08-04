@@ -26,6 +26,38 @@ const (
 	taskName = "Promptster Teams"
 )
 
+// State is what autostart is doing right now. It is a struct rather than the
+// (bool, string) it used to be because "installed" and "armed right now" are
+// genuinely different facts, and a caller that can only see the first has to
+// recover the second by pattern-matching the prose in Detail — which is how
+// `doctor` ended up printing a green check over "installed but not loaded".
+type State struct {
+	// Installed means the unit/plist/task exists, so capture returns at login.
+	Installed bool
+	// Loaded means the platform supervisor is watching the job RIGHT NOW.
+	//
+	// It is not the same question as Installed. `stop` boots the launchd job out
+	// of the live GUI domain and deliberately leaves the plist on disk, so a
+	// stopped-then-started machine is Installed && !Loaded: capture is running
+	// but unsupervised, and nothing revives it until the next login. On Linux the
+	// analogous fact is the enable symlink (a `systemctl --user stop` leaves the
+	// unit enabled), and on Windows an ONLOGON task has no separate loaded state,
+	// so Loaded == Installed there.
+	Loaded bool
+	// Detail is the human-readable one-liner for status output.
+	Detail string
+	// ProgramPath is the ABSOLUTE binary path baked into the unit at enable time
+	// — the binary that will actually run at the next login, which is not
+	// necessarily the one running now (see autostart repair).
+	//
+	// Empty means UNKNOWN, and callers must stay silent on unknown rather than
+	// guess. A diagnostic that cries wolf about a healthy machine is worse than
+	// one that says nothing: the Windows path is exactly where a naive parse
+	// produces a confident wrong answer, so it reports "" instead of parsing
+	// schtasks XML.
+	ProgramPath string
+}
+
 // Manager installs, removes, and reports the per-user autostart service for the
 // current platform. New() returns the platform implementation.
 type Manager interface {
@@ -41,8 +73,8 @@ type Manager interface {
 	Stop() error
 	// Disable stops and deregisters the service. Idempotent.
 	Disable() error
-	// Status reports whether autostart is installed plus a human-readable detail.
-	Status() (installed bool, detail string, err error)
+	// Status reports what autostart is doing right now.
+	Status() (State, error)
 }
 
 // xmlEscape escapes the five XML special chars for safe interpolation into the
@@ -117,6 +149,65 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 `
+}
+
+// programPathFromPlist reads back the binary renderPlist baked into
+// ProgramArguments. Parsing our OWN rendered XML is the whole reason this is
+// safe to do here while `autostart repair` still re-renders blind: repair must
+// work on any unit, this only has to describe one we wrote.
+//
+// Anything it cannot recognize returns "" (unknown), never a guess — the caller
+// prints nothing on unknown, so a parse that drifts degrades to silence instead
+// of to a false alarm about a healthy machine.
+func programPathFromPlist(xml string) string {
+	i := strings.Index(xml, "<key>ProgramArguments</key>")
+	if i < 0 {
+		return ""
+	}
+	rest := xml[i:]
+	j := strings.Index(rest, "<string>")
+	if j < 0 {
+		return ""
+	}
+	rest = rest[j+len("<string>"):]
+	k := strings.Index(rest, "</string>")
+	if k < 0 {
+		return ""
+	}
+	return xmlUnescape(rest[:k])
+}
+
+// xmlUnescape reverses xmlEscape. &amp; is applied LAST so a literal "&amp;lt;"
+// in a path survives the round trip instead of being decoded twice.
+func xmlUnescape(s string) string {
+	for _, r := range [][2]string{
+		{"&lt;", "<"}, {"&gt;", ">"}, {"&quot;", `"`}, {"&apos;", "'"}, {"&amp;", "&"},
+	} {
+		s = strings.ReplaceAll(s, r[0], r[1])
+	}
+	return s
+}
+
+// programPathFromUnit reads back the binary renderUnit baked into ExecStart.
+// renderUnit always quotes it (a home dir may contain spaces), so the quoted
+// span is the path; an unquoted ExecStart is not ours and reports "" rather
+// than a first-token guess that would truncate at the first space.
+func programPathFromUnit(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "ExecStart=") {
+			continue
+		}
+		v := strings.TrimPrefix(line, "ExecStart=")
+		if !strings.HasPrefix(v, `"`) {
+			return ""
+		}
+		if end := strings.Index(v[1:], `"`); end >= 0 {
+			return v[1 : 1+end]
+		}
+		return ""
+	}
+	return ""
 }
 
 // renderTaskArgs builds the schtasks argv (no shell) that creates the ONLOGON
