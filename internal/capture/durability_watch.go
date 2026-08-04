@@ -171,14 +171,16 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 		case lastSeen == "":
 			advanceDurabilityCursor(rootKey, tip) // baseline only
 		case lastSeen != tip:
-			// The foldable subset is DISCARDED here, so durability still folds the
-			// full range and double-counts a merge's edits — once in the merged-away
-			// branch's coordinate space, once in the merge's. The rework ledger no
-			// longer does (see gitNewCommits), so the two disagree on a history
-			// containing merges. Known and tracked, not intended: narrowing here needs
-			// an answer for where the cursor lands on a skipped commit, since
-			// pollDurabilityCommit advances it per commit inside its own transaction.
-			commits, _, ok := gitNewCommits(root, lastSeen, tip)
+			// The DEFAULT BRANCH'S OWN commits — its first-parent chain — never the
+			// full range. A merge's diff is read with `-m --first-parent`, so it
+			// already carries everything the merged-away branch brought in; folding
+			// that branch's commits too applies the same hunks twice, in a coordinate
+			// space no checkout ever had. The narrowing is in the ENUMERATOR rather
+			// than in this loop, so every commit below is one that gets folded and
+			// the per-commit cursor advance can only ever land on a folded commit —
+			// see gitNewDefaultBranchCommits for why a filter at the fold has no safe
+			// answer for where that cursor goes.
+			commits, ok := gitNewDefaultBranchCommits(root, lastSeen, tip)
 			if !ok {
 				continue // inconclusive — keep the cursor, retry next poll
 			}

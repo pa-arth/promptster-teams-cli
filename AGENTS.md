@@ -761,63 +761,61 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   falling inside the all-parents window and outside a `-n`-bounded chain window
   reads as "not on the chain" and is the same collapse by another route.
 
-- **THE TWO LEDGERS DISAGREE WITH EACH OTHER ON A HISTORY CONTAINING MERGES.**
-  This is a known, tracked gap, not intended behaviour:
+- **BOTH LEDGERS FOLD A MERGE EXACTLY ONCE, AND THE INVARIANT IS NOW STRUCTURAL
+  AT EVERY GATE IN THAT LOOP.** The rule both halves enforce: *a ledger's tracked
+  spans are addressed in the line space the commits it has FOLDED compose to, so
+  the code that RECORDS a commit and the code that FOLDS it must never disagree.*
+  The two ledgers' numbers therefore reconcile on a history containing merges.
 
-  - the REWORK ledger folds the first-parent chain, so a merge's edits are
-    counted once;
-  - the DURABILITY ledger still folds the FULL range (`pollDurability` takes
-    `gitNewCommits`' first return and discards the foldable subset), so
-    surviving-line figures still double-count on a merge — the same hunks
-    applied once in the merged-away branch's coordinate space and again in the
-    merge's;
-  - so the two ledgers' numbers are not reconcilable on such a history, and
-    neither is authoritative over the other there.
+  - **DURABILITY narrows in its own ENUMERATOR** — `gitNewDefaultBranchCommits`,
+    NOT a filter at the fold. Read that header before touching it. The cursor is
+    the reason: `pollDurabilityCommit` advances it per commit inside that
+    commit's ledger transaction, so a filter at the fold leaves it nowhere safe.
+    Advance it on a skipped commit and it parks OFF the chain, where
+    `cursor..tip` re-includes commits already folded; never advance it and a
+    batch holding no chain commit never moves it at all — `clampCommitBurst`
+    keeps the OLDEST cap commits, so merging a branch longer than the cap fills
+    one entirely with second-parent commits and durability stalls for that root
+    forever. Narrowing at the enumerator DISSOLVES the question rather than
+    answering it: every commit returned is one that gets folded, so **the cursor
+    only ever lands on a commit it folded**, and the root always drains.
+  - **REWORK's remaining gate is the scope switch's `default:` arm.** A scope
+    that folds nothing RELEASES the spans it cannot maintain, gated on the poll
+    having surfaced commits at all — a bare `git checkout --detach` and a bisect
+    walking ancestors of the cursor keep their tracking BECAUSE their range is
+    empty; detaching onto a ref off that cursor's ancestry releases anyway, an
+    undercount and never a fabrication. It is `default:` rather than
+    `case scopeUnknown:` so a fourth `branchScope` added later cannot silently
+    reopen the hole. `releaseReworkSpans` deliberately is NOT
+    `clearReworkLedger`: it keeps the seed tombstones and tombstones every path
+    it releases, because dropping them makes an already-churned path a FIRST
+    TOUCH again and its lingering ai-paths presence would seed a human's commit
+    as fresh AI — trading this fabrication for the one PR #128 closed.
+  - **EMISSION is untouched by both.** A commit reachable only through a merge's
+    second parent is still attributed exactly once; whether merged-in work counts
+    as AI-written stays a product question nobody has answered.
 
-  It is filed as its own task (`cli-durability-ledger-double-counts-merg-ca`,
-  since retitled "make record-and-fold agree") rather than fixed alongside the
-  rework narrowing, because `pollDurabilityCommit` advances the durability cursor
-  per commit inside its own ledger transaction, so skipping commits needs a
-  deliberate answer for where that cursor lands.
-
-- **`scopeUnknown` ATTRIBUTES AND RECORDS COMMITS WITHOUT FOLDING THEM, and an
-  ordinary `git rebase -i` reaches it.** This is the second live violation of the
-  one invariant that task covers — the code that RECORDS a commit as attributed
-  and the code that FOLDS its hunks must never disagree — and it is unfixed:
-
-  - `reworkScope` returns `scopeUnknown` when `durabilityDefaultRef` yields `""`
-    or `HEAD` is detached. `pollGitWatchWorkspace`'s scope switch has no
-    `scopeUnknown` case, deliberately: the root KEEPS its tracked spans, because
-    a transient detach mid-rebase must not wipe a real branch's tracking.
-  - But `preMerge` is false there, so `foldRework` is false for every commit in
-    the range, while `attributeAndReworkCommit` still emits and
-    `recordAttributedCommits` still writes each SHA down. A recorded commit is
-    never revisited, so those hunks never shift the spans the root just kept, and
-    a later rewrite of the human lines that moved into those coordinates emits a
-    `rework_verdict` over code the AI never wrote.
-  - **`git rebase -i` on a tracked feature branch reaches it through the
-    detached-HEAD half, and the git watcher polls every `gitWatchInterval` (60s,
-    `git_watch.go:29` — NOT the transcript watchers' 3s), so any rebase that
-    takes longer than that lands inside one, and an interactive rebase blocks on
-    the engineer's editor for far longer than a minute.** This is routine usage,
-    not a corner case, and not a transient one — the span stays wrong for good.
-
-  It is PRE-EXISTING (the `preMerge` gate has always worked this way; round 4
-  only renamed it `foldRework`) and is tracked on the same task, to be fixed in
-  one pass with the durability double-count: same file, same loop, same open
-  question about where the cursor lands on a skip.
+  **Still open, and NAMED here rather than left to be rediscovered: a BACKWARD
+  move of a tracked ref advances a cursor over spans nothing folded.**
+  `rev-list A..B` is empty when B is an ancestor of A — a `git reset --hard`
+  back, a force-push — and both loops read that as "nothing new" and move the
+  cursor to the new tip while the spans keep the old tip's coordinates. It is
+  PRE-EXISTING and unchanged by the fixes above (verified: the first-parent range
+  is empty exactly when the all-parents range is, so the narrowing added no new
+  empty-result path), and it hits BOTH ledgers identically, so they still agree
+  with each other. Closing it needs `pollGitWatch` to tell "nothing moved" apart
+  from "moved backwards" — a new signal out of that function, not an edit.
 
   **The rest of that sweep came back clean, and the bound was ESTABLISHED rather
-  than assumed** — do not redo it. Four other sites were checked for the same
-  signature (an empty or narrowed result treated as harmless while commits are
-  still attributed and recorded): `gitBranchCommitsSinceDefault` returning nil
-  records no attribution at all, so it is a pure documented undercount (the
-  cold-start cursor is already at head); `commitsWithFoldableChain`'s
-  `len(shas)==0` case has no commits to disagree about;
-  `replayReworkForAdoptedCommit`'s empty-diff early return runs only on commits
-  already attributed and carries no hunks to lose; and
-  `attributeAndReworkCommit`'s `!ok` branch skips the fold only when the diff is
-  empty, which has nothing to shift.
+  than assumed** — do not redo it. Four sites were checked for the same signature
+  (an empty or narrowed result treated as harmless while commits are still
+  attributed and recorded): `gitBranchCommitsSinceDefault` returning nil records
+  no attribution at all, so it is a pure documented undercount (the cold-start
+  cursor is already at head); `commitsWithFoldableChain`'s `len(shas)==0` case
+  has no commits to disagree about; `replayReworkForAdoptedCommit`'s empty-diff
+  early return runs only on commits already attributed and carries no hunks to
+  lose; and `attributeAndReworkCommit`'s `!ok` branch skips the fold only when
+  the diff is empty, which has nothing to shift.
 
 Rename handling has an extra trap rework does not share with durability: a pure
 rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`

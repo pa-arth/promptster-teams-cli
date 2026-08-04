@@ -404,6 +404,11 @@ func gitHead(root string) (string, bool) {
 // the unfolded hunks have already moved, and the next rewrite reports over lines
 // nobody wrote. That INFLATES. commitsWithFoldableChain is what keeps them apart.
 //
+// DURABILITY DOES NOT COME THROUGH HERE, and must not be wired back in. It has
+// its own cursor over the DEFAULT branch, advanced per commit inside that
+// commit's ledger transaction, so a range plus a foldable subset is the wrong
+// shape for it entirely — see gitNewDefaultBranchCommits.
+//
 // Spawn budget stays sane: the normal path is one `rev-list`, plus a second only
 // when it actually returned commits; the fallback adds at most one more, in the
 // rare gc'd case. No merge-base spawn.
@@ -475,6 +480,71 @@ func gitFirstParentSet(root, rev string) (map[string]struct{}, bool) {
 		set[sha] = struct{}{}
 	}
 	return set, true
+}
+
+// gitNewDefaultBranchCommits lists the DEFAULT BRANCH's own new commits — the
+// first-parent chain of lastSeen..tip, newest-first, bounded to
+// gitWatchMaxCommitsPerPoll. It is the durability ledger's enumerator and
+// nothing else calls it.
+//
+// IT IS A SEPARATE ENUMERATOR RATHER THAN A FILTER OVER gitNewCommits, AND THAT
+// IS THE WHOLE FIX. Durability used to take gitNewCommits' full range and discard
+// its foldable subset, so `git merge feature` onto the default branch folded the
+// merge — whose `-m --first-parent` diff already carries everything the branch
+// brought in — PLUS that branch's own commits, applying the same hunks twice, in
+// a coordinate space no checkout ever had. The rework ledger fixed the same
+// double fold by filtering at the fold. Durability cannot copy that, because
+// pollDurabilityCommit advances the cursor to each commit inside that commit's
+// OWN ledger transaction, and a filter at the fold leaves that cursor with no
+// safe place to land:
+//
+//   - advance it on a SKIPPED commit and it parks off the chain, where
+//     `cursor..tip` re-includes chain commits already folded — so a crash between
+//     two commits re-applies hunks the ledger already holds;
+//   - do NOT advance it and a batch holding no chain commit never moves it at
+//     all. clampCommitBurst keeps the OLDEST cap commits of `cursor..tip`, so
+//     merging a branch longer than the cap fills the entire batch with
+//     second-parent commits; the next poll enumerates the identical batch and
+//     durability stalls for that root forever.
+//
+// Narrowing HERE dissolves the question instead of answering it: every commit
+// returned is one durability folds, so THE CURSOR ONLY EVER LANDS ON A COMMIT
+// THAT WAS FOLDED, `cursor..tip` always means exactly "the chain commits not yet
+// folded", and the root always drains. That is also why this returns no foldable
+// subset — there is no second class of commit here to disagree about.
+//
+// --topo-order for the same reason gitBranchCommitsSinceDefault takes it: the
+// caller folds the list oldest-first, and rev-list's default is reverse
+// COMMIT-DATE order, which git does not promise is topological. One skewed
+// committer clock sorts a parent past its own descendants and the reversed fold
+// applies it after its child.
+//
+// The two-tier shape mirrors gitNewCommits and means the same things: a resolving
+// lastSeen gives the range; an unreachable one (gc'd/pruned after an aggressive
+// rewrite) falls back to a bounded recovery window over the tip's chain rather
+// than skipping it forever; and only a failing recovery is ok=false, which keeps
+// the cursor where it is and retries next poll. Spawn budget is one rev-list,
+// two in the rare gc'd case — strictly cheaper than the enumerator it replaces,
+// which spent a second spawn on the chain probe.
+func gitNewDefaultBranchCommits(root, lastSeen, tip string) ([]string, bool) {
+	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", lastSeen+".."+tip).Output()
+	if err == nil {
+		return clampCommitBurst(parseRevListShas(out), root), true
+	}
+	// lastSeen is unreachable: recover the tip region rather than skip it. If even
+	// that errors, keep the cursor and retry.
+	// #nosec G204 -- see above; read-only.
+	out, rerr := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", "-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), tip).Output()
+	if rerr != nil {
+		return nil, false
+	}
+	shas := parseRevListShas(out)
+	state.HookDebugf("durability: cursor %s unreachable on %s; recovered newest %d default-branch commit(s) from the tip",
+		lastSeen, gitWatchRootKey(root), len(shas))
+	return shas, true
 }
 
 // gitBranchCommitsSinceDefault lists the commits a root's checked-out branch
@@ -802,6 +872,10 @@ func pollGitWatchWorkspace(session Session) {
 
 	for _, root := range roots {
 		rootKey := gitWatchRootKey(root)
+		// Read BEFORE the scope switch, because the switch's third arm needs it: the
+		// spans a scope that folds nothing must release are only at risk when commits
+		// actually landed. It is used again below, unchanged.
+		commits := detected[rootKey]
 		// Rework scope, resolved ONCE per root (never per commit). Resolved BEFORE the
 		// no-new-commits guard so that returning to the default branch clears stale
 		// rework tracking even on a poll that surfaces no new commits (e.g. a plain
@@ -854,6 +928,42 @@ func pollGitWatchWorkspace(session Session) {
 				justAdopted = true
 			}
 			adopting = pending
+		default:
+			// EVERY OTHER SCOPE FOLDS NOTHING, AND THIS ARM IS WHAT KEEPS THAT FROM
+			// FABRICATING. `foldRework` below is gated on preMerge, so a commit
+			// reaching this root in any other scope is attributed and RECORDED —
+			// permanently, a recorded commit is never revisited — while its hunks
+			// never shift the spans the root is still holding. The next rewrite of the
+			// human lines that moved into those coordinates then emits a
+			// rework_verdict over code the AI never wrote.
+			//
+			// scopeUnknown is the one such scope today and an ordinary `git rebase -i`
+			// reaches it: HEAD is detached for the whole rebase, and this loop polls
+			// every gitWatchInterval (60s), which an interactive rebase spends waiting
+			// on the engineer's editor. It is `default:` rather than
+			// `case scopeUnknown:` so that a fourth branchScope added later lands here
+			// — releasing state it cannot maintain — instead of silently reopening
+			// this hole.
+			//
+			// The gate is "this poll surfaced NO COMMITS in cursor..HEAD", so a poll
+			// that surfaces nothing releases nothing. A bare `git checkout --detach`
+			// and a bisect walking ancestors of the cursor are covered BECAUSE their
+			// range is empty, not because nothing was committed. The residual, stated
+			// so nobody rediscovers it: detaching onto a ref that is NOT an ancestor
+			// of this root's cursor — a release tag, another branch's tip, a bisect
+			// whose range spans divergent history — surfaces a non-empty range with
+			// nothing written, and that root's spans are released anyway, an
+			// UNDERCOUNT and never a fabrication, which is the direction this ledger
+			// always resolves toward. And the release deliberately keeps the seed
+			// tombstones — see releaseReworkSpans for why dropping them would trade
+			// this fabrication for the one PR #128 closed.
+			//
+			// The cost is an undercount: a rebase drops the branch's rework tracking.
+			// That is the direction these ledgers always resolve toward, and a rebase
+			// rewrites the very history those coordinates were measured against.
+			if len(commits) > 0 {
+				releaseReworkSpans(session, root, rootKey)
+			}
 		}
 
 		// A root that has never been polled before — the ordinary `git worktree add`
@@ -879,7 +989,6 @@ func pollGitWatchWorkspace(session Session) {
 			replayReworkForColdStartBranch(session, root, coldStart[rootKey], attributed, nowMs)
 		}
 
-		commits := detected[rootKey]
 		if len(commits) == 0 {
 			// A root with no commits this poll either has nothing left to replay
 			// (drained) or was deferred with its whole range still owed. Only the
@@ -950,9 +1059,13 @@ func pollGitWatchWorkspace(session Session) {
 type branchScope int
 
 const (
-	// scopeUnknown: no resolvable default branch, or a detached/unborn HEAD. Neither
-	// seed rework (we cannot tell it is a feature branch) nor clear it (a transient
-	// detach mid-rebase must not wipe a real branch's tracking).
+	// scopeUnknown: no resolvable default branch, or a detached/unborn HEAD —
+	// which is what a `git rebase` in progress looks like. Rework is never SEEDED
+	// here (we cannot tell it is a feature branch), and the root's whole ledger is
+	// never CLEARED either — the tombstones and the recorded branch survive a
+	// transient detach. But a poll that surfaces COMMITS here releases the tracked
+	// spans, because nothing in this scope folds them forward; see the switch's
+	// default arm in pollGitWatchWorkspace.
 	scopeUnknown branchScope = iota
 	// scopeDefault: checked out ON the default branch — durability territory. Any
 	// rework tracking for this root is stale and gets cleared.

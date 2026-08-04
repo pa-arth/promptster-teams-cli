@@ -265,6 +265,55 @@ func dropReworkRoot(led *reworkLedger, rootKey string) {
 	}
 }
 
+// releaseReworkSpans drops ONLY a root's tracked spans, tombstoning every path
+// it drops, and is what a scope that folds nothing calls when commits land
+// anyway.
+//
+// WHY IT EXISTS. A root's spans are addressed in the line space the commits it
+// has FOLDED compose to. pollGitWatchWorkspace folds a commit only on the
+// pre-merge scope, but it attributes and RECORDS every commit in every scope —
+// and a recorded commit is never revisited. So a scope that surfaces commits it
+// will not fold leaves the spans behind while the file moves under them, and the
+// next rewrite of the human lines that took over those coordinates emits a
+// rework_verdict over code the AI never wrote. Releasing them is an undercount;
+// keeping them is a fabrication, and this ledger always resolves that way.
+//
+// WHY NOT clearReworkLedger. That drops the seed TOMBSTONES too, which is right
+// when a branch is genuinely leaving (they are that branch's seeding history)
+// and wrong here: the branch is not leaving, and a path that has already been
+// seeded and churned would go back to looking like a FIRST TOUCH. Its lingering
+// ai-paths presence would then seed a purely-human commit as fresh AI — the
+// exact inference PR #128 closed, re-opened by the fix for something else. The
+// recorded branch and any adoption obligation stay for the same reason: neither
+// is a coordinate, and dropping them would fire a spurious re-adoption when HEAD
+// comes back.
+//
+// So each released path is tombstoned exactly as the churn, harvest and rename
+// routes tombstone theirs — with the evidence current NOW, and never BELOW a
+// mark it already carried, or the release would loosen the gate it is holding.
+// A strictly newer per-path AI write still re-authorizes seeding, which is what
+// keeps a branch the agent keeps working on from going quiet for good.
+func releaseReworkSpans(session Session, root, rootKey string) {
+	if len(loadReworkLedger().Roots[rootKey]) == 0 {
+		return // nothing tracked — no lock, and no evidence spent on a no-op
+	}
+	// Resolved BEFORE the ledger lock, matching foldReworkCommit: the ai-paths
+	// ledger has its own, and the rework read-modify-write must never nest one.
+	evidence := newReworkSeedEvidence(root, session.TaskRoot)
+	mutateReworkLedger(func(led *reworkLedger) {
+		tracked := led.Roots[rootKey]
+		if len(tracked) == 0 {
+			return
+		}
+		for path := range tracked {
+			consumed := led.Seeded[rootKey][path]
+			tombstoneReworkSeededPath(led, rootKey, path, max(consumed, evidence.writeStampFor(path)))
+		}
+		delete(led.Roots, rootKey)
+	})
+	state.HookDebugf("git-watch: released %s's tracked rework spans — commits landed in a scope that folds nothing", rootKey)
+}
+
 // clearReworkLedger drops a root's entire rework tracking — called once the
 // branch has merged back to the default branch, so surviving AI lines pass to the
 // durability engine and a future branch never remaps against stale ranges.
