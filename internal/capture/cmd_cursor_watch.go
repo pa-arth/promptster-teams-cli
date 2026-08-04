@@ -306,16 +306,12 @@ func pollCursorTranscripts(
 
 	for _, path := range candidateCursorTranscripts(startCutoff) {
 		key := cursorProgressKey(path)
+		// A CLAIMED transcript is not skipped outright — it is narrowed to the
+		// events the hook rail structurally cannot produce. See
+		// cursorHookBlindKinds; nil means "emit everything".
+		var only map[string]bool
 		if isCursorHookClaimed(claims, key) {
-			// Advance the offset to EOF WITHOUT emitting, so that if the hook
-			// rail later stops covering this session (uninstall, claim TTL) the
-			// watcher resumes from here instead of replaying the whole file and
-			// duplicating everything the hooks already sent.
-			if info, err := os.Stat(path); err == nil {
-				progress.Offsets[key] = info.Size()
-				progress.Match[key] = "yes"
-			}
-			continue
+			only = cursorHookBlindKinds
 		}
 		switch progress.Match[key] {
 		case "no":
@@ -415,7 +411,7 @@ func pollCursorTranscripts(
 			}
 			processors[key] = proc
 		}
-		queued += tailCursorTranscript(path, key, progress, proc, session, captureProse)
+		queued += tailCursorTranscript(path, key, progress, proc, session, captureProse, only)
 	}
 
 	saveCursorWatchProgress(progress)
@@ -601,12 +597,41 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 // Advancing the offset unconditionally is safe only because delivery is durable
 // (internal/outbox): once queued, an event is delivered or loudly dropped, so
 // the offset no longer doubles as a delivery receipt.
+// cursorHookBlindKinds are the event kinds the HOOK rail cannot emit, so the
+// transcript rail must keep covering them even on a session the hooks claimed.
+//
+// WHY THIS EXISTS. The rail handoff was whole-transcript: a claimed session was
+// seeked to EOF unread, on the reasoning that the hook payload is strictly
+// richer. That is true of everything the hooks REPORT — and Cursor exposes no
+// hook for an MCP call or a subagent dispatch. We register sessionStart /
+// sessionEnd / beforeSubmitPrompt / afterFileEdit / afterShellExecution /
+// postToolUseFailure / afterAgentThought, and none of them carries either. So
+// on every hook-enrolled machine — the recommended install — delegation and MCP
+// identity were captured by nothing at all, and the asset boards read zero.
+//
+// NO DOUBLE-CAPTURE BY CONSTRUCTION, which is the property that makes this safe
+// rather than a partial re-opening of the thing the claim ledger prevents: the
+// two kinds here are disjoint from every kind the hook normalizer emits, so no
+// event can arrive twice. Both rails also agree on session identity — the hook's
+// payload sessionId equals the transcript filename stem, checked against 7 live
+// claims on a hook-enrolled machine — so these land on the SAME session the
+// hooks are populating rather than forking a second one.
+//
+// Widen this set only with the same argument: the hook rail must be structurally
+// incapable of the kind, not merely currently unregistered.
+var cursorHookBlindKinds = map[string]bool{
+	"task_dispatch": true,
+	"mcp_call":      true,
+}
+
 func tailCursorTranscript(
 	path, key string,
 	progress cursorWatchProgress,
 	proc *normalize.CursorTranscriptProcessor,
 	session Session,
 	captureProse bool,
+	// only limits emission to these event kinds; nil emits everything.
+	only map[string]bool,
 ) int {
 	// #nosec G304 -- path is a Cursor transcript discovered under the projects dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -640,6 +665,9 @@ func tailCursorTranscript(
 		// the engineer pasted or a tool printed.
 		redacted := redact.RedactBytes([]byte(trimmed))
 		for _, ev := range proc.Process(redacted, lineOffset) {
+			if only != nil && !only[ev.Kind] {
+				continue
+			}
 			queued += emitCursorEvent(ev, session, captureProse)
 		}
 	}
