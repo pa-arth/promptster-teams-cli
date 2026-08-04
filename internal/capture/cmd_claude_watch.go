@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -885,12 +886,33 @@ func pollClaudeTranscripts(
 }
 
 // candidateClaudeTranscripts lists transcript files modified at/after the
-// cutoff. Subagent transcripts (<session>/subagents/agent-*.jsonl) are
-// included — their token usage is real spend — but processed in UsageOnly
-// mode (see isClaudeSidechainFile): their "user" messages are agent-authored
-// prompts that must not enter the candidate's timeline.
+// cutoff, MOST RECENTLY MODIFIED FIRST. Subagent transcripts
+// (<session>/subagents/agent-*.jsonl) are included — their token usage is real
+// spend — but processed in UsageOnly mode (see isClaudeSidechainFile): their
+// "user" messages are agent-authored prompts that must not enter the
+// candidate's timeline.
+//
+// The ORDER is load-bearing, and both callers depend on it. filepath.Walk
+// yields lexical order, which put the oldest transcripts in the history window
+// ahead of the engineer's current session. Every caller here shares a bounded
+// per-poll read budget, so ascending order spends that budget at the far end of
+// the window first — during a full-window replay that means hours where the
+// only thing being uploaded is history and the engineer reads as inactive on
+// every freshness-gated surface.
+//
+// Descending by mtime fills the window from the present backwards: the recent
+// span every default dashboard reads is whole within a poll or two, and an
+// interrupted replay leaves a contiguous RECENT window instead of a contiguous
+// ancient one. Order WITHIN a transcript is untouched and stays ascending.
+//
+// Mirrors the candidate ordering in pollCodexRollouts — both watchers hold the
+// identical invariant.
 func candidateClaudeTranscripts(historyCutoff time.Time) []string {
-	var out []string
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	var found []candidate
 	_ = filepath.Walk(ClaudeProjectsDir(), func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
@@ -901,9 +923,22 @@ func candidateClaudeTranscripts(historyCutoff time.Time) []string {
 		if info.ModTime().Before(historyCutoff) {
 			return nil
 		}
-		out = append(out, path)
+		found = append(found, candidate{path: path, modTime: info.ModTime()})
 		return nil
 	})
+	// Path descending as the tie-break: mtime granularity can collide across
+	// files written in the same instant, and an unstable order would make the
+	// per-poll budget fall on a different transcript each poll.
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].modTime.Equal(found[j].modTime) {
+			return found[i].path > found[j].path
+		}
+		return found[i].modTime.After(found[j].modTime)
+	})
+	out := make([]string, 0, len(found))
+	for _, c := range found {
+		out = append(out, c.path)
+	}
 	return out
 }
 

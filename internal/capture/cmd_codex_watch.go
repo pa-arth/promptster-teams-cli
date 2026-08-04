@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -350,6 +351,74 @@ func RunCodexWatcher() error {
 	}
 }
 
+// candidateCodexRollouts lists rollout files under dir modified at/after the
+// cutoff, MOST RECENTLY MODIFIED FIRST.
+//
+// The ORDER is load-bearing. filepath.Walk yields lexical order, and a rollout's
+// name begins with its start timestamp — so walking it directly is chronological
+// ASCENDING: the oldest history in the window is read before anything recent.
+// The poll loop spends a bounded byte budget (codexWatchMaxBytesPerPoll) in that
+// order, so during a full-window replay the budget goes entirely to the far end
+// of the window while the engineer's current work sits unread behind it. Every
+// freshness-gated surface downstream (sessions.last_activity_at, the manager
+// activity band) then reads them as inactive for as long as the replay runs.
+//
+// Descending by recency fills the window from the present backwards: the span
+// every default dashboard reads is whole within a poll or two, and interrupting
+// the replay at any point leaves a contiguous RECENT window rather than a
+// contiguous ancient one.
+//
+// ModTime is the ordering key, deliberately NOT the session_meta timestamp that
+// gates AGE during classification. Ordering needs only a cheap monotonic proxy
+// for "how recently was this appended to", it is already what the candidate
+// filter below trusts, and reading session_meta here would mean opening every
+// rollout in the window on every poll just to decide what to open.
+//
+// Order WITHIN a file is untouched and stays ascending — CodexRolloutProcessor
+// correlates tool calls to their outputs by arrival order.
+//
+// Mirrors candidateClaudeTranscripts; both watchers hold the identical invariant.
+func candidateCodexRollouts(dir string, historyCutoff time.Time) []string {
+	type candidate struct {
+		path    string
+		modTime time.Time
+	}
+	var found []candidate
+	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		base := filepath.Base(path)
+		if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
+			return nil
+		}
+		// Cheap candidate filter: skip files last modified before the history
+		// window WITHOUT caching a decision — a file touched later re-enters
+		// classification. Caching "no" here is the old bug that dropped
+		// long/resumed/restart-spanning rollouts forever (mirrors
+		// candidateClaudeTranscripts).
+		if info.ModTime().Before(historyCutoff) {
+			return nil
+		}
+		found = append(found, candidate{path: path, modTime: info.ModTime()})
+		return nil
+	})
+	// Path descending as the tie-break: mtime granularity can collide across
+	// files written in the same instant, and an unstable order would make the
+	// per-poll budget fall on a different rollout each poll.
+	sort.Slice(found, func(i, j int) bool {
+		if found[i].modTime.Equal(found[j].modTime) {
+			return found[i].path > found[j].path
+		}
+		return found[i].modTime.After(found[j].modTime)
+	})
+	out := make([]string, 0, len(found))
+	for _, c := range found {
+		out = append(out, c.path)
+	}
+	return out
+}
+
 // pollCodexRollouts scans for rollout files, tails matched ones from their last
 // byte offset, and ingests normalized events. Returns the number sent.
 func pollCodexRollouts(
@@ -403,32 +472,18 @@ func pollCodexRollouts(
 		saveCodexWatchProgress(progress)
 	}
 
-	_ = filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
-			return nil
-		}
-		base := filepath.Base(path)
-		if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
-			return nil
-		}
-		// Cheap candidate filter: skip files last modified before the history
-		// window WITHOUT caching a decision — a file touched later
-		// re-enters classification. Caching "no" here is the old bug that dropped
-		// long/resumed/restart-spanning rollouts forever (mirrors
-		// candidateClaudeTranscripts).
-		if info.ModTime().Before(historyCutoff) {
-			return nil
-		}
+	candidates := candidateCodexRollouts(dir, historyCutoff)
 
+	processRollout := func(path string) {
 		switch progress.Match[path] {
 		case "no":
-			return nil
+			return
 		case "yes":
 			// proceed to tail
 		default:
 			if budget <= 0 {
 				deferredWork = true
-				return nil
+				return
 			}
 			remaining := budget
 			classifyBudget := budget
@@ -469,7 +524,7 @@ func pollCodexRollouts(
 					if err != nil {
 						clearCodexClassifyState(progress, path)
 						checkpoint()
-						return nil
+						return
 					}
 					progress.Offsets[path] = info.Size()
 				}
@@ -478,12 +533,12 @@ func pollCodexRollouts(
 				progress.Match[path] = "no"
 			default: // undecided — no readable session_meta yet; retry next poll
 				checkpoint()
-				return nil
+				return
 			}
 			clearCodexClassifyState(progress, path)
 			checkpoint()
 			if match == codexMatchNo {
-				return nil
+				return
 			}
 		}
 
@@ -493,7 +548,7 @@ func pollCodexRollouts(
 			// the processor is built, because a cold processor replays the whole
 			// consumed prefix and shells out to git for the repo identity.
 			deferredWork = true
-			return nil
+			return
 		}
 
 		proc := processors[path]
@@ -530,8 +585,11 @@ func pollCodexRollouts(
 		// backfill.
 		accrue(res.consumed)
 		checkpoint()
-		return nil
-	})
+	}
+
+	for _, path := range candidates {
+		processRollout(path)
+	}
 
 	if deferredWork && verboseWatch() {
 		fmt.Fprintf(os.Stderr, "codex-watcher: per-poll read budget spent (%d bytes) — remaining rollout history deferred to the next poll\n",
