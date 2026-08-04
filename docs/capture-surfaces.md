@@ -266,3 +266,48 @@ parts of that funnel assumed "this just happened". Five rules, all pinned by
   that classification measures against the SAME maximum so the two paths cannot
   disagree about which record is unsupported.
 
+## A progress-schema bump is a FLEET-WIDE replay event, and its cost is declared
+
+`claudeProgressSchemaV` / `codexProgressSchemaV` gate a one-time migration in
+`loadClaudeWatchProgress` / `loadCodexWatchProgress`. Bumping either one clears
+`Offsets`, so **every in-window transcript on every device is read again from
+byte zero.** One line of diff; the entire 28-day window re-enters the funnel.
+
+**Measured, v0.12.3's v2 bump, 2026-08-04:**
+
+| device | CLI | replayed |
+|---|---|---|
+| alex@ops.ai | 0.12.3 | **62,302 events**, ≈10.4h of replay |
+| ajamdagneya | 0.12.3 | 1,312 events |
+| paarthguardian | 0.12.2 | **114,041 events** queued, ≈19h — had not fired yet |
+
+The delivery backlog that produced reached **20,761 events with its oldest 15
+days stale**, draining at ~74/min against a per-minute ingest budget. Nothing was
+lost — the outbox is durable and every event eventually landed — but the fleet
+spent days reporting stale numbers, and the backlog was deep enough to saturate
+ingest and start costing the presence beat its own delivery.
+
+Three facts that make this easy to get wrong:
+
+- **It fires on the first DAEMON START after the upgrade, not on restart.** A
+  restart rescans nothing: `clearCodexWatcherState` removes only
+  `codex-watcher.json` (pid, heartbeat) and never `codex-watcher-progress.json`,
+  so the offsets survive. Reasoning from "why does a restart rescan?" leads to
+  hardening restart, which would have fixed nothing. **What rescans is an upgrade
+  across a schema bump.**
+- **The cost is not paid by whoever bumps it.** It lands on every enrolled device
+  at once, days later, as ingest pressure — long after the PR that caused it is
+  out of mind. The version transition is readable from
+  `engineer_keys.latest_cli_version`; **read it rather than inferring exposure
+  from release timing**, because a device that has not restarted has not fired.
+- **The replay is usually the POINT, not a bug.** v2 deliberately reopened
+  matched files so the new bounded-history policy got exactly one chance to
+  import the last 28 days. Pulling such a release denies users that import.
+  Ship the fix forward instead.
+
+**So: declare the cost in the PR that bumps the version.** Name (a) the window
+being re-read, (b) a rough events-per-device figure from the table above, and (c)
+what makes it worth a fleet-wide replay. A bump with no declared cost is
+indistinguishable from an accident, which is exactly how this one was diagnosed —
+after the fact, from a backlog.
+
