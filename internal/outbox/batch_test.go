@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -690,4 +691,87 @@ func toMemberResults(in []batchResultForTest) []ingest.BatchMemberResult {
 		out = append(out, ingest.BatchMemberResult{Index: r.Index, Status: r.Status})
 	}
 	return out
+}
+
+// TestBatchBodyCapDoesNotSkipEvents is the regression Greptile caught on #152,
+// and it is the worst failure class this package has: an event consumed from the
+// queue, never sent, and the cursor advanced past it anyway.
+//
+// The byte cap is the only path that reads a line it cannot use. bufio cannot
+// put a whole line back, so the first version simply returned — leaving the
+// shared reader positioned past the dropped line while the cursor had not
+// covered it. The next chunk's bytes were then added to a cursor short by the
+// dropped line's length, so the cursor landed MID-LINE: the skipped event was
+// lost outright and its neighbour was truncated into garbage.
+//
+// Falsified by restoring the silent return: 2 of 4 events arrive.
+func TestBatchBodyCapDoesNotSkipEvents(t *testing.T) {
+	newBatchTest(t)
+	warnOut = io.Discard
+	t.Cleanup(func() { warnOut = os.Stderr })
+
+	// Small enough that two events never fit in one request, so every chunk
+	// after the first is forced through the cap path.
+	origCap := batchMaxBodyBytes
+	batchMaxBodyBytes = 90
+	t.Cleanup(func() { batchMaxBodyBytes = origCap })
+
+	want := []string{"cap-1", "cap-2", "cap-3", "cap-4"}
+	lines := make([]string, 0, len(want))
+	for i, id := range want {
+		lines = append(lines, fmt.Sprintf(
+			`{"id":%q,"kind":"prompt","ts":"2026-08-04T12:00:0%dZ","sessionId":"s1"}`, id, i))
+	}
+	appendRaw(t, lines...)
+
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	done := make(chan struct{})
+	var once sync.Once
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env := readEnvelope(t, r)
+		mu.Lock()
+		for _, e := range env.Events {
+			var ev struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(e, &ev)
+			seen[ev.ID] = true
+		}
+		n := len(seen)
+		mu.Unlock()
+		allOK(w, len(env.Events))
+		if n == len(want) {
+			once.Do(func() { close(done) })
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+
+	if !runDrainCaps(t, srv, batchCaps(500), done, 15*time.Second) {
+		mu.Lock()
+		got := make([]string, 0, len(seen))
+		for id := range seen {
+			got = append(got, id)
+		}
+		mu.Unlock()
+		sort.Strings(got)
+		t.Fatalf("events were consumed but never sent — the body cap skipped some.\n"+
+			"want all of %v, the backend only ever saw %v", want, got)
+	}
+
+	if !waitPendingZero(t, 5*time.Second) {
+		t.Errorf("queue not drained: %d pending", PendingCount())
+	}
+	// A misaligned cursor shows up here: it would sit mid-line rather than at EOF.
+	cursor := readCursor()
+	fi, err := os.Stat(state.OutboxPath())
+	if err != nil {
+		t.Fatalf("stat outbox: %v", err)
+	}
+	if cursor != 0 && cursor != fi.Size() {
+		t.Errorf("cursor %d is neither compacted-to-0 nor at EOF %d — it is misaligned "+
+			"inside a line, which corrupts every later read", cursor, fi.Size())
+	}
 }

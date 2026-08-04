@@ -67,14 +67,17 @@ const (
 	// one. Long enough not to hammer a rolled-back backend on every pass; short
 	// enough that a redeploy is picked up without restarting the daemon.
 	batchProbeCooldown = 30 * time.Minute
-
-	// batchMaxBodyBytes caps one batch request. The backend's own bodyLimit is
-	// 10 MB and its member ceiling is 500 (~400 B/event ≈ 200 KB), so this is
-	// slack for unusually large events rather than the binding constraint — it
-	// exists so one pathological event cannot build a request the backend must
-	// refuse in full.
-	batchMaxBodyBytes = 4 << 20
 )
+
+// batchMaxBodyBytes caps one batch request. The backend's own bodyLimit is 10 MB
+// and its member ceiling is 500 (~400 B/event ≈ 200 KB), so this is slack for
+// unusually large events rather than the binding constraint — it exists so one
+// pathological event cannot build a request the backend must refuse in full.
+//
+// A var rather than a const so a test can shrink it: the path where it binds is
+// the one that has to consume a line it cannot use, and that path shipped a
+// silent event-loss bug the first time precisely because nothing exercised it.
+var batchMaxBodyBytes = 4 << 20
 
 // backoffBase is the first retry delay; it doubles from there to backoffCap.
 // A var rather than a const purely so tests can shrink the ramp.
@@ -494,7 +497,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			if _, _, stillBatching := resolveBatch(caps); !stillBatching {
 				break
 			}
-			chunk := readChunk(reader, maxSize)
+			chunk, desynced := readChunk(reader, maxSize)
 			if len(chunk) == 0 {
 				break // queue drained, or a partial trailing line — next pass
 			}
@@ -535,6 +538,13 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 				// cursor now points AT it. End the pass so the next one re-reads
 				// from there with that member at the head, where deliverChunk's
 				// backoff applies to it directly.
+				return delivered, nil
+			}
+			if desynced {
+				// readChunk consumed a line it did not hand us, so this reader can
+				// no longer be trusted to sit where the cursor does. The cursor
+				// itself is correct and durable; ending the pass reopens the file
+				// there. See readChunk.
 				return delivered, nil
 			}
 		}
@@ -606,8 +616,19 @@ func chunkBytes(chunk []chunkLine) int64 {
 // chunk of zero sendable members makes no progress and the queue would wedge on
 // it permanently — the same reasoning that makes the backend's budget admit an
 // oversized batch against an empty window.
-func readChunk(reader *bufio.Reader, maxSize int) []chunkLine {
-	chunk := make([]chunkLine, 0, maxSize)
+// It returns `desynced` when it consumed a line it did not include — the byte
+// cap is the only way that happens. bufio cannot put a whole line back, so the
+// reader is then positioned PAST a line the cursor has not accounted for, and
+// the caller MUST end the pass rather than keep reading: the next chunk would
+// otherwise start after the dropped line, so its bytes would be added to a
+// cursor that never covered the dropped one, leaving the cursor misaligned in
+// the middle of a later line. That loses the skipped event outright and then
+// truncates its neighbour. Ending the pass reopens the file at the cursor, where
+// the skipped line is the head of a fresh chunk and `sendable == 0` admits it
+// alone. Caught in review on #152; the first version returned silently and the
+// comment claimed a re-read that could not happen.
+func readChunk(reader *bufio.Reader, maxSize int) (chunk []chunkLine, desynced bool) {
+	chunk = make([]chunkLine, 0, maxSize)
 	sendable := 0
 	var bodyBytes int
 
@@ -630,10 +651,7 @@ func readChunk(reader *bufio.Reader, maxSize int) []chunkLine {
 			warnf("skipping unparseable queued line")
 		default:
 			if sendable > 0 && bodyBytes+len(body) > batchMaxBodyBytes {
-				// Would overflow the request. Leave this line for the next chunk —
-				// the reader has consumed it, but the cursor has not, so the next
-				// pass re-reads it from the file.
-				return chunk
+				return chunk, true
 			}
 			ln.body = body
 			bodyBytes += len(body)
@@ -641,7 +659,7 @@ func readChunk(reader *bufio.Reader, maxSize int) []chunkLine {
 		}
 		chunk = append(chunk, ln)
 	}
-	return chunk
+	return chunk, false
 }
 
 // memberAdvanceable reports whether a per-member status proves the member is
