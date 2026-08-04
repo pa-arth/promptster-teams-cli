@@ -124,6 +124,31 @@ func TestPendingStateCountsUnparseableLinesButTakesNoTimestamp(t *testing.T) {
 	}
 }
 
+func TestPendingStateSurvivesACompactionUnderneathIt(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	// The race, reproduced as its aftermath: the drain compacted (truncate to 0,
+	// cursor reset) and the watchers appended fresh work, but this reader is
+	// holding the pre-compaction cursor. It now points far past EOF.
+	writeOutbox(t, dir, 0, "2026-08-04T14:10:00Z", "2026-08-04T14:11:00Z", "2026-08-04T14:12:00Z")
+	if err := os.WriteFile(filepath.Join(dir, "outbox.jsonl.cursor"), []byte("5000000"), 0o600); err != nil {
+		t.Fatalf("cursor: %v", err)
+	}
+
+	got := outbox.PendingStateNow()
+	// Seeking past EOF SUCCEEDS and reads nothing, so the unguarded version
+	// reported 0 — a measured "this device is caught up" while three events sat
+	// queued. Reporting a false zero during a backlog is the single failure this
+	// field exists to prevent, which is why it is worth a branch.
+	if got.Count != 3 {
+		t.Fatalf("Count = %d, want 3 — a cursor past EOF must rewind, not read as caught-up", got.Count)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-08-04T14:10:00Z")
+	if !got.Oldest.Equal(want) {
+		t.Fatalf("Oldest = %v, want %v", got.Oldest, want)
+	}
+}
+
 func TestPendingStateOnEmptyQueue(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PROMPTSTER_STATE_DIR", dir)

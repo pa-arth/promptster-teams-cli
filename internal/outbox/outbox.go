@@ -232,6 +232,25 @@ type PendingState struct {
 // A malformed or unparseable line is COUNTED but contributes no timestamp: it
 // is still undelivered work, and dropping it from the count would understate a
 // real backlog. Cost is one pass over the tail, run once per beat (5 min).
+//
+// CONCURRENCY. This runs on the presence goroutine while the drain advances the
+// cursor, compacts, and the watchers append — none of it under a lock. Two
+// windows exist and they are not equally acceptable:
+//
+//   - The cursor advances between our read and our scan, so we count a handful
+//     of lines the drain has since delivered. Bounded by the drain rate over a
+//     sub-second scan (~1 event) and it OVERSTATES, which at worst shows a beat
+//     of backlog that has already cleared. Left unsynchronized deliberately.
+//   - The queue COMPACTS between our read and our seek: compact() truncates to
+//     zero and resets the cursor, the watchers append fresh events, and our
+//     stale cursor now points past EOF. Seeking there succeeds and reads
+//     nothing, so we would report a MEASURED ZERO — "this device is caught up" —
+//     while real work sat queued. That is the exact lie this whole field exists
+//     to prevent, so it is handled: a cursor past EOF means the queue was
+//     compacted out from under us and the only correct reading is from the
+//     start, the same conclusion drainOnce reaches at the same fork. Unlike
+//     drainOnce we do NOT write the rewound cursor back — a reader must never
+//     mutate delivery state; the drain will correct it on its own next pass.
 func PendingStateNow() PendingState {
 	cursor := readCursor()
 	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
@@ -240,6 +259,9 @@ func PendingStateNow() PendingState {
 		return PendingState{}
 	}
 	defer f.Close()
+	if fi, err := f.Stat(); err == nil && cursor > fi.Size() {
+		cursor = 0
+	}
 	if _, err := f.Seek(cursor, 0); err != nil {
 		return PendingState{}
 	}
