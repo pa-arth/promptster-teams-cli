@@ -6,7 +6,91 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.3] — 2026-08-04
+
+**Upgrade this one by restarting capture, not just by installing it.** Several
+fixes here run at `watch` startup or inside the daemon, so a machine that
+installs the new binary but leaves the old daemon running gets none of them. On
+a daemon predating this release nothing on our side can fix that — it does not
+carry the code that would. Run `promptster-teams stop && promptster-teams start`
+once; after that the daemon keeps itself current on its own.
+
 ### Fixed
+
+- **The daemon now adopts a newer binary already sitting on its own disk,
+  instead of running the old one until the next reboot.** Self-update only ever
+  compared the running version against a GitHub release tag, so the daemon was
+  blind to the most common way it goes stale: a newer binary arriving by a route
+  that is not us — `npm i -g`, `install.sh`, an MDM push, another invocation
+  swapping the shared managed path. The machine already had the fix, and since
+  nothing outside a process can change the code that process is running, only a
+  reboot or a human typing `stop && start` ever picked it up. **That is the root
+  cause behind every "doctor is green but the daemon is months old" report.**
+
+  Every 5-minute poll now checks the binary on disk before it asks the network,
+  and re-execs into it when it is strictly newer. It downloads nothing and
+  verifies no signature because it installs nothing — which is also why it is
+  **not** gated on `--no-auto-update` or a pinned version: those govern what gets
+  fetched and installed onto a machine, and this executes what is already there.
+  A pin's enforcement point is still the download. A project-local install is
+  left alone entirely; its lockfile is a deliberate pin.
+
+  It follows the daemon's own path first, then the managed one — the second is
+  what reaches a daemon `autostart` launches from a baked absolute path that is
+  now stale, and a daemon whose own directory is not writable, which can never
+  self-update but can exec.
+
+- **`doctor` now describes the process that is capturing, not the one printing
+  the report.** Those are routinely different builds — self-update swaps the
+  file and re-execs, `autostart` bakes an absolute path, a running process keeps
+  its inode after its file is deleted, and under `npx` the foreground binary is
+  the newest thing on the machine by definition. A machine running 0.12.2 in the
+  foreground with a pre-0.12.0 daemon printed "up to date" with a straight face
+  while the Cursor hook rail, which enrolls at `watch` startup, had never run.
+
+  The watcher now stamps its version and executable under the capture lock, and
+  that record is trusted only while the recorded PID is the live lock holder's —
+  a record left by a dead process reads as **unknown**, never as whatever holds
+  the lock now. `doctor` splits four outcomes that were previously one silence:
+  not running / older (an error, naming the fix) / unknown build / newer, which
+  is deliberately not an error, because there the foreground copy is the stale
+  one and a restart would install an older build.
+
+  `start` acts on it too: a live daemon on a strictly older build is restarted
+  rather than met with "already running", and the restart is confirmed by process
+  identity before it is reported.
+
+- **`stop && start` no longer leaves capture running unsupervised until the next
+  login.** Our own `stop` boots the autostart unit out of its supervisor domain,
+  and nothing re-armed it. `start` now re-enables a unit left installed-but-
+  unloaded — the only state reachable from our `stop` — which also re-renders a
+  baked binary path that an `npm` upgrade has since deleted. It never enrolls
+  autostart for anyone who has not enabled it.
+
+- **The npm launcher now installs the managed binary itself**, rather than
+  trusting `postinstall` to have done it. Newer npm gates install scripts behind
+  an approval and reports a **fully successful install** while running none of
+  ours — observed in the field, twice on one machine — and `--ignore-scripts`
+  lands in the same place. What silently did not happen was everything that
+  matters: the managed binary was never written and autostart was never
+  re-pointed at it. Running the CLI at all now converges the machine, gated
+  behind a marker file so the common "nothing to do" answer costs one small read.
+
+- **A branch's AI history now survives being opened in a new local copy.** A
+  fresh `git worktree add` is a new path and therefore a cold start: the cursor
+  was baselined straight to head and none of the branch's existing commits were
+  ever surfaced, so that copy read as though the branch held no AI work at all
+  and every later rewrite of its AI lines emitted no rework verdict. A
+  cold-started root now re-folds its branch's own commits for their state alone —
+  nothing is re-attributed, no verdict is re-emitted.
+
+  It is gated on this device **already holding attribution** for a commit in the
+  range, and that gate, not the cursor, is what leaves a genuinely fresh install
+  untouched: a new machine has nothing attributed, so the range is dropped
+  without reading a single commit. This recovers history the device measured
+  through another copy; it does not import history it never saw. The range is
+  taken whole or not at all — a partial rebuild starts mid-branch, and both cut
+  ends fabricate.
 
 - **Surviving-line figures move DOWN for any repository whose default branch
   contains merges — the same edits were previously counted twice.** A merge
@@ -1284,7 +1368,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.3...HEAD
+[0.12.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.11.4...v0.12.0
