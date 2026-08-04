@@ -6,6 +6,49 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Surviving-line figures move DOWN for any repository whose default branch
+  contains merges — the same edits were previously counted twice.** A merge
+  commit's diff is read with `git show -m --first-parent`, so it already carries
+  everything the merged-away branch brought in. The durability watcher
+  nevertheless folded that branch's own commits as well, applying the same hunks
+  once in the merged-away branch's coordinate space and again in the merge's.
+  Every tracked AI span then slid by an offset already applied, until it
+  addressed lines nobody wrote — and a span sitting on lines the AI never touched
+  is not churned when the AI's real lines are rewritten, so it quietly survived
+  its 30 days and reported as `durable`. The corrected numbers are lower, and
+  they are the honest ones.
+
+  **If a durability figure dropped after this release, this is why**, and the
+  size of the drop tracks how many merges the branch has. Nothing was lost: the
+  merge itself is still folded, so the lines it brought in are still tracked —
+  once.
+
+  The pre-merge rework ledger stopped double-folding merges in 0.12.2, and that
+  entry said fixing durability was a separate change — this is it. Until now
+  **the two ledgers disagreed with each other on any history containing merges**
+  and neither was authoritative there. They now agree.
+
+- **A `git rebase` no longer leaves a feature branch's AI spans pointing at lines
+  nobody wrote.** HEAD is detached for the whole of a rebase, and the watcher
+  polls every 60 seconds — an interactive rebase spends far longer than that
+  waiting on the editor. A poll landing in that window attributed and recorded
+  every replayed commit while folding none of them into the rework ledger, and a
+  recorded commit is never revisited. The branch's tracked spans kept coordinates
+  the replayed hunks had already moved, so the next rewrite of the *human* lines
+  that took over those coordinates emitted a `rework_verdict` against them. Those
+  spurious verdicts are gone.
+
+  A rebase now releases that branch's rework tracking instead, which is an
+  undercount rather than an invention — and a rebase rewrites the very history
+  those coordinates were measured against. A detached HEAD that creates no
+  commits (a `git bisect`, a CI checkout) moved nothing and keeps its tracking.
+
+- Commit attribution is unchanged by both fixes. Every commit in the detected
+  range is still emitted exactly once, including one reachable only through a
+  merge's second parent.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added
