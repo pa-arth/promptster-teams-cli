@@ -155,6 +155,50 @@ func TestCatchupGuardStopsARestartLoopWhenTheExecDoesNotTake(t *testing.T) {
 	}
 }
 
+// THE COOLDOWN MUST STAY REACHABLE FROM ONE LONG-LIVED UPDATER.
+//
+// The updater outlives every poll, and its stamp cache is what stops an
+// unchanged file buying a subprocess. Caching a target that IS newer suppresses
+// every later poll for that file, which makes the guard's six-hour cooldown
+// unreachable in the only situations it exists for: an exec that FAILED
+// (ETXTBSY while an installer is still writing, a permission fault) or one the
+// guard BLOCKED. The daemon then stays stale for the life of the process, which
+// on this product is weeks.
+//
+// TestCatchupGuardStopsARestartLoop cannot catch this: it builds a fresh updater
+// per attempt and changes the stamp between them, so it never exercises the
+// cache at all. Caught by review on PR #139.
+func TestCatchupRetriesAfterTheCooldownEvenThoughTheFileNeverChanged(t *testing.T) {
+	w := newDiskWorld("0.12.2", "0.13.0")
+	u := w.updater("0.12.2", nil, false) // ONE updater for every poll, as in production
+	u.reexec = func(p string) error {
+		w.execd = append(w.execd, p)
+		return fmt.Errorf("exec failed: text file busy")
+	}
+
+	if got := u.catchUpToDisk(); got != catchupNone {
+		t.Fatalf("failed exec = %v, want catchupNone", got)
+	}
+	// Several more polls inside the cooldown, file untouched: blocked, not silent.
+	for i := 0; i < 3; i++ {
+		if got := u.catchUpToDisk(); got != catchupBlockedRetry {
+			t.Fatalf("poll %d inside the cooldown = %v, want catchupBlockedRetry — the stamp cache swallowed the decision", i, got)
+		}
+	}
+	if len(w.execd) != 1 {
+		t.Fatalf("re-exec calls inside the cooldown = %v, want exactly one", w.execd)
+	}
+
+	// Past the cooldown, still the same unchanged file on disk: it must try again.
+	// The verdict is catchupNone because this fake exec fails a second time too —
+	// the evidence that the retry happened is that the exec was ATTEMPTED.
+	w.now = w.now.Add(catchupCooldown + time.Minute)
+	u.catchUpToDisk()
+	if len(w.execd) != 2 {
+		t.Fatalf("re-exec calls past the cooldown = %v, want two — the daemon would stay stale for the life of the process", w.execd)
+	}
+}
+
 // On unix the exec never returns, so a guard written after it is a guard that is
 // never written at all — and the anti-loop protection above would not exist.
 func TestCatchupWritesTheGuardBeforeExecing(t *testing.T) {

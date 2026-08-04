@@ -390,6 +390,18 @@ that file before changing it. Four things there are decisions, not implementatio
   silently drops the opening prompt of every session in between. That is data loss, not
   churn. The record is written BEFORE the exec because on unix the exec never returns.
 
+  **The stamp cache must never cover a candidate that IS newer**, or the cooldown becomes
+  unreachable and the guard turns into a permanent block. The updater outlives every poll,
+  so caching a newer target suppresses the probe on every later poll, and the two cases the
+  cooldown exists for — an exec that FAILED (ETXTBSY while an installer is still writing, a
+  permission fault) and one the guard BLOCKED — are never reconsidered. The daemon then
+  stays stale for the life of the process, which here is weeks. Only "not newer" is cached;
+  a probe ERROR is not cached either, since it is usually transient. Caught by review on
+  PR #139, and note WHY the existing loop test missed it: it built a fresh updater per
+  attempt and changed the stamp between them, so it never exercised the cache at all
+  (`TestCatchupRetriesAfterTheCooldownEvenThoughTheFileNeverChanged` uses ONE updater and an
+  unchanged file, which is the production shape).
+
 **Windows needs `EnvHandoff`, and the reason generalises.** `reexecInto` has no execve there:
 it spawns a detached child and exits, so for a few milliseconds two processes exist and the
 child races the parent for the single-instance lock. Losing that race is not a retry — the

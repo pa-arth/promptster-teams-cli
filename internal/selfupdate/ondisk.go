@@ -254,20 +254,33 @@ func (u *updater) catchUpToDisk() catchupVerdict {
 		}
 		diskVer, err := u.binVersionOf(path)
 		if err != nil {
+			// Deliberately NOT cached. A probe failure is usually transient (a file
+			// mid-rename, a machine under load), and caching it would suspend the
+			// whole mechanism until something happened to change the file again.
+			// The cost of getting this wrong the other way is one spawn per poll.
 			u.logf("selfupdate: catch-up: cannot read version of %s: %v", path, err)
 			continue
 		}
-		// Recorded whatever we decide: a file we have judged does not need judging
-		// again until it changes, and that includes one we decided not to run.
+
+		if stampedVersion(u.currentVersion) && stampedVersion(diskVer) && IsNewer(u.currentVersion, diskVer) {
+			// NOT cached either, and this is the subtle one. Caching here suppresses
+			// every later poll for this file, which silently makes the guard's
+			// cooldown unreachable: an exec that FAILED (ETXTBSY while an installer
+			// is still writing, a permission fault) or one the guard BLOCKED would
+			// never be reconsidered, so the daemon stays stale for the life of the
+			// process instead of retrying once the cooldown lapses. A file that is
+			// newer than us is interesting BY DEFINITION — the gate exists to skip
+			// files that are not. Caught by review on PR #139.
+			target = catchupTarget{Path: path, Version: diskVer}
+			break
+		}
+
+		// Only "not newer" is cached — that is the answer approximately always, and
+		// it is the one that cannot go stale while the file does not change.
 		if u.lastProbed == nil {
 			u.lastProbed = map[string]string{}
 		}
 		u.lastProbed[path] = stamp
-
-		if stampedVersion(u.currentVersion) && stampedVersion(diskVer) && IsNewer(u.currentVersion, diskVer) {
-			target = catchupTarget{Path: path, Version: diskVer}
-			break
-		}
 	}
 	if target.Path == "" {
 		return catchupNone
