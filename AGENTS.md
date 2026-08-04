@@ -914,12 +914,14 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   the source's spent stamp and the destination's own, since a mark holding only the
   source's is read against a different path's clock and the agent that renamed the
   file usually recorded the new name too. Durability's marks are pruned by EVIDENCE
-  rather than by a TTL, and the pruner must read the SEED GATE'S OWN predicate —
-  presence in the AI-paths ledger, shared as one `aiPathKnown` func value, never a
-  second expression that merely looks compatible. Judging a mark by its write stamp
-  is what re-opens the hole: a ledger written before per-path stamps carries its
-  paths with a 0 stamp for the full 7-day TTL, so every tombstone on a deployed
-  install is deleted while the gate is still consulting the path.
+  rather than by a TTL, and the pruner must ask the SEED GATE'S OWN QUESTION —
+  presence in the AI-paths ledger, never a second expression that merely looks
+  compatible — but over EVERY checkout of the repository, a WIDER domain than the
+  gate itself is authorized against (the two-view rule below, stated in full in
+  `durability.go`'s header). Judging a mark by its write stamp is what re-opens
+  the hole: a ledger written before per-path stamps carries its paths with a 0
+  stamp for the full 7-day TTL, so every tombstone on a deployed install is
+  deleted while the gate is still consulting the path.
 - **Its state is scoped to a BRANCH, and `reworkLedger.Branches` is what enforces
   that.** The clear on `scope == scopeDefault` alone is not a bound: `git switch
   -c` off a feature branch and a per-branch worktree never stand on the default
@@ -1067,16 +1069,98 @@ rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
 and the commit would never reach `pollReworkCommit` at all. It returns the raw
 diff on that path specifically so renames still land.
 
-**Known gap, unfixed: AI-path evidence is keyed PER WORKTREE, so a second
-worktree reconciles the same commit as `unknown`.** `resolveLedgerScope` looks
-evidence up under `rel(taskRoot, root)/<path>`, but capture recorded it under the
-path of whichever worktree the agent actually edited in. Verified on one commit:
-`likely_ai` from the original checkout, `unknown` from a `git worktree add` copy
-of the same branch. This bounds every cross-worktree recovery path above — they
-replay the right commits and find no AI ranges to seed — and it is upstream of
-rework, so it affects `commit_attribution` itself.
-`TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` does not catch it:
-it simulates the second worktree inside ONE directory.
+**A COMMIT BELONGS TO THE REPOSITORY, NOT TO A CHECKOUT OF IT, and that is why
+`ledgerScope` carries the repo's other worktrees.** The ai-paths ledger records
+a path relative to whichever checkout the agent edited in, so a lookup keyed on
+the polled checkout alone read every commit made in a SIBLING worktree as
+`unknown` — a silent under-count of `commit_attribution` itself, and the
+ceiling on both cross-checkout replays above (they replayed the right commits
+and found no AI ranges to seed). `resolveLedgerScope` now appends one alt scope
+per `git worktree list` entry and `ledgerLookup` falls through them, own
+checkout FIRST so a single-checkout machine is byte-for-byte unchanged and a
+two-worktree tie is deterministic.
+
+**The widening is over CHECKOUTS, never over PATHS — and only over checkouts on
+THIS COMMIT'S OWN LINE OF HISTORY.** Only this repository's worktrees are
+consulted, so another repo, or a CLONE of the same upstream, cannot contribute
+evidence — a clone has its own object store and its own worktree list, and that
+under-count is deliberate. The committed path must still match exactly.
+
+A bare repo-relative match across checkouts FABRICATES, because worktrees are
+how one repository holds several branches at once: an agent writes
+`internal/x.go` in the feature worktree, a human hand-edits `internal/x.go` on
+the default branch inside the 7-day TTL and commits it there, and the human's
+commit inherits the agent's session. So every alt is gated: **a sibling's
+evidence counts ONLY when that checkout's HEAD REACHES the commit** — the commit
+is an ancestor-or-self of its HEAD, i.e. that checkout holds it. Where it does
+not, the lookup MISSES rather than falling through to the bare path.
+
+**ONE DIRECTION ONLY — "the commit DESCENDS from the sibling's HEAD" is not
+accepted, and an earlier revision that accepted it gated nothing.** `git worktree
+add -b feat` leaves the new checkout parked on the branch point and evidence is
+recorded when the agent WRITES, with no commit of its own — so every later commit
+on every branch descends from that HEAD. That is the ORDINARY state of a worktree,
+not a corner case, and in it the descends-from direction hands the agent's
+evidence to a human's commit on the default branch.
+`TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom` pins it
+(absence of attribution, of a session, and of a durability span).
+
+**What that deliberately does NOT recover**: evidence held by a checkout that
+does not hold the commit — the agent's worktree switched branches, was reset, or
+never committed what it wrote. That reads `unknown`. It is a conservative
+under-count, on purpose, and a wrong number outranks a missing one. The residual
+that DOES remain is the path-level one `reconcileCommitAttribution` note 2
+already documents — a file AI-touched then human-edited inside the 7-day TTL
+reads `likely_ai` — now reachable from a sibling that holds the commit rather
+than from the polled directory alone. It is NOT "the same granularity" as the
+one-directory residual: the blast radius is every checkout holding that commit,
+which is why the lineage gate is the thing holding it down.
+
+**THE GATE AND THE TOMBSTONE BOOKKEEPING READ THE SAME MARKS THROUGH TWO
+DIFFERENT VIEWS, and collapsing them is a live defect in both ledgers.**
+`resolveLedgerScope` (gated) is what may AUTHORIZE a seed. Everything that can
+only ever SUPPRESS one takes `resolveLedgerScopeAllCheckouts` (every checkout,
+ungated): `harvestDurable`, which ages spans out on a clock and holds no commit
+to gate against, **and the tombstone bookkeeping in `pollDurabilityCommit` and
+`foldReworkCommit`** — `pruneSeedTombstones`, and the stamp a departing path is
+tombstoned at. Under the narrow view a sibling moving off the commit PRUNES a
+live tombstone (re-arming first-touch seeding) and tombstones a departing path at
+0, so the write already spent on it clears the strictly-newer gate and seeds it
+again. Both are pinned by tests, and both tombstone writers are additionally
+MONOTONIC — a mark may only ever rise. `durability.go`'s header states the
+two-view rule in full.
+
+**COST: one `git rev-list` per sibling per commit-loop, per poll — NOT per
+commit.** `siblingLineage` asks each sibling once, for the poll's whole range,
+and every gate answer is then read from memory; a poll spends 2N reads per root
+with N siblings (the attribution loop and the durability loop each build one),
+plus one per cold-start replay, and that number does not grow with the commit
+count. The earlier per-commit `git merge-base --is-ancestor` shape cost up to
+`gitWatchMaxCommitsPerPollTotal` × 3 call sites × N siblings × 2 processes —
+~1,200N per burst poll, tens of seconds of subprocess time inside a 60s interval,
+landing exactly on the bursts (cold start, adoption replay, a large pull) the
+recovery paths exist for.
+
+`repoHasLinkedWorktrees` short-circuits, stat-only, before any spawn or memo, so
+a repo that never had `git worktree add` run against it costs nothing AND picks
+its first worktree up immediately. Only a repo that already has one pays the
+memoized `git worktree list` (≤1 spawn per root per poll) and the reachability
+reads. `resolveLedgerScope` runs once per COMMIT in three places, so both the
+enumeration and the mapping of siblings onto the ledger path space are memoized
+on one entry (`siblingLedgerScopes`) — an unmemoized spawn, or a re-resolved
+scope, would scale with commits × worktrees.
+
+**Any test here must use a REAL second directory.**
+`TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` simulates the
+second worktree inside ONE directory, which is exactly what let this defect
+through — one directory is one ledger key, so the divergence never appears.
+`commit_attribution_worktree_test.go` uses `git worktree add` throughout, and
+two tests there are the bound that keeps the widening honest — both with real AI
+evidence at the same relative path, both asserting the ABSENCE of attribution, of
+a session, and of a durability span:
+`TestCommitAttributionDoesNotCrossADivergentSiblingBranch` (sibling on another
+branch) and `TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom`
+(sibling parked on the branch point with no commit of its own).
 
 ## Maintaining this file
 

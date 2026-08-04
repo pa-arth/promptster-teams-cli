@@ -82,7 +82,7 @@ func TestDurabilityFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 3 {
 		t.Fatalf("seeded lines = %d, want 3", got)
 	}
@@ -92,7 +92,7 @@ func TestDurabilityFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites all of app.go")
-	churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if len(churn) == 0 {
 		t.Fatal("a full rewrite must emit churn")
 	}
@@ -104,7 +104,7 @@ func TestDurabilityFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 20))
 	git("add", "-A")
 	git("commit", "-m", "human appends 20 lines")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Errorf("a purely HUMAN commit was seeded as AI: %d lines tracked, want 0 (ranges %+v)",
@@ -132,7 +132,7 @@ func TestDurabilityHarvestedPathDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	// The spans mature and are dropped (a durable range is emitted exactly once).
 	if v := harvestDurable(sess, ws, key, t0+31*dayMs); len(v) == 0 {
@@ -146,7 +146,7 @@ func TestDurabilityHarvestedPathDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n"+strings.Repeat("human\n", 10))
 	git("add", "-A")
 	git("commit", "-m", "human appends after the harvest")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+32*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+32*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Errorf("a harvested path re-seeded human code as AI: %d lines tracked, want 0 (ranges %+v)",
@@ -181,12 +181,12 @@ func TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite(t *testing.T)
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites all of app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Fatalf("setup: the full churn must empty the path, got %d lines", got)
 	}
@@ -197,7 +197,7 @@ func TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite(t *testing.T)
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\n")
 	git("add", "-A")
 	git("commit", "-m", "human appends")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Fatalf("path presence re-seeded human code as AI: %d lines tracked", got)
 	}
@@ -211,7 +211,7 @@ func TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite(t *testing.T)
 	git("add", "-A")
 	git("commit", "-m", "ai writes app.go again")
 	sha := gitOut("rev-parse", "HEAD")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs, siblingLineage{})
 	spans := ledgerRanges(t, key, "app.go")
 	if len(spans) == 0 {
 		t.Fatal("a fresh agent write was silenced: the path must re-enter the ledger")
@@ -228,11 +228,11 @@ func TestDurabilitySeedTombstoneBlocksInferenceButNotAFreshAiWrite(t *testing.T)
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nc1\nc2\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites the new AI lines")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+4*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+4*dayMs, siblingLineage{})
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\nh4\nc1\nc2\nc3\n")
 	git("add", "-A")
 	git("commit", "-m", "human appends again")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+5*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+5*dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Errorf("a spent write authorized a second re-entry: %d lines tracked, want 0", got)
 	}
@@ -264,7 +264,7 @@ func TestDurabilityHarvestedPathStaysVisibleToLaterAiWork(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	if v := harvestDurable(sess, ws, key, t0+31*dayMs); len(v) == 0 {
 		t.Fatal("setup: expected a durable harvest at 31d")
@@ -278,7 +278,7 @@ func TestDurabilityHarvestedPathStaysVisibleToLaterAiWork(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\nb1\nb2\n")
 	git("add", "-A")
 	git("commit", "-m", "ai extends app.go a month later")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+32*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+32*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "app.go"); got == 0 {
 		t.Errorf("AI work on a harvested path is invisible: 0 lines tracked, want the new lines (ranges %+v)",
@@ -309,11 +309,11 @@ func TestDurabilityTombstoneDoesNotBlockFingerprintTransfer(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 	writeCommitFile(t, ws, "app.go", "h1\nh2\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Fatalf("full churn should have emptied app.go, got %d", got)
 	}
@@ -335,7 +335,7 @@ func TestDurabilityTombstoneDoesNotBlockFingerprintTransfer(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nfunc A() {\n}\n")
 	git("add", "-A")
 	git("commit", "-m", "squash: land the branch")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "app.go"); got != 2 {
 		t.Errorf("fingerprint transfer was blocked by the tombstone: %d lines tracked, want 2 (ranges %+v)",
@@ -365,7 +365,7 @@ func TestDurabilityPureRenameCarriesTheSpan(t *testing.T) {
 	writeCommitFile(t, ws, "old.go", "l1\nl2\nl3\nl4\nl5\nl6\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds old.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 	if got := trackedLineCount(t, key, "old.go"); got != 6 {
 		t.Fatalf("seeded = %d lines, want 6", got)
 	}
@@ -373,7 +373,7 @@ func TestDurabilityPureRenameCarriesTheSpan(t *testing.T) {
 	// Day 3: a pure rename, no content change.
 	git("mv", "old.go", "new.go")
 	git("commit", "-m", "rename old.go -> new.go")
-	if churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs); len(churn) != 0 {
+	if churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs, siblingLineage{}); len(churn) != 0 {
 		t.Errorf("a pure rename churns nothing, got %+v", churn)
 	}
 
@@ -426,14 +426,14 @@ func TestDurabilityRenameWithEditRemapsAndChurns(t *testing.T) {
 	writeCommitFile(t, ws, "old.go", "l1\nl2\nl3\nl4\nl5\nl6\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds old.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	// Rename AND rewrite line 2 in one commit.
 	git("mv", "old.go", "new.go")
 	writeCommitFile(t, ws, "new.go", "l1\nCHANGED\nl3\nl4\nl5\nl6\n")
 	git("add", "-A")
 	git("commit", "-m", "rename + edit line 2")
-	churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs)
+	churn := pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs, siblingLineage{})
 
 	cdata := durVerdictFor(t, churn, "new.go")
 	if got := rangeSet(t, cdata, "churnedRanges"); !got["2..2"] {
@@ -478,13 +478,13 @@ func TestDurabilityRenameOfPartiallyChurnedPath(t *testing.T) {
 	writeCommitFile(t, ws, "old.go", "l1\nl2\nl3\nl4\nl5\nl6\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds old.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	// Day 1: a human rewrites line 3 — that line churns, 1..2 and 4..6 survive.
 	writeCommitFile(t, ws, "old.go", "l1\nl2\nHUMAN\nl4\nl5\nl6\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites line 3")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "old.go"); got != 5 {
 		t.Fatalf("after partial churn tracked = %d, want 5", got)
 	}
@@ -492,7 +492,7 @@ func TestDurabilityRenameOfPartiallyChurnedPath(t *testing.T) {
 	// Day 3: pure rename.
 	git("mv", "old.go", "new.go")
 	git("commit", "-m", "rename old.go -> new.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "old.go"); got != 0 {
 		t.Errorf("%d lines still tracked at the dead path old.go, want 0", got)
@@ -587,14 +587,14 @@ func TestDurabilityTombstonesPrunedOnAQuietRoot(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	// A repo-wide reformat churns every tracked line: the path is tombstoned and
 	// the root's tracked map disappears with it.
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "reformat rewrites all of app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if len(loadDurabilityLedger().Seeded[key]) == 0 {
 		t.Fatal("a full churn must leave a tombstone")
 	}
@@ -646,7 +646,7 @@ func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	git("commit", "-m", "ai adds app.go")
 	sha1 := gitOut("rev-parse", "HEAD")
 	diff1, files1 := commitDiffFiles(t, ws, sha1)
-	pollReworkCommit(sess, ws, sha1, diff1, files1, t0)
+	pollReworkCommit(sess, ws, sha1, diff1, files1, t0, siblingLineage{})
 	if c := reworkCovered(key, "app.go"); !c[1] || !c[2] || !c[3] {
 		t.Fatalf("rework ledger = %+v, want 1..3 seeded", c)
 	}
@@ -657,7 +657,7 @@ func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	git("commit", "-m", "human rewrites all of app.go")
 	sha2 := gitOut("rev-parse", "HEAD")
 	diff2, files2 := commitDiffFiles(t, ws, sha2)
-	if v := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs); len(v) == 0 {
+	if v := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs, siblingLineage{}); len(v) == 0 {
 		t.Fatal("a full rewrite must emit a rework verdict")
 	}
 	if c := reworkCovered(key, "app.go"); len(c) != 0 {
@@ -672,7 +672,7 @@ func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	git("commit", "-m", "human appends 20 lines")
 	sha3 := gitOut("rev-parse", "HEAD")
 	diff3, files3 := commitDiffFiles(t, ws, sha3)
-	pollReworkCommit(sess, ws, sha3, diff3, files3, t0+2*dayMs)
+	pollReworkCommit(sess, ws, sha3, diff3, files3, t0+2*dayMs, siblingLineage{})
 
 	if c := reworkCovered(key, "app.go"); len(c) != 0 {
 		t.Fatalf("a purely HUMAN commit was seeded as AI into the rework ledger: %+v", c)
@@ -684,7 +684,7 @@ func TestReworkFullChurnDoesNotReseedHumanCodeAsAi(t *testing.T) {
 	git("commit", "-m", "human rewrites their own 20 lines")
 	sha4 := gitOut("rev-parse", "HEAD")
 	diff4, files4 := commitDiffFiles(t, ws, sha4)
-	if v := pollReworkCommit(sess, ws, sha4, diff4, files4, t0+3*dayMs); len(v) != 0 {
+	if v := pollReworkCommit(sess, ws, sha4, diff4, files4, t0+3*dayMs, siblingLineage{}); len(v) != 0 {
 		t.Errorf("fabricated rework_verdict over human-written lines: %+v", v)
 	}
 }
@@ -719,14 +719,14 @@ func seedReworkCommit(t *testing.T, ws string, git func(...string), gitOut func(
 	sha := gitOut("rev-parse", "HEAD")
 	// Mirrors attributeAndReworkCommit, including its !ok branch: a pure rename
 	// has a real diff but no attributable files, and rework must still see it.
-	diff, files, _, ok := commitAttributionFromDiff(ws, ws, sha)
+	diff, files, _, ok := commitAttributionFromDiff(ws, ws, sha, siblingLineage{})
 	if diff == "" {
 		t.Fatalf("no diff for %s", sha)
 	}
 	if !ok {
 		files = nil
 	}
-	return sha, pollReworkCommit(Session{DeviceID: "dev", TaskRoot: ws}, ws, sha, diff, files, nowMs)
+	return sha, pollReworkCommit(Session{DeviceID: "dev", TaskRoot: ws}, ws, sha, diff, files, nowMs, siblingLineage{})
 }
 
 // TestReworkRepeatIterationStaysObserved is the TOO-RESTRICTIVE direction, and
@@ -1254,13 +1254,13 @@ func TestDurabilityRenameCarriesTheTombstone(t *testing.T) {
 	writeCommitFile(t, ws, "old.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds old.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 
 	// Full churn → old.go leaves the ledger and is tombstoned.
 	writeCommitFile(t, ws, "old.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites all of old.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "old.go"); got != 0 {
 		t.Fatalf("full churn should have emptied old.go, got %d", got)
 	}
@@ -1268,13 +1268,13 @@ func TestDurabilityRenameCarriesTheTombstone(t *testing.T) {
 	// Rename it. Nothing is tracked, so nothing moves — but the MARK must.
 	git("mv", "old.go", "new.go")
 	git("commit", "-m", "rename old.go -> new.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs, siblingLineage{})
 
 	// A purely human commit under the new name must still be refused.
 	writeCommitFile(t, ws, "new.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 8))
 	git("add", "-A")
 	git("commit", "-m", "human appends under the new name")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+3*dayMs, siblingLineage{})
 
 	if got := trackedLineCount(t, key, "new.go"); got != 0 {
 		t.Errorf("the tombstone did not follow the rename: %d human lines seeded as AI at new.go (ranges %+v)",
@@ -1331,7 +1331,7 @@ func TestDurabilityTombstoneSurvivesAStamplessAiPathsLedger(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "a1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "ai adds app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 3 {
 		t.Fatalf("setup: presence must seed the path, got %d lines", got)
 	}
@@ -1339,7 +1339,7 @@ func TestDurabilityTombstoneSurvivesAStamplessAiPathsLedger(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "human rewrites all of app.go")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+dayMs, siblingLineage{})
 	if got := trackedLineCount(t, key, "app.go"); got != 0 {
 		t.Fatalf("setup: the full churn must empty the path, got %d lines", got)
 	}
@@ -1352,7 +1352,7 @@ func TestDurabilityTombstoneSurvivesAStamplessAiPathsLedger(t *testing.T) {
 	writeCommitFile(t, ws, "app.go", "h1\nh2\nh3\n"+strings.Repeat("human\n", 8))
 	git("add", "-A")
 	git("commit", "-m", "human appends")
-	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs)
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), t0+2*dayMs, siblingLineage{})
 
 	if _, tombstoned := loadDurabilityLedger().Seeded[key]["app.go"]; !tombstoned {
 		t.Error("a 0-stamp tombstone was pruned while its path was still seedable")

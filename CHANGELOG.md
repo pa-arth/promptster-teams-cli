@@ -76,6 +76,63 @@ follows [Semantic Versioning](https://semver.org/).
   uncaptured. Classification measures against that same maximum, so it skips
   such a record instead of restarting from byte zero forever.
 
+- **AI attribution now agrees across every checkout of a repository.** The
+  AI-path ledger records a file under the checkout the agent edited in, but a
+  commit belongs to the repository, not to one of its checkouts — so a commit
+  reconciled from a *sibling* `git worktree` reported `unknown` where the
+  original checkout reported `likely_ai`. Anyone running more than one worktree
+  against one repository was under-reporting AI attribution on every commit made
+  in another worktree, and the same gap capped the cross-checkout replays added
+  in 0.12.2 and #128: they replayed the right commits and found no AI evidence to
+  match them against.
+
+  **Reported figures will move UPWARD for anyone running more than one
+  worktree** — `commit_attribution`, and the durability and rework verdicts
+  downstream of it. Nothing is re-attributed retroactively: commits already
+  recorded keep the attribution they were given, so the change appears going
+  forward.
+
+  A lookup now falls through to the repository's other worktrees, own checkout
+  first. It is scoped **to** the checkouts `git worktree list` reports for that
+  one repository *whose HEAD reaches the commit* — that checkout holds it — and
+  **against** everything else: a different repository cannot contribute evidence,
+  two unrelated files that merely share a relative path cannot collide, neither
+  can a *clone* of the same upstream (its own object store, its own worktree
+  list), and neither can a worktree parked on a **divergent branch** or on the
+  commit's own **branch point**. The gate runs in that one direction only. "The
+  commit descends from the sibling's HEAD" looks like the same fact from the other
+  side and gates nothing: `git worktree add -b feat` leaves the new checkout
+  sitting on the branch point, and evidence is recorded the moment the agent
+  writes a file, so every later commit on every branch descends from it — which
+  would hand an agent's write in the feature worktree to a human's commit on the
+  default branch. The widening is over checkouts, never over paths: the committed
+  path must still match exactly, so a path no agent wrote in any checkout stays
+  `unknown`. Evidence already on disk is read exactly as before and is never
+  invalidated.
+
+  **What it deliberately does not recover:** evidence held by a checkout that does
+  not hold the commit — the agent's worktree switched branches, was reset, or
+  never committed what it wrote. Those commits keep reading `unknown`. That is a
+  conservative under-count on purpose; an invented number is the failure this
+  product cannot afford, a missing one is not.
+
+  The reachability answers are computed **once per sibling per poll** over the
+  whole range being processed and then read from memory — one `git rev-list` per
+  sibling per commit loop, a number that does not grow with the commit count.
+
+- **A seed tombstone is no longer dropped, or written empty, because a sibling
+  worktree moved.** Tombstones record which AI-write evidence has already been
+  *spent* on a path, and only a strictly newer write may re-authorize seeding.
+  They were being read through the same commit-gated view as the seed gate itself,
+  which is the wrong question for bookkeeping that can only ever suppress: a
+  sibling checkout moving onto its own branch pruned tombstones whose evidence
+  lived there — re-arming first-touch seeding, so the next purely human commit to
+  that path was recorded as fresh AI — and a path leaving the ledger was
+  tombstoned at "no evidence", letting the write already spent on it clear the
+  gate and seed the path a second time. Both ledgers (durability and rework) now
+  read every checkout for that bookkeeping while the seed gate keeps the narrow
+  view, and a tombstone may only ever rise.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added

@@ -90,7 +90,7 @@ var diffHunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@`)
 // exact shape — a real diff with `rename from`/`rename to` and not one `@@` — and
 // the rework ledger has to see it or the renamed file's tracked spans strand at a
 // path that no longer exists. Only a failed `git show` yields an empty diff.
-func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files []attrFile, primarySession string, ok bool) {
+func commitAttributionFromDiff(root, taskRoot, sha string, lin siblingLineage) (diff string, files []attrFile, primarySession string, ok bool) {
 	diff, ok = gitCommitRawDiff(root, sha)
 	if !ok || diff == "" {
 		return "", nil, "", false
@@ -105,7 +105,7 @@ func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files [
 	// repo-relative path into the workspace-relative key it was stored under. When
 	// root == taskRoot (explicit repo) the scope is the identity. Scoping to one
 	// key also keeps a same-named path AI-touched in a DIFFERENT repo from bleeding in.
-	scope := resolveLedgerScope(root, taskRoot)
+	scope := resolveLedgerScope(root, taskRoot, sha, lin)
 	files, primarySession = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
 	return diff, files, primarySession, true
 }
@@ -194,11 +194,18 @@ func reconcileCommitAttribution(root string, scope ledgerScope, fileRanges map[s
 		//      The bash-mtime recovery pass below shares this residual: a human
 		//      save landing inside an AI bash window is recovered as likely_ai.
 		//   3. aiPaths keys are relativized against the workspace (session.TaskRoot),
-		//      while `path` is relative to the git root polled. scope.ledgerPath
-		//      bridges them: it prepends rel(taskRoot, root) so a commit in a repo
-		//      DISCOVERED under the daemon's HOME workspace matches its home-relative
-		//      ledger key. When root == taskRoot the translation is the identity.
-		if sid, ok := aiPaths[scope.ledgerPath(path)]; ok {
+		//      while `path` is relative to the git root polled. ledgerLookup bridges
+		//      them: it prepends rel(taskRoot, root) so a commit in a repo DISCOVERED
+		//      under the daemon's HOME workspace matches its home-relative ledger key.
+		//      When root == taskRoot the translation is the identity. It then falls
+		//      through to the repository's other worktrees WHOSE HEAD REACHES THIS
+		//      COMMIT, because the ledger records the checkout the agent edited in
+		//      while a commit belongs to the repo — without that, every commit made in
+		//      a sibling worktree read `unknown`. A sibling that does not hold the
+		//      commit is excluded, including one parked on the commit's own branch
+		//      point: matching its evidence by relative path alone is how a human's
+		//      commit here would inherit an agent's write there.
+		if sid, ok := ledgerLookup(scope, aiPaths, path); ok {
 			attribution = attributionLikelyAI
 			session = sid
 		} else if sid, ok := recoverBashSession(root, path, bashWindows); ok {
@@ -320,8 +327,8 @@ func mostFrequentSession(counts map[string]int) string {
 // land as []interface{} of map[string]interface{} — the only shape the redaction
 // projector's element allowlist can walk. Assigning the struct straight to Data
 // would silently ship {} (see eventDataMap's header).
-func buildCommitAttributionEvent(session Session, root, sha string) (event.Event, bool) {
-	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
+func buildCommitAttributionEvent(session Session, root, sha string, lin siblingLineage) (event.Event, bool) {
+	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
 	if !ok {
 		return event.Event{}, false
 	}
@@ -389,8 +396,8 @@ func emitCommitAttribution(ev event.Event) (queued bool) {
 // squashed commit's patch-id is the union diff of its sources and matches no
 // single source commit, so there is nothing to match against. Recovering it
 // would need an explicit merge/squash signal we do not collect out-of-band.
-func attributeCommit(session Session, root, sha string, nowMs int64) {
-	attributeAndReworkCommit(session, root, sha, false, nowMs)
+func attributeCommit(session Session, root, sha string, nowMs int64, lin siblingLineage) {
+	attributeAndReworkCommit(session, root, sha, false, nowMs, lin)
 }
 
 // attributeAndReworkCommit does attribution for one detected working-HEAD commit
@@ -413,8 +420,8 @@ func attributeCommit(session Session, root, sha string, nowMs int64) {
 // later poll would reach the same answer and only cost another `git show`.
 // It is false ONLY when an emit was attempted and failed to queue, so the retry
 // survives.
-func attributeAndReworkCommit(session Session, root, sha string, foldRework bool, nowMs int64) (recordable bool) {
-	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
+func attributeAndReworkCommit(session Session, root, sha string, foldRework bool, nowMs int64, lin siblingLineage) (recordable bool) {
+	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
 	if !ok {
 		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
 		// shapes land here that rework still has to see. A pure RENAME: its tracked
@@ -427,7 +434,7 @@ func attributeAndReworkCommit(session Session, root, sha string, foldRework bool
 		// Passing no attributable files means neither shape can SEED: removing a file
 		// is not evidence that anyone wrote anything.
 		if foldRework && diff != "" {
-			pollReworkCommit(session, root, sha, diff, nil, nowMs)
+			pollReworkCommit(session, root, sha, diff, nil, nowMs, lin)
 		}
 		return true
 	}
@@ -442,7 +449,7 @@ func attributeAndReworkCommit(session Session, root, sha string, foldRework bool
 	recordAiFingerprints(gitWatchRootKey(root), sha, diff, files, nowMs)
 	if foldRework {
 		// Reuse the same diff + files — no extra spawn — to track pre-merge rework.
-		pollReworkCommit(session, root, sha, diff, files, nowMs)
+		pollReworkCommit(session, root, sha, diff, files, nowMs, lin)
 	}
 	return true
 }

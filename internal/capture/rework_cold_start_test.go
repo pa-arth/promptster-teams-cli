@@ -32,12 +32,16 @@ import (
 //
 // WHAT THESE TESTS EXERCISE IS THE ROUTE, NOT AN END-TO-END PAYOFF. They stand a
 // cursorless root up inside ONE directory, so the AI-path evidence they record is
-// keyed to the very root that polls it. A genuine second directory is a different
-// key, and AI-path evidence is still recorded under whichever checkout the agent
-// actually edited in (the known gap in AGENTS.md), so a real `git worktree add`
-// replays exactly these commits and finds no AI ranges to seed. Read every
-// assertion below as "the replay ran, over the right range, positioned at head" —
-// not as "a fresh worktree now shows the branch's spans".
+// keyed to the very root that polls it. Read every assertion below as "the replay
+// ran, over the right range, positioned at head" — not as "a fresh worktree now
+// shows the branch's spans".
+//
+// The evidence half of that payoff is no longer missing: ledgerLookup now reaches
+// the AI-path evidence a SIBLING worktree recorded, so a real `git worktree add`
+// replays these commits and does find AI ranges to seed. It is exercised where it
+// can actually be observed — against a genuine second directory, in
+// commit_attribution_worktree_test.go — because one directory is one ledger key
+// and the divergence cannot appear here at all.
 
 // coldStartRepo stands up a repo on main with one baseline commit and an outbox
 // to assert against, and — the whole point — takes NO poll, so the root has no

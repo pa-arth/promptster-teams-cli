@@ -44,9 +44,9 @@ func reworkCovered(rootKey, path string) map[int]bool {
 // feeds them into rework.
 func commitDiffFiles(t *testing.T, root, sha string) (string, []attrFile) {
 	t.Helper()
-	diff, files, _, ok := commitAttributionFromDiff(root, root, sha)
+	diff, files, _, ok := commitAttributionFromDiff(root, root, sha, siblingLineage{})
 	if !ok {
-		t.Fatalf("commitAttributionFromDiff(%s) not ok", sha)
+		t.Fatalf("commitAttributionFromDiff(%s, siblingLineage{}) not ok", sha)
 	}
 	return diff, files
 }
@@ -75,7 +75,7 @@ func TestReworkChurnEmitsVerdict(t *testing.T) {
 	sha1 := gitOut("rev-parse", "HEAD")
 
 	diff1, files1 := commitDiffFiles(t, ws, sha1)
-	if seed := pollReworkCommit(sess, ws, sha1, diff1, files1, t0); len(seed) != 0 {
+	if seed := pollReworkCommit(sess, ws, sha1, diff1, files1, t0, siblingLineage{}); len(seed) != 0 {
 		t.Fatalf("seeding a first-touch AI commit must emit no rework, got %+v", seed)
 	}
 	if c := reworkCovered(key, "feature.go"); !c[1] || !c[2] || !c[3] {
@@ -90,7 +90,7 @@ func TestReworkChurnEmitsVerdict(t *testing.T) {
 	sha2 := gitOut("rev-parse", "HEAD")
 
 	diff2, files2 := commitDiffFiles(t, ws, sha2)
-	verdicts := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs)
+	verdicts := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs, siblingLineage{})
 	data := reworkVerdictFor(t, verdicts, "feature.go")
 	reworked := rangeSet(t, data, "reworkedRanges")
 	if !reworked["2..2"] {
@@ -128,7 +128,7 @@ func TestReworkFirstTouchOnly(t *testing.T) {
 	git("commit", "-m", "ai adds feature.go")
 	sha1 := gitOut("rev-parse", "HEAD")
 	diff1, files1 := commitDiffFiles(t, ws, sha1)
-	pollReworkCommit(sess, ws, sha1, diff1, files1, t0)
+	pollReworkCommit(sess, ws, sha1, diff1, files1, t0, siblingLineage{})
 
 	// Rework line 2 → emitted once, dropped.
 	recordAiTouchedPath("sess-rw", key, "feature.go")
@@ -137,7 +137,7 @@ func TestReworkFirstTouchOnly(t *testing.T) {
 	git("commit", "-m", "reworks line 2")
 	sha2 := gitOut("rev-parse", "HEAD")
 	diff2, files2 := commitDiffFiles(t, ws, sha2)
-	if v := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs); len(v) == 0 {
+	if v := pollReworkCommit(sess, ws, sha2, diff2, files2, t0+dayMs, siblingLineage{}); len(v) == 0 {
 		t.Fatal("first rework of line 2 must emit a verdict")
 	}
 
@@ -148,7 +148,7 @@ func TestReworkFirstTouchOnly(t *testing.T) {
 	git("commit", "-m", "reworks line 2 again")
 	sha3 := gitOut("rev-parse", "HEAD")
 	diff3, files3 := commitDiffFiles(t, ws, sha3)
-	if v := pollReworkCommit(sess, ws, sha3, diff3, files3, t0+2*dayMs); len(v) != 0 {
+	if v := pollReworkCommit(sess, ws, sha3, diff3, files3, t0+2*dayMs, siblingLineage{}); len(v) != 0 {
 		t.Errorf("a reworked line must not re-count on a later rewrite, got %+v", v)
 	}
 }

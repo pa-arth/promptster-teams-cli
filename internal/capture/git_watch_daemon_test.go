@@ -62,7 +62,7 @@ func TestResolveLedgerScope(t *testing.T) {
 
 	// 1. root == taskRoot (explicit-repo / dev / subcommand): identity — same key,
 	//    no prefix, so behavior is byte-for-byte what it was before discovery.
-	s := resolveLedgerScope(repo, repo)
+	s := resolveLedgerScope(repo, repo, "", siblingLineage{})
 	if s.aiKey != gitWatchRootKey(repo) || s.prefix != "" {
 		t.Fatalf("root==taskRoot: got key=%q prefix=%q, want key=%q prefix=\"\"", s.aiKey, s.prefix, gitWatchRootKey(repo))
 	}
@@ -72,7 +72,7 @@ func TestResolveLedgerScope(t *testing.T) {
 
 	// 2. root UNDER taskRoot (the daemon: TaskRoot=home, repo discovered under it):
 	//    read under the HOME key, look up with the sub-repo prefix.
-	s = resolveLedgerScope(repo, home)
+	s = resolveLedgerScope(repo, home, "", siblingLineage{})
 	if s.aiKey != gitWatchRootKey(home) {
 		t.Fatalf("root-under-home: key=%q, want home key %q", s.aiKey, gitWatchRootKey(home))
 	}
@@ -89,7 +89,7 @@ func TestResolveLedgerScope(t *testing.T) {
 	//    under the HOME key and look the path up by its absolute form. Reading under
 	//    the repo key would miss the evidence entirely.
 	other := t.TempDir()
-	s = resolveLedgerScope(other, home)
+	s = resolveLedgerScope(other, home, "", siblingLineage{})
 	if s.aiKey != gitWatchRootKey(home) {
 		t.Fatalf("outside-home: key=%q, want home key %q (evidence was stored under it)", s.aiKey, gitWatchRootKey(home))
 	}
@@ -149,7 +149,7 @@ func TestCommitAttributionTranslatesHomeAnchoredLedger(t *testing.T) {
 	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
 
 	// Session mirrors the daemon: TaskRoot is HOME, the polled root is the sub-repo.
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: home}, repo, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: home}, repo, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -187,7 +187,7 @@ func TestCommitAttributionOutsideWorkspace(t *testing.T) {
 	absFoo := filepath.ToSlash(filepath.Join(resolvePath(repo), "foo.go"))
 	recordAiTouchedPath("ai-sess-ext", gitWatchRootKey(home), absFoo)
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: home}, repo, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: home}, repo, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}

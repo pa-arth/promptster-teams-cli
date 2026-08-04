@@ -133,7 +133,7 @@ func TestDurabilityLineDurableAfter30d(t *testing.T) {
 	const t0 int64 = 1_000_000_000_000
 
 	// Seed the ledger from the AI commit; nothing churned, no verdict yet.
-	if churn := pollDurabilityCommit(ws, key, sess, sha, t0); len(churn) != 0 {
+	if churn := pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{}); len(churn) != 0 {
 		t.Fatalf("seeding an AI commit must churn nothing, got %+v", churn)
 	}
 	// Before 30 days: no durable verdict.
@@ -173,7 +173,7 @@ func TestDurabilityChurnBeforeWindow(t *testing.T) {
 	sha1 := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha1, t0)
+	pollDurabilityCommit(ws, key, sess, sha1, t0, siblingLineage{})
 
 	// A human rewrites line 2 four days later (no AI evidence for this commit).
 	writeCommitFile(t, ws, "ai.go", "l1\nCHANGED\nl3\n")
@@ -181,7 +181,7 @@ func TestDurabilityChurnBeforeWindow(t *testing.T) {
 	git("commit", "-m", "human rewrites line 2")
 	sha2 := gitOut("rev-parse", "HEAD")
 
-	churn := pollDurabilityCommit(ws, key, sess, sha2, t0+4*dayMs)
+	churn := pollDurabilityCommit(ws, key, sess, sha2, t0+4*dayMs, siblingLineage{})
 	cdata := durVerdictFor(t, churn, "ai.go")
 	churned := rangeSet(t, cdata, "churnedRanges")
 	if !churned["2..2"] {
@@ -257,14 +257,14 @@ func TestDurabilityInsertionShiftsSurvivor(t *testing.T) {
 	key := gitWatchRootKey(ws)
 	sess := Session{DeviceID: "dev", TaskRoot: ws}
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha1, t0)
+	pollDurabilityCommit(ws, key, sess, sha1, t0, siblingLineage{})
 
 	// Insert two lines at the very top (human), pushing the AI lines to 3..5.
 	writeCommitFile(t, ws, "ai.go", "new0\nnew00\na1\na2\na3\n")
 	git("add", "-A")
 	git("commit", "-m", "insert two lines above")
 	sha2 := gitOut("rev-parse", "HEAD")
-	pollDurabilityCommit(ws, key, sess, sha2, t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, sha2, t0+dayMs, siblingLineage{})
 
 	// The AI lines survived, now reported at 3..5, and go durable at 30d.
 	v := harvestDurable(sess, ws, key, t0+31*dayMs)
@@ -309,7 +309,7 @@ func TestDurabilityMergeCommitSeedsFirstParent(t *testing.T) {
 	}
 
 	// The merge commit's first-parent diff surfaces feature.go's AI lines → seed.
-	if churn := pollDurabilityCommit(ws, key, sess, mergeSha, t0); len(churn) != 0 {
+	if churn := pollDurabilityCommit(ws, key, sess, mergeSha, t0, siblingLineage{}); len(churn) != 0 {
 		t.Fatalf("seeding a merge commit must churn nothing, got %+v", churn)
 	}
 	// They mature to durable 30d after landing on the default branch.
@@ -434,7 +434,7 @@ func TestDurabilityCommitAdvancesCursorAtomically(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "ai adds ai.go")
 	aiSha := gitOut("rev-parse", "HEAD")
-	pollDurabilityCommit(ws, key, sess, aiSha, t0)
+	pollDurabilityCommit(ws, key, sess, aiSha, t0, siblingLineage{})
 	if got := durabilityCursor(key); got != aiSha {
 		t.Fatalf("cursor after AI commit = %q, want %q (advanced atomically with ranges)", got, aiSha)
 	}
@@ -443,7 +443,7 @@ func TestDurabilityCommitAdvancesCursorAtomically(t *testing.T) {
 	// reprocessed every poll.
 	git("commit", "--allow-empty", "-m", "empty")
 	emptySha := gitOut("rev-parse", "HEAD")
-	pollDurabilityCommit(ws, key, sess, emptySha, t0+dayMs)
+	pollDurabilityCommit(ws, key, sess, emptySha, t0+dayMs, siblingLineage{})
 	if got := durabilityCursor(key); got != emptySha {
 		t.Errorf("cursor after empty commit = %q, want %q (zero-hunk commit must advance)", got, emptySha)
 	}
@@ -478,7 +478,7 @@ func TestLivingInventoryReportsUndecidedSpans(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha, t0)
+	pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{})
 
 	// Day 4: harvest yields nothing (correct — 30d not reached).
 	if v := harvestDurable(sess, ws, key, t0+4*dayMs); len(v) != 0 {
@@ -519,7 +519,7 @@ func TestLivingInventoryDoesNotConsumeTheSpan(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha, t0)
+	pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{})
 
 	// Inventory on several days...
 	for _, d := range []int64{1, 2, 3} {
@@ -554,7 +554,7 @@ func TestLivingInventoryThrottledToOncePerDay(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha, t0)
+	pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{})
 
 	// A never-inventoried root fires immediately — a fresh install must report
 	// survival on its first poll, not a day later.
@@ -610,7 +610,7 @@ func TestLivingInventoryEmptyRootDoesNotBurnThrottle(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "ai adds ai.go")
 	sha := gitOut("rev-parse", "HEAD")
-	pollDurabilityCommit(ws, key, sess, sha, t0+60_000)
+	pollDurabilityCommit(ws, key, sess, sha, t0+60_000, siblingLineage{})
 
 	// It must be reportable NOW, not after the throttle the empty poll would
 	// otherwise have started.
@@ -642,7 +642,7 @@ func TestLivingInventoryClockRollbackDoesNotWedgeTheThrottle(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha, t0)
+	pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{})
 
 	// A first inventory stamps the ledger at a clock that is 3 days FAST.
 	future := t0 + 3*dayMs
@@ -685,7 +685,7 @@ func TestLivingInventoryFailedDeliveryDoesNotBurnTheDailySlot(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 
 	const t0 int64 = 1_000_000_000_000
-	pollDurabilityCommit(ws, key, sess, sha, t0)
+	pollDurabilityCommit(ws, key, sess, sha, t0, siblingLineage{})
 
 	// Make the outbox undeliverable: point it at a DIRECTORY, so the append open
 	// fails with EISDIR. (A merely missing parent dir would not do it —

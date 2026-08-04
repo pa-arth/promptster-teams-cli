@@ -64,6 +64,28 @@ import (
 // left. A stamp that merely CHANGED does not re-authorize, and an absent stamp
 // (0) reads as inference — the undercount-never-inflation direction.
 //
+// THE EVIDENCE IS READ THROUGH TWO VIEWS, AND THEY MUST NOT BE COLLAPSED. A
+// repository's other worktrees can hold the AI evidence for a commit, so a lookup
+// falls through them (resolveLedgerScope). Which siblings count depends on what
+// is being asked:
+//
+//   - AUTHORIZING A SEED — the path-level fallback and durabilitySeedAuthorized —
+//     reads the NARROW view: only checkouts whose HEAD REACHES this commit. A
+//     sibling that does not hold the commit is a different line of work, and
+//     letting its evidence seed here is the fabrication (human code read as AI)
+//     that the lineage gate exists to stop.
+//   - RECORDING WHAT HAS BEEN SPENT — pruneSeedTombstones and every
+//     tombstoneSeededPath stamp — reads the WIDE view: every checkout, ungated.
+//     Both can only ever SUPPRESS a later seed, so the wide view's error direction
+//     is an undercount, while the narrow view's is not an error direction at all
+//     but two live defects: a tombstone whose evidence lives in a sibling that has
+//     moved gets PRUNED while the path is still live, and a departing path gets
+//     tombstoned at 0, both of which hand a spent write back to the gate.
+//
+// So this file deliberately does NOT read the two through one shared predicate.
+// They agree on a single-checkout machine, which is why the collapse survives
+// testing; they diverge exactly when a sibling worktree moves.
+//
 // RENAMES ARE CARRIED, NOT STRANDED. A rename emits no `@@` hunks under the
 // tracked path, so its spans were neither remapped nor churned: they sat at a
 // path that no longer existed and matured into a `durable` verdict — fabricated
@@ -147,12 +169,21 @@ type durabilityLedger struct {
 //
 // A zero stamp is meaningful: it records "there was no per-write AI evidence
 // here", which only inference could have seeded, and inference stays blocked.
+//
+// A mark only ever RISES, here as in the rename carry that spells it out inline.
+// Lowering one hands back evidence already spent: a checkout that has since moved
+// off this commit's history, or a TTL eviction, would drop the recorded stamp and
+// let the very write this tombstone was written for clear the strictly-newer gate
+// a second time.
 func tombstoneSeededPath(led *durabilityLedger, rootKey, path string, writeMs int64) {
 	if led.Seeded == nil {
 		led.Seeded = map[string]map[string]int64{}
 	}
 	if led.Seeded[rootKey] == nil {
 		led.Seeded[rootKey] = map[string]int64{}
+	}
+	if prior, ok := led.Seeded[rootKey][path]; ok && prior > writeMs {
+		return
 	}
 	led.Seeded[rootKey][path] = writeMs
 }
@@ -179,12 +210,17 @@ func durabilitySeedAuthorized(led *durabilityLedger, rootKey, path string, write
 // one map walk over one root's marks.
 //
 // The bound is EVIDENCE, not time, and what makes dropping a mark safe is that
-// the caller hands in the SEED GATE'S OWN predicate — the same aiPathKnown value
-// the fallback below is guarded by, not a second expression that merely looks
-// compatible. A mark the gate can never consult cannot change any decision, so
-// keeping it and dropping it are the same decision and only one of them is
-// unbounded; a path whose evidence IS live keeps its mark, which is the case the
-// tombstone exists for.
+// the caller hands in the SEED GATE'S OWN QUESTION — presence in the AI-paths
+// ledger — never a second expression that merely looks compatible. A mark the
+// gate can never consult cannot change any decision, so keeping it and dropping
+// it are the same decision and only one of them is unbounded; a path whose
+// evidence IS live keeps its mark, which is the case the tombstone exists for.
+//
+// It is asked over EVERY CHECKOUT of the repository, which is wider than the view
+// the gate itself is authorized against — see the two-view rule in the file
+// header. Same question, larger domain: a mark must survive while ANY checkout
+// could still put its path in front of the gate, and pruning is the direction in
+// which being wider is the safe error.
 //
 // Judging a mark by its WRITE STAMP instead is what breaks that: an AI-paths
 // ledger written before per-path stamps existed carries its paths with a 0 stamp
@@ -598,7 +634,7 @@ func applyDurabilityRenames(led *durabilityLedger, rootKey string, files map[str
 // shift what survives; (2) FIRST-TOUCH seed the AI-authored paths this commit
 // introduces (see file header for why re-seeding is unsafe). Returns (and
 // emits) a churn verdict per path with churned spans. One git spawn total.
-func pollDurabilityCommit(root, rootKey string, session Session, sha string, nowMs int64) []event.Event {
+func pollDurabilityCommit(root, rootKey string, session Session, sha string, nowMs int64, lin siblingLineage) []event.Event {
 	diff, ok := gitCommitRawDiff(root, sha)
 	if !ok {
 		// Inconclusive (git failed): do NOT advance the cursor, so this commit is
@@ -614,17 +650,34 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	// sees the AI evidence; when root == taskRoot the scope is the identity. (The
 	// per-root rootKey still keys fingerprints and the durability cursor below —
 	// those are git-watch's own on-device state, correctly per-repo.)
-	scope := resolveLedgerScope(root, session.TaskRoot)
+	//
+	// TWO VIEWS, because the seed gate and the tombstone bookkeeping ask different
+	// questions of the same marks (see the file header). seedScope is the checkouts
+	// that HOLD this commit and is what may authorize a seed; recordScope is every
+	// checkout of the repository and is what may only ever SUPPRESS one. Both key
+	// the same ai-paths ledger, so the marks are read once.
+	seedScope := resolveLedgerScope(root, session.TaskRoot, sha, lin)
+	recordScope := resolveLedgerScopeAllCheckouts(root, session.TaskRoot)
 	// The full-fidelity read, not readAiTouchedPaths: seeding a path the root has
 	// already first-touched turns on the per-path WRITE STAMP, which is the only
 	// thing in this ledger that distinguishes "an agent wrote this file again"
 	// from "this path is still sitting in a 7-day presence cache".
-	marks := readAiPathMarks(scope.aiKey)
-	// ONE predicate, read in exactly two places: the path-level seed gate below and
-	// pruneSeedTombstones. A tombstone is worth keeping precisely while the gate it
-	// guards can still fire, so both read this func value, not two that agree.
-	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
-	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
+	marks := readAiPathMarks(seedScope.aiKey)
+	aiPathSeedable := func(path string) bool { _, ok := ledgerLookup(seedScope, marks, path); return ok }
+	seedStamp := func(path string) int64 { m, _ := ledgerLookup(seedScope, marks, path); return m.WriteMs }
+	// The pruner's predicate is the WIDE one, and it is still the SEED GATE'S OWN
+	// question asked of the whole repository: a mark stays while ANY checkout could
+	// still put this path back in front of the gate. Judged by the narrow view, a
+	// sibling moving off this commit's history would delete a live tombstone.
+	aiPathKnownAnywhere := func(path string) bool { _, ok := ledgerLookup(recordScope, marks, path); return ok }
+	// The stamp a tombstone is WRITTEN with: the later of the two views. ledgerLookup
+	// returns the first scope that matches, so neither view dominates the other, and
+	// a tombstone written below the evidence that actually exists hands that same
+	// spent write back to the strictly-newer gate.
+	recordedStamp := func(path string) int64 {
+		m, _ := ledgerLookup(recordScope, marks, path)
+		return max(m.WriteMs, seedStamp(path))
+	}
 
 	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
 	// ledger lock, so the ledger's read-modify-write never nests another lock.
@@ -650,8 +703,8 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 		if files == nil {
 			files = map[string][]durTrackedRange{}
 		}
-		pruneSeedTombstones(led, rootKey, aiPathKnown)
-		applyDurabilityRenames(led, rootKey, files, renames, writeStamp)
+		pruneSeedTombstones(led, rootKey, aiPathKnownAnywhere)
+		applyDurabilityRenames(led, rootKey, files, renames, recordedStamp)
 		for path, hs := range hunks {
 			if existing := files[path]; len(existing) > 0 {
 				// Already tracked: remap only — never re-seed (header rationale).
@@ -663,7 +716,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 					// branch below re-arms and the next purely-human commit to this
 					// path is seeded as fresh AI.
 					delete(files, path)
-					tombstoneSeededPath(led, rootKey, path, writeStamp(path))
+					tombstoneSeededPath(led, rootKey, path, recordedStamp(path))
 				}
 				if len(churned) > 0 {
 					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nil, nowMs))
@@ -687,14 +740,14 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 			// tombstone does NOT gate fingerprint transfer above — that evidence is
 			// line-precise and is the only thing carrying lineage through a
 			// squash-merge.
-			var seeded []durTrackedRange
+			var spans []durTrackedRange
 			if fps := fpsByPath[path]; fps != nil {
 				for _, r := range matchedAiRuns(diffNewLines[path], fps, durabilityMinTransferRun) {
 					r.BornTsMs = nowMs
-					seeded = append(seeded, r)
+					spans = append(spans, r)
 				}
-			} else if aiPathKnown(path) {
-				written := writeStamp(path)
+			} else if aiPathSeedable(path) {
+				written := seedStamp(path)
 				if !durabilitySeedAuthorized(led, rootKey, path, written) {
 					continue
 				}
@@ -702,16 +755,16 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 				for _, r := range newSideAiRanges(hs) {
 					r.LineageID = lineage
 					r.BornTsMs = nowMs
-					seeded = append(seeded, r)
+					spans = append(spans, r)
 				}
 				// Spend the evidence: the same write must not authorize a second
 				// re-entry once these spans churn back out.
-				if _, tombstoned := led.Seeded[rootKey][path]; tombstoned && len(seeded) > 0 {
-					tombstoneSeededPath(led, rootKey, path, written)
+				if _, tombstoned := led.Seeded[rootKey][path]; tombstoned && len(spans) > 0 {
+					tombstoneSeededPath(led, rootKey, path, recordedStamp(path))
 				}
 			}
-			if len(seeded) > 0 {
-				files[path] = seeded
+			if len(spans) > 0 {
+				files[path] = spans
 			}
 		}
 
@@ -746,10 +799,17 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	// Resolved BEFORE the ledger lock (the ai-paths ledger has its own): a
 	// harvested path leaves the ledger, so it is tombstoned with the evidence
 	// current now, exactly as the churn route is.
-	scope := resolveLedgerScope(root, session.TaskRoot)
+	//
+	// ALL CHECKOUTS, ungated: harvesting is driven by a clock, not by a commit, so
+	// there is no commit to gate a sibling worktree's evidence against. That is
+	// safe in exactly this direction — both uses below (the tombstone pruner and
+	// the write stamp a departing path is tombstoned at) can only SUPPRESS later
+	// seeding, never authorize it, and the narrower view is the one that would
+	// tombstone at 0 and let spent evidence re-arm the seed gate.
+	scope := resolveLedgerScopeAllCheckouts(root, session.TaskRoot)
 	marks := readAiPathMarks(scope.aiKey)
-	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
-	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
+	aiPathKnown := func(path string) bool { _, ok := ledgerLookup(scope, marks, path); return ok }
+	writeStamp := func(path string) int64 { m, _ := ledgerLookup(scope, marks, path); return m.WriteMs }
 
 	var matured []harvested
 	mutateDurabilityLedger(func(led *durabilityLedger) {
