@@ -334,6 +334,8 @@ func pollCodexRollouts(
 		budget = 0
 	}
 	deferredWork := false
+	// One oversized-record probe per poll — see the Claude half.
+	oversizeProbe := true
 	// Same root set the Claude watcher matches against: the workspace, every
 	// directory registered by a later `start`, and their git worktrees. Codex
 	// used to compare against the single workspace, so a registered second tree
@@ -426,13 +428,16 @@ func pollCodexRollouts(
 			proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(codexRolloutCwd(path))
 			processors[path] = proc
 		}
-		n, consumed, more := tailCodexRollout(path, progress, proc, session, captureProse, budget)
+		n, res := tailCodexRollout(path, progress, proc, session, captureProse, budget, oversizeProbe)
 		sent += n
-		budget -= consumed
-		if more {
+		budget -= res.consumed
+		if res.probedOversize {
+			oversizeProbe = false
+		}
+		if res.truncated {
 			deferredWork = true
 		}
-		if consumed > 0 {
+		if res.consumed > 0 {
 			// Persist after every rollout that moved: an unsaved offset replays
 			// from byte zero after a SIGKILL, which is what stops a restart loop
 			// ever finishing a long backfill.
@@ -572,12 +577,15 @@ func codexRolloutCwd(path string) string {
 // tailCodexRollout reads new complete lines from path (starting at the stored
 // offset), processes them, queues resulting events, and advances the offset.
 // A trailing partial line (no newline yet) is left for the next poll. Returns
-// (events queued, bytes consumed, whether readable bytes remain unread).
+// the number of events queued plus the shared read outcome (see
+// readTranscriptRecords — one implementation for both rails).
 //
 // budget caps the bytes THIS call may read so one enormous rollout cannot spend
 // a whole poll before the caller's loop gets to check. Stopping early is safe
 // for the same reason the offset advance is: unread bytes stay on disk and the
-// offset stops short of them.
+// offset stops short of them. oversizeProbe carries the poll's single allowance
+// to read past that budget, and only to establish that one record exceeds
+// transcriptMaxRecordBytes.
 //
 // As in the claude watcher, advancing the offset unconditionally is only safe
 // because delivery is now durable: this loop used to POST inline and advance
@@ -589,53 +597,34 @@ func tailCodexRollout(
 	session Session,
 	captureProse bool,
 	budget int64,
-) (int, int64, bool) {
+	oversizeProbe bool,
+) (int, transcriptReadOutcome) {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, false
+		return 0, transcriptReadOutcome{}
 	}
 	defer f.Close()
 
 	offset := progress.Offsets[path]
 	if _, err := f.Seek(offset, 0); err != nil {
-		return 0, 0, false
+		return 0, transcriptReadOutcome{}
 	}
 
-	limited := &io.LimitedReader{R: f, N: budget}
-	reader := bufio.NewReader(limited)
-	consumed := int64(0)
 	queued := 0
-	truncated := false
 	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
-	for {
-		if consumed >= budget {
-			truncated = true
-			break
-		}
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF && limited.N == 0 {
-				truncated = true
-				if consumed == 0 && budget == transcriptMaxRecordBytes && int64(len(line)) == budget {
-					consumed = int64(len(line))
-				}
-			}
-			// No trailing newline yet — leave this partial line for next poll.
-			break
-		}
-		consumed += int64(len(line))
-		trimmed := strings.TrimSpace(string(line))
-		if trimmed == "" {
-			continue
-		}
+	res := readTranscriptRecords(f, budget, oversizeProbe, func(record []byte) {
 		// Scrub secrets before parsing/ingest — same redaction the hook path
 		// applies. Rollout lines carry prompt text, command output, and file
 		// patches that may contain keys/tokens the candidate pasted or printed.
-		redacted := redact.RedactBytes([]byte(trimmed))
+		redacted := redact.RedactBytes(record)
 		for _, ev := range proc.Process(redacted) {
 			queued += emit(ev)
 		}
+	})
+	if res.discarded > 0 {
+		fmt.Fprintf(os.Stderr, "codex-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
+			res.discarded, transcriptMaxRecordBytes, filepath.Base(path))
 	}
 
 	// Release a recovered user turn the next line will never come for. Runs on
@@ -644,19 +633,19 @@ func tailCodexRollout(
 	// end-of-read hook that only fired after new bytes would never reach it.
 	// Skipped when the budget cut the read short: the lines that would complete
 	// that turn are sitting unread in the file, not absent.
-	if !truncated {
+	if !res.truncated {
 		for _, ev := range proc.FlushStaleUserPrompt() {
 			queued += emit(ev)
 		}
 	}
 
-	if consumed > 0 {
-		progress.Offsets[path] = offset + consumed
+	if res.consumed > 0 {
+		progress.Offsets[path] = offset + res.consumed
 		if queued > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
 	}
-	return queued, consumed, truncated
+	return queued, res
 }
 
 // emitCodexEvent stamps, dedupes, ledgers and queues one normalized event.

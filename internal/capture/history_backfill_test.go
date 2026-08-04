@@ -510,17 +510,17 @@ func TestTailClaudeTranscriptDoesNotCrossBudgetMidRecord(t *testing.T) {
 	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
 	budget := int64(len(line1) + len(line2)/2)
 
-	_, consumed, more := tailClaudeTranscript(path, progress, proc, session, true, false, budget)
-	if !more || consumed != int64(len(line1)) {
-		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", consumed, more, len(line1))
+	_, res := tailClaudeTranscript(path, progress, proc, session, true, false, budget, true)
+	if !res.truncated || res.consumed != int64(len(line1)) {
+		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", res.consumed, res.truncated, len(line1))
 	}
 	if got := progress.Offsets[key]; got != int64(len(line1)) {
 		t.Fatalf("partial second record advanced offset to %d, want %d", got, len(line1))
 	}
 
-	_, consumed, _ = tailClaudeTranscript(path, progress, proc, session, true, false, int64(len(line2)+1))
-	if consumed != int64(len(line2)) || progress.Offsets[key] != int64(len(line1)+len(line2)) {
-		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", consumed, progress.Offsets[key])
+	_, res = tailClaudeTranscript(path, progress, proc, session, true, false, int64(len(line2)+1), true)
+	if res.consumed != int64(len(line2)) || progress.Offsets[key] != int64(len(line1)+len(line2)) {
+		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", res.consumed, progress.Offsets[key])
 	}
 }
 
@@ -683,17 +683,17 @@ func TestTailCodexRolloutDoesNotCrossBudgetMidRecord(t *testing.T) {
 	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
 	budget := int64(len(line1) + len(line2)/2)
 
-	_, consumed, more := tailCodexRollout(path, progress, proc, session, false, budget)
-	if !more || consumed != int64(len(line1)) {
-		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", consumed, more, len(line1))
+	_, res := tailCodexRollout(path, progress, proc, session, false, budget, true)
+	if !res.truncated || res.consumed != int64(len(line1)) {
+		t.Fatalf("first poll consumed %d bytes (more=%v), want exactly first record %d", res.consumed, res.truncated, len(line1))
 	}
 	if got := progress.Offsets[path]; got != int64(len(line1)) {
 		t.Fatalf("partial second record advanced offset to %d, want %d", got, len(line1))
 	}
 
-	_, consumed, _ = tailCodexRollout(path, progress, proc, session, false, int64(len(line2)+1))
-	if consumed != int64(len(line2)) || progress.Offsets[path] != int64(len(line1)+len(line2)) {
-		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", consumed, progress.Offsets[path])
+	_, res = tailCodexRollout(path, progress, proc, session, false, int64(len(line2)+1), true)
+	if res.consumed != int64(len(line2)) || progress.Offsets[path] != int64(len(line1)+len(line2)) {
+		t.Fatalf("deferred record did not drain intact: consumed=%d offset=%d", res.consumed, progress.Offsets[path])
 	}
 }
 
@@ -908,5 +908,206 @@ func TestPollCodexRolloutsDefersUnderOutboxPressure(t *testing.T) {
 	}
 	if sent := pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false); sent == 0 {
 		t.Fatal("deferred history must drain once pressure clears")
+	}
+}
+
+// oversizedRecordLine builds a single JSONL record with no newline inside it,
+// larger than n bytes — the shape no bounded poll can ever complete.
+func oversizedRecordLine(n int) string {
+	return `{"type":"user","blob":"` + strings.Repeat("x", n) + `"}` + "\n"
+}
+
+// TestPollClaudeDiscardsOversizedRecordAfterAnotherFileConsumed pins the escape
+// hatch for an unsupported record against WALK ORDER, which is what made it
+// unreachable in practice. It used to fire only while the stalled transcript was
+// the first budget-consuming file of the poll (`budget == transcriptMaxRecordBytes`),
+// so one live session a few kilobytes ahead of it in the walk kept the stalled
+// file's offset pinned at the same byte for as long as that session stayed
+// active — the exact "must not stall capture forever" case.
+func TestPollClaudeDiscardsOversizedRecordAfterAnotherFileConsumed(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	prevMax, prevPoll := transcriptMaxRecordBytes, claudeWatchMaxBytesPerPoll
+	transcriptMaxRecordBytes, claudeWatchMaxBytesPerPoll = 4096, 4096
+	t.Cleanup(func() { transcriptMaxRecordBytes, claudeWatchMaxBytesPerPoll = prevMax, prevPoll })
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	dir := filepath.Join(root, "-Users-me-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	record := func(text string) string {
+		return fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":%q}}`+"\n", ws, ts, text)
+	}
+	// The live session the walk reaches FIRST — it consumes budget every poll.
+	live := filepath.Join(dir, "a-live.jsonl")
+	if err := os.WriteFile(live, []byte(record("live turn")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The stalled transcript: an unsupported record, then ordinary content that
+	// must become reachable again once the record is discarded.
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	stalled := filepath.Join(dir, "b-oversized.jsonl")
+	if err := os.WriteFile(stalled, []byte(huge+record("reachable after the discard")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stalledKey := claudeProgressKey(stalled)
+	stalledSize := int64(len(huge) + len(record("reachable after the discard")))
+
+	session := Session{DeviceID: "sess-oversized", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+
+	pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+	if got := loadClaudeWatchProgress().Offsets[stalledKey]; got != transcriptMaxRecordBytes {
+		t.Fatalf("oversized record left the offset at %d; want it advanced by %d even though an earlier file spent budget first",
+			got, transcriptMaxRecordBytes)
+	}
+
+	// And the discard must actually unblock the file: the ordinary record after
+	// it parses on a later poll.
+	parsedAfter := 0
+	for i := 0; i < 10 && loadClaudeWatchProgress().Offsets[stalledKey] < stalledSize; i++ {
+		before := loadClaudeWatchProgress().Offsets[stalledKey]
+		n, _ := pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+		parsedAfter += n
+		if loadClaudeWatchProgress().Offsets[stalledKey] == before {
+			break
+		}
+	}
+	if got := loadClaudeWatchProgress().Offsets[stalledKey]; got != stalledSize {
+		t.Fatalf("stalled transcript drained to %d of %d bytes", got, stalledSize)
+	}
+	if parsedAfter == 0 {
+		t.Fatal("content after the discarded record never parsed")
+	}
+}
+
+// TestPollClaudeOversizedDiscardDoesNotDegradeParser pins the OTHER half: bytes
+// no parser was ever offered must not count as evidence the parser is broken.
+// The discard used to be reported as ordinary consumed bytes, and one discard
+// exceeds claudeDegradedByteThreshold on its own — flipping the watcher to
+// degraded, where the next poll parses and DROPS everything it reads while the
+// hook rail that is supposed to cover that window is not driven from here.
+func TestPollClaudeOversizedDiscardDoesNotDegradeParser(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	// Above claudeDegradedByteThreshold, so a discard reported as consumed
+	// degrades the watcher in a single poll.
+	prevMax, prevPoll := transcriptMaxRecordBytes, claudeWatchMaxBytesPerPoll
+	transcriptMaxRecordBytes = claudeDegradedByteThreshold + 64*1024
+	claudeWatchMaxBytesPerPoll = transcriptMaxRecordBytes
+	t.Cleanup(func() { transcriptMaxRecordBytes, claudeWatchMaxBytesPerPoll = prevMax, prevPoll })
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	dir := filepath.Join(root, "-Users-me-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	tail := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"after"}}`+"\n", ws, ts)
+	path := filepath.Join(dir, "oversized.jsonl")
+	if err := os.WriteFile(path, []byte(huge+tail), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "sess-degrade", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	parsed, consumed := pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()),
+		map[string]*normalize.ClaudeTranscriptProcessor{}, true, false)
+	if got := loadClaudeWatchProgress().Offsets[claudeProgressKey(path)]; got != transcriptMaxRecordBytes {
+		t.Fatalf("discard did not durably advance the offset: %d, want %d", got, transcriptMaxRecordBytes)
+	}
+	if consumed != 0 {
+		t.Fatalf("poll reported %d parser-visible bytes for a record no parser saw; want 0", consumed)
+	}
+	if degraded, _ := claudeDegradationStep(false, parsed, consumed, 0); degraded {
+		t.Fatal("a single unsupported record degraded the watcher and handed the window to hooks")
+	}
+}
+
+// TestPollCodexDiscardsOversizedRecordAfterAnotherFileConsumed is the Codex half
+// of the walk-order regression — the same escape hatch, the same gate, and the
+// same stall.
+func TestPollCodexDiscardsOversizedRecordAfterAnotherFileConsumed(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	prevMax, prevPoll := transcriptMaxRecordBytes, codexWatchMaxBytesPerPoll
+	transcriptMaxRecordBytes, codexWatchMaxBytesPerPoll = 4096, 4096
+	t.Cleanup(func() { transcriptMaxRecordBytes, codexWatchMaxBytesPerPoll = prevMax, prevPoll })
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	dir := filepath.Join(root, "2026", "07", "20")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	userMsg := func(text string) string {
+		return fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":%q,"images":[]}}`+"\n", ts, text)
+	}
+	live := filepath.Join(dir, "rollout-a-live.jsonl")
+	if err := os.WriteFile(live, []byte(codexSessionMetaLine(ws, ts)+userMsg("live turn")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	meta := codexSessionMetaLine(ws, ts)
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	stalled := filepath.Join(dir, "rollout-b-oversized.jsonl")
+	if err := os.WriteFile(stalled, []byte(meta+huge+userMsg("reachable after the discard")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "sess-codex-oversized", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+
+	// Poll 1 consumes the header and stops at the unsupported record.
+	pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+	if got := loadCodexWatchProgress().Offsets[stalled]; got != int64(len(meta)) {
+		t.Fatalf("first poll advanced to %d, want the header only (%d)", got, len(meta))
+	}
+
+	// The live rollout grows, so poll 2 reaches the stalled one with a PARTIAL
+	// budget — which is what the old equality gate could not survive.
+	f, err := os.OpenFile(live, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(userMsg("another live turn")); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+	want := int64(len(meta)) + transcriptMaxRecordBytes
+	if got := loadCodexWatchProgress().Offsets[stalled]; got != want {
+		t.Fatalf("oversized record left the offset at %d; want %d after the bounded discard", got, want)
+	}
+
+	total := int64(len(meta) + len(huge) + len(userMsg("reachable after the discard")))
+	for i := 0; i < 10 && loadCodexWatchProgress().Offsets[stalled] < total; i++ {
+		before := loadCodexWatchProgress().Offsets[stalled]
+		pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+		if loadCodexWatchProgress().Offsets[stalled] == before {
+			break
+		}
+	}
+	if got := loadCodexWatchProgress().Offsets[stalled]; got != total {
+		t.Fatalf("stalled rollout drained to %d of %d bytes", got, total)
 	}
 }

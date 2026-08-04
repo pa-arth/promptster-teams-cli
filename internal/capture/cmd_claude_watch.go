@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -76,7 +75,11 @@ var claudeWatchMaxBytesPerPoll int64 = 8 << 20
 // larger record cannot be parsed safely within one bounded poll, so it is
 // discarded in bounded chunks rather than making every future poll reread the
 // same prefix forever.
-const transcriptMaxRecordBytes int64 = 8 << 20
+//
+// It is the yardstick oversizedness is measured against — never the remaining
+// per-poll budget, which depends on which files the walk reached first. See
+// readTranscriptRecords. A var, not a const, so a test can lower it.
+var transcriptMaxRecordBytes int64 = 8 << 20
 
 // claudeDegradationStep advances the degraded-detection state machine for one
 // poll: any parsed event proves the parser works (reset); otherwise consumed
@@ -614,6 +617,10 @@ func pollClaudeTranscripts(
 		budget = 0
 	}
 	deferredWork := false
+	// One oversized-record probe per poll: it is the only read allowed past the
+	// shared budget, so granting it once keeps the poll's total work bounded
+	// while making the escape independent of walk order.
+	oversizeProbe := true
 	roots := workspaceMatchRoots(workspace)
 	// Any root-set change must revalidate cached decisions: widening can admit a
 	// prior mismatch, while narrowing must revoke a prior match. See RootsFP.
@@ -694,14 +701,21 @@ func pollClaudeTranscripts(
 			}
 			processors[key] = proc
 		}
-		n, c, more := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget)
+		n, res := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget, oversizeProbe)
 		parsed += n
-		consumed += c
-		budget -= c
-		if more {
+		// Discarded bytes decrement the SCHEDULING budget (they were read) but
+		// are withheld from the returned total, which feeds the parser-health
+		// detector: a record no parser was ever offered says nothing about
+		// whether the parser works.
+		consumed += res.consumed - res.discarded
+		budget -= res.consumed
+		if res.probedOversize {
+			oversizeProbe = false
+		}
+		if res.truncated {
 			deferredWork = true
 		}
-		if c > 0 {
+		if res.consumed > 0 {
 			// Persist after every file that moved, not once at the end: an
 			// unsaved offset is replayed from byte zero after a SIGKILL or a
 			// crash, which is what makes a restart loop unable to ever finish a
@@ -943,8 +957,9 @@ func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 
 // tailClaudeTranscript reads new complete lines from path starting at the
 // stored offset, processes them, queues resulting events, and advances the
-// offset. A trailing partial line is left for the next poll. Returns (events
-// parsed, bytes consumed, whether readable bytes remain unread).
+// offset. A trailing partial line is left for the next poll. Returns the number
+// of events parsed plus the shared read outcome (see readTranscriptRecords,
+// which both rails go through so their stop conditions cannot drift).
 //
 // budget caps the bytes THIS call may read, so one enormous transcript cannot
 // consume a whole poll on its own (the poll-wide cap alone would not stop it —
@@ -952,6 +967,9 @@ func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 // Stopping early is safe for exactly the reason the offset advance is: the
 // unread bytes stay on disk and the offset stops short of them, so the next
 // poll resumes at the byte after the last complete line processed.
+//
+// oversizeProbe carries the poll's single allowance to read past that budget,
+// and only to establish that one record exceeds transcriptMaxRecordBytes.
 //
 // Advancing the offset unconditionally is now SAFE, which it was not before.
 // This loop used to POST inline and advance regardless of the result, so a
@@ -967,11 +985,12 @@ func tailClaudeTranscript(
 	dryRun bool,
 	captureProse bool,
 	budget int64,
-) (int, int64, bool) {
+	oversizeProbe bool,
+) (int, transcriptReadOutcome) {
 	// #nosec G304 -- path is a Claude transcript discovered under ~/.claude/projects by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, 0, false
+		return 0, transcriptReadOutcome{}
 	}
 	defer f.Close()
 
@@ -981,42 +1000,15 @@ func tailClaudeTranscript(
 	// already-tailed transcript reads nothing and contributes nothing. That is
 	// exactly the desired outcome — the alias is not new content.
 	if _, err := f.Seek(offset, 0); err != nil {
-		return 0, 0, false
+		return 0, transcriptReadOutcome{}
 	}
 
-	limited := &io.LimitedReader{R: f, N: budget}
-	reader := bufio.NewReader(limited)
-	consumed := int64(0)
 	parsed := 0
-	truncated := false
-	for {
-		if consumed >= budget {
-			truncated = true
-			break
-		}
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF && limited.N == 0 {
-				truncated = true
-				// A partial record is normally retried intact next poll. When a
-				// single record itself reaches the supported 8 MiB maximum, no
-				// future bounded poll can complete it; advance over this bounded
-				// fragment so subsequent polls discard the rest up to its newline.
-				if consumed == 0 && budget == transcriptMaxRecordBytes && int64(len(line)) == budget {
-					consumed = int64(len(line))
-				}
-			}
-			break // partial line — next poll
-		}
-		consumed += int64(len(line))
-		trimmed := strings.TrimSpace(string(line))
-		if trimmed == "" {
-			continue
-		}
+	res := readTranscriptRecords(f, budget, oversizeProbe, func(record []byte) {
 		// Scrub secrets BEFORE parsing and before anything is persisted or
 		// queued — transcript lines carry prompt text, command output, and file
 		// content. This ordering is load-bearing; do not move it.
-		redacted := redact.RedactBytes([]byte(trimmed))
+		redacted := redact.RedactBytes(record)
 		for _, ev := range proc.Process(redacted) {
 			parsed++
 			if dryRun {
@@ -1024,15 +1016,19 @@ func tailClaudeTranscript(
 			}
 			queueClaudeWatchEvent(ev, session, captureProse)
 		}
-	}
+	})
 
-	if consumed > 0 {
-		progress.Offsets[key] = offset + consumed
+	if res.discarded > 0 {
+		fmt.Fprintf(os.Stderr, "claude-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
+			res.discarded, transcriptMaxRecordBytes, filepath.Base(path))
+	}
+	if res.consumed > 0 {
+		progress.Offsets[key] = offset + res.consumed
 		if parsed > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
 	}
-	return parsed, consumed, truncated
+	return parsed, res
 }
 
 // queueClaudeWatchEvent runs the shared per-event funnel: stamp device
