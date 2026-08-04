@@ -204,6 +204,93 @@ func PendingCount() int {
 	return n
 }
 
+// PendingState is what the liveness beat reports about this device's backlog.
+//
+// Count alone is not enough and that is the whole point. 62,000 events queued
+// from the last five minutes is a busy engineer; 62,000 queued whose oldest is
+// dated three weeks ago is an outage. On 2026-08-04 the backend could see
+// neither, so it reported an actively-working engineer as having zero active
+// sessions for over an hour while ingest ran at 100% 2xx.
+type PendingState struct {
+	// Undelivered lines past the cursor. 0 is a MEASUREMENT ("caught up"), and
+	// the backend stores it as one — distinct from never having been told.
+	Count int
+	// Event timestamp of the OLDEST undelivered event, zero when the queue is
+	// empty. This is the lag, and the lag is what makes the count interpretable.
+	Oldest time.Time
+}
+
+// PendingStateNow scans the undelivered tail once and reports both numbers.
+//
+// The MINIMUM `ts` across pending lines, deliberately NOT the first line's.
+// Append order stopped being chronological the moment history replay started
+// running newest-first (cmd_codex_watch.go / cmd_claude_watch.go): during a
+// backfill the head of the queue is recent work and the three-week-old events
+// are behind it. Taking the head's timestamp would report the lag as minutes
+// during exactly the episode the field exists to describe.
+//
+// A malformed or unparseable line is COUNTED but contributes no timestamp: it
+// is still undelivered work, and dropping it from the count would understate a
+// real backlog. Cost is one pass over the tail, run once per beat (5 min).
+//
+// CONCURRENCY. This runs on the presence goroutine while the drain advances the
+// cursor, compacts, and the watchers append — none of it under a lock. Two
+// windows exist and they are not equally acceptable:
+//
+//   - The cursor advances between our read and our scan, so we count a handful
+//     of lines the drain has since delivered. Bounded by the drain rate over a
+//     sub-second scan (~1 event) and it OVERSTATES, which at worst shows a beat
+//     of backlog that has already cleared. Left unsynchronized deliberately.
+//   - The queue COMPACTS between our read and our seek: compact() truncates to
+//     zero and resets the cursor, the watchers append fresh events, and our
+//     stale cursor now points past EOF. Seeking there succeeds and reads
+//     nothing, so we would report a MEASURED ZERO — "this device is caught up" —
+//     while real work sat queued. That is the exact lie this whole field exists
+//     to prevent, so it is handled: a cursor past EOF means the queue was
+//     compacted out from under us and the only correct reading is from the
+//     start, the same conclusion drainOnce reaches at the same fork. Unlike
+//     drainOnce we do NOT write the rewound cursor back — a reader must never
+//     mutate delivery state; the drain will correct it on its own next pass.
+func PendingStateNow() PendingState {
+	cursor := readCursor()
+	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
+	f, err := os.Open(state.OutboxPath())
+	if err != nil {
+		return PendingState{}
+	}
+	defer f.Close()
+	if fi, err := f.Stat(); err == nil && cursor > fi.Size() {
+		cursor = 0
+	}
+	if _, err := f.Seek(cursor, 0); err != nil {
+		return PendingState{}
+	}
+	out := PendingState{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if len(line) == 0 {
+			continue
+		}
+		out.Count++
+		var probe struct {
+			TS string `json:"ts"`
+		}
+		if json.Unmarshal([]byte(line), &probe) != nil || probe.TS == "" {
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339Nano, probe.TS)
+		if err != nil {
+			continue
+		}
+		if out.Oldest.IsZero() || ts.Before(out.Oldest) {
+			out.Oldest = ts
+		}
+	}
+	return out
+}
+
 // --- drain -------------------------------------------------------------------
 
 var startOnce sync.Once
