@@ -67,6 +67,32 @@ const (
 // A var rather than a const purely so tests can shrink the ramp.
 var backoffBase = 500 * time.Millisecond
 
+// PressureHighWater is the queue size at which a producer that can DEFER its
+// work should stop producing. A var, not a const, so a test can lower it.
+//
+// Half of OutboxMaxBytes leaves the other half as headroom for producers that
+// cannot defer (a live tool hook has nowhere to put the event but here).
+var PressureHighWater int64 = OutboxMaxBytes / 2
+
+// UnderPressure reports whether the queue has grown past PressureHighWater.
+//
+// It exists for the transcript watchers' history backfill, which is the one
+// producer whose input is ALREADY durable: the transcript is on disk and the
+// byte offset has not advanced, so declining to read it defers the work
+// perfectly. Appending instead would race the queue toward OutboxMaxBytes,
+// where Append DROPS — trading a deferral for real telemetry loss, and taking
+// live capture down with it.
+//
+// Cheap by construction (one Stat, no lock): it is advisory backpressure, not
+// an invariant, so a stale read only costs one poll.
+func UnderPressure() bool {
+	fi, err := os.Stat(state.OutboxPath())
+	if err != nil {
+		return false
+	}
+	return fi.Size() >= PressureHighWater
+}
+
 // Append enqueues an already-signed, already-redacted event for delivery.
 //
 // It takes the outbox lock, so it is safe across the four concurrent emitters

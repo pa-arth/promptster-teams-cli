@@ -26,6 +26,13 @@ import (
 
 const codexWatchInterval = 3 * time.Second
 
+// codexWatchMaxBytesPerPoll bounds how many rollout bytes ONE poll reads across
+// all matched rollouts combined. Mirrors claudeWatchMaxBytesPerPoll — see that
+// comment for why a bounded poll is what keeps shutdown responsive, keeps
+// backfill progress durable across a SIGKILL, and keeps a first-boot burst from
+// racing the outbox to the cap where Append drops. A var so a test can lower it.
+var codexWatchMaxBytesPerPoll int64 = 8 << 20
+
 // codexHome returns the codex state dir (CODEX_HOME or ~/.codex), where session
 // rollout files live under sessions/YYYY/MM/DD/rollout-*.jsonl.
 func codexHome() string {
@@ -86,6 +93,12 @@ func codexWatcherLogPath() string   { return filepath.Join(state.StateDir(), "co
 // workspace-match decision so each line is processed exactly once across polls.
 type codexWatchProgress struct {
 	Offsets map[string]int64 `json:"offsets"`
+	// Discarding marks offsets that are inside an unsupported oversized record.
+	// Persisting it prevents a restart from parsing the malformed suffix.
+	Discarding         map[string]bool  `json:"discarding,omitempty"`
+	ClassifyOffsets    map[string]int64 `json:"classify_offsets,omitempty"`
+	ClassifyDiscarding map[string]bool  `json:"classify_discarding,omitempty"`
+	ClassifyScanned    map[string]int   `json:"classify_scanned,omitempty"`
 	// Match: path -> "yes"|"no" classification cache so we only read+parse a
 	// file's session_meta header once.
 	Match map[string]string `json:"match"`
@@ -94,26 +107,38 @@ type codexWatchProgress struct {
 	// runs a one-time migration when the stored V is behind codexProgressSchemaV.
 	V int `json:"v"`
 	// RootsFP fingerprints the match ROOT SET the cached decisions were made
-	// against; a change drops every cached "no" so a widened set reaches files
-	// already judged mismatches. Mirrors claudeWatchProgress.RootsFP.
+	// against; a change drops every cached decision so both a widened and a
+	// narrowed set are applied to files already classified. Mirrors
+	// claudeWatchProgress.RootsFP.
 	RootsFP string `json:"roots_fp"`
 }
 
-// codexProgressSchemaV is the current progress-file schema version. v1 drops
-// every cached "no" once: the old timestamp rule cached a "no" for any rollout
-// whose session_meta predated the watch cutoff (dropping long/resumed/
-// restart-spanning sessions forever), and the poll loop's `case "no": continue`
-// never re-evaluates them. Forcing one re-classification lets the go-forward
-// rule pick them up; genuinely cwd-mismatched files simply re-cache "no" next
-// poll. Mirrors claudeProgressSchemaV.
-const codexProgressSchemaV = 1
+// codexProgressSchemaV is the current progress-file schema version. v1 dropped
+// stale timestamp-based "no" decisions. v2 reopens previously matched files so
+// the new bounded history policy gets exactly one chance to replay the last 28
+// days. Mirrors claudeProgressSchemaV.
+const codexProgressSchemaV = 2
 
 func codexWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "codex-watcher-progress.json")
 }
 
+// clearCodexClassifyState is the Codex half of clearClaudeClassifyState: the
+// cursor, its skip count and its discard flag are retired together, whether the
+// decision settled or the pass was abandoned. A cursor left parked past the
+// header that already decided the file resumes with a partly-spent skip budget,
+// which is how a transient failure turns into a permanent codexMatchNo.
+func clearCodexClassifyState(p codexWatchProgress, key string) {
+	delete(p.ClassifyOffsets, key)
+	delete(p.ClassifyDiscarding, key)
+	delete(p.ClassifyScanned, key)
+}
+
 func loadCodexWatchProgress() codexWatchProgress {
-	p := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{}}
+	p := codexWatchProgress{
+		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{},
+		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
+	}
 	data, err := os.ReadFile(codexWatchProgressPath())
 	if err != nil {
 		// Nothing on disk means nothing to migrate: stamp the CURRENT schema so
@@ -131,18 +156,41 @@ func loadCodexWatchProgress() codexWatchProgress {
 	if p.Match == nil {
 		p.Match = map[string]string{}
 	}
-	// One-time schema upgrade: drop every cached "no" so previously-dropped
-	// pre-cutoff sessions get re-classified under the go-forward rule (the poll
-	// loop's `case "no": continue` would otherwise never re-evaluate them).
-	// Genuinely cwd-mismatched files re-cache "no" on the next poll.
-	if p.V < codexProgressSchemaV {
+	if p.Discarding == nil {
+		p.Discarding = map[string]bool{}
+	}
+	if p.ClassifyOffsets == nil {
+		p.ClassifyOffsets = map[string]int64{}
+	}
+	if p.ClassifyDiscarding == nil {
+		p.ClassifyDiscarding = map[string]bool{}
+	}
+	if p.ClassifyScanned == nil {
+		p.ClassifyScanned = map[string]int{}
+	}
+	// v1: drop cached "no" decisions written by the old timestamp gate.
+	if p.V < 1 {
 		for k, v := range p.Match {
 			if v == "no" {
 				delete(p.Match, k)
 			}
 		}
-		p.V = codexProgressSchemaV
 	}
+	// v2: reset old matched offsets so classification can replay only the new
+	// bounded window. Preserve genuine cwd mismatches from v1.
+	if p.V < 2 {
+		p.Offsets = map[string]int64{}
+		p.Discarding = map[string]bool{}
+		p.ClassifyOffsets = map[string]int64{}
+		p.ClassifyDiscarding = map[string]bool{}
+		p.ClassifyScanned = map[string]int{}
+		for k, v := range p.Match {
+			if v == "yes" {
+				delete(p.Match, k)
+			}
+		}
+	}
+	p.V = codexProgressSchemaV
 	return p
 }
 
@@ -186,9 +234,12 @@ func saveCodexWatcherState(s codexWatcherState) error {
 	return os.Rename(tmp, path)
 }
 
+// clearCodexWatcherState drops only the watcher's liveness state; the durable
+// rollout offsets survive a clean exit so the bounded history window is
+// backfilled once rather than at every restart. See clearClaudeWatcherState for
+// the full reasoning — both watchers hold the identical invariant.
 func clearCodexWatcherState() {
 	_ = os.Remove(codexWatcherStatePath())
-	_ = os.Remove(codexWatchProgressPath())
 }
 
 func isCodexWatcherRunning() (codexWatcherState, bool) {
@@ -234,9 +285,6 @@ func RunCodexWatcher() error {
 	// Resolve the workspace path through symlinks once (macOS /tmp -> /private/tmp)
 	// so cwd comparison against rollout session_meta is reliable.
 	workspace := resolvePath(session.TaskRoot)
-	// Only consider rollout sessions that started at/after this capture session
-	// began, so we never replay unrelated prior codex sessions.
-	startCutoff := session.StartedAt.Add(-2 * time.Minute)
 
 	// SIGTERM as well as SIGINT — see the matching note in RunClaudeWatcher.
 	signals := make(chan os.Signal, 1)
@@ -278,7 +326,12 @@ func RunCodexWatcher() error {
 
 	for {
 		captureProse := policyResolver.CaptureAssistantProse()
-		queued := pollCodexRollouts(session, workspace, startCutoff, processors, captureProse)
+		// Backfill the same bounded history the product visualizes. The rollout's
+		// session_meta timestamp, not file mtime, is the authoritative age gate.
+		// Recomputed every poll so the window actually ROLLS; frozen at boot it
+		// is an absolute date a long-lived daemon drifts away from.
+		historyCutoff := transcriptHistoryCutoff(time.Now().UTC())
+		queued := pollCodexRollouts(session, workspace, historyCutoff, processors, captureProse)
 		eventsCaptured += queued
 		windowEmitter.maybe(session, time.Now(), captureProse)
 
@@ -302,13 +355,41 @@ func RunCodexWatcher() error {
 func pollCodexRollouts(
 	session Session,
 	workspace string,
-	startCutoff time.Time,
+	historyCutoff time.Time,
 	processors map[string]*normalize.CodexRolloutProcessor,
 	captureProse bool,
 ) int {
 	dir := codexSessionsDir()
 	progress := loadCodexWatchProgress()
 	sent := 0
+	// Shared per-poll read budget; zeroed while the queue is under pressure so
+	// the backfill defers instead of pushing the outbox to its dropping cap.
+	// The rollout bytes stay on disk with the offset unmoved, so a deferred read
+	// is never a lost read. See claudeWatchMaxBytesPerPoll.
+	budget := codexWatchMaxBytesPerPoll
+	if outbox.UnderPressure() {
+		budget = 0
+	}
+	deferredWork := false
+	// Byte-throttled mid-poll checkpoints — see transcriptProgressCheckpointBytes
+	// and the Claude half for why accruing and flushing are separate steps.
+	//
+	// The separation is sharper here: session_meta is the ONLY rollout record
+	// carrying cwd, so a flush landing between the cursor advancing past it and
+	// the decision being written is unrecoverable. The next poll resumes AFTER
+	// the header, finds no other cwd anywhere in the file, spends
+	// codexClassifyMaxSkips and caches "no" for good. The Claude half survives
+	// the same crash only because its later records repeat cwd.
+	unsaved := int64(0)
+	accrue := func(consumed int64) { unsaved += consumed }
+	checkpoint := func() {
+		if unsaved >= transcriptProgressCheckpointBytes {
+			unsaved = 0
+			saveCodexWatchProgress(progress)
+		}
+	}
+	// One oversized-record probe per poll — see the Claude half.
+	oversizeProbe := true
 	// Same root set the Claude watcher matches against: the workspace, every
 	// directory registered by a later `start`, and their git worktrees. Codex
 	// used to compare against the single workspace, so a registered second tree
@@ -316,7 +397,7 @@ func pollCodexRollouts(
 	roots := workspaceMatchRoots(workspace)
 	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
 		if dropped > 0 {
-			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d previously unmatched rollout(s)\n", dropped)
+			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d cached rollout(s)\n", dropped)
 		}
 		progress.RootsFP = fp
 		saveCodexWatchProgress(progress)
@@ -330,12 +411,12 @@ func pollCodexRollouts(
 		if !strings.HasPrefix(base, "rollout-") || !strings.HasSuffix(base, ".jsonl") {
 			return nil
 		}
-		// Cheap candidate filter: skip files last modified before this capture
-		// session started WITHOUT caching a decision — a file touched later
+		// Cheap candidate filter: skip files last modified before the history
+		// window WITHOUT caching a decision — a file touched later
 		// re-enters classification. Caching "no" here is the old bug that dropped
 		// long/resumed/restart-spanning rollouts forever (mirrors
 		// candidateClaudeTranscripts).
-		if info.ModTime().Before(startCutoff) {
+		if info.ModTime().Before(historyCutoff) {
 			return nil
 		}
 
@@ -345,20 +426,49 @@ func pollCodexRollouts(
 		case "yes":
 			// proceed to tail
 		default:
-			switch classifyCodexRollout(path, roots, startCutoff) {
+			if budget <= 0 {
+				deferredWork = true
+				return nil
+			}
+			remaining := budget
+			classifyBudget := budget
+			if oversizeProbe && classifyBudget < transcriptMaxRecordBytes {
+				classifyBudget = transcriptMaxRecordBytes
+			}
+			match, res, scanned := classifyCodexRolloutBounded(
+				path, roots, historyCutoff,
+				progress.ClassifyOffsets[path], progress.ClassifyScanned[path], classifyBudget,
+				oversizeProbe, progress.ClassifyDiscarding[path],
+			)
+			progress.ClassifyOffsets[path] += res.consumed
+			progress.ClassifyScanned[path] = scanned
+			if res.discardingOversize {
+				progress.ClassifyDiscarding[path] = true
+			} else {
+				delete(progress.ClassifyDiscarding, path)
+			}
+			budget -= res.consumed
+			if res.probedOversize || res.consumed > remaining {
+				oversizeProbe = false
+			}
+			accrue(res.consumed)
+			switch match {
 			case codexMatchYes:
 				progress.Match[path] = "yes"
 			case codexMatchYesPreexisting:
-				// Go-forward: capture ongoing activity but NOT the pre-watcher
+				// Go-forward: capture ongoing activity but not out-of-window
 				// history. Seed the offset to current EOF so tailing starts at new
 				// content. Only when unseen — a real prior offset (a restart-spanning
 				// session already being tailed) must be preserved. If the stat fails
 				// transiently, DON'T cache "yes" yet: leave the match undecided and
 				// retry next poll, so a later success seeds EOF instead of tailing the
-				// whole pre-watcher file from offset 0.
+				// whole old file from offset 0. The retry has to start classification
+				// OVER — see clearCodexClassifyState.
 				if _, ok := progress.Offsets[path]; !ok {
 					info, err := os.Stat(path)
 					if err != nil {
+						clearCodexClassifyState(progress, path)
+						checkpoint()
 						return nil
 					}
 					progress.Offsets[path] = info.Size()
@@ -366,10 +476,24 @@ func pollCodexRollouts(
 				progress.Match[path] = "yes"
 			case codexMatchNo:
 				progress.Match[path] = "no"
-				return nil
-			default: // undecided — line 1 not a readable session_meta yet; retry next poll
+			default: // undecided — no readable session_meta yet; retry next poll
+				checkpoint()
 				return nil
 			}
+			clearCodexClassifyState(progress, path)
+			checkpoint()
+			if match == codexMatchNo {
+				return nil
+			}
+		}
+
+		if budget <= 0 {
+			// Budget spent: leave this rollout's offset untouched so its unread
+			// bytes re-surface next poll. Deferred, never dropped. Checked before
+			// the processor is built, because a cold processor replays the whole
+			// consumed prefix and shells out to git for the repo identity.
+			deferredWork = true
+			return nil
 		}
 
 		proc := processors[path]
@@ -392,10 +516,27 @@ func pollCodexRollouts(
 			proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(codexRolloutCwd(path))
 			processors[path] = proc
 		}
-		n := tailCodexRollout(path, progress, proc, session, captureProse)
+		n, res := tailCodexRollout(path, progress, proc, session, captureProse, budget, oversizeProbe)
 		sent += n
+		budget -= res.consumed
+		if res.probedOversize {
+			oversizeProbe = false
+		}
+		if res.truncated {
+			deferredWork = true
+		}
+		// Checkpoint mid-poll: an unsaved offset replays from byte zero after a
+		// SIGKILL, which is what stops a restart loop ever finishing a long
+		// backfill.
+		accrue(res.consumed)
+		checkpoint()
 		return nil
 	})
+
+	if deferredWork && verboseWatch() {
+		fmt.Fprintf(os.Stderr, "codex-watcher: per-poll read budget spent (%d bytes) — remaining rollout history deferred to the next poll\n",
+			codexWatchMaxBytesPerPoll)
+	}
 
 	saveCodexWatchProgress(progress)
 	return sent
@@ -432,38 +573,49 @@ type codexMatchResult int
 
 const (
 	codexMatchUndecided      codexMatchResult = iota
-	codexMatchYes                             // matched; started at/after cutoff — tail from the start
-	codexMatchYesPreexisting                  // matched; started BEFORE cutoff (long/resumed/restart-spanning) — capture GO-FORWARD from EOF
+	codexMatchYes                             // matched; inside the history window — tail from the start
+	codexMatchYesPreexisting                  // matched; older than the history window — capture go-forward from EOF
 	codexMatchNo
 )
 
 // classifyCodexRollout decides whether a rollout belongs to this capture
-// session by reading its first line — the session_meta header, the ONLY rollout
-// line carrying cwd and the session start timestamp.
+// session by reading its first classifiable record — the session_meta header,
+// the ONLY rollout record carrying cwd and the session start timestamp. Records
+// too large for any pass to parse are skipped to reach it (nextClassifyRecord);
+// without that, one ahead of the header stalled the file forever.
 //
-// cwd is authoritative: a cwd match belongs to this session regardless of when
-// it started. The timestamp only distinguishes NEW from PRE-EXISTING. A session
-// whose session_meta predates this watch start (a long/resumed session, or one
-// spanning a daemon restart — the daemon resets startCutoff every launch, and
-// laptop sleep/wake restarts it constantly) is returned as
-// codexMatchYesPreexisting and captured GO-FORWARD from current EOF, not dropped
-// (the old bug, which silently lost every restart-spanning session).
+// cwd is authoritative. The timestamp admits sessions in the bounded history
+// window from byte zero; older matched sessions are returned as
+// codexMatchYesPreexisting and captured go-forward from current EOF.
 //
-// Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on line
-// 1 only, so a file caught mid-creation whose first line is not yet a readable
-// session_meta is returned codexMatchUndecided (retry next poll) rather than
-// cached as a mismatch — caching "no" would drop it forever.
-func classifyCodexRollout(path string, roots []string, startCutoff time.Time) codexMatchResult {
+// Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on the
+// header only, so a file caught mid-creation whose first record is not yet a
+// readable session_meta is returned codexMatchUndecided (retry next poll) rather
+// than cached as a mismatch — caching "no" would drop it forever.
+//
+// This is the CONVENIENCE classifier: it re-reads from byte zero, so "retry next
+// poll" is the only deferral it has. The poll loop runs
+// classifyCodexRolloutBounded instead, which owns a durable cursor and therefore
+// resolves the same record by SKIPPING it under a bound. Both refuse to cache a
+// "no" off one unreadable record; only the bounded one can also make progress
+// past it.
+func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
 		return codexMatchUndecided
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
-	if !scanner.Scan() {
+	line, ok := firstClassifiableCodexRecord(newClassifyReader(f))
+	if !ok {
 		return codexMatchUndecided
+	}
+	if line == nil {
+		// Nothing but unsupported records where the header belongs. A rollout
+		// header is a small record, so this file is not one — and caching the
+		// answer is what stops the every-poll re-read this bound exists to
+		// prevent. Fail closed: no cwd was ever read, so nothing is captured.
+		return codexMatchNo
 	}
 	var rec struct {
 		Timestamp string `json:"timestamp"`
@@ -472,7 +624,7 @@ func classifyCodexRollout(path string, roots []string, startCutoff time.Time) co
 			Cwd string `json:"cwd"`
 		} `json:"payload"`
 	}
-	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+	if err := json.Unmarshal(line, &rec); err != nil {
 		return codexMatchUndecided
 	}
 	if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
@@ -481,20 +633,127 @@ func classifyCodexRollout(path string, roots []string, startCutoff time.Time) co
 	if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
 		return codexMatchNo
 	}
-	// cwd matches. A session whose session_meta predates this watch start is
-	// pre-existing — capture it GO-FORWARD from current EOF rather than dropping
-	// it (the old bug) or re-uploading its whole history. A session started
-	// at/after the cutoff is genuinely new — tail from the start.
-	if t, err := time.Parse(time.RFC3339, rec.Timestamp); err == nil && t.Before(startCutoff) {
+	// Replay in-window history from the start. Anything older — INCLUDING a
+	// rollout whose session_meta timestamp will not parse — remains eligible for
+	// go-forward capture without uploading its historical prefix. The gate fails
+	// CLOSED for the same reason the Claude one does: mtime is the only other
+	// bound, and a months-old session resumed today has today's mtime.
+	t, err := time.Parse(time.RFC3339, rec.Timestamp)
+	if err != nil || t.Before(historyCutoff) {
 		return codexMatchYesPreexisting
 	}
 	return codexMatchYes
 }
 
+// classifyCodexRolloutBounded is the durable poll-path classifier. It keeps a
+// cursor distinct from the replay offset so an unsupported leading record can
+// be skipped over multiple bounded polls without forfeiting history.
+//
+// A record that is READABLE but is not the session_meta header is a SKIP, not a
+// verdict, and that is the one place this deliberately does more than its
+// unbounded sibling above rather than less. The sibling has no cursor, so its
+// only options on such a record are "undecided" (re-read the file from byte
+// zero every 3s, forever) or "no" (drop the session, forever); it takes the
+// recoverable one. The cursor here supplies a third: step past the record and
+// keep looking, with codexClassifyMaxSkips bounding the search so an
+// unclassifiable file still reaches a decision. Both halves therefore obey the
+// same rule — a single odd record never costs a whole session — and neither can
+// read without end.
+func classifyCodexRolloutBounded(
+	path string,
+	roots []string,
+	historyCutoff time.Time,
+	offset int64,
+	skipped int,
+	budget int64,
+	oversizeProbe bool,
+	discarding bool,
+) (codexMatchResult, transcriptReadOutcome, int) {
+	// #nosec G304 -- candidate path discovered under the Codex sessions dir.
+	f, err := os.Open(path)
+	if err != nil {
+		return codexMatchUndecided, transcriptReadOutcome{}, skipped
+	}
+	defer f.Close()
+	if _, err := f.Seek(offset, 0); err != nil {
+		return codexMatchUndecided, transcriptReadOutcome{}, skipped
+	}
+
+	result := codexMatchUndecided
+	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
+		if result != codexMatchUndecided {
+			return false
+		}
+		skipped++
+		if skipped > codexClassifyMaxSkips+1 {
+			result = codexMatchNo
+			return false
+		}
+		var rec struct {
+			Type      string `json:"type"`
+			Timestamp string `json:"timestamp"`
+			Payload   struct {
+				Cwd string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(line, &rec) != nil {
+			return true
+		}
+		if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
+			return true
+		}
+		if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
+			result = codexMatchNo
+			return false
+		}
+		t, err := time.Parse(time.RFC3339, rec.Timestamp)
+		if err != nil || t.Before(historyCutoff) {
+			result = codexMatchYesPreexisting
+			return false
+		}
+		result = codexMatchYes
+		return false
+	})
+	return result, out, skipped
+}
+
+// codexClassifyMaxSkips bounds how many records a classification pass steps
+// over before giving up on finding the session_meta header — unsupported, blank
+// or merely not the header. It is what keeps an unclassifiable file from being
+// scanned without end, the same job claudeClassifyMaxScanLines does on the
+// Claude side. The bounded classifier spends it across polls (its cursor is
+// durable); the convenience one spends it within a single pass.
+const codexClassifyMaxSkips = 50
+
+// firstClassifiableCodexRecord returns the first record a rollout's header
+// could be. ok false means the file ended mid-record — still being written, so
+// retry next poll. A nil record with ok true means the skip bound was reached
+// without one, which is a decision, not a deferral.
+func firstClassifiableCodexRecord(r *bufio.Reader) ([]byte, bool) {
+	for skipped := 0; skipped <= codexClassifyMaxSkips; skipped++ {
+		line, ok := nextClassifyRecord(r)
+		if !ok {
+			return nil, false
+		}
+		if len(line) > 0 {
+			return line, true
+		}
+	}
+	return nil, true
+}
+
 // codexRolloutCwd returns the absolute cwd recorded in a rollout file's
-// session_meta header (the only rollout line carrying cwd), or "" when the first
-// line is not a readable session_meta. Read-only, first line only — the body is
-// never retained; the caller reduces the cwd to a privacy-safe repo identity.
+// session_meta header (the only rollout record carrying cwd), or "" when no
+// readable session_meta appears within the classifier's skip bound. Read-only,
+// header only — the body is never retained; the caller reduces the cwd to a
+// privacy-safe repo identity.
+//
+// It walks to the header exactly the way classifyCodexRolloutBounded does —
+// past unsupported records, past readable non-header ones, AND past a
+// session_meta carrying no cwd, under the same codexClassifyMaxSkips bound.
+// Every one of those is a skip there too, and any of them treated as a stop
+// here would admit a rollout the classifier only reached the header PAST with
+// no repo identity at all.
 func codexRolloutCwd(path string) string {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only and only the cwd field is read.
 	f, err := os.Open(path)
@@ -502,30 +761,41 @@ func codexRolloutCwd(path string) string {
 		return ""
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
-	if !scanner.Scan() {
-		return ""
+	reader := newClassifyReader(f)
+	for skipped := 0; skipped <= codexClassifyMaxSkips; skipped++ {
+		line, ok := nextClassifyRecord(reader)
+		if !ok {
+			return ""
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Cwd string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(line, &rec) != nil || rec.Type != "session_meta" || rec.Payload.Cwd == "" {
+			continue
+		}
+		return rec.Payload.Cwd
 	}
-	var rec struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Cwd string `json:"cwd"`
-		} `json:"payload"`
-	}
-	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
-		return ""
-	}
-	if rec.Type != "session_meta" {
-		return ""
-	}
-	return rec.Payload.Cwd
+	return ""
 }
 
 // tailCodexRollout reads new complete lines from path (starting at the stored
 // offset), processes them, queues resulting events, and advances the offset.
 // A trailing partial line (no newline yet) is left for the next poll. Returns
-// the number of events parsed and queued.
+// the number of events queued plus the shared read outcome (see
+// readTranscriptRecords — one implementation for both rails).
+//
+// budget caps the bytes THIS call may read so one enormous rollout cannot spend
+// a whole poll before the caller's loop gets to check. Stopping early is safe
+// for the same reason the offset advance is: unread bytes stay on disk and the
+// offset stops short of them. oversizeProbe carries the poll's single allowance
+// to read past that budget, and only to establish that one record exceeds
+// transcriptMaxRecordBytes.
 //
 // As in the claude watcher, advancing the offset unconditionally is only safe
 // because delivery is now durable: this loop used to POST inline and advance
@@ -536,58 +806,63 @@ func tailCodexRollout(
 	proc *normalize.CodexRolloutProcessor,
 	session Session,
 	captureProse bool,
-) int {
+	budget int64,
+	oversizeProbe bool,
+) (int, transcriptReadOutcome) {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
 	if err != nil {
-		return 0
+		return 0, transcriptReadOutcome{}
 	}
 	defer f.Close()
 
 	offset := progress.Offsets[path]
 	if _, err := f.Seek(offset, 0); err != nil {
-		return 0
+		return 0, transcriptReadOutcome{}
 	}
 
-	reader := bufio.NewReader(f)
-	consumed := int64(0)
 	queued := 0
 	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
-	for {
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			// No trailing newline yet — leave this partial line for next poll.
-			break
-		}
-		consumed += int64(len(line))
-		trimmed := strings.TrimSpace(string(line))
-		if trimmed == "" {
-			continue
-		}
+	wasDiscarding := progress.Discarding[path]
+	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte) bool {
 		// Scrub secrets before parsing/ingest — same redaction the hook path
 		// applies. Rollout lines carry prompt text, command output, and file
 		// patches that may contain keys/tokens the candidate pasted or printed.
-		redacted := redact.RedactBytes([]byte(trimmed))
+		redacted := redact.RedactBytes(record)
 		for _, ev := range proc.Process(redacted) {
 			queued += emit(ev)
 		}
+		return true
+	})
+	if res.discarded > 0 {
+		fmt.Fprintf(os.Stderr, "codex-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
+			res.discarded, transcriptMaxRecordBytes, filepath.Base(path))
 	}
 
 	// Release a recovered user turn the next line will never come for. Runs on
 	// EVERY poll, including polls that consumed nothing — a rollout whose final
 	// line is the human's turn produces no further lines to flush it, so an
 	// end-of-read hook that only fired after new bytes would never reach it.
-	for _, ev := range proc.FlushStaleUserPrompt() {
-		queued += emit(ev)
+	// Skipped when the budget cut the read short: the lines that would complete
+	// that turn are sitting unread in the file, not absent.
+	if !res.truncated {
+		for _, ev := range proc.FlushStaleUserPrompt() {
+			queued += emit(ev)
+		}
 	}
 
-	if consumed > 0 {
-		progress.Offsets[path] = offset + consumed
+	if res.consumed > 0 {
+		progress.Offsets[path] = offset + res.consumed
 		if queued > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
 	}
-	return queued
+	if res.discardingOversize {
+		progress.Discarding[path] = true
+	} else {
+		delete(progress.Discarding, path)
+	}
+	return queued, res
 }
 
 // emitCodexEvent stamps, dedupes, ledgers and queues one normalized event.
@@ -604,11 +879,15 @@ func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
 	// Record AI bash execution windows for later commit-attribution recovery —
 	// same as the Claude watcher. No-op unless this is an AI-attributed
 	// `command` event.
-	recordAiBashWindow(&ev, session.TaskRoot)
+	// Codex stamps every rollout record with its own timestamp, so the bounded
+	// history replay is separable from the live tail per event — same terms as
+	// the Claude funnel.
+	replay := transcriptEventIsHistorical(&ev)
+	recordAiBashWindow(&ev, session.TaskRoot, replay)
 	// Idempotency: skip a file_diff whose resulting content the git watcher (or
 	// another channel) has already emitted, so an apply_patch edit isn't
 	// double-counted when the working-tree poll sees it later.
-	if !dedupeFileDiff(session.TaskRoot, &ev) {
+	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
 		return 0
 	}
 	// Ledger first — it projects, scrubs, and signs ev in place, so the queued

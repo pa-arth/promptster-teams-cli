@@ -144,13 +144,12 @@ func RegisterCaptureRoot(dir string) (added bool, all []string, err error) {
 // captureRootsFingerprint is a stable digest of an effective root SET (order
 // and duplicates do not matter).
 //
-// Both watchers cache a per-file "no" classification forever, so widening the
-// roots is invisible to any file already judged a mismatch — a newly
-// registered directory's existing sessions would stay dropped for the life of
-// the progress file. Storing this digest alongside the cache lets a poll drop
-// exactly the "no" entries when the set changed. "yes" entries and byte
-// offsets are untouched: widening never un-matches anything, so re-tailing a
-// matched file from zero would duplicate events.
+// Both watchers cache per-file classification decisions. Storing this digest
+// alongside the cache lets a poll invalidate those decisions whenever the
+// effective root set changes. That includes cached "yes" entries: narrowing
+// the roots can make a previously accepted transcript fall outside the current
+// capture scope. Byte offsets live in a separate map and remain untouched, so
+// reclassification never re-uploads content that was already consumed.
 func captureRootsFingerprint(roots []string) string {
 	uniq := make([]string, 0, len(roots))
 	seen := map[string]bool{}
@@ -168,12 +167,12 @@ func captureRootsFingerprint(roots []string) string {
 
 // syncMatchCacheToRoots reconciles a watcher's classification cache with the
 // root set it is about to classify against. When the set changed since those
-// decisions were made, every cached "no" is dropped in place so the widened set
-// is applied to files already judged mismatches; "yes" entries survive, because
-// widening never un-matches anything and clearing one would reset its byte
-// offset and re-upload a whole transcript.
+// decisions were made, every cached decision is dropped in place. Widening can
+// turn "no" into "yes"; narrowing can turn "yes" into "no". The callers retain
+// their independent offset maps, so an accepted transcript that remains in
+// scope resumes from its durable offset after reclassification.
 //
-// Returns the fingerprint to store, how many mismatches were dropped, and
+// Returns the fingerprint to store, how many cached decisions were dropped, and
 // whether anything changed. It is a function rather than inline poll code so
 // the decision is observable: the poll re-caches an unchanged "no" within the
 // same pass, which makes "invalidate always" and "invalidate on change" look
@@ -184,11 +183,9 @@ func syncMatchCacheToRoots(match map[string]string, storedFP string, roots []str
 	if fp == storedFP {
 		return fp, 0, false
 	}
-	for k, v := range match {
-		if v == "no" {
-			delete(match, k)
-			dropped++
-		}
+	for k := range match {
+		delete(match, k)
+		dropped++
 	}
 	return fp, dropped, true
 }

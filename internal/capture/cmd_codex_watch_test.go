@@ -121,9 +121,8 @@ func TestClassifyCodexRolloutUndecidedWhenNotSessionMeta(t *testing.T) {
 	}
 }
 
-// TestPollCodexSeedsPreexistingOffsetToEOF is the key regression proof: a
-// rollout whose session_meta timestamp predates the cutoff (would've been
-// dropped by the old time-gate) is now matched and captured GO-FORWARD — its
+// TestPollCodexSeedsPreexistingOffsetToEOF proves the history bound: a rollout
+// whose session_meta predates the 28-day cutoff stays GO-FORWARD — its
 // offset seeded to current file size so pre-watcher history is NOT re-uploaded.
 // A newly appended line is then the only content tailed.
 func TestPollCodexSeedsPreexistingOffsetToEOF(t *testing.T) {
@@ -140,10 +139,8 @@ func TestPollCodexSeedsPreexistingOffsetToEOF(t *testing.T) {
 	}
 	path := filepath.Join(dir, "rollout-2026-06-11T11-24-52-019eb780-3081-7ce0-9ba0-8a0bad13b532.jsonl")
 
-	// session_meta timestamp is well before the watch start, so the session is
-	// pre-existing (the old gate would have dropped it). A user_message line of
-	// pre-watcher history follows.
-	preTS := time.Now().Add(-2 * time.Hour).UTC().Format(time.RFC3339)
+	// session_meta is older than the product window. A historical prompt follows.
+	preTS := time.Now().Add(-29 * 24 * time.Hour).UTC().Format(time.RFC3339)
 	history := codexSessionMetaLine(resolvePath(workspace), preTS) +
 		`{"timestamp":"` + preTS + `","type":"event_msg","payload":{"type":"user_message","message":"old history","images":[]}}` + "\n"
 	if err := os.WriteFile(path, []byte(history), 0o600); err != nil {
@@ -154,14 +151,13 @@ func TestPollCodexSeedsPreexistingOffsetToEOF(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// StartedAt now; startCutoff = now-2min. The session_meta -2h timestamp is
-	// pre-cutoff, so classify returns yesPreexisting. The file's mod-time is now
-	// (just written) so it passes the cheap mod-time candidate filter.
-	session := Session{DeviceID: "sess-codex-pre", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
-	startCutoff := session.StartedAt.Add(-2 * time.Minute)
+	// The file's mod-time is now, so it reaches the authoritative timestamp gate.
+	now := time.Now().UTC()
+	session := Session{DeviceID: "sess-codex-pre", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	historyCutoff := transcriptHistoryCutoff(now)
 	processors := map[string]*normalize.CodexRolloutProcessor{}
 
-	sent := pollCodexRollouts(session, resolvePath(workspace), startCutoff, processors, false)
+	sent := pollCodexRollouts(session, resolvePath(workspace), historyCutoff, processors, false)
 	if sent != 0 {
 		t.Errorf("pre-existing history must NOT be queued (offset seeded to EOF); got %d queued", sent)
 	}
@@ -187,7 +183,7 @@ func TestPollCodexSeedsPreexistingOffsetToEOF(t *testing.T) {
 	}
 	f.Close()
 
-	sent = pollCodexRollouts(session, resolvePath(workspace), startCutoff, processors, false)
+	sent = pollCodexRollouts(session, resolvePath(workspace), historyCutoff, processors, false)
 	if sent != 1 {
 		t.Errorf("only the newly appended line must be tailed; got %d queued", sent)
 	}
@@ -202,11 +198,40 @@ func TestPollCodexSeedsPreexistingOffsetToEOF(t *testing.T) {
 	}
 }
 
-// TestLoadCodexWatchProgressDropsStaleNo is the load-migration regression: a v0
-// progress file's cached "no" entries were written under the OLD time-gate,
-// which dropped pre-cutoff rollouts. On upgrade to v1 they must be deleted
-// (forcing one re-classification), while "yes" entries survive and the schema
-// version advances so this only runs once.
+func TestPollCodexBackfillsInWindowHistory(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	dir := filepath.Join(root, "2026", "07", "20")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ts := now.Add(-7 * 24 * time.Hour).Format(time.RFC3339)
+	history := codexSessionMetaLine(resolvePath(workspace), ts) +
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"user_message","message":"historical prompt","images":[]}}` + "\n"
+	path := filepath.Join(dir, "rollout-history.jsonl")
+	if err := os.WriteFile(path, []byte(history), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "sess-codex-history", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	sent := pollCodexRollouts(session, resolvePath(workspace), transcriptHistoryCutoff(now), map[string]*normalize.CodexRolloutProcessor{}, false)
+	if sent != 2 {
+		t.Fatalf("in-window history queued %d events, want session_start + prompt", sent)
+	}
+	saved := loadCodexWatchProgress()
+	if saved.Offsets[path] != int64(len(history)) {
+		t.Fatalf("in-window history offset = %d, want %d", saved.Offsets[path], len(history))
+	}
+}
+
+// TestLoadCodexWatchProgressDropsStaleNo covers v0 -> v2: stale timestamp
+// decisions and accepted offsets are both reopened exactly once.
 func TestLoadCodexWatchProgressDropsStaleNo(t *testing.T) {
 	stateDir := t.TempDir()
 	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
@@ -228,8 +253,11 @@ func TestLoadCodexWatchProgressDropsStaleNo(t *testing.T) {
 	if _, ok := got.Match["/x.jsonl"]; ok {
 		t.Errorf(`stale "no" entry must be dropped on v0->v1 upgrade; still present: %v`, got.Match)
 	}
-	if got.Match["/y.jsonl"] != "yes" {
-		t.Errorf(`"yes" entry must survive; got %q`, got.Match["/y.jsonl"])
+	if _, ok := got.Match["/y.jsonl"]; ok {
+		t.Errorf(`old "yes" entry must be reopened for bounded backfill; got %v`, got.Match)
+	}
+	if len(got.Offsets) != 0 {
+		t.Errorf("old offsets must be cleared for bounded backfill; got %v", got.Offsets)
 	}
 	if got.V != codexProgressSchemaV {
 		t.Errorf("schema version = %d, want %d", got.V, codexProgressSchemaV)
@@ -245,5 +273,23 @@ func TestLoadCodexWatchProgressDropsStaleNo(t *testing.T) {
 	}
 	if again.Match["/z.jsonl"] != "no" {
 		t.Errorf(`a "no" cached at/after v1 must survive reload; got %q`, again.Match["/z.jsonl"])
+	}
+}
+
+func TestLoadCodexWatchProgressV2PreservesCwdMismatch(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	saveCodexWatchProgress(codexWatchProgress{
+		Offsets: map[string]int64{"accepted.jsonl": 20},
+		Match:   map[string]string{"accepted.jsonl": "yes", "outside.jsonl": "no"},
+		V:       1,
+	})
+
+	got := loadCodexWatchProgress()
+	if len(got.Offsets) != 0 || got.Match["accepted.jsonl"] != "" {
+		t.Fatalf("accepted rollout was not reopened: offsets=%v match=%v", got.Offsets, got.Match)
+	}
+	if got.Match["outside.jsonl"] != "no" {
+		t.Fatalf("genuine cwd mismatch must survive v2 migration; got %v", got.Match)
 	}
 }

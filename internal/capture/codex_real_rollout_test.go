@@ -62,7 +62,7 @@ func TestRealCodexRolloutCapture(t *testing.T) {
 	progress := codexWatchProgress{Offsets: map[string]int64{}, Match: map[string]string{rollout: "yes"}}
 	session := Session{DeviceID: "dev-real-rollout-smoke", TaskRoot: root}
 
-	queued := tailCodexRollout(rollout, progress, proc, session, false)
+	queued, _ := tailCodexRollout(rollout, progress, proc, session, false, codexWatchMaxBytesPerPoll, true)
 	if queued == 0 {
 		t.Fatal("real rollout produced zero queued events")
 	}

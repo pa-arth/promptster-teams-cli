@@ -49,6 +49,33 @@ follows [Semantic Versioning](https://semver.org/).
   range is still emitted exactly once, including one reachable only through a
   merge's second parent.
 
+- **Context history now appears after first boot instead of starting on install
+  day.** Claude Code and Codex capture now backfill the previous 28 days of local
+  sessions whose recorded cwd is inside a watched root. The bound matches the
+  context re-read heatmap, and each transcript's own timestamp is authoritative;
+  older sessions remain go-forward only. Existing installs receive the backfill
+  once through a progress-state migration, with deterministic event ids keeping
+  overlap idempotent. Cursor remains go-forward because its transcripts expose
+  neither a trustworthy session timestamp nor the token telemetry this view
+  needs.
+
+- **Removing a capture root now actually stops that directory's sessions from
+  uploading.** 0.12.2 re-checked only the transcripts cached as mismatches, so
+  widening the roots took effect but narrowing them did not: a transcript
+  already accepted kept being tailed after its directory was no longer watched.
+  Any change to the effective root set now revalidates every cached
+  classification in both directions. Byte offsets are kept, so nothing already
+  consumed is uploaded twice.
+
+- **A single oversized transcript record no longer stalls a session's capture
+  indefinitely.** Records are read whole or deferred whole against the per-poll
+  byte budget, so a partial record is never half-consumed. A record larger than
+  the 8 MiB supported maximum — which no future poll could complete — is
+  discarded in bounded chunks and reported on stderr, rather than being re-read
+  from the same offset on every poll while the rest of the session goes
+  uncaptured. Classification measures against that same maximum, so it skips
+  such a record instead of restarting from byte zero forever.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added

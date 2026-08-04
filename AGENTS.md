@@ -125,10 +125,12 @@ in ways that are easy to "simplify" back into bugs:
 
 **Pre-existing vs new is decided by the FIRST POLL**, since there is no timestamp
 to ask. Transcripts already on disk when the watcher starts are seeded to EOF; one
-that appears on a later poll is tailed from 0. Both directions matter: seed
-everything and every new session loses its opening prompt (a transcript only
-becomes classifiable at its first tool call, several records past the prompt);
-tail everything from 0 and the first daemon run re-uploads months of history.
+that appears on a later poll is tailed from 0. This remains Cursor-only behavior:
+Claude and Codex carry timestamps and safely backfill a bounded 28-day window.
+Both Cursor directions matter: seed everything and every new session loses its
+opening prompt (a transcript only becomes classifiable at its first tool call,
+several records past the prompt); tail everything from 0 and the first daemon run
+re-uploads months of unbounded history.
 
 ### Cursor egresses counts, never code
 
@@ -187,19 +189,84 @@ distinction does not exist at the transcript layer.
 
 ### The real gate is cwd, not surface
 
-`classifyClaudeTranscript` (`cmd_claude_watch.go:501`) ingests a transcript only
+`classifyClaudeTranscript` (`cmd_claude_watch.go`) ingests a transcript only
 if its recorded `cwd` sits inside the capture workspace or one of its registered
-git worktrees (`workspaceMatchRoots`, `cmd_claude_watch.go:477`). Codex applies
-the same test (`cmd_codex_watch.go:272`), and Cursor applies it to observed paths
-instead of a recorded cwd (`cursorClassify`, `cmd_cursor_watch.go`). The
+git worktrees (`workspaceMatchRoots`, same file). Codex applies the same test
+(`classifyCodexRollout`, `cmd_codex_watch.go`), and Cursor applies it to observed
+paths instead of a recorded cwd (`cursorClassify`, `cmd_cursor_watch.go`). The
 workspace defaults to `os.Getwd()` and is overridable with
-`PROMPTSTER_TEAMS_WATCH_DIR` (`teams.go:90`).
+`PROMPTSTER_TEAMS_WATCH_DIR` (`watchDirFromEnv`, `teams.go`).
+
+The Claude and Codex decisions are CACHED per file in the progress file, and that
+cache is keyed to the root set that produced them (`captureRootsFingerprint` /
+`syncMatchCacheToRoots`, `capture_roots.go`): any change to the effective roots
+drops every cached decision, in both directions — widening admits a prior
+mismatch, narrowing revokes a prior match so a removed workspace stops uploading.
+Byte offsets live in a separate map and survive, so revalidation never re-uploads
+consumed bytes.
 
 So a session is dropped when it runs outside the watched workspace — e.g. the
 desktop app opened on a different folder — no matter which surface produced it.
 When triaging "why didn't X get captured", check cwd before suspecting the
 surface. Transcripts carry no surface marker at all, so capture could not
 distinguish CLI from IDE even if it wanted to.
+
+### Claude + Codex replay 28 days of history through the LIVE funnel
+
+`transcriptHistoryCutoff` (`session.go`) bounds it, both watch loops recompute it
+**every poll** (frozen at boot it is an absolute date a long-lived daemon drifts
+away from), and a progress-schema bump (v2) grants the replay exactly once.
+Cursor is excluded — no trustworthy timestamp.
+
+The hazard is not the reading, it is that replayed events go through
+`queueClaudeWatchEvent` / `emitCodexEvent`, the same funnel live events use — and
+parts of that funnel assumed "this just happened". Five rules, all pinned by
+`history_backfill_test.go` and all mutation-tested:
+
+- **The attribution ledgers are stamped from the EVENT, never the wall clock.**
+  `recordAiTouchedPathAt` takes the stamp; `dedupeFileDiff` passes `e.Ts`. Stamp
+  `time.Now()` instead and a file an agent last touched 20 days ago re-enters the
+  ai-paths ledger as touched TODAY — the git watcher then tags the next commit's
+  purely human lines `likely_ai` and `aiPathKnown` seeds them as AI durability
+  spans. That is the fabrication class the durability ledger exists to refuse.
+  A replayed write also must not win the per-path collision bump: the bump
+  distinguishes two LIVE writes in one millisecond, and letting history take it
+  manufactures the "the agent wrote this again" evidence `durabilitySeedAuthorized`
+  is checking for.
+- **A replayed `file_diff` skips the dedup claim entirely.** The claim key is the
+  file's CURRENT content hash, so keeping it collapses every replayed edit of one
+  path onto today's bytes: first wins, rest vanish, and the claim then blocks a
+  genuine live edit for the next 5 minutes.
+- **`replay` is a PRODUCER signal, never inferred inside the shared funnel.**
+  `dedupeFileDiff` and `recordAiBashWindow` take it as an argument. Only Claude
+  and Codex pass `transcriptEventIsHistorical` (age vs `diffDedupTTL`), because
+  age means age only where every record carries its OWN timestamp. **Cursor
+  passes a hard `false` on both rails** — it never backfills, and
+  `CursorTranscriptProcessor.eventTs` stamps every action in a turn with that
+  TURN'S START anchor, so a 46-minute turn's live edits look 46 minutes old.
+  Inferring from age there silently disabled live cross-channel dedupe and froze
+  the per-path stamp `durabilitySeedAuthorized` reads as "the agent wrote this
+  again". A live observation is stamped NOW whatever the transcript claims; only
+  a replay is stamped from `e.Ts`.
+- **The age gate fails CLOSED.** An absent or unparseable transcript timestamp
+  routes to `…YesPreexisting` (seed to EOF), because mtime is the only other
+  bound and a six-month-old session resumed today has today's mtime.
+- **A poll's reads are BUDGETED** (`claudeWatchMaxBytesPerPoll` /
+  `codexWatchMaxBytesPerPoll`, 8 MiB, the byte analogue of
+  `gitWatchMaxCommitsPerPollTotal`), progress is saved per file, and the budget
+  is zeroed outright while `outbox.UnderPressure()`. Deferring costs nothing —
+  the transcript IS the durable buffer and the offset has not moved — whereas an
+  unbounded first pass blocks every shutdown for its full duration (the signal
+  select sits after the poll) and races the outbox to `OutboxMaxBytes`, where
+  `Append` DROPS and takes live capture down with the backfill. The budget is a
+  RECORD boundary, not a byte one: both rails read through
+  `readTranscriptRecords` (`transcript_read.go`), which defers a record that
+  does not fit rather than half-reading it. The one read allowed past the budget
+  is a single per-poll probe establishing that a record exceeds
+  `transcriptMaxRecordBytes`, which is the only case a record is discarded
+  instead of deferred — read that file's header before touching either, and note
+  that classification measures against the SAME maximum so the two paths cannot
+  disagree about which record is unsupported.
 
 ## Uninstall (`uninstall`, `internal/cli/uninstall.go`)
 
