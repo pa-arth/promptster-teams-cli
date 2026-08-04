@@ -38,8 +38,17 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		t.Fatalf("unmarshal presence data: %v", err)
 	}
+	// `pendingEvents` is the device's own outbox backlog — a COUNT of undelivered
+	// events, never anything about what is in them. It joins the closed shape
+	// because the alternative (a manager being told an actively-working engineer
+	// has zero active sessions, 2026-08-04) is worse than one more integer.
+	//
+	// `pendingOldestEventAt` is deliberately NOT in this required set: it is
+	// omitted when the queue is empty, which is the state this test's fixture is
+	// in. Its presence-when-non-empty is pinned by presence_pending_test.go.
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
+		"pendingEvents": true, "pendingOldestEventAt": true,
 	}
 	for k := range data {
 		if !allowed[k] {
@@ -47,6 +56,9 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 		}
 	}
 	for k := range allowed {
+		if k == "pendingOldestEventAt" {
+			continue // omitempty: absent on an empty queue, by design
+		}
 		if _, ok := data[k]; !ok {
 			t.Errorf("presence data missing expected field %q", k)
 		}

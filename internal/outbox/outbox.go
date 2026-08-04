@@ -204,6 +204,71 @@ func PendingCount() int {
 	return n
 }
 
+// PendingState is what the liveness beat reports about this device's backlog.
+//
+// Count alone is not enough and that is the whole point. 62,000 events queued
+// from the last five minutes is a busy engineer; 62,000 queued whose oldest is
+// dated three weeks ago is an outage. On 2026-08-04 the backend could see
+// neither, so it reported an actively-working engineer as having zero active
+// sessions for over an hour while ingest ran at 100% 2xx.
+type PendingState struct {
+	// Undelivered lines past the cursor. 0 is a MEASUREMENT ("caught up"), and
+	// the backend stores it as one — distinct from never having been told.
+	Count int
+	// Event timestamp of the OLDEST undelivered event, zero when the queue is
+	// empty. This is the lag, and the lag is what makes the count interpretable.
+	Oldest time.Time
+}
+
+// PendingStateNow scans the undelivered tail once and reports both numbers.
+//
+// The MINIMUM `ts` across pending lines, deliberately NOT the first line's.
+// Append order stopped being chronological the moment history replay started
+// running newest-first (cmd_codex_watch.go / cmd_claude_watch.go): during a
+// backfill the head of the queue is recent work and the three-week-old events
+// are behind it. Taking the head's timestamp would report the lag as minutes
+// during exactly the episode the field exists to describe.
+//
+// A malformed or unparseable line is COUNTED but contributes no timestamp: it
+// is still undelivered work, and dropping it from the count would understate a
+// real backlog. Cost is one pass over the tail, run once per beat (5 min).
+func PendingStateNow() PendingState {
+	cursor := readCursor()
+	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
+	f, err := os.Open(state.OutboxPath())
+	if err != nil {
+		return PendingState{}
+	}
+	defer f.Close()
+	if _, err := f.Seek(cursor, 0); err != nil {
+		return PendingState{}
+	}
+	out := PendingState{}
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if len(line) == 0 {
+			continue
+		}
+		out.Count++
+		var probe struct {
+			TS string `json:"ts"`
+		}
+		if json.Unmarshal([]byte(line), &probe) != nil || probe.TS == "" {
+			continue
+		}
+		ts, err := time.Parse(time.RFC3339Nano, probe.TS)
+		if err != nil {
+			continue
+		}
+		if out.Oldest.IsZero() || ts.Before(out.Oldest) {
+			out.Oldest = ts
+		}
+	}
+	return out
+}
+
 // --- drain -------------------------------------------------------------------
 
 var startOnce sync.Once
