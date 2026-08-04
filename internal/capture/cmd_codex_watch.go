@@ -123,6 +123,17 @@ func codexWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "codex-watcher-progress.json")
 }
 
+// clearCodexClassifyState is the Codex half of clearClaudeClassifyState: the
+// cursor, its skip count and its discard flag are retired together, whether the
+// decision settled or the pass was abandoned. A cursor left parked past the
+// header that already decided the file resumes with a partly-spent skip budget,
+// which is how a transient failure turns into a permanent codexMatchNo.
+func clearCodexClassifyState(p codexWatchProgress, key string) {
+	delete(p.ClassifyOffsets, key)
+	delete(p.ClassifyDiscarding, key)
+	delete(p.ClassifyScanned, key)
+}
+
 func loadCodexWatchProgress() codexWatchProgress {
 	p := codexWatchProgress{
 		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{},
@@ -360,6 +371,16 @@ func pollCodexRollouts(
 		budget = 0
 	}
 	deferredWork := false
+	// Byte-throttled mid-poll checkpoints — see transcriptProgressCheckpointBytes
+	// and the Claude half.
+	unsaved := int64(0)
+	checkpoint := func(consumed int64) {
+		unsaved += consumed
+		if unsaved >= transcriptProgressCheckpointBytes {
+			unsaved = 0
+			saveCodexWatchProgress(progress)
+		}
+	}
 	// One oversized-record probe per poll — see the Claude half.
 	oversizeProbe := true
 	// Same root set the Claude watcher matches against: the workspace, every
@@ -423,9 +444,7 @@ func pollCodexRollouts(
 			if res.probedOversize || res.consumed > remaining {
 				oversizeProbe = false
 			}
-			if res.consumed > 0 {
-				saveCodexWatchProgress(progress)
-			}
+			checkpoint(res.consumed)
 			switch match {
 			case codexMatchYes:
 				progress.Match[path] = "yes"
@@ -436,10 +455,12 @@ func pollCodexRollouts(
 				// session already being tailed) must be preserved. If the stat fails
 				// transiently, DON'T cache "yes" yet: leave the match undecided and
 				// retry next poll, so a later success seeds EOF instead of tailing the
-				// whole old file from offset 0.
+				// whole old file from offset 0. The retry has to start classification
+				// OVER — see clearCodexClassifyState.
 				if _, ok := progress.Offsets[path]; !ok {
 					info, err := os.Stat(path)
 					if err != nil {
+						clearCodexClassifyState(progress, path)
 						return nil
 					}
 					progress.Offsets[path] = info.Size()
@@ -447,12 +468,10 @@ func pollCodexRollouts(
 				progress.Match[path] = "yes"
 			case codexMatchNo:
 				progress.Match[path] = "no"
-			default: // undecided — line 1 not a readable session_meta yet; retry next poll
+			default: // undecided — no readable session_meta yet; retry next poll
 				return nil
 			}
-			delete(progress.ClassifyOffsets, path)
-			delete(progress.ClassifyDiscarding, path)
-			delete(progress.ClassifyScanned, path)
+			clearCodexClassifyState(progress, path)
 			if match == codexMatchNo {
 				return nil
 			}
@@ -496,12 +515,10 @@ func pollCodexRollouts(
 		if res.truncated {
 			deferredWork = true
 		}
-		if res.consumed > 0 {
-			// Persist after every rollout that moved: an unsaved offset replays
-			// from byte zero after a SIGKILL, which is what stops a restart loop
-			// ever finishing a long backfill.
-			saveCodexWatchProgress(progress)
-		}
+		// Checkpoint mid-poll: an unsaved offset replays from byte zero after a
+		// SIGKILL, which is what stops a restart loop ever finishing a long
+		// backfill.
+		checkpoint(res.consumed)
 		return nil
 	})
 
@@ -564,6 +581,13 @@ const (
 // header only, so a file caught mid-creation whose first record is not yet a
 // readable session_meta is returned codexMatchUndecided (retry next poll) rather
 // than cached as a mismatch — caching "no" would drop it forever.
+//
+// This is the CONVENIENCE classifier: it re-reads from byte zero, so "retry next
+// poll" is the only deferral it has. The poll loop runs
+// classifyCodexRolloutBounded instead, which owns a durable cursor and therefore
+// resolves the same record by SKIPPING it under a bound. Both refuse to cache a
+// "no" off one unreadable record; only the bounded one can also make progress
+// past it.
 func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -613,6 +637,17 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 // classifyCodexRolloutBounded is the durable poll-path classifier. It keeps a
 // cursor distinct from the replay offset so an unsupported leading record can
 // be skipped over multiple bounded polls without forfeiting history.
+//
+// A record that is READABLE but is not the session_meta header is a SKIP, not a
+// verdict, and that is the one place this deliberately does more than its
+// unbounded sibling above rather than less. The sibling has no cursor, so its
+// only options on such a record are "undecided" (re-read the file from byte
+// zero every 3s, forever) or "no" (drop the session, forever); it takes the
+// recoverable one. The cursor here supplies a third: step past the record and
+// keep looking, with codexClassifyMaxSkips bounding the search so an
+// unclassifiable file still reaches a decision. Both halves therefore obey the
+// same rule — a single odd record never costs a whole session — and neither can
+// read without end.
 func classifyCodexRolloutBounded(
 	path string,
 	roots []string,
@@ -634,12 +669,10 @@ func classifyCodexRolloutBounded(
 	}
 
 	result := codexMatchUndecided
-	seen := false
 	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
-		if result != codexMatchUndecided || seen {
+		if result != codexMatchUndecided {
 			return false
 		}
-		seen = true
 		skipped++
 		if skipped > codexClassifyMaxSkips+1 {
 			result = codexMatchNo
@@ -653,11 +686,10 @@ func classifyCodexRolloutBounded(
 			} `json:"payload"`
 		}
 		if json.Unmarshal(line, &rec) != nil {
-			return false
+			return true
 		}
 		if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
-			result = codexMatchNo
-			return false
+			return true
 		}
 		if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
 			result = codexMatchNo
@@ -674,11 +706,12 @@ func classifyCodexRolloutBounded(
 	return result, out, skipped
 }
 
-// codexClassifyMaxSkips bounds how many unsupported (or blank) records one
-// classification pass skips before giving up on finding the session_meta
-// header. Classification has no durable cursor, so every skip is re-read next
-// poll; the bound is what keeps an unclassifiable file from re-reading without
-// end, the same job maxScanLines does on the Claude side.
+// codexClassifyMaxSkips bounds how many records a classification pass steps
+// over before giving up on finding the session_meta header — unsupported, blank
+// or merely not the header. It is what keeps an unclassifiable file from being
+// scanned without end, the same job claudeClassifyMaxScanLines does on the
+// Claude side. The bounded classifier spends it across polls (its cursor is
+// durable); the convenience one spends it within a single pass.
 const codexClassifyMaxSkips = 50
 
 // firstClassifiableCodexRecord returns the first record a rollout's header
@@ -699,10 +732,16 @@ func firstClassifiableCodexRecord(r *bufio.Reader) ([]byte, bool) {
 }
 
 // codexRolloutCwd returns the absolute cwd recorded in a rollout file's
-// session_meta header (the only rollout record carrying cwd), or "" when the
-// first classifiable record is not a readable session_meta. Read-only, header
-// only — the body is never retained; the caller reduces the cwd to a
+// session_meta header (the only rollout record carrying cwd), or "" when no
+// readable session_meta appears within the classifier's skip bound. Read-only,
+// header only — the body is never retained; the caller reduces the cwd to a
 // privacy-safe repo identity.
+//
+// It walks to the header exactly the way classifyCodexRolloutBounded does —
+// past unsupported records AND past readable non-header ones, under the same
+// codexClassifyMaxSkips bound. Stopping at the first non-empty record instead
+// would admit a rollout the classifier only reached the header PAST with no
+// repo identity at all.
 func codexRolloutCwd(path string) string {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only and only the cwd field is read.
 	f, err := os.Open(path)
@@ -710,26 +749,27 @@ func codexRolloutCwd(path string) string {
 		return ""
 	}
 	defer f.Close()
-	// Skips unsupported records exactly as the classifier does — otherwise a
-	// rollout the classifier only reached PAST one would be admitted with no
-	// repo identity at all.
-	line, ok := firstClassifiableCodexRecord(newClassifyReader(f))
-	if !ok || line == nil {
-		return ""
+	reader := newClassifyReader(f)
+	for skipped := 0; skipped <= codexClassifyMaxSkips; skipped++ {
+		line, ok := nextClassifyRecord(reader)
+		if !ok {
+			return ""
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Type    string `json:"type"`
+			Payload struct {
+				Cwd string `json:"cwd"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal(line, &rec) != nil || rec.Type != "session_meta" {
+			continue
+		}
+		return rec.Payload.Cwd
 	}
-	var rec struct {
-		Type    string `json:"type"`
-		Payload struct {
-			Cwd string `json:"cwd"`
-		} `json:"payload"`
-	}
-	if err := json.Unmarshal(line, &rec); err != nil {
-		return ""
-	}
-	if rec.Type != "session_meta" {
-		return ""
-	}
-	return rec.Payload.Cwd
+	return ""
 }
 
 // tailCodexRollout reads new complete lines from path (starting at the stored

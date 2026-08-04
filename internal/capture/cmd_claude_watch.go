@@ -237,14 +237,26 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 		V:                  p.V,
 		RootsFP:            p.RootsFP,
 	}
+	// A ZERO VALUE IS NEVER STORED in the flag/counter maps. `omitempty` on a map
+	// only drops it when the map is EMPTY, so writing an absent key's zero value
+	// here serializes it, reloads it, and re-writes it on the next load — the
+	// poll loop's deletes only cover the files it touched, so the padding is
+	// permanent, self-restoring, and roughly doubles the key count of a progress
+	// file the backfill rewrites repeatedly.
 	for k, v := range p.ClassifyOffsets {
 		nk := claudeProgressKey(k)
 		if cur, ok := out.ClassifyOffsets[nk]; !ok || v > cur {
 			out.ClassifyOffsets[nk] = v
-			out.ClassifyDiscarding[nk] = p.ClassifyDiscarding[k]
-			out.ClassifyScanned[nk] = p.ClassifyScanned[k]
+			if p.ClassifyDiscarding[k] {
+				out.ClassifyDiscarding[nk] = true
+			} else {
+				delete(out.ClassifyDiscarding, nk)
+			}
 		}
 	}
+	// ClassifyScanned is folded by MAXIMUM over every alias, which is why the
+	// loop above deliberately does not seed it: a seed would be an unconditional
+	// write, and the max fold already reaches every alias that has a value.
 	for k, v := range p.ClassifyScanned {
 		nk := claudeProgressKey(k)
 		if v > out.ClassifyScanned[nk] {
@@ -255,7 +267,11 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 		nk := claudeProgressKey(k)
 		if cur, ok := out.Offsets[nk]; !ok || v > cur {
 			out.Offsets[nk] = v
-			out.Discarding[nk] = p.Discarding[k]
+			if p.Discarding[k] {
+				out.Discarding[nk] = true
+			} else {
+				delete(out.Discarding, nk)
+			}
 		}
 	}
 	for k, v := range p.Match {
@@ -271,6 +287,22 @@ func migrateClaudeProgressKeys(p claudeWatchProgress) claudeWatchProgress {
 		out.Match[nk] = v
 	}
 	return out
+}
+
+// clearClaudeClassifyState retires a transcript's classification cursor once
+// its decision is settled — or abandons a partial pass so the next poll starts
+// classification over with a full record budget.
+//
+// The three keys are one unit: the cursor is meaningless without the scan count
+// that bounds it and the discard flag that says whether it points inside an
+// unsupported record. Leaving any of them behind parks the cursor PAST the
+// record that already decided the file while the budget stays partly spent, so
+// a retry that finds no further cwd line caches "no" and drops the session for
+// good.
+func clearClaudeClassifyState(p claudeWatchProgress, key string) {
+	delete(p.ClassifyOffsets, key)
+	delete(p.ClassifyDiscarding, key)
+	delete(p.ClassifyScanned, key)
 }
 
 func loadClaudeWatchProgress() claudeWatchProgress {
@@ -668,6 +700,20 @@ func pollClaudeTranscripts(
 		budget = 0
 	}
 	deferredWork := false
+	// Mid-poll checkpoints are throttled by BYTES CONSUMED, not by file count.
+	// The durability rule is "a crash may replay at most one checkpoint's worth
+	// of work", and bytes are what that rule is actually about; saving once per
+	// drained file makes the poll's write volume O(files x progress-file size),
+	// which during the backfill is tens of megabytes of whole-file rewrites
+	// every interval. See transcriptProgressCheckpointBytes.
+	unsaved := int64(0)
+	checkpoint := func(consumed int64) {
+		unsaved += consumed
+		if unsaved >= transcriptProgressCheckpointBytes {
+			unsaved = 0
+			saveClaudeWatchProgress(progress)
+		}
+	}
 	// One oversized-record probe per poll: it is the only read allowed past the
 	// shared budget, so granting it once keeps the poll's total work bounded
 	// while making the escape independent of walk order.
@@ -716,9 +762,7 @@ func pollClaudeTranscripts(
 			if res.probedOversize || res.consumed > remaining {
 				oversizeProbe = false
 			}
-			if res.consumed > 0 {
-				saveClaudeWatchProgress(progress)
-			}
+			checkpoint(res.consumed)
 			switch match {
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
@@ -728,10 +772,12 @@ func pollClaudeTranscripts(
 				// content. Only when unseen — a real prior offset must be preserved.
 				// If the stat fails transiently, DON'T cache "yes" yet: leave the
 				// match undecided and retry next poll, so a later success seeds EOF
-				// instead of tailing the whole old file from offset 0.
+				// instead of tailing the whole old file from offset 0. The retry has
+				// to start classification OVER — see clearClaudeClassifyState.
 				if _, ok := progress.Offsets[key]; !ok {
 					info, err := os.Stat(path)
 					if err != nil {
+						clearClaudeClassifyState(progress, key)
 						continue
 					}
 					progress.Offsets[key] = info.Size()
@@ -742,9 +788,7 @@ func pollClaudeTranscripts(
 			default: // undecided — no cwd line yet; retry next poll
 				continue
 			}
-			delete(progress.ClassifyOffsets, key)
-			delete(progress.ClassifyDiscarding, key)
-			delete(progress.ClassifyScanned, key)
+			clearClaudeClassifyState(progress, key)
 			if match == claudeMatchNo {
 				continue
 			}
@@ -799,13 +843,10 @@ func pollClaudeTranscripts(
 		if res.truncated {
 			deferredWork = true
 		}
-		if res.consumed > 0 {
-			// Persist after every file that moved, not once at the end: an
-			// unsaved offset is replayed from byte zero after a SIGKILL or a
-			// crash, which is what makes a restart loop unable to ever finish a
-			// long backfill.
-			saveClaudeWatchProgress(progress)
-		}
+		// Checkpoint mid-poll, not only at the end: an unsaved offset is replayed
+		// from byte zero after a SIGKILL or a crash, which is what makes a restart
+		// loop unable to ever finish a long backfill.
+		checkpoint(res.consumed)
 	}
 
 	// Force-flush assistant messages that stopped receiving lines (turn ended
@@ -946,6 +987,18 @@ func workspaceMatchRoots(workspace string) []string {
 	return roots
 }
 
+// claudeClassifyMaxScanLines bounds how many records either classifier examines
+// before concluding a cwd-less file is not a session transcript. It is package
+// scope for the same reason transcriptMaxRecordBytes is: the bounded poll-path
+// classifier and its convenience sibling must not drift on it.
+//
+// The two do count it slightly differently, and deliberately.
+// readTranscriptRecords never hands a blank or oversized record to the bounded
+// classifier's callback, so those cost cursor bytes but no scan credit, whereas
+// nextClassifyRecord returns them to the unbounded pass as empty records that
+// do spend credit. Neither can run without end, which is all the bound is for.
+const claudeClassifyMaxScanLines = 50
+
 // classifyClaudeTranscript decides whether a transcript belongs to this
 // capture session by scanning its first lines for one carrying cwd and matching
 // it against the workspace or any of its registered worktrees. Early lines
@@ -965,9 +1018,8 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 
 	// A record over the supported maximum is skipped, not stalled on: see
 	// nextClassifyRecord. It still counts toward the line budget below, so the
-	// pass stays bounded by the same 50 records it always was.
+	// pass stays bounded by the same records it always was.
 	reader := newClassifyReader(f)
-	const maxScanLines = 50
 	scanned := 0
 	for {
 		line, ok := nextClassifyRecord(reader)
@@ -975,7 +1027,7 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 			break
 		}
 		scanned++
-		if scanned > maxScanLines {
+		if scanned > claudeClassifyMaxScanLines {
 			// A real session writes a cwd-bearing line within the first
 			// prompt; a long cwd-less file is not a session transcript.
 			return claudeMatchNo
@@ -1049,7 +1101,7 @@ func classifyClaudeTranscriptBounded(
 			return false
 		}
 		scanned++
-		if scanned > 50 {
+		if scanned > claudeClassifyMaxScanLines {
 			result = claudeMatchNo
 			return false
 		}

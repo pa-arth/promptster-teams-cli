@@ -110,6 +110,22 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe, discardin
 	return out
 }
 
+// transcriptProgressCheckpointBytes is how many consumed bytes a poll may leave
+// unsaved before it rewrites the progress file, shared by both rails so they
+// cannot drift on the durability bound.
+//
+// It exists because the two costs pull in opposite directions. Saving only at
+// the end of a poll means a SIGKILL replays the whole poll, and a restart loop
+// then never finishes a long backfill. Saving once per drained file makes the
+// write volume O(files-drained x progress-file size) — during the 28-day
+// backfill one poll can drain dozens of small transcripts against a progress
+// file holding thousands of keys, so the whole file is rewritten (temp +
+// rename) dozens of times every interval. Bounding by BYTES is what the
+// durability rule was always about: a crash costs at most this much replayed
+// reading, whatever the file count, and a poll checkpoints at most
+// budget/this many times.
+const transcriptProgressCheckpointBytes = 1 << 20 // 1 MiB
+
 // classifyReadBufSize is the fixed working buffer the classification readers
 // stream through. A record is accumulated up to transcriptMaxRecordBytes;
 // anything larger is discarded to its newline through this same buffer, so
