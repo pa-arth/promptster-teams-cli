@@ -404,6 +404,11 @@ func gitHead(root string) (string, bool) {
 // the unfolded hunks have already moved, and the next rewrite reports over lines
 // nobody wrote. That INFLATES. commitsWithFoldableChain is what keeps them apart.
 //
+// DURABILITY DOES NOT COME THROUGH HERE, and must not be wired back in. It has
+// its own cursor over the DEFAULT branch, advanced per commit inside that
+// commit's ledger transaction, so a range plus a foldable subset is the wrong
+// shape for it entirely — see gitNewDefaultBranchCommits.
+//
 // Spawn budget stays sane: the normal path is one `rev-list`, plus a second only
 // when it actually returned commits; the fallback adds at most one more, in the
 // rare gc'd case. No merge-base spawn.
