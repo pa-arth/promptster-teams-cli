@@ -706,9 +706,19 @@ func pollClaudeTranscripts(
 	// drained file makes the poll's write volume O(files x progress-file size),
 	// which during the backfill is tens of megabytes of whole-file rewrites
 	// every interval. See transcriptProgressCheckpointBytes.
+	//
+	// ACCRUING AND FLUSHING ARE SEPARATE because a cursor advance and the
+	// decision it produces are written at different moments, and only some of
+	// the states in between survive a SIGKILL intact. accrue() records the read
+	// as soon as it happens; checkpoint() is called only where what is in memory
+	// is a state the next poll can resume from — cursor advanced with its
+	// decision, cursor advanced with no decision and nothing consumed past it,
+	// or cursor cleared. Flushing between an advance and its decision persists a
+	// cursor parked PAST the record that already decided the file, which is the
+	// state clearClaudeClassifyState exists to prevent.
 	unsaved := int64(0)
-	checkpoint := func(consumed int64) {
-		unsaved += consumed
+	accrue := func(consumed int64) { unsaved += consumed }
+	checkpoint := func() {
 		if unsaved >= transcriptProgressCheckpointBytes {
 			unsaved = 0
 			saveClaudeWatchProgress(progress)
@@ -762,7 +772,7 @@ func pollClaudeTranscripts(
 			if res.probedOversize || res.consumed > remaining {
 				oversizeProbe = false
 			}
-			checkpoint(res.consumed)
+			accrue(res.consumed)
 			switch match {
 			case claudeMatchYes:
 				progress.Match[key] = "yes"
@@ -778,6 +788,7 @@ func pollClaudeTranscripts(
 					info, err := os.Stat(path)
 					if err != nil {
 						clearClaudeClassifyState(progress, key)
+						checkpoint()
 						continue
 					}
 					progress.Offsets[key] = info.Size()
@@ -786,9 +797,11 @@ func pollClaudeTranscripts(
 			case claudeMatchNo:
 				progress.Match[key] = "no"
 			default: // undecided — no cwd line yet; retry next poll
+				checkpoint()
 				continue
 			}
 			clearClaudeClassifyState(progress, key)
+			checkpoint()
 			if match == claudeMatchNo {
 				continue
 			}
@@ -846,7 +859,8 @@ func pollClaudeTranscripts(
 		// Checkpoint mid-poll, not only at the end: an unsaved offset is replayed
 		// from byte zero after a SIGKILL or a crash, which is what makes a restart
 		// loop unable to ever finish a long backfill.
-		checkpoint(res.consumed)
+		accrue(res.consumed)
+		checkpoint()
 	}
 
 	// Force-flush assistant messages that stopped receiving lines (turn ended
