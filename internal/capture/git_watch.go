@@ -945,10 +945,16 @@ func pollGitWatchWorkspace(session Session) {
 			// — releasing state it cannot maintain — instead of silently reopening
 			// this hole.
 			//
-			// Gated on commits having landed, which is the whole precision of it: a
-			// detached HEAD that commits nothing (a `git bisect`, a CI checkout, a
-			// read-only `git checkout --detach`) has moved no line space, so its
-			// branch keeps its tracking. And the release deliberately keeps the seed
+			// The gate is "this poll surfaced NO COMMITS in cursor..HEAD", so a poll
+			// that surfaces nothing releases nothing. A bare `git checkout --detach`
+			// and a bisect walking ancestors of the cursor are covered BECAUSE their
+			// range is empty, not because nothing was committed. The residual, stated
+			// so nobody rediscovers it: detaching onto a ref that is NOT an ancestor
+			// of this root's cursor — a release tag, another branch's tip, a bisect
+			// whose range spans divergent history — surfaces a non-empty range with
+			// nothing written, and that root's spans are released anyway, an
+			// UNDERCOUNT and never a fabrication, which is the direction this ledger
+			// always resolves toward. And the release deliberately keeps the seed
 			// tombstones — see releaseReworkSpans for why dropping them would trade
 			// this fabrication for the one PR #128 closed.
 			//

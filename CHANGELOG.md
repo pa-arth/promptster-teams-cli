@@ -42,8 +42,8 @@ follows [Semantic Versioning](https://semver.org/).
 
   A rebase now releases that branch's rework tracking instead, which is an
   undercount rather than an invention — and a rebase rewrites the very history
-  those coordinates were measured against. A detached HEAD that creates no
-  commits (a `git bisect`, a CI checkout) moved nothing and keeps its tracking.
+  those coordinates were measured against. A poll that surfaces no commits
+  releases nothing, so a bare `git checkout --detach` keeps its tracking.
 
 - Commit attribution is unchanged by both fixes. Every commit in the detected
   range is still emitted exactly once, including one reachable only through a

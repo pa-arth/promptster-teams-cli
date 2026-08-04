@@ -780,9 +780,11 @@ Two things about it that are easy to get wrong, both learned the expensive way:
     answering it: every commit returned is one that gets folded, so **the cursor
     only ever lands on a commit it folded**, and the root always drains.
   - **REWORK's remaining gate is the scope switch's `default:` arm.** A scope
-    that folds nothing RELEASES the spans it cannot maintain, gated on commits
-    having actually landed — a detached HEAD that commits nothing (a `git
-    bisect`, a CI checkout) moved no line space and keeps its tracking. It is
+    that folds nothing RELEASES the spans it cannot maintain, gated on the poll
+    having surfaced commits at all — a bare `git checkout --detach` and a bisect
+    walking ancestors of the cursor keep their tracking BECAUSE their range is
+    empty; detaching onto a ref off that cursor's ancestry releases anyway, an
+    undercount and never a fabrication. It is
     `default:` rather than `case scopeUnknown:` so a fourth `branchScope` added
     later cannot silently reopen the hole. `releaseReworkSpans` deliberately is
     NOT `clearReworkLedger`: it keeps the seed tombstones and tombstones every
