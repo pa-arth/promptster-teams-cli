@@ -393,6 +393,27 @@ jobs:
 
   # Guardrail: the teams CLI must contain ONLY capture + redaction + signing.
   # Fail the build if the sibling hiring product's anti-cheat / surveillance
+  # A progress-schema bump is a FLEET-WIDE replay event: clearing `Offsets` makes
+  # every device re-read every in-window transcript from zero. #140 was one line
+  # of diff that cost 62,302 replayed events on one device and a 15-day-stale
+  # backlog, and nothing in review could see it. This gate parses the loaders and
+  # refuses an offset-clearing migration whose replay cost is not declared.
+  #
+  # Its own job, not folded into `build & test`, so a failure names the invariant
+  # instead of appearing as one red line among hundreds.
+  progress-migration-cost:
+    name: progress-schema migrations declare their replay cost
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - name: every offset-clearing migration declares a ReplayHorizon
+        run: |
+          go test ./internal/capture/ -run 'TestEveryOffsetClearingMigrationDeclaresItsReplayHorizon|TestSchemaVersionsComeFromTheMigrationTables|TestMigrationTablesAreGaplessAndOrdered' -v 2>&1 | tail -40
+
   # surface ever creeps back into this source.
   audit-cleanliness:
     name: audit (no surveillance/anti-cheat logic)

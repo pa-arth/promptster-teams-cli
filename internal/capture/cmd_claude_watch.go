@@ -187,13 +187,6 @@ type claudeWatchProgress struct {
 	RootsFP string `json:"roots_fp"`
 }
 
-// claudeProgressSchemaV is the current progress-file schema version. v1 dropped
-// stale timestamp-based "no" decisions. v2 reopens previously matched files so
-// the new bounded history policy gets exactly one chance to replay the last 28
-// days. Deterministic event ids make overlap with already-captured live tails
-// idempotent at ingest.
-const claudeProgressSchemaV = 2
-
 func claudeWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "claude-watcher-progress.json")
 }
@@ -340,6 +333,11 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	if p.ClassifyScanned == nil {
 		p.ClassifyScanned = map[string]int{}
 	}
+	// Announce BEFORE migrating, because after it the file reads as current and
+	// the cost is unrecoverable from the data. See progress_migrations.go: the
+	// failure #140 exposed was not the replay itself but that it happened
+	// silently, on someone else's machine, days after the commit.
+	announceProgressReplay("claude", claudeProgressMigrations, p.V)
 	// Idempotent: already-relative keys map to themselves, so this runs
 	// harmlessly on every load and needs no version flag.
 	migrated := migrateClaudeProgressKeys(p)
