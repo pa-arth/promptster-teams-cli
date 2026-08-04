@@ -279,6 +279,113 @@ func TestCommitAttributionDoesNotCrossADivergentSiblingBranch(t *testing.T) {
 	}
 }
 
+// commitsHeldBy IS THE GATE, AND PRODUCTION ALWAYS ASKS IT ABOUT A WHOLE POLL'S
+// RANGE — never one commit at a time. `newSiblingLineage` passes every sha the
+// poll surfaced in ONE read, so a batch mixing commits the sibling holds with
+// commits it does not is the ordinary input, not an edge case.
+//
+// It matters because the interpretation is INVERTED from what git prints:
+// `rev-list <shas...> --not HEAD` lists what the sibling does NOT hold, and held
+// is the complement. Both ways of collapsing that on a mixed batch are silent and
+// opposite — treat any output as "holds nothing" and a whole poll's real evidence
+// is discarded; treat empty-for-some as "holds everything" and an unrelated
+// sibling branch's evidence is admitted, which is the fabrication the gate exists
+// to stop. Single-sha tests cannot tell those apart, because with one input the
+// output is either empty or everything.
+//
+// The short-sha row is in the same batch deliberately: rev-list resolves an
+// abbreviated rev and prints the FULL name, so the abbreviation never appears in
+// the not-held set and would read as held without isFullObjectName — evidence
+// admitted from a sibling that does not hold the commit at all.
+// Requested by review on PR #136.
+func TestCommitsHeldByAnswersEachShaInAMixedRange(t *testing.T) {
+	home := t.TempDir()
+	primary := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, primary)
+
+	writeCommitFile(t, primary, "base.go", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	base := gitOut("rev-parse", "HEAD")
+
+	// A sibling worktree branched at base, given one commit of its own. Its HEAD
+	// therefore holds base and its own commit, and nothing the primary does after.
+	wt := filepath.Join(home, "repos", "proj-wt")
+	git("worktree", "add", "-b", "feat", wt)
+	wtGit, wtOut := gitIn(t, wt)
+	writeCommitFile(t, wt, "feat.go", "feat\n")
+	wtGit("add", "-A")
+	wtGit("commit", "-m", "on feat")
+	onFeat := wtOut("rev-parse", "HEAD")
+
+	// Two more commits on the default branch, after the worktree branched off.
+	writeCommitFile(t, primary, "after1.go", "a1\n")
+	git("add", "-A")
+	git("commit", "-m", "after 1")
+	after1 := gitOut("rev-parse", "HEAD")
+	writeCommitFile(t, primary, "after2.go", "a2\n")
+	git("add", "-A")
+	git("commit", "-m", "after 2")
+	after2 := gitOut("rev-parse", "HEAD")
+
+	// ONE batch, interleaved so neither a prefix nor a suffix of the input could
+	// produce the right answer by accident.
+	shortBase := base[:8]
+	held := commitsHeldBy(wt, []string{after1, base, after2, onFeat, shortBase})
+
+	want := map[string]bool{
+		base:    true,  // the branch point — the sibling holds it
+		onFeat:  true,  // the sibling's own commit
+		after1:  false, // landed on the default branch after it forked
+		after2:  false,
+		// shortBase is NOT expected: rev-list prints full names, so an
+		// abbreviation cannot be compared against the output it is judged by.
+	}
+	for sha, wantHeld := range want {
+		if held[sha] != wantHeld {
+			t.Errorf("commitsHeldBy(%s)[%s] = %v, want %v — a mixed range must be answered per-sha, not collapsed",
+				wt, sha[:8], held[sha], wantHeld)
+		}
+	}
+	if held[shortBase] {
+		t.Errorf("an abbreviated rev (%s) read as held — rev-list prints FULL object names, so a short one can never match the output it is compared against, and admitting it lets a sibling contribute evidence about a commit it may not hold", shortBase)
+	}
+	if len(held) != 2 {
+		t.Errorf("held = %v, want exactly the two commits the sibling reaches", held)
+	}
+
+	// The same batch through the production entry point, to pin that the gate the
+	// attribution loop actually consults agrees with the read above. Keyed by
+	// resolvePath because gitSiblingWorktrees resolves every checkout it returns —
+	// on macOS a t.TempDir() path is a symlink into /private, so the raw path is
+	// not the key production uses.
+	sib := resolvePath(wt)
+	lin := newSiblingLineage(primary, []string{after1, base, after2, onFeat})
+	if !lin.reaches(sib, base) || !lin.reaches(sib, onFeat) {
+		t.Errorf("siblingLineage lost evidence the sibling genuinely holds: base=%v onFeat=%v", lin.reaches(sib, base), lin.reaches(sib, onFeat))
+	}
+	if lin.reaches(sib, after1) || lin.reaches(sib, after2) {
+		t.Errorf("siblingLineage admitted commits the sibling forked away from: after1=%v after2=%v", lin.reaches(sib, after1), lin.reaches(sib, after2))
+	}
+}
+
+// A sibling that cannot be read at all must hold NOTHING. The inverted rev-list
+// makes the safe direction the non-obvious one: a failed read produces no output,
+// and "no output" is also what a sibling holding every sha produces, so anything
+// that keys off the output rather than the error admits an entire poll's evidence
+// from a checkout it could not even inspect.
+func TestCommitsHeldByHoldsNothingWhenTheSiblingCannotBeRead(t *testing.T) {
+	home := t.TempDir()
+	primary := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, primary)
+	git("commit", "--allow-empty", "-m", "base")
+	sha := gitOut("rev-parse", "HEAD")
+
+	if held := commitsHeldBy(filepath.Join(home, "no-such-checkout"), []string{sha}); len(held) != 0 {
+		t.Errorf("held = %v, want empty — an unreadable checkout is not evidence of anything", held)
+	}
+}
+
 // gitSiblingWorktrees is the primitive the entire scoping argument rests on: it
 // is what says a checkout belongs to THIS repository and nothing else does. All
 // three answers are pinned together — none, one, and never-a-clone — because the
