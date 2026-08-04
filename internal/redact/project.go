@@ -173,8 +173,24 @@ var projectFieldAllowlist = map[string][]string{
 	"api_request":   {"status"},
 	"api_error":     {"status", "error"},
 	// Presence / liveness: device + CLI/host metadata. All non-source.
-	"heartbeat": {"device", "cliVersion", "os", "arch", "watching"},
-	"presence":  {"device", "cliVersion", "os", "arch", "watching", "state"},
+	//
+	// `pendingEvents` / `pendingOldestEventAt` are the device's own outbox
+	// backlog — an integer and a timestamp ABOUT THIS QUEUE, never about what is
+	// in it. They exist because on 2026-08-04 the backend could not tell
+	// "connected and idle" from "connected and hours behind", and told a manager
+	// that an actively-working engineer had zero active sessions.
+	//
+	// Both kinds must list them. This rail default-DENIES, so a field the CLI
+	// sends and this map does not name is stripped SILENTLY: the beat would keep
+	// returning 201 and the numbers would simply never arrive.
+	"heartbeat": {
+		"device", "cliVersion", "os", "arch", "watching",
+		"pendingEvents", "pendingOldestEventAt",
+	},
+	"presence": {
+		"device", "cliVersion", "os", "arch", "watching", "state",
+		"pendingEvents", "pendingOldestEventAt",
+	},
 	// Config census: token-count inventory — counts and names only.
 	// workspaceKey is a git remote slug (owner/name) or an opaque sha256(path)
 	// hash — never a filesystem path and never file contents (pinned by

@@ -7,6 +7,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	"github.com/pa-arth/promptster-teams-cli/internal/version"
@@ -52,6 +53,28 @@ type presenceData struct {
 	OS         string   `json:"os"`         // runtime.GOOS
 	Arch       string   `json:"arch"`       // runtime.GOARCH
 	Watching   []string `json:"watching"`   // tool sources this device is watching
+
+	// DELIVERY BACKLOG. This device is the only party that knows how far behind
+	// its own outbox is, and until now it had no way to say so. On 2026-08-04 a
+	// manager was told an engineer had zero active sessions for over an hour
+	// while that engineer worked the whole time: the CLI was replaying 28 days of
+	// history through a FIFO outbox, the events landing were three weeks old, and
+	// the server's monotonic `last_activity_at` correctly refused to move. Ingest
+	// was 100% healthy throughout. Nothing on the wire could distinguish
+	// "connected and idle" from "connected and hours behind".
+	//
+	// NOT omitempty, and that is the entire contract. A reported ZERO is a
+	// measurement ("caught up") and must reach the server as one; the server
+	// distinguishes it from silence via its own `latest_pending_reported_at`
+	// stamp, which it only writes when a usable count arrived. Adding omitempty
+	// here would erase every caught-up report and put the fleet straight back to
+	// being indistinguishable from one that cannot report at all.
+	PendingEvents int `json:"pendingEvents"`
+	// RFC3339 timestamp of the oldest undelivered event, omitted when the queue
+	// is empty. The AGE is what separates a busy afternoon from an outage — the
+	// count alone cannot tell 62k-queued-from-five-minutes-ago from
+	// 62k-queued-from-three-weeks-ago.
+	PendingOldestEventAt string `json:"pendingOldestEventAt,omitempty"`
 }
 
 // watchedTools reports which AI tools this device is set up to capture, keyed
@@ -101,15 +124,29 @@ func dirExists(path string) bool {
 // watch restart would look like a brand-new device and seat counts would
 // inflate without bound.
 func buildPresenceEvent(session Session) event.Event {
+	// Read the backlog at BUILD time, so the numbers are stamped alongside the
+	// `ts` they describe rather than sampled at some later point in the funnel.
+	pending := outbox.PendingStateNow()
+	oldest := ""
+	// Only alongside a non-empty queue, and only from the same observation. An
+	// age reported next to a count of 0 would leave a three-week-old timestamp
+	// standing on a queue that has drained — the server nulls it defensively for
+	// exactly this reason, and sending it anyway would make that defence the only
+	// thing standing between a manager and a permanent phantom outage.
+	if pending.Count > 0 && !pending.Oldest.IsZero() {
+		oldest = pending.Oldest.UTC().Format(time.RFC3339Nano)
+	}
 	e := event.NewEvent("presence", session.DeviceID)
 	e.Source = presenceSource
 	e.DeviceID = session.DeviceID
 	e.Data = eventDataMap(presenceData{
-		Device:     session.DeviceID,
-		CLIVersion: version.Version,
-		OS:         runtime.GOOS,
-		Arch:       runtime.GOARCH,
-		Watching:   watchedTools(),
+		Device:               session.DeviceID,
+		CLIVersion:           version.Version,
+		OS:                   runtime.GOOS,
+		Arch:                 runtime.GOARCH,
+		Watching:             watchedTools(),
+		PendingEvents:        pending.Count,
+		PendingOldestEventAt: oldest,
 	})
 	return e
 }
