@@ -614,7 +614,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	// sees the AI evidence; when root == taskRoot the scope is the identity. (The
 	// per-root rootKey still keys fingerprints and the durability cursor below —
 	// those are git-watch's own on-device state, correctly per-repo.)
-	scope := resolveLedgerScope(root, session.TaskRoot)
+	scope := resolveLedgerScope(root, session.TaskRoot, sha)
 	// The full-fidelity read, not readAiTouchedPaths: seeding a path the root has
 	// already first-touched turns on the per-path WRITE STAMP, which is the only
 	// thing in this ledger that distinguishes "an agent wrote this file again"
@@ -746,7 +746,14 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	// Resolved BEFORE the ledger lock (the ai-paths ledger has its own): a
 	// harvested path leaves the ledger, so it is tombstoned with the evidence
 	// current now, exactly as the churn route is.
-	scope := resolveLedgerScope(root, session.TaskRoot)
+	//
+	// ALL CHECKOUTS, ungated: harvesting is driven by a clock, not by a commit, so
+	// there is no commit to gate a sibling worktree's evidence against. That is
+	// safe in exactly this direction — both uses below (the tombstone pruner and
+	// the write stamp a departing path is tombstoned at) can only SUPPRESS later
+	// seeding, never authorize it, and the narrower view is the one that would
+	// tombstone at 0 and let spent evidence re-arm the seed gate.
+	scope := resolveLedgerScopeAllCheckouts(root, session.TaskRoot)
 	marks := readAiPathMarks(scope.aiKey)
 	aiPathKnown := func(path string) bool { _, ok := ledgerLookup(scope, marks, path); return ok }
 	writeStamp := func(path string) int64 { m, _ := ledgerLookup(scope, marks, path); return m.WriteMs }

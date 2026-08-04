@@ -45,6 +45,15 @@ func gitIn(t *testing.T, dir string) (run func(args ...string), out func(args ..
 // several worktrees against one repository is the ordinary move that hits it, and
 // every one of them under-reported.
 //
+// The recovery is GATED ON LINEAGE, because worktrees are how one repository
+// holds several branches at once: a sibling's evidence counts only while that
+// checkout stands on the same line of history as the commit. Matching on the
+// relative path alone would hand a feature worktree's AI write to a human's
+// commit on the default branch — see
+// TestCommitAttributionDoesNotCrossADivergentSiblingBranch, which is the
+// fabrication case and asserts absence on all three of attribution, session and
+// durability spans.
+//
 // EVERY TEST IN THIS FILE USES A GENUINE SECOND DIRECTORY (`git worktree add`).
 // That is not incidental: the pre-existing
 // TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree simulates the second
@@ -216,6 +225,57 @@ func TestCommitAttributionDoesNotCrossIntoASeparateClone(t *testing.T) {
 	}
 }
 
+// COLLISION #3, AND THE ONE THAT FABRICATES — a sibling worktree of the SAME
+// repository, holding real AI evidence for the SAME relative path, but parked on
+// a DIVERGENT branch. Sibling worktrees are how a repository holds several
+// branches at once, so matching a sibling's evidence on the relative path alone
+// hands an agent's write in the feature worktree to a human's commit on the
+// default branch — an invented number, which outranks any under-count.
+//
+// The commit is not reachable from the agent worktree's HEAD and does not descend
+// from it, so the lookup MISSES: `unknown`, no session, and no durability span.
+// Absence on all three, so a wrong answer and a missing answer cannot pass the
+// same assertion.
+func TestCommitAttributionDoesNotCrossADivergentSiblingBranch(t *testing.T) {
+	home, primary, wt, _, _ := worktreeAttributionRepo(t)
+	const t0 int64 = 1_000_000_000_000
+
+	// The agent's checkout, moved onto a feature branch and given a commit of its
+	// own so its history genuinely diverges from the default branch. The evidence
+	// is recorded exactly as capture would: workspace root key, path relative to
+	// the checkout the agent edited in.
+	wtGit, _ := gitIn(t, wt)
+	wtGit("checkout", "-b", "feat")
+	recordAiTouchedPath("sess-feat", gitWatchRootKey(home), "work/proj-wt/internal/x.go")
+	writeCommitFile(t, wt, "internal/x.go", "ai1\nai2\nai3\n")
+	wtGit("add", "-A")
+	wtGit("commit", "-m", "ai writes internal/x.go on feat")
+
+	// A human hand-writes the SAME relative path in the OTHER checkout, on the
+	// default branch, well inside the 7-day ai-paths TTL, and commits it there.
+	git, gitOut := gitIn(t, primary)
+	writeCommitFile(t, primary, "internal/x.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human writes internal/x.go on the default branch")
+	humanSha := gitOut("rev-parse", "HEAD")
+
+	got, sess := attributionOf(t, primary, home, humanSha)
+	if got["internal/x.go"] != attributionUnknown {
+		t.Fatalf("divergent sibling: internal/x.go = %q, want %q — a worktree on another branch is not evidence about this commit",
+			got["internal/x.go"], attributionUnknown)
+	}
+	if sess != "" {
+		t.Fatalf("divergent sibling: session = %q, want no session at all", sess)
+	}
+
+	primaryKey := gitWatchRootKey(primary)
+	pollDurabilityCommit(primary, primaryKey, Session{DeviceID: "dev-primary", TaskRoot: home}, humanSha, t0)
+	if n := trackedLineCount(t, primaryKey, "internal/x.go"); n != 0 {
+		t.Fatalf("a human's lines were seeded as AI off a divergent worktree's evidence: %d lines tracked, want 0 (ranges %+v)",
+			n, ledgerRanges(t, primaryKey, "internal/x.go"))
+	}
+}
+
 // gitSiblingWorktrees is the primitive the entire scoping argument rests on: it
 // is what says a checkout belongs to THIS repository and nothing else does. All
 // three answers are pinned together — none, one, and never-a-clone — because the
@@ -276,6 +336,11 @@ func TestGitSiblingWorktreesIsScopedToOneRepository(t *testing.T) {
 //	           (this half fails before the fix: 0 lines tracked);
 //	negative — a path NO agent wrote anywhere is NOT, even though the very same
 //	           commit carries a path that is. Absence, not a count.
+//
+// It is also the lineage gate's descends-from direction: the sibling holding the
+// evidence has not moved, so this commit is built directly on top of its HEAD.
+// That is the shape a worktree the agent last worked in is normally left in —
+// distinct from the divergent-branch shape, which must miss.
 func TestDurabilitySeedsFromSiblingWorktreeEvidenceButNotUntouchedPaths(t *testing.T) {
 	home, primary, wt, _, _ := worktreeAttributionRepo(t)
 	const t0 int64 = 1_000_000_000_000

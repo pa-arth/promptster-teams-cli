@@ -1078,27 +1078,60 @@ per `git worktree list` entry and `ledgerLookup` falls through them, own
 checkout FIRST so a single-checkout machine is byte-for-byte unchanged and a
 two-worktree tie is deterministic.
 
-**The widening is over CHECKOUTS, never over PATHS.** Only this repository's
-worktrees are consulted, so another repo, or a CLONE of the same upstream,
-cannot contribute evidence — a clone has its own object store and its own
-worktree list, and that under-count is deliberate. The committed path must
-still match exactly. The residual inherited is the one path-level attribution
-already documents (a file AI-touched then human-edited inside the 7-day TTL
-reads `likely_ai`), now spanning a repo's worktrees rather than one directory:
-same class, same granularity.
+**The widening is over CHECKOUTS, never over PATHS — and only over checkouts on
+THIS COMMIT'S OWN LINE OF HISTORY.** Only this repository's worktrees are
+consulted, so another repo, or a CLONE of the same upstream, cannot contribute
+evidence — a clone has its own object store and its own worktree list, and that
+under-count is deliberate. The committed path must still match exactly.
+
+A bare repo-relative match across checkouts FABRICATES, because worktrees are
+how one repository holds several branches at once: an agent writes
+`internal/x.go` in the feature worktree, a human hand-edits `internal/x.go` on
+the default branch inside the 7-day TTL and commits it there, and the human's
+commit inherits the agent's session. So `commitInCheckoutLineage` gates every
+alt — its HEAD must reach the commit, or the commit must descend from its HEAD
+(two `git merge-base --is-ancestor` probes at most, per sibling, per commit;
+`repoHasLinkedWorktrees` keeps a repo with no siblings at zero). A sibling on a
+divergent branch is dropped, and the lookup then MISSES rather than falling
+through to the bare path.
+
+**What that deliberately does NOT recover**: evidence held by a checkout whose
+HEAD has moved off the commit's history — the agent's worktree switched
+branches, or was reset elsewhere, before the commit was polled. That reads
+`unknown`. It is a conservative under-count, on purpose, and a wrong number
+outranks a missing one. The residual that DOES remain is the path-level one
+`reconcileCommitAttribution` note 2 already documents — a file AI-touched then
+human-edited inside the 7-day TTL reads `likely_ai` — now reachable from a
+sibling sharing the commit's history rather than from the polled directory
+alone. It is NOT "the same granularity" as the one-directory residual: the blast
+radius is every checkout on that line of history, which is why the lineage gate
+is the thing holding it down.
+
+`harvestDurable` is the ONE caller that takes alts ungated
+(`resolveLedgerScopeAllCheckouts`): it ages spans out on a clock, so there is no
+commit to gate against, and both things it reads the scope for — the tombstone
+pruner and the stamp a departing path is tombstoned at — can only SUPPRESS later
+seeding. The narrow view is the unsafe one there: it would tombstone at 0 and
+let spent evidence re-arm the seed gate.
 
 `repoHasLinkedWorktrees` short-circuits, stat-only, before any spawn or memo, so
 a repo that never had `git worktree add` run against it costs nothing AND picks
 its first worktree up immediately. Only a repo that already has one pays the
-memoized `git worktree list` (≤1 spawn per root per poll — `resolveLedgerScope`
-runs once per COMMIT in three places, so an unmemoized spawn would scale with
-commits).
+memoized `git worktree list` (≤1 spawn per root per poll) and the lineage
+probes. `resolveLedgerScope` runs once per COMMIT in three places, so both the
+enumeration and the mapping of siblings onto the ledger path space are memoized
+on one entry (`siblingLedgerScopes`) — an unmemoized spawn, or a re-resolved
+scope, would scale with commits × worktrees.
 
 **Any test here must use a REAL second directory.**
 `TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` simulates the
 second worktree inside ONE directory, which is exactly what let this defect
 through — one directory is one ledger key, so the divergence never appears.
-`commit_attribution_worktree_test.go` uses `git worktree add` throughout.
+`commit_attribution_worktree_test.go` uses `git worktree add` throughout, and
+`TestCommitAttributionDoesNotCrossADivergentSiblingBranch` is the bound that
+keeps the widening honest: real AI evidence, same relative path, divergent
+branch, and it asserts the ABSENCE of attribution, of a session, and of a
+durability span.
 
 ## Maintaining this file
 

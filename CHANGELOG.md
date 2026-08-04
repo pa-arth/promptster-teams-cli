@@ -94,13 +94,25 @@ follows [Semantic Versioning](https://semver.org/).
 
   A lookup now falls through to the repository's other worktrees, own checkout
   first. It is scoped **to** the checkouts `git worktree list` reports for that
-  one repository, and **against** everything else: a different repository cannot
-  contribute evidence, two unrelated files that merely share a relative path
-  cannot collide, and neither can a *clone* of the same upstream (its own object
-  store, its own worktree list) — a deliberate under-count on the conservative
-  side. The widening is over checkouts, never over paths: the committed path must
-  still match exactly, so a path no agent wrote in any checkout stays `unknown`.
-  Evidence already on disk is read exactly as before and is never invalidated.
+  one repository *that stand on the commit's own line of history* — the sibling's
+  HEAD reaches the commit, or the commit descends from it — and **against**
+  everything else: a different repository cannot contribute evidence, two
+  unrelated files that merely share a relative path cannot collide, neither can a
+  *clone* of the same upstream (its own object store, its own worktree list), and
+  neither can a worktree parked on a **divergent branch**. That last one is the
+  reason for the history check rather than a plain path match: worktrees are how
+  one repository holds several branches at once, so matching on the relative path
+  alone would hand an agent's write in the feature worktree to a human's commit
+  on the default branch. The widening is over checkouts, never over paths: the
+  committed path must still match exactly, so a path no agent wrote in any
+  checkout stays `unknown`. Evidence already on disk is read exactly as before and
+  is never invalidated.
+
+  **What it deliberately does not recover:** evidence held by a checkout whose
+  HEAD has since moved off the commit's history — the agent's worktree switched
+  branches before the commit was polled. Those commits keep reading `unknown`.
+  That is a conservative under-count on purpose; an invented number is the failure
+  this product cannot afford, a missing one is not.
 
 ## [0.12.2] — 2026-08-03
 

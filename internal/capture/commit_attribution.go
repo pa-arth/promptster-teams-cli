@@ -105,7 +105,7 @@ func commitAttributionFromDiff(root, taskRoot, sha string) (diff string, files [
 	// repo-relative path into the workspace-relative key it was stored under. When
 	// root == taskRoot (explicit repo) the scope is the identity. Scoping to one
 	// key also keeps a same-named path AI-touched in a DIFFERENT repo from bleeding in.
-	scope := resolveLedgerScope(root, taskRoot)
+	scope := resolveLedgerScope(root, taskRoot, sha)
 	files, primarySession = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
 	return diff, files, primarySession, true
 }
@@ -198,9 +198,12 @@ func reconcileCommitAttribution(root string, scope ledgerScope, fileRanges map[s
 		//      them: it prepends rel(taskRoot, root) so a commit in a repo DISCOVERED
 		//      under the daemon's HOME workspace matches its home-relative ledger key.
 		//      When root == taskRoot the translation is the identity. It then falls
-		//      through to the repository's OTHER worktrees, because the ledger records
-		//      the checkout the agent edited in while a commit belongs to the repo —
-		//      without that, every commit made in a sibling worktree read `unknown`.
+		//      through to the repository's other worktrees THAT STAND ON THIS COMMIT'S
+		//      OWN LINE OF HISTORY, because the ledger records the checkout the agent
+		//      edited in while a commit belongs to the repo — without that, every
+		//      commit made in a sibling worktree read `unknown`. A sibling on a
+		//      divergent branch is excluded: matching its evidence by relative path
+		//      alone is how a human's commit here would inherit an agent's write there.
 		if sid, ok := ledgerLookup(scope, aiPaths, path); ok {
 			attribution = attributionLikelyAI
 			session = sid

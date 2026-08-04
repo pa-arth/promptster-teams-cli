@@ -116,12 +116,14 @@ type ledgerScope struct {
 	aiKey   string // the root key the ai-paths / bash-windows ledgers are stored under
 	prefix  string // POSIX rel(taskRoot, root) when root is UNDER taskRoot ("" == taskRoot)
 	absRoot string // resolved root, set when root is OUTSIDE taskRoot (evidence stored absolute)
-	// alts are the polled repository's OTHER worktrees, each mapped into the
-	// ledger's path space by the identical rule (see resolveLedgerScope). They
-	// exist because the ledger records a path relative to the checkout the agent
-	// actually edited in, while attribution asks about a commit — and a commit
-	// belongs to the REPOSITORY, not to one of its checkouts. Always nil on an
-	// alt itself: the expansion is exactly one level deep.
+	root    string // resolved checkout this scope maps; an alt is probed here for lineage
+	// alts are the polled repository's OTHER worktrees that stand on the SAME LINE
+	// OF HISTORY as the commit being reconciled, each mapped into the ledger's path
+	// space by the identical rule (see resolveLedgerScope). They exist because the
+	// ledger records a path relative to the checkout the agent actually edited in,
+	// while attribution asks about a commit — and a commit belongs to the
+	// REPOSITORY, not to one of its checkouts. Always nil on an alt itself: the
+	// expansion is exactly one level deep.
 	alts []ledgerScope
 }
 
@@ -145,34 +147,83 @@ type ledgerScope struct {
 // taskRoot == "" (no workspace, e.g. a malformed session) falls back to the
 // per-root key.
 //
-// SIBLING WORKTREES. The rule above resolves ONE checkout, but the ledger records
-// a path relative to whichever checkout the agent actually edited in, and a
-// commit belongs to the repository rather than to a checkout of it. So a machine
-// running several worktrees against one repository read every commit made in
-// another worktree as `unknown` — a silent under-count of the headline
-// AI-attribution number, and the ceiling on every cross-checkout recovery path
-// (they replay the right commits and find no AI ranges to seed). The scope
-// therefore also carries the repository's OTHER worktrees, each mapped by the
-// SAME rule, and a lookup falls through to them (see ledgerLookup).
+// SIBLING WORKTREES, AND THE LINEAGE GATE ON THEM. The rule above resolves ONE
+// checkout, but the ledger records a path relative to whichever checkout the
+// agent actually edited in, and a commit belongs to the repository rather than to
+// a checkout of it. So a machine running several worktrees against one repository
+// read every commit made in another worktree as `unknown` — a silent under-count
+// of the headline AI-attribution number, and the ceiling on every cross-checkout
+// recovery path (they replay the right commits and find no AI ranges to seed).
+// The scope therefore also carries the repository's OTHER worktrees, each mapped
+// by the SAME rule, and a lookup falls through to them (see ledgerLookup).
 //
-// What that widening is scoped TO and AGAINST:
+// A BARE repo-relative match across checkouts would FABRICATE, because sibling
+// worktrees hold DIFFERENT BRANCHES: an agent writes internal/x.go in the feature
+// worktree, a human hand-edits internal/x.go in the default-branch checkout
+// inside the 7-day ai-paths TTL and commits it there, and the human's commit
+// picks the agent's evidence up off the shared relative path. So a sibling's
+// evidence counts ONLY while that checkout stands on the SAME LINE OF HISTORY as
+// the commit — commitInCheckoutLineage. Where it does not, the lookup MISSES; it
+// never falls through to a bare path match. A wrong number is disqualifying, a
+// missing one is merely a conservative under-count.
+//
+// What the gated lookup GUARANTEES, scoped TO and AGAINST:
 //   - TO: the checkouts `git worktree list` reports for THIS repository — one
-//     object store, one branch namespace, one file namespace. "The same
-//     repo-relative path in a worktree of this repo" is the same file in the same
-//     repository, which is exactly the fact the ledger already asserts.
+//     object store, one file namespace — AND, of those, only the ones whose HEAD
+//     shares a line of history with the commit. That covers every genuine
+//     recovery: the same branch observed from another checkout, the branch-adoption
+//     replay, and the cold-start worktree replay all reconcile a commit that the
+//     evidence-holding checkout's own HEAD reaches (or that descends from it).
 //   - AGAINST: everything else. Another repository never appears in this repo's
 //     worktree list, so two unrelated files that merely share a relative path
 //     cannot collide. Neither can a CLONE of the same upstream: it has its own
-//     object store and its own worktree list, so evidence does not cross it. That
-//     is a deliberate under-count on the conservative side.
+//     object store and its own worktree list. And a sibling parked on a DIVERGENT
+//     branch contributes nothing, however exactly its paths line up.
 //
-// It does NOT widen which PATHS count: the committed path must match exactly,
-// in a checkout of this same repository. The residual it inherits is the one
-// path-level attribution already documents (reconcileCommitAttribution note 2) —
-// a file AI-touched and later human-edited inside the 7-day TTL still reads
-// likely_ai — now spanning that repo's worktrees rather than one directory. Same
-// class, same granularity, no new one.
-func resolveLedgerScope(root, taskRoot string) ledgerScope {
+// What it deliberately does NOT recover: evidence held by a checkout whose HEAD
+// has moved off the commit's line of history — the agent's worktree switched
+// branches, or was reset elsewhere, before the commit was polled. That reads
+// `unknown`. It is an under-count on purpose, not a bug.
+//
+// It does NOT widen which PATHS count either: the committed path must match
+// exactly, in a checkout of this same repository standing on this same history.
+// The residual it inherits is the one path-level attribution already documents
+// (reconcileCommitAttribution note 2) — a file AI-touched and later human-edited
+// inside the 7-day TTL still reads likely_ai — now reachable from a sibling that
+// shares the commit's history rather than from the polled directory alone.
+//
+// commitSha == "" yields NO alts: a caller with no commit in hand cannot be given
+// evidence it has no way to gate. resolveLedgerScopeAllCheckouts is the one
+// deliberate exception and documents why it is safe there.
+func resolveLedgerScope(root, taskRoot, commitSha string) ledgerScope {
+	return ledgerScopeWithAlts(root, taskRoot, func(alt ledgerScope) bool {
+		// SPAWN BUDGET, concretely: at most two `git merge-base --is-ancestor`
+		// probes per sibling per call (the second only when the first says no), and
+		// only for a repository that actually HAS a sibling — repoHasLinkedWorktrees
+		// keeps every other repo at zero. Bounded per poll by
+		// gitWatchMaxCommitsPerPollTotal commits x 3 scope resolutions x siblings.
+		// Same order as the read-only probe #132 already spends per poll.
+		return commitSha != "" && commitInCheckoutLineage(alt.root, commitSha)
+	})
+}
+
+// resolveLedgerScopeAllCheckouts is resolveLedgerScope for the ONE caller that
+// holds no commit: harvestDurable, which ages spans out on a clock rather than
+// folding a commit. Its alts are ungated because there is nothing to gate them
+// against, and that is safe HERE and only here — both things it reads the scope
+// for can merely SUPPRESS seeding, never authorize it. A wider aiPathKnown keeps
+// MORE seed tombstones alive (pruneSeedTombstones only ever deletes what the gate
+// can no longer fire on), and a wider write stamp tombstones a harvested path
+// HIGHER, which the strictly-newer evidence rule then demands more to lift. A
+// NARROWER view here would be the unsafe direction: it would tombstone a departing
+// path at stamp 0 and let evidence already spent on it re-authorize seeding.
+func resolveLedgerScopeAllCheckouts(root, taskRoot string) ledgerScope {
+	return ledgerScopeWithAlts(root, taskRoot, func(ledgerScope) bool { return true })
+}
+
+// ledgerScopeWithAlts resolves the polled checkout and appends the sibling scopes
+// `keep` accepts.
+func ledgerScopeWithAlts(root, taskRoot string, keep func(ledgerScope) bool) ledgerScope {
 	s := ledgerScopeFor(root, taskRoot)
 	if taskRoot == "" {
 		// No workspace to anchor to, so every scope falls back to its OWN root key
@@ -181,8 +232,10 @@ func resolveLedgerScope(root, taskRoot string) ledgerScope {
 		// widen to; stay on the fallback exactly as before.
 		return s
 	}
-	for _, sibling := range gitSiblingWorktrees(root) {
-		s.alts = append(s.alts, ledgerScopeFor(sibling, taskRoot))
+	for _, alt := range siblingLedgerScopes(root, taskRoot) {
+		if keep(alt) {
+			s.alts = append(s.alts, alt)
+		}
 	}
 	return s
 }
@@ -193,17 +246,17 @@ func resolveLedgerScope(root, taskRoot string) ledgerScope {
 // is byte-for-byte what it was.
 func ledgerScopeFor(root, taskRoot string) ledgerScope {
 	if taskRoot == "" {
-		return ledgerScope{aiKey: gitWatchRootKey(root)}
+		return ledgerScope{aiKey: gitWatchRootKey(root), root: resolvePath(root)}
 	}
 	rRoot := resolvePath(root)
 	rel, err := filepath.Rel(resolvePath(taskRoot), rRoot)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return ledgerScope{aiKey: gitWatchRootKey(taskRoot), absRoot: rRoot} // outside workspace
+		return ledgerScope{aiKey: gitWatchRootKey(taskRoot), absRoot: rRoot, root: rRoot} // outside workspace
 	}
 	if rel == "." {
 		rel = ""
 	}
-	return ledgerScope{aiKey: gitWatchRootKey(taskRoot), prefix: filepath.ToSlash(rel)}
+	return ledgerScope{aiKey: gitWatchRootKey(taskRoot), prefix: filepath.ToSlash(rel), root: rRoot}
 }
 
 // ledgerPath translates a repo-relative committed path into the key the ai-paths
@@ -222,7 +275,11 @@ func (s ledgerScope) ledgerPath(committedRel string) string {
 
 // ledgerLookup resolves one repo-relative committed path against a ledger map
 // keyed the way capture records paths, trying the polled checkout first and then
-// each of the repository's other worktrees.
+// each alt scope — the repository's other worktrees that resolveLedgerScope
+// already gated onto the commit's own line of history. A checkout parked on a
+// divergent branch is not among them, so its evidence is never reached: this
+// falls through to a repo-relative path in a SIBLING OF THIS COMMIT'S HISTORY,
+// never to a bare repo-relative path.
 //
 // OWN CHECKOUT FIRST, and the order is load-bearing twice over. It makes the
 // deployed single-checkout case identical to the pre-sibling behavior — evidence
@@ -243,6 +300,91 @@ func ledgerLookup[T any](s ledgerScope, m map[string]T, committedRel string) (T,
 	}
 	var zero T
 	return zero, false
+}
+
+// commitInCheckoutLineage reports whether `checkout` stands on the SAME LINE OF
+// HISTORY as sha — either its HEAD reaches the commit, or the commit descends
+// from its HEAD. That is the gate that keeps a sibling worktree's AI-path
+// evidence from attributing human code:
+//
+//   - HEAD reaches sha: the checkout holds the commit, which is every genuine
+//     cross-checkout recovery — the branch the agent worked on, observed from
+//     another copy (adoption replay, cold-start replay, a shared branch).
+//   - sha descends from HEAD: the commit is built directly on top of what this
+//     checkout has out, so the agent's working-tree writes recorded there sit in
+//     the commit's own lineage. This is the direction a worktree that has not
+//     moved since the agent wrote lands in.
+//   - NEITHER: the histories have diverged — the classic feature-worktree /
+//     default-branch pair — and the evidence is dropped. Under-count, on purpose.
+//
+// Read-only, and every failure (git missing, an object not present, a checkout
+// with no HEAD) returns false, so an inconclusive probe drops the evidence rather
+// than widening on it.
+func commitInCheckoutLineage(checkout, sha string) bool {
+	if checkout == "" || sha == "" {
+		return false
+	}
+	return gitIsAncestor(checkout, sha, "HEAD") || gitIsAncestor(checkout, "HEAD", sha)
+}
+
+// gitIsAncestor runs one `git merge-base --is-ancestor`, whose exit status IS the
+// answer: 0 for yes, non-zero for no or for any error. A commit is its own
+// ancestor, so a checkout sitting exactly on sha answers yes.
+func gitIsAncestor(dir, ancestor, descendant string) bool {
+	// #nosec G204 -- constant argv; dir is a checkout of a repo this install already polls and the revs are git object names read from that same repo, not attacker input. Read-only: it resolves objects and returns an exit code.
+	return exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
+}
+
+// siblingLedgerScopes maps root's sibling worktrees onto the ledger's path space,
+// memoized alongside the worktree list itself.
+//
+// The memo is the point: resolveLedgerScope runs once per COMMIT in three places,
+// and ledgerScopeFor costs ~3 filepath.EvalSymlinks per sibling, so recomputing
+// it per commit multiplied symlink resolution by the worktree count on every
+// burst poll. taskRoot is the daemon's single workspace and does not change
+// within a poll, so one slot per entry is enough; a different taskRoot simply
+// recomputes. The scopes are stored on the SAME entry as the roots they were
+// derived from and are only reused while those roots are unchanged, so a
+// refreshed worktree list can never be read through stale scopes.
+func siblingLedgerScopes(root, taskRoot string) []ledgerScope {
+	siblings := gitSiblingWorktrees(root)
+	if len(siblings) == 0 {
+		return nil
+	}
+	key := resolvePath(root)
+
+	worktreeRootsMu.Lock()
+	if e, ok := worktreeRootsCache[key]; ok && e.scopeTaskRoot == taskRoot && samePaths(e.roots, siblings) {
+		worktreeRootsMu.Unlock()
+		return e.scopes
+	}
+	worktreeRootsMu.Unlock()
+
+	scopes := make([]ledgerScope, 0, len(siblings))
+	for _, sibling := range siblings {
+		scopes = append(scopes, ledgerScopeFor(sibling, taskRoot))
+	}
+
+	worktreeRootsMu.Lock()
+	if e, ok := worktreeRootsCache[key]; ok && samePaths(e.roots, siblings) {
+		e.scopeTaskRoot, e.scopes = taskRoot, scopes
+		worktreeRootsCache[key] = e
+	}
+	worktreeRootsMu.Unlock()
+	return scopes
+}
+
+// samePaths reports whether two resolved, sorted worktree lists are identical.
+func samePaths(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // gitSiblingWorktrees returns the OTHER checkouts registered to root's
@@ -344,6 +486,12 @@ var gitWorktreeRootsTTL = gitWatchInterval
 type worktreeRootsEntry struct {
 	roots []string
 	atMs  int64
+	// scopes are `roots` mapped onto the ledger path space for scopeTaskRoot, held
+	// here so the mapping is not recomputed once per commit (see
+	// siblingLedgerScopes). Refreshing the entry drops them with the roots they
+	// describe.
+	scopeTaskRoot string
+	scopes        []ledgerScope
 }
 
 var (

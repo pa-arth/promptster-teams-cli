@@ -62,7 +62,7 @@ func TestResolveLedgerScope(t *testing.T) {
 
 	// 1. root == taskRoot (explicit-repo / dev / subcommand): identity — same key,
 	//    no prefix, so behavior is byte-for-byte what it was before discovery.
-	s := resolveLedgerScope(repo, repo)
+	s := resolveLedgerScope(repo, repo, "")
 	if s.aiKey != gitWatchRootKey(repo) || s.prefix != "" {
 		t.Fatalf("root==taskRoot: got key=%q prefix=%q, want key=%q prefix=\"\"", s.aiKey, s.prefix, gitWatchRootKey(repo))
 	}
@@ -72,7 +72,7 @@ func TestResolveLedgerScope(t *testing.T) {
 
 	// 2. root UNDER taskRoot (the daemon: TaskRoot=home, repo discovered under it):
 	//    read under the HOME key, look up with the sub-repo prefix.
-	s = resolveLedgerScope(repo, home)
+	s = resolveLedgerScope(repo, home, "")
 	if s.aiKey != gitWatchRootKey(home) {
 		t.Fatalf("root-under-home: key=%q, want home key %q", s.aiKey, gitWatchRootKey(home))
 	}
@@ -89,7 +89,7 @@ func TestResolveLedgerScope(t *testing.T) {
 	//    under the HOME key and look the path up by its absolute form. Reading under
 	//    the repo key would miss the evidence entirely.
 	other := t.TempDir()
-	s = resolveLedgerScope(other, home)
+	s = resolveLedgerScope(other, home, "")
 	if s.aiKey != gitWatchRootKey(home) {
 		t.Fatalf("outside-home: key=%q, want home key %q (evidence was stored under it)", s.aiKey, gitWatchRootKey(home))
 	}

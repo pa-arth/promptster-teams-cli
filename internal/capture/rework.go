@@ -169,8 +169,8 @@ type reworkSeedEvidence struct {
 	marks map[string]aiPathMark
 }
 
-func newReworkSeedEvidence(root, taskRoot string) reworkSeedEvidence {
-	scope := resolveLedgerScope(root, taskRoot)
+func newReworkSeedEvidence(root, taskRoot, sha string) reworkSeedEvidence {
+	scope := resolveLedgerScope(root, taskRoot, sha)
 	return reworkSeedEvidence{scope: scope, marks: readAiPathMarks(scope.aiKey)}
 }
 
@@ -183,9 +183,12 @@ func newReworkSeedEvidence(root, taskRoot string) reworkSeedEvidence {
 // The path is translated through the ledger scope, exactly as attribution does,
 // so a repo discovered under the daemon's HOME workspace looks its evidence up
 // under the same key it was recorded with — and, through the same lookup, under
-// the key a SIBLING WORKTREE of the repository would have recorded it with. That
-// second half is what makes the cross-checkout replays (adoption, cold start)
-// find AI ranges to seed instead of replaying the right commits over no evidence.
+// the key a SIBLING WORKTREE of the repository would have recorded it with, while
+// that worktree stands on this commit's own line of history. That second half is
+// what makes the cross-checkout replays (adoption, cold start) find AI ranges to
+// seed instead of replaying the right commits over no evidence; the lineage gate
+// on it is what keeps a sibling parked on a divergent branch from lending its
+// write stamp to a commit it never contained.
 func (e reworkSeedEvidence) writeStampFor(path string) int64 {
 	m, _ := ledgerLookup(e.scope, e.marks, path)
 	return m.WriteMs
@@ -522,7 +525,7 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 	// Resolved BEFORE the ledger lock, matching pollDurabilityCommit: the ai-paths
 	// ledger has its own lock and the rework ledger's read-modify-write must never
 	// nest another one.
-	evidence := newReworkSeedEvidence(root, session.TaskRoot)
+	evidence := newReworkSeedEvidence(root, session.TaskRoot, sha)
 	rootKey := gitWatchRootKey(root)
 
 	var verdicts []event.Event
