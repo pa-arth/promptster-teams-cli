@@ -83,6 +83,54 @@ var batchMaxBodyBytes = 4 << 20
 // A var rather than a const purely so tests can shrink the ramp.
 var backoffBase = 500 * time.Millisecond
 
+// LiveHorizon is how old an event may be and still count as live.
+//
+// STRICTLY GREATER than the backend's 20-minute active window, and that
+// inequality is the whole design. The backend calls a device idle when nothing
+// has arrived inside its window; if our horizon matched it exactly, an event
+// classified backfill at the boundary would be deferred past the moment it was
+// needed to prove the device alive. The gap is slack in the safe direction: we
+// call something live for ten minutes longer than the backend needs it.
+//
+// A var so tests can compress it.
+var LiveHorizon = 30 * time.Minute
+
+// Lane is one of the two queues. Two files, two cursors, two locks, two
+// independent heads — the last of those is what stops a wedged replay from
+// blocking a prompt typed a second ago.
+type Lane struct {
+	// Name appears in warnings and in the batch request's `lane` field.
+	Name string
+	// path/cursorPath/lockPath are functions, not strings, because the state dir
+	// is resolved from the environment at call time (tests relocate it).
+	path       func() string
+	cursorPath func() string
+	lockPath   func() string
+}
+
+// LaneLive carries work happening now. Its file name is unchanged from the
+// single-queue era on purpose: a device upgrading mid-backlog keeps draining
+// what it already queued instead of stranding it under a new name.
+func LaneLive() Lane {
+	return Lane{
+		Name:       "live",
+		path:       state.OutboxPath,
+		cursorPath: state.OutboxCursorPath,
+		lockPath:   state.OutboxLockPath,
+	}
+}
+
+// LaneBackfill carries replayed history — the one producer that can genuinely
+// wait, because its source bytes are already durable on disk.
+func LaneBackfill() Lane {
+	return Lane{
+		Name:       "backfill",
+		path:       state.OutboxBackfillPath,
+		cursorPath: func() string { return state.OutboxCursorPathFor(state.OutboxBackfillPath()) },
+		lockPath:   func() string { return state.OutboxLockPathFor(state.OutboxBackfillPath()) },
+	}
+}
+
 // PressureHighWater is the queue size at which a producer that can DEFER its
 // work should stop producing. A var, not a const, so a test can lower it.
 //
@@ -90,47 +138,100 @@ var backoffBase = 500 * time.Millisecond
 // cannot defer (a live tool hook has nowhere to put the event but here).
 var PressureHighWater int64 = OutboxMaxBytes / 2
 
-// UnderPressure reports whether the queue has grown past PressureHighWater.
+// UnderPressure reports whether the BACKFILL lane has grown past
+// PressureHighWater.
 //
-// It exists for the transcript watchers' history backfill, which is the one
-// producer whose input is ALREADY durable: the transcript is on disk and the
-// byte offset has not advanced, so declining to read it defers the work
-// perfectly. Appending instead would race the queue toward OutboxMaxBytes,
-// where Append DROPS — trading a deferral for real telemetry loss, and taking
-// live capture down with it.
+// It reads the backfill lane and not the live one, which is the §1.4 change and
+// is not cosmetic. Its only caller is the transcript watchers' history replay —
+// the one producer whose input is ALREADY durable, so declining to read defers
+// the work perfectly rather than losing it. Measuring the LIVE lane would have
+// asked the wrong queue: live pressure is caused by producers that cannot defer
+// at all (a tool hook has nowhere to put its event but here), so throttling
+// replay on it both fails to relieve the real pressure and stalls the one thing
+// that was safe to keep going. Each lane now has its own OutboxMaxBytes and its
+// own loud drop, so neither can fill the other's ceiling.
 //
 // Cheap by construction (one Stat, no lock): it is advisory backpressure, not
 // an invariant, so a stale read only costs one poll.
 func UnderPressure() bool {
-	fi, err := os.Stat(state.OutboxPath())
+	fi, err := os.Stat(state.OutboxBackfillPath())
 	if err != nil {
 		return false
 	}
 	return fi.Size() >= PressureHighWater
 }
 
-// Append enqueues an already-signed, already-redacted event for delivery.
+// Append enqueues an already-signed, already-redacted event on the LIVE lane.
 //
-// It takes the outbox lock, so it is safe across the four concurrent emitters
-// and across processes. It never blocks on the network — that is the entire
-// point of the split.
+// This is the right call for every producer whose input is NOT durable on disk:
+// tool hooks, presence, census, durability, commit attribution, window usage.
+// They have nowhere else to put the event, so deferring it would lose it.
+//
+// It takes the lane's lock, so it is safe across the concurrent emitters and
+// across processes. It never blocks on the network — that is the entire point
+// of the split.
 func Append(ev event.Event) error {
+	return AppendTo(LaneLive(), ev)
+}
+
+// AppendFromDurableSource enqueues an event parsed from bytes that are ALREADY
+// on disk, letting it be classified onto the backfill lane.
+//
+// Both halves of the §1.2 rule are required and each rules out a real mistake:
+//
+//   - DURABLE SOURCE is the caller's static property, not something inferred
+//     here. Only the Claude and Codex transcript watchers can say yes — their
+//     input is a file whose read offset has not advanced, so a deferred event is
+//     never a lost one. Cursor never backfills. Inferring "old ⇒ deferrable"
+//     instead would strand events with no second copy anywhere.
+//   - OLDER THAN LiveHorizon, measured on the event's OWN timestamp. A watcher
+//     tailing the live tip of a transcript is a durable source too, and its
+//     events are happening now; sending those down the slow lane would defer
+//     exactly the traffic that proves the device is alive.
+//
+// An unparseable or absent timestamp resolves to LIVE. That is the fail-safe
+// direction: the cost of a wrong live is a little queue jumping, while the cost
+// of a wrong backfill is work deferred behind a replay that may run for hours.
+func AppendFromDurableSource(ev event.Event) error {
+	return AppendTo(laneFor(ev), ev)
+}
+
+// laneFor applies the §1.2 classification to an event from a durable source.
+func laneFor(ev event.Event) Lane {
+	ts, err := time.Parse(time.RFC3339Nano, ev.Ts)
+	if err != nil {
+		return LaneLive() // unreadable age — fail toward live, see AppendFromDurableSource
+	}
+	if time.Since(ts) > LiveHorizon {
+		return LaneBackfill()
+	}
+	return LaneLive()
+}
+
+// AppendTo enqueues onto a named lane. Exported so a caller that has already
+// decided (a migration replay, which knows its own horizon) can say so directly.
+func AppendTo(lane Lane, ev event.Event) error {
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
-	return sign.WithBufferLock(state.OutboxLockPath(), func() error {
-		p := state.OutboxPath()
+	return sign.WithBufferLock(lane.lockPath(), func() error {
+		p := lane.path()
+		// PER LANE, deliberately. Each lane gets the full OutboxMaxBytes rather
+		// than sharing one, so a replay that fills its own queue cannot consume
+		// the headroom live capture needs — the drop below is the failure this
+		// whole package exists to avoid, and letting one lane cause it in the
+		// other would undo the split.
 		if fi, err := os.Stat(p); err == nil && fi.Size() >= OutboxMaxBytes {
 			// Dropping is a real loss of telemetry, never a normal condition, so
 			// it is reported unconditionally rather than through the debug-gated
 			// logger. The event still exists in the signed ledger — the audit
 			// trail stays complete; only the upload is lost.
-			warnf("outbox is full (%d bytes) — DROPPING event (%s). Delivery has been failing long enough to fill the queue; check connectivity and the ingest endpoint.",
-				fi.Size(), ev.Kind)
+			warnf("%s outbox is full (%d bytes) — DROPPING event (%s). Delivery has been failing long enough to fill the queue; check connectivity and the ingest endpoint.",
+				lane.Name, fi.Size(), ev.Kind)
 			return nil
 		}
-		// #nosec G304 -- p is state.OutboxPath(), derived from state.StateDir(), not user input.
+		// #nosec G304 -- p is lane.path(), derived from state.StateDir(), not user input.
 		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
@@ -143,12 +244,23 @@ func Append(ev event.Event) error {
 
 // warnOut is where warnf writes. A var so tests can capture it; nothing else
 // should reassign it.
-var warnOut io.Writer = os.Stderr
+//
+// warnMu guards it because the two lane goroutines both warn. os.Stderr would
+// survive unsynchronized (one write syscall), but the capture buffer tests
+// substitute would not — an interleaved write there is a data race and a
+// corrupted assertion, and the point of these warnings is that an operator can
+// read them.
+var (
+	warnMu  sync.Mutex
+	warnOut io.Writer = os.Stderr
+)
 
 // warnf reports a delivery problem. Deliberately NOT debug-gated: a queue that
 // silently stops draining is indistinguishable from an idle one, which is the
 // exact failure this package exists to prevent.
 func warnf(format string, args ...interface{}) {
+	warnMu.Lock()
+	defer warnMu.Unlock()
 	fmt.Fprintf(warnOut, "promptster-teams: outbox: "+format+"\n", args...)
 }
 
@@ -162,8 +274,8 @@ func warnf(format string, args ...interface{}) {
 // thousands of already-delivered events, and starting a drain over it at offset
 // 0 would replay the entire backlog and cause the very 429 storm this change
 // removes. The outbox has no history to replay, so 0 is trivially safe.
-func readCursor() int64 {
-	data, err := os.ReadFile(state.OutboxCursorPath())
+func readCursor(lane Lane) int64 {
+	data, err := os.ReadFile(lane.cursorPath())
 	if err != nil {
 		return 0
 	}
@@ -175,14 +287,18 @@ func readCursor() int64 {
 }
 
 // writeCursor commits the offset. A var so tests can inject IO faults; nothing
-// else should reassign it.
+// else should reassign it. Reassigned only in tests, but read from BOTH lane
+// goroutines — a substitute must be safe for concurrent use.
 var writeCursor = writeCursorFile
 
 // writeCursorFile commits the offset via temp+rename so a crash mid-write cannot
 // leave a half-written number that parses as a smaller offset (which would
 // re-send) or a larger one (which would skip).
-func writeCursorFile(n int64) error {
-	p := state.OutboxCursorPath()
+//
+// The temp file is per-lane too (it is derived from the lane's cursor path), so
+// the two lanes' commits cannot rename over each other.
+func writeCursorFile(lane Lane, n int64) error {
+	p := lane.cursorPath()
 	tmp := p + ".tmp"
 	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(n, 10)), 0o600); err != nil {
 		return err
@@ -198,10 +314,25 @@ func writeCursorFile(n int64) error {
 // perpetually "pending", while "all events shipped" could only appear on a
 // device that had captured nothing. Counting the queue makes both states mean
 // what they say.
+//
+// BOTH LANES, summed. "Events pending upload" is a device-level question and the
+// engineer does not have two outboxes — reporting only live would show a caught-
+// up device with 60,000 replayed events still queued behind it, which is the
+// misreport this whole change exists to remove.
 func PendingCount() int {
-	cursor := readCursor()
-	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
-	f, err := os.Open(state.OutboxPath())
+	return pendingCountIn(LaneLive()) + pendingCountIn(LaneBackfill())
+}
+
+// PendingIn reports one lane's undelivered depth. Exported for doctor, whose
+// stuck verdict is PER LANE — a live lane delivering every second must not paper
+// over a backfill lane that has not advanced in an hour. PendingCount answers
+// the device-level question and sums them; this answers "which lane".
+func PendingIn(lane Lane) int { return pendingCountIn(lane) }
+
+func pendingCountIn(lane Lane) int {
+	cursor := readCursor(lane)
+	// #nosec G304 -- lane.path() is StateDir()-derived, not user input.
+	f, err := os.Open(lane.path())
 	if err != nil {
 		return 0
 	}
@@ -267,10 +398,25 @@ type PendingState struct {
 //     start, the same conclusion drainOnce reaches at the same fork. Unlike
 //     drainOnce we do NOT write the rewound cursor back — a reader must never
 //     mutate delivery state; the drain will correct it on its own next pass.
+//
+// BOTH LANES. Count sums; Oldest is the minimum across them, which is almost
+// always the backfill lane's head — and that is precisely the number the beat
+// exists to carry. Reporting live alone would answer "is this engineer working"
+// correctly and "is this device caught up" backwards.
 func PendingStateNow() PendingState {
-	cursor := readCursor()
-	// #nosec G304 -- state.OutboxPath() is StateDir()-derived, not user input.
-	f, err := os.Open(state.OutboxPath())
+	live := pendingStateIn(LaneLive())
+	back := pendingStateIn(LaneBackfill())
+	out := PendingState{Count: live.Count + back.Count, Oldest: live.Oldest}
+	if out.Oldest.IsZero() || (!back.Oldest.IsZero() && back.Oldest.Before(out.Oldest)) {
+		out.Oldest = back.Oldest
+	}
+	return out
+}
+
+func pendingStateIn(lane Lane) PendingState {
+	cursor := readCursor(lane)
+	// #nosec G304 -- lane.path() is StateDir()-derived, not user input.
+	f, err := os.Open(lane.path())
 	if err != nil {
 		return PendingState{}
 	}
@@ -395,11 +541,40 @@ func StartDrain(client *http.Client, apiKey string, caps BatchCapability) {
 // When caps reports batch support the same rules apply PER MEMBER, read off the
 // backend's 207 — see deliverChunk. The rules do not change with the transport;
 // only how many events one round-trip carries.
+// The two lanes drain CONCURRENTLY, one goroutine each, and that is the §1.3
+// decision. The obvious alternative — one goroutine round-robinning "live to
+// empty, then a bounded backfill slice" — cannot actually meet the acceptance
+// this change is for ("backfill head wedged on a permanent 5xx, live throughput
+// unaffected"). A single goroutine sitting in backfill's retry backoff is a
+// goroutine not delivering live, so the best it can do is bound the damage to
+// one slice's worth of latency; and bounding the retry means abandoning the
+// never-give-up rule that keeps the queue honest. Two goroutines make live
+// genuinely independent, and the backend already budgets the lanes separately
+// (live 100/min, backfill 60/min) — a budget per lane only makes sense if the
+// lanes can be in flight at once.
+//
+// The singleton in StartDrain still holds. What it protects against is TWO
+// DRAINS ON ONE QUEUE — same cursor, same events, both advancing. These two
+// share no queue, no cursor and no lock; they share the HTTP client (safe) and
+// the batch-suppression latch (mutex-guarded, and a property of the backend
+// rather than of either lane).
 func Drain(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		drainLane(ctx, client, apiKey, caps, LaneBackfill())
+	}()
+	drainLane(ctx, client, apiKey, caps, LaneLive())
+	wg.Wait()
+}
+
+// drainLane runs one lane's delivery loop until ctx is cancelled.
+func drainLane(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability, lane Lane) {
 	failures := 0
 	var lastWarn time.Time
 	for {
-		n, err := drainOnce(ctx, client, apiKey, caps)
+		n, err := drainOnce(ctx, client, apiKey, caps, lane)
 		if ctx.Err() != nil {
 			return
 		}
@@ -420,11 +595,11 @@ func Drain(ctx context.Context, client *http.Client, apiKey string, caps BatchCa
 			// worse than a bounded duplicate the backend already dedupes.
 			failures++
 			if failures == 1 || time.Since(lastWarn) >= stuckRepeatInterval {
-				warnf("cannot record delivery progress (%d consecutive failure(s)): %v — "+
+				warnf("cannot record %s delivery progress (%d consecutive failure(s)): %v — "+
 					"events are captured and queued, but %s cannot be written, so already-delivered "+
 					"events may be re-sent until this clears. Check free disk space and that the "+
 					"state directory is writable.",
-					failures, err, state.OutboxCursorPath())
+					lane.Name, failures, err, lane.cursorPath())
 				lastWarn = time.Now()
 			}
 			if !sleepCtx(ctx, backoffFor(failures-1)) {
@@ -445,9 +620,9 @@ func Drain(ctx context.Context, client *http.Client, apiKey string, caps BatchCa
 
 // drainOnce delivers every event currently queued past the cursor, then
 // compacts. Returns how many events it delivered (or permanently skipped).
-func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability) (int, error) {
-	cursor := readCursor()
-	p := state.OutboxPath()
+func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability, lane Lane) (int, error) {
+	cursor := readCursor(lane)
+	p := lane.path()
 
 	fi, err := os.Stat(p)
 	if err != nil {
@@ -461,16 +636,16 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 	// than stall forever — re-reading a compacted queue is empty by definition.
 	if cursor > fi.Size() {
 		cursor = 0
-		if err := writeCursor(0); err != nil {
+		if err := writeCursor(lane, 0); err != nil {
 			return 0, err
 		}
 	}
 	if cursor == fi.Size() {
-		compact(cursor)
+		compact(lane, cursor)
 		return 0, nil
 	}
 
-	// #nosec G304 -- p is state.OutboxPath(), derived from state.StateDir(), not user input.
+	// #nosec G304 -- p is lane.path(), derived from state.StateDir(), not user input.
 	f, err := os.Open(p)
 	if err != nil {
 		return 0, err
@@ -501,7 +676,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			if len(chunk) == 0 {
 				break // queue drained, or a partial trailing line — next pass
 			}
-			advance, count, fellBack := deliverChunk(ctx, client, apiKey, endpoint, chunk)
+			advance, count, fellBack := deliverChunk(ctx, client, apiKey, endpoint, lane, chunk)
 			if fellBack {
 				// The backend cannot answer a batch. Deliver THIS chunk one event
 				// at a time rather than dropping it or re-reading it: the bytes are
@@ -516,7 +691,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 						return delivered, nil // ctx cancelled mid-retry
 					}
 					cursor += ln.size
-					if err := writeCursor(cursor); err != nil {
+					if err := writeCursor(lane, cursor); err != nil {
 						return delivered, fmt.Errorf("persist cursor: %w", err)
 					}
 					delivered++
@@ -526,7 +701,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			delivered += count
 			if advance > 0 {
 				cursor += advance
-				if err := writeCursor(cursor); err != nil {
+				if err := writeCursor(lane, cursor); err != nil {
 					// Same reasoning as the per-event path below: without a durable
 					// cursor every further send is one we cannot prove.
 					return delivered, fmt.Errorf("persist cursor: %w", err)
@@ -565,7 +740,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			return delivered, nil // ctx cancelled mid-retry; cursor stays put
 		}
 		cursor += int64(len(line))
-		if err := writeCursor(cursor); err != nil {
+		if err := writeCursor(lane, cursor); err != nil {
 			// Stop this pass immediately: without a durable cursor, every event
 			// we send from here on is one we cannot prove we sent, and a restart
 			// would re-send the lot. Drain treats this as a local fault and backs
@@ -576,7 +751,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 		}
 		delivered++
 	}
-	compact(cursor)
+	compact(lane, cursor)
 	return delivered, nil
 }
 
@@ -732,6 +907,7 @@ func deliverChunk(
 	client *http.Client,
 	apiKey string,
 	endpoint string,
+	lane Lane,
 	chunk []chunkLine,
 ) (advance int64, lines int, fellBack bool) {
 	bodies := make([][]byte, 0, len(chunk))
@@ -750,7 +926,7 @@ func deliverChunk(
 	started := time.Now()
 	var lastWarn time.Time
 	for {
-		results, err := ingest.IngestBatchWithClient(client, endpoint, bodies, apiKey)
+		results, err := ingest.IngestBatchWithClient(client, endpoint, bodies, apiKey, lane.Name)
 
 		switch {
 		case err == nil:
@@ -930,25 +1106,25 @@ func backoffFor(attempt int) time.Duration {
 // retains them). Guarded by the same lock appends take, and re-checks the size
 // under that lock — an append that landed since the caller's read makes size >
 // cursor, and compacting then would discard an undelivered event.
-func compact(cursor int64) {
+func compact(lane Lane, cursor int64) {
 	if cursor <= 0 {
 		return
 	}
-	err := sign.WithBufferLock(state.OutboxLockPath(), func() error {
-		fi, err := os.Stat(state.OutboxPath())
+	err := sign.WithBufferLock(lane.lockPath(), func() error {
+		fi, err := os.Stat(lane.path())
 		if err != nil {
 			return nil //nolint:nilerr // nothing to compact
 		}
 		if fi.Size() != cursor {
 			return nil // raced with an append — leave it for the next pass
 		}
-		if err := os.Truncate(state.OutboxPath(), 0); err != nil {
+		if err := os.Truncate(lane.path(), 0); err != nil {
 			return err
 		}
-		return writeCursor(0)
+		return writeCursor(lane, 0)
 	})
 	if err != nil {
-		warnf("compaction failed (queue will keep growing until it succeeds): %v", err)
+		warnf("%s compaction failed (queue will keep growing until it succeeds): %v", lane.Name, err)
 	}
 }
 

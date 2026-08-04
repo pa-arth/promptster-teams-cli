@@ -12,6 +12,7 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // Regression coverage for the bounded-history backfill. Every test here pins a
@@ -582,7 +583,11 @@ func TestPollClaudeTranscriptsDefersUnderOutboxPressure(t *testing.T) {
 	ws := resolvePath(workspace)
 	path, size := writeClaudeHistory(t, root, ws, "pressured.jsonl", 10)
 
-	if err := os.WriteFile(outboxPath, []byte(strings.Repeat("x", 4096)), 0o600); err != nil {
+	// The BACKFILL lane is what backpressure measures, and it has to be: replay
+	// is the only producer that can defer, so throttling it on a full LIVE queue
+	// would stall the one thing that was safe to keep going without relieving the
+	// pressure live producers actually caused.
+	if err := os.WriteFile(state.OutboxBackfillPath(), []byte(strings.Repeat("x", 4096)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	prev := outbox.PressureHighWater
@@ -601,7 +606,7 @@ func TestPollClaudeTranscriptsDefersUnderOutboxPressure(t *testing.T) {
 
 	// Pressure clears — the deferred bytes are still there to read.
 	outbox.PressureHighWater = prev
-	if err := os.Remove(outboxPath); err != nil {
+	if err := os.Remove(state.OutboxBackfillPath()); err != nil {
 		t.Fatal(err)
 	}
 	if _, consumed := pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false); consumed != size {
@@ -885,7 +890,11 @@ func TestPollCodexRolloutsDefersUnderOutboxPressure(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := os.WriteFile(outboxPath, []byte(strings.Repeat("x", 4096)), 0o600); err != nil {
+	// The BACKFILL lane is what backpressure measures, and it has to be: replay
+	// is the only producer that can defer, so throttling it on a full LIVE queue
+	// would stall the one thing that was safe to keep going without relieving the
+	// pressure live producers actually caused.
+	if err := os.WriteFile(state.OutboxBackfillPath(), []byte(strings.Repeat("x", 4096)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	prev := outbox.PressureHighWater
@@ -903,7 +912,7 @@ func TestPollCodexRolloutsDefersUnderOutboxPressure(t *testing.T) {
 	}
 
 	outbox.PressureHighWater = prev
-	if err := os.Remove(outboxPath); err != nil {
+	if err := os.Remove(state.OutboxBackfillPath()); err != nil {
 		t.Fatal(err)
 	}
 	if sent := pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false); sent == 0 {

@@ -61,14 +61,18 @@ type batchResponse struct {
 // json.Marshal of [][]byte would base64 them, and of []json.RawMessage would be
 // correct but re-parse every member for no benefit.
 //
-// No `lane` field is sent. The backend defaults an unlabelled batch to the live
-// lane, which is what every event is today; lane classification arrives with the
-// outbox split (spec §1.1-§1.2) and this envelope is additive-ready for it.
+// lane labels the batch so the backend can charge it against the right budget
+// (live 100 events/min, backfill 60). It is APPENDED, never spliced ahead of the
+// members, so the member bytes keep the byte-for-byte identity described above.
+// An empty lane sends no field at all and the backend defaults it to live — that
+// is the compatible reading for any caller that has not been taught about lanes,
+// and it fails toward the fast budget rather than the slow one.
 func IngestBatchWithClient(
 	client *http.Client,
 	endpoint string,
 	bodies [][]byte,
 	apiKey string,
+	lane string,
 ) ([]BatchMemberResult, error) {
 	if len(bodies) == 0 {
 		return nil, nil
@@ -82,7 +86,19 @@ func IngestBatchWithClient(
 		}
 		buf.Write(b)
 	}
-	buf.WriteString(`]}`)
+	buf.WriteString(`]`)
+	if lane != "" {
+		// Marshalled rather than interpolated: lane reaches here from a Lane
+		// value, but a raw string in a JSON document is exactly the place where
+		// "it can only ever be one of two constants" stops being true one day.
+		laneJSON, err := json.Marshal(lane)
+		if err != nil {
+			return nil, fmt.Errorf("encode lane: %w", err)
+		}
+		buf.WriteString(`,"lane":`)
+		buf.Write(laneJSON)
+	}
+	buf.WriteString(`}`)
 
 	req, err := http.NewRequest(http.MethodPost, apiURL()+endpoint, bytes.NewReader(buf.Bytes()))
 	if err != nil {
