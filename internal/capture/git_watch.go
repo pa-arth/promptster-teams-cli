@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
@@ -114,6 +116,13 @@ type ledgerScope struct {
 	aiKey   string // the root key the ai-paths / bash-windows ledgers are stored under
 	prefix  string // POSIX rel(taskRoot, root) when root is UNDER taskRoot ("" == taskRoot)
 	absRoot string // resolved root, set when root is OUTSIDE taskRoot (evidence stored absolute)
+	// alts are the polled repository's OTHER worktrees, each mapped into the
+	// ledger's path space by the identical rule (see resolveLedgerScope). They
+	// exist because the ledger records a path relative to the checkout the agent
+	// actually edited in, while attribution asks about a commit — and a commit
+	// belongs to the REPOSITORY, not to one of its checkouts. Always nil on an
+	// alt itself: the expansion is exactly one level deep.
+	alts []ledgerScope
 }
 
 // resolveLedgerScope computes the scope for reconciling `root`'s committed paths
@@ -135,7 +144,54 @@ type ledgerScope struct {
 //
 // taskRoot == "" (no workspace, e.g. a malformed session) falls back to the
 // per-root key.
+//
+// SIBLING WORKTREES. The rule above resolves ONE checkout, but the ledger records
+// a path relative to whichever checkout the agent actually edited in, and a
+// commit belongs to the repository rather than to a checkout of it. So a machine
+// running several worktrees against one repository read every commit made in
+// another worktree as `unknown` — a silent under-count of the headline
+// AI-attribution number, and the ceiling on every cross-checkout recovery path
+// (they replay the right commits and find no AI ranges to seed). The scope
+// therefore also carries the repository's OTHER worktrees, each mapped by the
+// SAME rule, and a lookup falls through to them (see ledgerLookup).
+//
+// What that widening is scoped TO and AGAINST:
+//   - TO: the checkouts `git worktree list` reports for THIS repository — one
+//     object store, one branch namespace, one file namespace. "The same
+//     repo-relative path in a worktree of this repo" is the same file in the same
+//     repository, which is exactly the fact the ledger already asserts.
+//   - AGAINST: everything else. Another repository never appears in this repo's
+//     worktree list, so two unrelated files that merely share a relative path
+//     cannot collide. Neither can a CLONE of the same upstream: it has its own
+//     object store and its own worktree list, so evidence does not cross it. That
+//     is a deliberate under-count on the conservative side.
+//
+// It does NOT widen which PATHS count: the committed path must match exactly,
+// in a checkout of this same repository. The residual it inherits is the one
+// path-level attribution already documents (reconcileCommitAttribution note 2) —
+// a file AI-touched and later human-edited inside the 7-day TTL still reads
+// likely_ai — now spanning that repo's worktrees rather than one directory. Same
+// class, same granularity, no new one.
 func resolveLedgerScope(root, taskRoot string) ledgerScope {
+	s := ledgerScopeFor(root, taskRoot)
+	if taskRoot == "" {
+		// No workspace to anchor to, so every scope falls back to its OWN root key
+		// and there is no single ledger read the alts could be resolved against —
+		// an alt here would carry a key its caller never read. Nothing coherent to
+		// widen to; stay on the fallback exactly as before.
+		return s
+	}
+	for _, sibling := range gitSiblingWorktrees(root) {
+		s.alts = append(s.alts, ledgerScopeFor(sibling, taskRoot))
+	}
+	return s
+}
+
+// ledgerScopeFor resolves ONE checkout onto the ledger's path space. It is the
+// whole of the pre-sibling behavior and stays free of any git spawn, so the
+// polled root's own mapping — the only one a single-checkout machine ever needs —
+// is byte-for-byte what it was.
+func ledgerScopeFor(root, taskRoot string) ledgerScope {
 	if taskRoot == "" {
 		return ledgerScope{aiKey: gitWatchRootKey(root)}
 	}
@@ -152,7 +208,8 @@ func resolveLedgerScope(root, taskRoot string) ledgerScope {
 
 // ledgerPath translates a repo-relative committed path into the key the ai-paths
 // ledger stored it under: workspace-relative when the repo is under the workspace,
-// absolute when it is outside (see resolveLedgerScope).
+// absolute when it is outside (see resolveLedgerScope). It is THIS checkout's key
+// only — use ledgerLookup to also reach the repository's other worktrees.
 func (s ledgerScope) ledgerPath(committedRel string) string {
 	if s.absRoot != "" {
 		return filepath.ToSlash(filepath.Join(s.absRoot, committedRel))
@@ -162,6 +219,137 @@ func (s ledgerScope) ledgerPath(committedRel string) string {
 	}
 	return s.prefix + "/" + committedRel
 }
+
+// ledgerLookup resolves one repo-relative committed path against a ledger map
+// keyed the way capture records paths, trying the polled checkout first and then
+// each of the repository's other worktrees.
+//
+// OWN CHECKOUT FIRST, and the order is load-bearing twice over. It makes the
+// deployed single-checkout case identical to the pre-sibling behavior — evidence
+// already on disk is read exactly as before, never invalidated — and it makes the
+// result deterministic when two worktrees both hold evidence for one path
+// (`alts` is sorted), so repeated polls cannot oscillate between two sessions.
+// The whole mark is taken from ONE checkout's entry rather than assembled across
+// them, so the session and its write stamp always describe the same recorded
+// write.
+func ledgerLookup[T any](s ledgerScope, m map[string]T, committedRel string) (T, bool) {
+	if v, ok := m[s.ledgerPath(committedRel)]; ok {
+		return v, true
+	}
+	for _, alt := range s.alts {
+		if v, ok := m[alt.ledgerPath(committedRel)]; ok {
+			return v, true
+		}
+	}
+	var zero T
+	return zero, false
+}
+
+// gitSiblingWorktrees returns the OTHER checkouts registered to root's
+// repository — `git worktree list` minus root itself — resolved and sorted so a
+// caller's fallback order is deterministic. A non-repo, or a repo with no linked
+// worktrees, yields nil and every caller behaves exactly as it did before.
+//
+// It reuses the primitive workspaceMatchRoots already uses to enumerate
+// worktrees, so there is ONE worktree-enumeration idiom in this package rather
+// than a hand-rolled reader of .git/worktrees/*/gitdir that would have to
+// re-implement git's own resolution (a linked worktree's .git is a FILE, and git
+// may write its gitdir pointer relative).
+//
+// SPAWN BUDGET. resolveLedgerScope is called once per COMMIT in three places
+// (commitAttributionFromDiff, pollDurabilityCommit, foldReworkCommit), so an
+// unmemoized spawn here would scale with commits — 3 per commit, and a burst poll
+// is bounded at gitWatchMaxCommitsPerPollTotal. The cache below holds it to at
+// most one spawn per root per poll, the same order as the `git rev-parse HEAD`
+// the detection loop already spends.
+func gitSiblingWorktrees(root string) []string {
+	if root == "" {
+		return nil
+	}
+	if !repoHasLinkedWorktrees(root) {
+		return nil
+	}
+	key := resolvePath(root)
+	nowMs := time.Now().UnixMilli()
+
+	worktreeRootsMu.Lock()
+	if e, ok := worktreeRootsCache[key]; ok && nowMs-e.atMs < gitWorktreeRootsTTL.Milliseconds() {
+		worktreeRootsMu.Unlock()
+		return e.roots
+	}
+	worktreeRootsMu.Unlock()
+
+	var siblings []string
+	// #nosec G204 -- constant argv; root is a repo this install already polls, not attacker input. Reads only the local worktree list.
+	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if err == nil {
+		seen := map[string]bool{key: true}
+		for _, line := range strings.Split(string(out), "\n") {
+			if !strings.HasPrefix(line, "worktree ") {
+				continue
+			}
+			p := resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree ")))
+			if p == "" || seen[p] {
+				continue
+			}
+			seen[p] = true
+			siblings = append(siblings, p)
+		}
+		sort.Strings(siblings)
+	}
+	// A failed spawn is cached as "no siblings" for one interval, deliberately:
+	// retrying it per commit is the fan-out this cache exists to prevent, and the
+	// cost of the miss is an under-count that the next poll corrects.
+	worktreeRootsMu.Lock()
+	worktreeRootsCache[key] = worktreeRootsEntry{roots: siblings, atMs: nowMs}
+	worktreeRootsMu.Unlock()
+	return siblings
+}
+
+// repoHasLinkedWorktrees is a stat-only short-circuit so a repository that has
+// never had `git worktree add` run against it — the overwhelming majority —
+// spends NO spawn and carries NO cache staleness at all.
+//
+// It reads one git invariant: a linked worktree exists iff the repository's
+// common dir holds a `worktrees/` directory, and a checkout's own `.git` is a
+// DIRECTORY for the main worktree and a FILE for a linked one. So `.git` being a
+// file already proves a linked worktree exists (this root is one), and `.git`
+// being a directory with no `worktrees/` under it proves none do.
+//
+// Every uncertain case — `.git` missing, unreadable, or any layout not covered
+// above — falls THROUGH to the real enumeration. The short-circuit may only ever
+// return the conservative answer for a case it can prove; it must never be the
+// thing that decides evidence does not exist.
+func repoHasLinkedWorktrees(root string) bool {
+	info, err := os.Stat(filepath.Join(root, ".git"))
+	if err != nil {
+		return true // unknown layout — let `git worktree list` answer
+	}
+	if !info.IsDir() {
+		return true // a linked worktree's .git is a file: this root IS one
+	}
+	if _, err := os.Stat(filepath.Join(root, ".git", "worktrees")); err != nil {
+		return false // main worktree, no linked ones have ever been registered
+	}
+	return true
+}
+
+// gitWorktreeRootsTTL bounds how long one repo's worktree list is reused. One
+// poll interval: a `git worktree add` must start contributing its evidence
+// promptly (that is the whole scenario), while a burst of commits inside a single
+// poll spends one spawn, not one per commit. A package var so a test can disable
+// the cache.
+var gitWorktreeRootsTTL = gitWatchInterval
+
+type worktreeRootsEntry struct {
+	roots []string
+	atMs  int64
+}
+
+var (
+	worktreeRootsMu    sync.Mutex
+	worktreeRootsCache = map[string]worktreeRootsEntry{}
+)
 
 // gitRootOf walks up from dir to the nearest ancestor that is a git repo root
 // (its .git exists — reusing isGitRepoRoot), or ok=false at the filesystem root.

@@ -623,8 +623,8 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 	// ONE predicate, read in exactly two places: the path-level seed gate below and
 	// pruneSeedTombstones. A tombstone is worth keeping precisely while the gate it
 	// guards can still fire, so both read this func value, not two that agree.
-	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
-	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
+	aiPathKnown := func(path string) bool { _, ok := ledgerLookup(scope, marks, path); return ok }
+	writeStamp := func(path string) int64 { m, _ := ledgerLookup(scope, marks, path); return m.WriteMs }
 
 	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
 	// ledger lock, so the ledger's read-modify-write never nests another lock.
@@ -748,8 +748,8 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	// current now, exactly as the churn route is.
 	scope := resolveLedgerScope(root, session.TaskRoot)
 	marks := readAiPathMarks(scope.aiKey)
-	aiPathKnown := func(path string) bool { _, ok := marks[scope.ledgerPath(path)]; return ok }
-	writeStamp := func(path string) int64 { return marks[scope.ledgerPath(path)].WriteMs }
+	aiPathKnown := func(path string) bool { _, ok := ledgerLookup(scope, marks, path); return ok }
+	writeStamp := func(path string) int64 { m, _ := ledgerLookup(scope, marks, path); return m.WriteMs }
 
 	var matured []harvested
 	mutateDurabilityLedger(func(led *durabilityLedger) {

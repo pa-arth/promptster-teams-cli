@@ -1067,16 +1067,38 @@ rename produces no `@@` hunks, so `commitAttributionFromDiff` reports `ok=false`
 and the commit would never reach `pollReworkCommit` at all. It returns the raw
 diff on that path specifically so renames still land.
 
-**Known gap, unfixed: AI-path evidence is keyed PER WORKTREE, so a second
-worktree reconciles the same commit as `unknown`.** `resolveLedgerScope` looks
-evidence up under `rel(taskRoot, root)/<path>`, but capture recorded it under the
-path of whichever worktree the agent actually edited in. Verified on one commit:
-`likely_ai` from the original checkout, `unknown` from a `git worktree add` copy
-of the same branch. This bounds every cross-worktree recovery path above — they
-replay the right commits and find no AI ranges to seed — and it is upstream of
-rework, so it affects `commit_attribution` itself.
-`TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` does not catch it:
-it simulates the second worktree inside ONE directory.
+**A COMMIT BELONGS TO THE REPOSITORY, NOT TO A CHECKOUT OF IT, and that is why
+`ledgerScope` carries the repo's other worktrees.** The ai-paths ledger records
+a path relative to whichever checkout the agent edited in, so a lookup keyed on
+the polled checkout alone read every commit made in a SIBLING worktree as
+`unknown` — a silent under-count of `commit_attribution` itself, and the
+ceiling on both cross-checkout replays above (they replayed the right commits
+and found no AI ranges to seed). `resolveLedgerScope` now appends one alt scope
+per `git worktree list` entry and `ledgerLookup` falls through them, own
+checkout FIRST so a single-checkout machine is byte-for-byte unchanged and a
+two-worktree tie is deterministic.
+
+**The widening is over CHECKOUTS, never over PATHS.** Only this repository's
+worktrees are consulted, so another repo, or a CLONE of the same upstream,
+cannot contribute evidence — a clone has its own object store and its own
+worktree list, and that under-count is deliberate. The committed path must
+still match exactly. The residual inherited is the one path-level attribution
+already documents (a file AI-touched then human-edited inside the 7-day TTL
+reads `likely_ai`), now spanning a repo's worktrees rather than one directory:
+same class, same granularity.
+
+`repoHasLinkedWorktrees` short-circuits, stat-only, before any spawn or memo, so
+a repo that never had `git worktree add` run against it costs nothing AND picks
+its first worktree up immediately. Only a repo that already has one pays the
+memoized `git worktree list` (≤1 spawn per root per poll — `resolveLedgerScope`
+runs once per COMMIT in three places, so an unmemoized spawn would scale with
+commits).
+
+**Any test here must use a REAL second directory.**
+`TestReworkAdoptionRebuildsSpansAttributedByAnotherWorktree` simulates the
+second worktree inside ONE directory, which is exactly what let this defect
+through — one directory is one ledger key, so the divergence never appears.
+`commit_attribution_worktree_test.go` uses `git worktree add` throughout.
 
 ## Maintaining this file
 

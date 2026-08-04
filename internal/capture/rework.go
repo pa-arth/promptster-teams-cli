@@ -182,9 +182,13 @@ func newReworkSeedEvidence(root, taskRoot string) reworkSeedEvidence {
 //
 // The path is translated through the ledger scope, exactly as attribution does,
 // so a repo discovered under the daemon's HOME workspace looks its evidence up
-// under the same key it was recorded with.
+// under the same key it was recorded with — and, through the same lookup, under
+// the key a SIBLING WORKTREE of the repository would have recorded it with. That
+// second half is what makes the cross-checkout replays (adoption, cold start)
+// find AI ranges to seed instead of replaying the right commits over no evidence.
 func (e reworkSeedEvidence) writeStampFor(path string) int64 {
-	return e.marks[e.scope.ledgerPath(path)].WriteMs
+	m, _ := ledgerLookup(e.scope, e.marks, path)
+	return m.WriteMs
 }
 
 func reworkLedgerPath() string {

@@ -194,11 +194,14 @@ func reconcileCommitAttribution(root string, scope ledgerScope, fileRanges map[s
 		//      The bash-mtime recovery pass below shares this residual: a human
 		//      save landing inside an AI bash window is recovered as likely_ai.
 		//   3. aiPaths keys are relativized against the workspace (session.TaskRoot),
-		//      while `path` is relative to the git root polled. scope.ledgerPath
-		//      bridges them: it prepends rel(taskRoot, root) so a commit in a repo
-		//      DISCOVERED under the daemon's HOME workspace matches its home-relative
-		//      ledger key. When root == taskRoot the translation is the identity.
-		if sid, ok := aiPaths[scope.ledgerPath(path)]; ok {
+		//      while `path` is relative to the git root polled. ledgerLookup bridges
+		//      them: it prepends rel(taskRoot, root) so a commit in a repo DISCOVERED
+		//      under the daemon's HOME workspace matches its home-relative ledger key.
+		//      When root == taskRoot the translation is the identity. It then falls
+		//      through to the repository's OTHER worktrees, because the ledger records
+		//      the checkout the agent edited in while a commit belongs to the repo —
+		//      without that, every commit made in a sibling worktree read `unknown`.
+		if sid, ok := ledgerLookup(scope, aiPaths, path); ok {
 			attribution = attributionLikelyAI
 			session = sid
 		} else if sid, ok := recoverBashSession(root, path, bashWindows); ok {

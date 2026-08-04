@@ -76,6 +76,32 @@ follows [Semantic Versioning](https://semver.org/).
   uncaptured. Classification measures against that same maximum, so it skips
   such a record instead of restarting from byte zero forever.
 
+- **AI attribution now agrees across every checkout of a repository.** The
+  AI-path ledger records a file under the checkout the agent edited in, but a
+  commit belongs to the repository, not to one of its checkouts — so a commit
+  reconciled from a *sibling* `git worktree` reported `unknown` where the
+  original checkout reported `likely_ai`. Anyone running more than one worktree
+  against one repository was under-reporting AI attribution on every commit made
+  in another worktree, and the same gap capped the cross-checkout replays added
+  in 0.12.2 and #128: they replayed the right commits and found no AI evidence to
+  match them against.
+
+  **Reported figures will move UPWARD for anyone running more than one
+  worktree** — `commit_attribution`, and the durability and rework verdicts
+  downstream of it. Nothing is re-attributed retroactively: commits already
+  recorded keep the attribution they were given, so the change appears going
+  forward.
+
+  A lookup now falls through to the repository's other worktrees, own checkout
+  first. It is scoped **to** the checkouts `git worktree list` reports for that
+  one repository, and **against** everything else: a different repository cannot
+  contribute evidence, two unrelated files that merely share a relative path
+  cannot collide, and neither can a *clone* of the same upstream (its own object
+  store, its own worktree list) — a deliberate under-count on the conservative
+  side. The widening is over checkouts, never over paths: the committed path must
+  still match exactly, so a path no agent wrote in any checkout stays `unknown`.
+  Evidence already on disk is read exactly as before and is never invalidated.
+
 ## [0.12.2] — 2026-08-03
 
 ### Added
