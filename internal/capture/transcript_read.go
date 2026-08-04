@@ -87,6 +87,88 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe bool, hand
 	return out
 }
 
+// classifyReadBufSize is the fixed working buffer the classification readers
+// stream through. A record is accumulated up to transcriptMaxRecordBytes;
+// anything larger is discarded to its newline through this same buffer, so
+// skipping an unsupported record costs no memory beyond it.
+const classifyReadBufSize = 64 * 1024
+
+// newClassifyReader wraps a transcript for a classification pass.
+//
+// It replaces the bufio.Scanner these passes used to run, which capped a token
+// at 8 MiB and had no way to say "skip this one": a record over the cap made
+// Scan return false, so the classifier returned undecided, cached nothing, and
+// the file was re-read from byte zero on every 3s poll FOREVER — never reaching
+// the tail path, which is where the oversized-record escape lives. See
+// nextClassifyRecord.
+func newClassifyReader(r io.Reader) *bufio.Reader {
+	return bufio.NewReaderSize(r, classifyReadBufSize)
+}
+
+// nextClassifyRecord returns the next record from a classification reader,
+// trimmed. ok reports that a record BOUNDARY was reached; the returned slice
+// aliases the reader's buffer and is only valid until the next call.
+//
+// A record longer than transcriptMaxRecordBytes is DISCARDED to its newline and
+// returned as an empty record with ok true. No future poll could parse it
+// however much budget it had — it is measured against the same supported
+// maximum the tail path uses, never against a scanner constant that can drift
+// from it — so skipping it is what lets classification reach the record it
+// actually needs (the first cwd-bearing line for Claude, session_meta for
+// Codex) instead of stalling on the one ahead of it. The skip stops exactly at
+// the newline, so the next record is never consumed with it.
+//
+// An oversized record that has NOT terminated by EOF returns ok false: it may
+// still be growing, and the same "defer, never drop" rule the tail path applies
+// holds here. A final SUPPORTED-size record with no trailing newline is still
+// returned, matching the Scanner behavior this replaced.
+func nextClassifyRecord(r *bufio.Reader) ([]byte, bool) {
+	var buf []byte
+	var size int64
+	for {
+		frag, err := r.ReadSlice('\n')
+		size += int64(len(frag))
+		if size > transcriptMaxRecordBytes {
+			switch err {
+			case nil:
+				return nil, true // terminated inside this fragment: already skipped
+			case bufio.ErrBufferFull:
+				return nil, discardRecordToNewline(r)
+			default:
+				return nil, false // unterminated at EOF: may still be growing
+			}
+		}
+		switch err {
+		case nil:
+			if len(buf) == 0 {
+				return bytes.TrimSpace(frag), true
+			}
+			return bytes.TrimSpace(append(buf, frag...)), true
+		case bufio.ErrBufferFull:
+			buf = append(buf, frag...)
+		default:
+			if err == io.EOF && len(buf)+len(frag) > 0 {
+				return bytes.TrimSpace(append(buf, frag...)), true
+			}
+			return nil, false
+		}
+	}
+}
+
+// discardRecordToNewline streams past the remainder of an unsupported record,
+// reporting whether its newline was reached. Nothing is retained.
+func discardRecordToNewline(r *bufio.Reader) bool {
+	for {
+		switch _, err := r.ReadSlice('\n'); err {
+		case nil:
+			return true
+		case bufio.ErrBufferFull:
+		default:
+			return false
+		}
+	}
+}
+
 // resolveOversizedRecord decides what to do with a record that swallowed the
 // whole remaining budget without terminating, having consumed nothing before
 // it. reader/limited are the in-flight readers, positioned at scanned bytes

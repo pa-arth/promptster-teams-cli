@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -71,14 +70,16 @@ const claudeDegradedByteThreshold = 256 * 1024
 var claudeWatchMaxBytesPerPoll int64 = 8 << 20
 
 // transcriptMaxRecordBytes is the largest JSONL record the transcript readers
-// support. It matches the scanners used for transcript classification. A
-// larger record cannot be parsed safely within one bounded poll, so it is
-// discarded in bounded chunks rather than making every future poll reread the
-// same prefix forever.
+// support. A larger record cannot be parsed safely within one bounded poll, so
+// it is discarded in bounded chunks rather than making every future poll reread
+// the same prefix forever.
 //
 // It is the yardstick oversizedness is measured against — never the remaining
-// per-poll budget, which depends on which files the walk reached first. See
-// readTranscriptRecords. A var, not a const, so a test can lower it.
+// per-poll budget, which depends on which files the walk reached first (see
+// readTranscriptRecords), and never a scanner's own literal, which is what let
+// CLASSIFICATION drift from the tail path and stall on a record the tail path
+// would have escaped (see nextClassifyRecord). Both paths measure against THIS.
+// A var, not a const, so a test can lower it.
 var transcriptMaxRecordBytes int64 = 8 << 20
 
 // claudeDegradationStep advances the degraded-detection state machine for one
@@ -879,11 +880,17 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	// A record over the supported maximum is skipped, not stalled on: see
+	// nextClassifyRecord. It still counts toward the line budget below, so the
+	// pass stays bounded by the same 50 records it always was.
+	reader := newClassifyReader(f)
 	const maxScanLines = 50
 	scanned := 0
-	for scanner.Scan() {
+	for {
+		line, ok := nextClassifyRecord(reader)
+		if !ok {
+			break
+		}
 		scanned++
 		if scanned > maxScanLines {
 			// A real session writes a cwd-bearing line within the first
@@ -894,7 +901,7 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 			Cwd       string `json:"cwd"`
 			Timestamp string `json:"timestamp"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+		if err := json.Unmarshal(line, &rec); err != nil {
 			continue
 		}
 		if rec.Cwd == "" {

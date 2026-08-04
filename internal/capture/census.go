@@ -1,7 +1,6 @@
 package capture
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -986,11 +985,17 @@ func transcriptCwd(path string) string {
 	}
 	defer f.Close()
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
+	// Skips unsupported records exactly as classifyClaudeTranscript does —
+	// otherwise a transcript the classifier only reached PAST one would be
+	// admitted with no repo identity at all.
+	reader := newClassifyReader(f)
 	const maxScanLines = 50
 	scanned := 0
-	for scanner.Scan() {
+	for {
+		line, ok := nextClassifyRecord(reader)
+		if !ok {
+			break
+		}
 		scanned++
 		if scanned > maxScanLines {
 			return ""
@@ -998,7 +1003,7 @@ func transcriptCwd(path string) string {
 		var rec struct {
 			Cwd string `json:"cwd"`
 		}
-		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+		if err := json.Unmarshal(line, &rec); err != nil {
 			continue
 		}
 		if rec.Cwd != "" {

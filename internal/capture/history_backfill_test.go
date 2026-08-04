@@ -1111,3 +1111,185 @@ func TestPollCodexDiscardsOversizedRecordAfterAnotherFileConsumed(t *testing.T) 
 		t.Fatalf("stalled rollout drained to %d of %d bytes", got, total)
 	}
 }
+
+// TestClassifyClaudeTranscriptSkipsOversizedRecordAheadOfCwd pins the
+// CLASSIFICATION half of the oversized-record escape.
+//
+// The escape lives in the tail path, and a transcript only reaches the tail once
+// it is classified. So a record over the supported maximum sitting AHEAD of the
+// first cwd-bearing line hit the classifier's own reader instead: it returned
+// undecided, cached nothing, and the file was re-read from byte zero on every
+// 3s poll forever — never tailed, so the escape never ran. Reproduced on the
+// real binary with a 9,437,209-byte leading record: match uncached and offset 0
+// across 30s of polling, 0 events captured.
+//
+// The skip must not widen what is captured: a cwd outside the watched roots
+// reached PAST an unsupported record is still a definitive mismatch.
+//
+// Run at PRODUCTION transcriptMaxRecordBytes on purpose. The classifier used a
+// scanner capped by its own 8 MiB literal rather than by the supported maximum,
+// so a lowered maximum leaves that literal — and the bug — untouched: this test
+// only reproduces against a record over the real 8 MiB.
+func TestClassifyClaudeTranscriptSkipsOversizedRecordAheadOfCwd(t *testing.T) {
+	ws := resolvePath(t.TempDir())
+	outside := resolvePath(t.TempDir())
+	ts := time.Now().UTC().Format(time.RFC3339)
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+
+	write := func(name, cwd string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), name)
+		body := huge + fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q}`+"\n", cwd, ts)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cutoff := transcriptHistoryCutoff(time.Now().UTC())
+
+	if got := classifyClaudeTranscript(write("inside.jsonl", ws), []string{ws}, cutoff); got != claudeMatchYes {
+		t.Fatalf("classify past an unsupported record = %v, want claudeMatchYes (%v) — the cwd line after it must not be lost",
+			got, claudeMatchYes)
+	}
+	if got := classifyClaudeTranscript(write("outside.jsonl", outside), []string{ws}, cutoff); got != claudeMatchNo {
+		t.Fatalf("classify past an unsupported record with an unwatched cwd = %v, want claudeMatchNo (%v)", got, claudeMatchNo)
+	}
+	// transcriptCwd feeds the repo identity of every prompt the newly-unblocked
+	// transcript emits, so it has to clear the same record.
+	if got := transcriptCwd(write("cwd.jsonl", ws)); got != ws {
+		t.Fatalf("transcriptCwd past an unsupported record = %q, want %q", got, ws)
+	}
+}
+
+// TestPollClaudeDrainsTranscriptLedByAnOversizedRecord is the real-path half:
+// one poll must CACHE the decision (no re-read next poll) and the content behind
+// the unsupported record must actually reach the parser. Production constants,
+// for the reason given on the classification half.
+func TestPollClaudeDrainsTranscriptLedByAnOversizedRecord(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	dir := filepath.Join(root, "-Users-me-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tail := fmt.Sprintf(`{"type":"user","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"reachable after the discard"}}`+"\n", ws, ts)
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	stalled := filepath.Join(dir, "head-oversized.jsonl")
+	if err := os.WriteFile(stalled, []byte(huge+tail), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := claudeProgressKey(stalled)
+	total := int64(len(huge) + len(tail))
+
+	session := Session{DeviceID: "sess-head-oversized", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+
+	pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+	if got := loadClaudeWatchProgress().Match[key]; got != "yes" {
+		t.Fatalf("first poll cached match %q, want \"yes\" — an uncached decision re-reads the whole file every 3s forever", got)
+	}
+
+	parsed := 0
+	for i := 0; i < 10 && loadClaudeWatchProgress().Offsets[key] < total; i++ {
+		before := loadClaudeWatchProgress().Offsets[key]
+		n, _ := pollClaudeTranscripts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, true, false)
+		parsed += n
+		if loadClaudeWatchProgress().Offsets[key] == before {
+			break
+		}
+	}
+	if got := loadClaudeWatchProgress().Offsets[key]; got != total {
+		t.Fatalf("transcript drained to %d of %d bytes", got, total)
+	}
+	if parsed == 0 {
+		t.Fatal("content after the unsupported leading record never parsed")
+	}
+}
+
+// TestClassifyCodexRolloutSkipsOversizedRecordAheadOfSessionMeta is the Codex
+// half. session_meta is the ONLY rollout record carrying cwd, so an unsupported
+// record ahead of it stalls classification exactly as it does on the Claude
+// rail — and codexRolloutCwd, which supplies the session's repo identity, has
+// to clear the same record or the rollout is admitted with no repo at all.
+// Production constants, for the reason given on the Claude half.
+func TestClassifyCodexRolloutSkipsOversizedRecordAheadOfSessionMeta(t *testing.T) {
+	ws := resolvePath(t.TempDir())
+	outside := resolvePath(t.TempDir())
+	ts := time.Now().UTC().Format(time.RFC3339)
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+
+	write := func(name, cwd string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, []byte(huge+codexSessionMetaLine(cwd, ts)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	cutoff := transcriptHistoryCutoff(time.Now().UTC())
+
+	if got := classifyCodexRollout(write("rollout-inside.jsonl", ws), []string{ws}, cutoff); got != codexMatchYes {
+		t.Fatalf("classify past an unsupported record = %v, want codexMatchYes (%v) — the session_meta after it must not be lost",
+			got, codexMatchYes)
+	}
+	if got := classifyCodexRollout(write("rollout-outside.jsonl", outside), []string{ws}, cutoff); got != codexMatchNo {
+		t.Fatalf("classify past an unsupported record with an unwatched cwd = %v, want codexMatchNo (%v)", got, codexMatchNo)
+	}
+	if got := codexRolloutCwd(write("rollout-cwd.jsonl", ws)); got != ws {
+		t.Fatalf("codexRolloutCwd past an unsupported record = %q, want %q", got, ws)
+	}
+}
+
+// TestPollCodexDrainsRolloutLedByAnOversizedRecord is the Codex real-path half.
+func TestPollCodexDrainsRolloutLedByAnOversizedRecord(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	ts := time.Now().UTC().Format(time.RFC3339)
+	dir := filepath.Join(root, "2026", "07", "20")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	huge := oversizedRecordLine(int(transcriptMaxRecordBytes) + 2048)
+	meta := codexSessionMetaLine(ws, ts)
+	userMsg := fmt.Sprintf(`{"timestamp":%q,"type":"event_msg","payload":{"type":"user_message","message":"reachable after the discard","images":[]}}`+"\n", ts)
+	stalled := filepath.Join(dir, "rollout-head-oversized.jsonl")
+	if err := os.WriteFile(stalled, []byte(huge+meta+userMsg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total := int64(len(huge) + len(meta) + len(userMsg))
+
+	session := Session{DeviceID: "sess-codex-head-oversized", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+
+	sent := pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+	if got := loadCodexWatchProgress().Match[stalled]; got != "yes" {
+		t.Fatalf("first poll cached match %q, want \"yes\" — an uncached decision re-reads the whole file every 3s forever", got)
+	}
+
+	for i := 0; i < 10 && loadCodexWatchProgress().Offsets[stalled] < total; i++ {
+		before := loadCodexWatchProgress().Offsets[stalled]
+		sent += pollCodexRollouts(session, ws, transcriptHistoryCutoff(time.Now().UTC()), processors, false)
+		if loadCodexWatchProgress().Offsets[stalled] == before {
+			break
+		}
+	}
+	if got := loadCodexWatchProgress().Offsets[stalled]; got != total {
+		t.Fatalf("rollout drained to %d of %d bytes", got, total)
+	}
+	if sent == 0 {
+		t.Fatal("content after the unsupported leading record never reached the parser")
+	}
+}

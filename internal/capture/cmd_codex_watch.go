@@ -492,17 +492,19 @@ const (
 )
 
 // classifyCodexRollout decides whether a rollout belongs to this capture
-// session by reading its first line — the session_meta header, the ONLY rollout
-// line carrying cwd and the session start timestamp.
+// session by reading its first classifiable record — the session_meta header,
+// the ONLY rollout record carrying cwd and the session start timestamp. Records
+// too large for any pass to parse are skipped to reach it (nextClassifyRecord);
+// without that, one ahead of the header stalled the file forever.
 //
 // cwd is authoritative. The timestamp admits sessions in the bounded history
 // window from byte zero; older matched sessions are returned as
 // codexMatchYesPreexisting and captured go-forward from current EOF.
 //
-// Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on line
-// 1 only, so a file caught mid-creation whose first line is not yet a readable
-// session_meta is returned codexMatchUndecided (retry next poll) rather than
-// cached as a mismatch — caching "no" would drop it forever.
+// Unlike the Claude watcher's multi-line scan, cwd + timestamp both live on the
+// header only, so a file caught mid-creation whose first record is not yet a
+// readable session_meta is returned codexMatchUndecided (retry next poll) rather
+// than cached as a mismatch — caching "no" would drop it forever.
 func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) codexMatchResult {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only.
 	f, err := os.Open(path)
@@ -510,10 +512,16 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 		return codexMatchUndecided
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
-	if !scanner.Scan() {
+	line, ok := firstClassifiableCodexRecord(newClassifyReader(f))
+	if !ok {
 		return codexMatchUndecided
+	}
+	if line == nil {
+		// Nothing but unsupported records where the header belongs. A rollout
+		// header is a small record, so this file is not one — and caching the
+		// answer is what stops the every-poll re-read this bound exists to
+		// prevent. Fail closed: no cwd was ever read, so nothing is captured.
+		return codexMatchNo
 	}
 	var rec struct {
 		Timestamp string `json:"timestamp"`
@@ -522,7 +530,7 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 			Cwd string `json:"cwd"`
 		} `json:"payload"`
 	}
-	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+	if err := json.Unmarshal(line, &rec); err != nil {
 		return codexMatchUndecided
 	}
 	if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
@@ -543,10 +551,35 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 	return codexMatchYes
 }
 
+// codexClassifyMaxSkips bounds how many unsupported (or blank) records one
+// classification pass skips before giving up on finding the session_meta
+// header. Classification has no durable cursor, so every skip is re-read next
+// poll; the bound is what keeps an unclassifiable file from re-reading without
+// end, the same job maxScanLines does on the Claude side.
+const codexClassifyMaxSkips = 50
+
+// firstClassifiableCodexRecord returns the first record a rollout's header
+// could be. ok false means the file ended mid-record — still being written, so
+// retry next poll. A nil record with ok true means the skip bound was reached
+// without one, which is a decision, not a deferral.
+func firstClassifiableCodexRecord(r *bufio.Reader) ([]byte, bool) {
+	for skipped := 0; skipped <= codexClassifyMaxSkips; skipped++ {
+		line, ok := nextClassifyRecord(r)
+		if !ok {
+			return nil, false
+		}
+		if len(line) > 0 {
+			return line, true
+		}
+	}
+	return nil, true
+}
+
 // codexRolloutCwd returns the absolute cwd recorded in a rollout file's
-// session_meta header (the only rollout line carrying cwd), or "" when the first
-// line is not a readable session_meta. Read-only, first line only — the body is
-// never retained; the caller reduces the cwd to a privacy-safe repo identity.
+// session_meta header (the only rollout record carrying cwd), or "" when the
+// first classifiable record is not a readable session_meta. Read-only, header
+// only — the body is never retained; the caller reduces the cwd to a
+// privacy-safe repo identity.
 func codexRolloutCwd(path string) string {
 	// #nosec G304 -- path is a Codex rollout file discovered under the Codex sessions dir by the watcher, not user input; opened read-only and only the cwd field is read.
 	f, err := os.Open(path)
@@ -554,9 +587,11 @@ func codexRolloutCwd(path string) string {
 		return ""
 	}
 	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 1024*1024), 8*1024*1024)
-	if !scanner.Scan() {
+	// Skips unsupported records exactly as the classifier does — otherwise a
+	// rollout the classifier only reached PAST one would be admitted with no
+	// repo identity at all.
+	line, ok := firstClassifiableCodexRecord(newClassifyReader(f))
+	if !ok || line == nil {
 		return ""
 	}
 	var rec struct {
@@ -565,7 +600,7 @@ func codexRolloutCwd(path string) string {
 			Cwd string `json:"cwd"`
 		} `json:"payload"`
 	}
-	if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
+	if err := json.Unmarshal(line, &rec); err != nil {
 		return ""
 	}
 	if rec.Type != "session_meta" {
