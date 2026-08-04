@@ -342,6 +342,25 @@ type updater struct {
 	// instead of replacing the process.
 	apply func(self, staged string) error
 
+	// --- on-disk catch-up edges (see ondisk.go) --------------------------------
+	// canonicalBin names the managed install path, fileExists/fileStamp probe the
+	// filesystem, binVersionOf spawns `<path> --version`, load/saveGuard persist
+	// the anti-loop record and reexec replaces this process. All injected for the
+	// same reason as the fields above: the policy must be assertable without a
+	// filesystem or a process replacement.
+	canonicalBin func() string
+	fileExists   func(path string) bool
+	fileStamp    func(path string) string
+	binVersionOf func(path string) (string, error)
+	loadGuard    func() catchupGuard
+	saveGuard    func(catchupGuard)
+	reexec       func(path string) error
+
+	// lastProbed maps a candidate path to the fileStamp we last spawned
+	// `--version` on. In-memory by design: after a restart one extra probe costs
+	// nothing, and persisting it would be a second thing that can go stale.
+	lastProbed map[string]string
+
 	logf func(format string, args ...any)
 	now  func() time.Time
 }
@@ -359,9 +378,22 @@ func newDefaultUpdater(currentVersion string, noAutoUpdate bool, pol PolicyView)
 		httpRedirect:   httpRedirectLocation,
 		resolveSelf:    resolveSelfPath,
 		apply:          applySwapAndReexec,
+		canonicalBin:   state.CanonicalInstallBin,
+		fileExists:     fileExists,
+		fileStamp:      fileStamp,
+		binVersionOf:   probeBinaryVersion,
+		loadGuard:      loadCatchupGuard,
+		saveGuard:      saveCatchupGuard,
+		reexec:         reexecInto,
 		logf:           state.HookDebugf,
 		now:            time.Now,
 	}
+}
+
+// fileExists is the real-filesystem probe behind updater.fileExists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // checkAndApply runs one full gate → fetch → verify → swap cycle. It is
@@ -742,6 +774,16 @@ func (u *updater) checkInterval() time.Duration {
 // raising minCliVersion mid-run escalates a watcher that is already up — which
 // is the entire point of the lever.
 func runAutoUpdate(u *updater, stop <-chan struct{}) {
+	// Catch-up runs on the POLL, not the update cadence, and BEFORE the network
+	// check. It costs a stat in the overwhelmingly common case and needs no
+	// network at all, and what it is racing is a human who just ran `npm i -g`
+	// and is about to ask why the daemon still reports the old version. Putting
+	// it behind a 30m interval keyed to GitHub — or behind a check a firewalled
+	// machine never gets past — would answer the wrong question.
+	// In production the go verdict does not return: the process is replaced.
+	if u.catchUpToDisk() == catchupGo {
+		return
+	}
 	res := u.checkAndApply()
 	saveLastUpdateCheck(u.now())
 	startupBanner(res)
@@ -753,6 +795,9 @@ func runAutoUpdate(u *updater, stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
+			if u.catchUpToDisk() == catchupGo {
+				return
+			}
 			if u.now().Sub(loadLastUpdateCheck()) >= u.checkInterval() {
 				_ = u.checkAndApply()
 				saveLastUpdateCheck(u.now())

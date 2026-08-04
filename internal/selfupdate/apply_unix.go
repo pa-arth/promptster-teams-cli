@@ -35,11 +35,29 @@ func applySwapAndReexec(self, staged string) error {
 	if err := os.Rename(staged, self); err != nil {
 		return fmt.Errorf("selfupdate: swap in new binary: %w", err)
 	}
-	// Re-exec the freshly-swapped binary with the same argv and environment.
-	// Never returns on success.
-	// #nosec G204 G702 -- `self` is os.Executable()-resolved (not user input) and os.Args is our own process argv; re-execing ourselves with our own args is the whole point of an in-place self-update, not command injection.
-	if err := syscall.Exec(self, os.Args, os.Environ()); err != nil {
-		return fmt.Errorf("selfupdate: re-exec %s: %w", self, err)
+	// Re-exec the freshly-swapped binary. Never returns on success.
+	return reexecInto(self)
+}
+
+// reexecInto replaces the running process image with the binary at target,
+// keeping this process's arguments and environment. On success it DOES NOT
+// RETURN — same PID, same redirected log fds, same supervisor.json entry, so
+// capture continues seamlessly on the new version.
+//
+// argv[0] is set to target rather than carried over from os.Args, so `ps` names
+// the file that is actually executing. That matters most in the case this exists
+// for: a daemon catching up out of a path that no longer exists into the managed
+// one, where the inherited argv[0] would name the deleted file forever.
+// (os.Executable() reads /proc/self/exe and _NSGetExecutablePath, so it is
+// unaffected either way — nothing in this repo reads os.Args[0].)
+//
+// The single-instance flock fd is opened O_CLOEXEC by the Go runtime, so execve
+// releases it and the new image re-acquires it cleanly — no self-deadlock.
+func reexecInto(target string) error {
+	argv := append([]string{target}, os.Args[1:]...)
+	// #nosec G204 G702 -- target is os.Executable()-resolved or the managed install path (never user input) and the args are this process's own argv; re-execing ourselves is the whole point, not command injection.
+	if err := syscall.Exec(target, argv, os.Environ()); err != nil {
+		return fmt.Errorf("selfupdate: re-exec %s: %w", target, err)
 	}
 	return nil
 }

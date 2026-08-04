@@ -408,6 +408,82 @@ reported as **unknown**, never attributed to whatever holds the lock now. Consum
 **A recorded version is proof; an absent one is not evidence of health.** Never infer the
 daemon's build from the foreground version — that inference IS the bug.
 
+### The daemon catches up to the binary on its own disk (`ondisk.go`)
+
+Everything above REPORTS and REPAIRS the mismatch from outside. `internal/selfupdate/ondisk.go`
+removes the cause: **`checkAndApply` compares the running version against a GitHub release
+tag and nothing else**, so the daemon was blind to the most common way it goes stale — a
+newer binary arriving on its own disk by a route that is not us (`npm i -g`, `install.sh`,
+an MDM push, another invocation swapping the shared managed path). The machine already had
+the fix; nothing outside a process can change the code that process is running, and only a
+reboot or a human typing `stop && start` ever picked it up.
+
+So `runAutoUpdate` now calls `catchUpToDisk()` on every 5-minute POLL, before the network
+check, and re-execs into the on-disk binary when it is strictly newer. Read the header in
+that file before changing it. Four things there are decisions, not implementation details:
+
+- **It is deliberately NOT gated on `--no-auto-update`, `AutoUpdateEnabled`, or
+  `PinnedCliVersion`, and must not become so.** Those govern what we FETCH AND INSTALL;
+  catch-up installs nothing and fetches nothing. An org that turns auto-update off does it
+  to control which build lands on its machines — and then lands one. Refusing to execute it
+  means their fleet can never move a daemon without a reboot, which is this bug wearing a
+  different hat, and the file on disk is the version running after that reboot anyway. A
+  pin's enforcement point is the download. `TestCatchupIsNotGatedOnTheAutoUpdateSwitchOrThePin`
+  pins this precisely because it looks like a missing check.
+- **The stamped-build gate is the one gate it keeps.** `dev`/`""` parse as 0.0.0
+  (`parseVersion`), so without it a developer's watcher execs any release binary in the
+  managed path, and a released daemon execs a local `dev` build and strands itself there
+  permanently — nothing can ever look newer than 0.0.0 again.
+- **`catchupCandidates` is OUR OWN path first, then the MANAGED path**, and the caller takes
+  the first that is strictly newer — so the ordering IS the policy. Own path first because an
+  installer that replaced our file in place is the most direct statement of intent on the
+  machine (including a `npm ci`'d project-local copy: the project-local gate in
+  `checkAndApply` blocks US overwriting THEIR pin, not us executing what they installed).
+  The managed path second because two observed states are unreachable without it, and both
+  were the customer-reported shape rather than hypotheses: **autostart bakes an absolute
+  path** at enable time, so launchd keeps starting the daemon from a stale file that still
+  exists and that no installer will ever touch again; and a daemon whose own dir is **not
+  writable** cannot self-update at all — but exec needs no write permission, so this is the
+  only repair available to it, and afterwards its `os.Executable()` IS the managed path so
+  self-update starts working too. A **project-local** install never gets the second rule in
+  either direction: substituting the shared binary for a lockfile-pinned copy is precisely
+  what the lockfile refuses. An earlier revision of this section described the fallback as
+  firing only when our own path was GONE — that is the tidier invariant and it MISSES the
+  reported case, which is the one where the stale file is still sitting there.
+- **The `last-catchup` guard is anti-LOOP, not anti-repeat.** Termination normally holds by
+  construction (after the exec our version IS the disk version), but only while a binary's
+  `--version` agrees with what it comes up as. When it does not, the process re-execs every
+  poll forever — and a watcher restart re-seeds the Cursor rail to EOF, so a 5-minute bounce
+  silently drops the opening prompt of every session in between. That is data loss, not
+  churn. The record is written BEFORE the exec because on unix the exec never returns.
+
+  **The stamp cache must never cover a candidate that IS newer**, or the cooldown becomes
+  unreachable and the guard turns into a permanent block. The updater outlives every poll,
+  so caching a newer target suppresses the probe on every later poll, and the two cases the
+  cooldown exists for — an exec that FAILED (ETXTBSY while an installer is still writing, a
+  permission fault) and one the guard BLOCKED — are never reconsidered. The daemon then
+  stays stale for the life of the process, which here is weeks. Only "not newer" is cached;
+  a probe ERROR is not cached either, since it is usually transient. Caught by review on
+  PR #139, and note WHY the existing loop test missed it: it built a fresh updater per
+  attempt and changed the stamp between them, so it never exercised the cache at all
+  (`TestCatchupRetriesAfterTheCooldownEvenThoughTheFileNeverChanged` uses ONE updater and an
+  unchanged file, which is the production shape).
+
+**Windows needs `EnvHandoff`, and the reason generalises.** `reexecInto` has no execve there:
+it spawns a detached child and exits, so for a few milliseconds two processes exist and the
+child races the parent for the single-instance lock. Losing that race is not a retry — the
+child prints "already running", the parent is already gone, and the machine captures nothing
+until the next login. The marker tells `RunTeamsWatch` to WAIT (`awaitWatchLock`) instead of
+bowing out; an unmarked second `watch` still fails fast, so a human double-starting capture
+is still told immediately. This also closes the same pre-existing race in the Windows
+self-update swap, which shares the extracted `reexecInto`.
+
+**What this does NOT fix, and it is the reason support still has a job:** a daemon running a
+build from before this shipped does not have the code. It cannot catch up, cannot stamp its
+version, and `start` will not auto-restart it (`staleCapture("")` returns `""`). That fleet
+needs exactly one `promptster-teams stop && promptster-teams start` — after which it is
+self-maintaining.
+
 ### How the check resolves a version (NOT the JSON API)
 
 `fetchLatestTag` issues a **HEAD that does not follow redirects** against
