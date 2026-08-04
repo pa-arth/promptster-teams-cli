@@ -61,7 +61,23 @@ const (
 	// stuckRepeatInterval bounds how often the stuck warning repeats, so a
 	// wedged queue keeps saying so without flooding stderr.
 	stuckRepeatInterval = 5 * time.Minute
+
+	// batchProbeCooldown is how long the drain stops attempting batch delivery
+	// after a backend answers "no such route" while the policy still advertises
+	// one. Long enough not to hammer a rolled-back backend on every pass; short
+	// enough that a redeploy is picked up without restarting the daemon.
+	batchProbeCooldown = 30 * time.Minute
 )
+
+// batchMaxBodyBytes caps one batch request. The backend's own bodyLimit is 10 MB
+// and its member ceiling is 500 (~400 B/event ≈ 200 KB), so this is slack for
+// unusually large events rather than the binding constraint — it exists so one
+// pathological event cannot build a request the backend must refuse in full.
+//
+// A var rather than a const so a test can shrink it: the path where it binds is
+// the one that has to consume a line it cannot use, and that path shipped a
+// silent event-loss bug the first time precisely because nothing exercised it.
+var batchMaxBodyBytes = 4 << 20
 
 // backoffBase is the first retry delay; it doubles from there to backoffCap.
 // A var rather than a const purely so tests can shrink the ramp.
@@ -295,6 +311,54 @@ func PendingStateNow() PendingState {
 
 var startOnce sync.Once
 
+// BatchCapability answers whether the backend can take a batch right now, and
+// on what terms. Its shape is exactly policy.Resolver.BatchIngest's, so a caller
+// passes that method value directly and this package stays free of a dependency
+// on policy.
+//
+// Consulted once per chunk rather than once per process: the resolver refreshes
+// in the background, so a backend that gains or loses the route is picked up
+// without restarting the daemon. A nil BatchCapability means per-event delivery,
+// which is what every caller that has not been taught about batching gets.
+type BatchCapability func() (endpoint string, maxSize int, ok bool)
+
+// batchSuppressedUntil latches batch delivery OFF after a backend answered "no
+// such route" to one. Guarded by its own mutex because the drain is one
+// goroutine but tests reach in.
+//
+// This exists because the two sources of truth can disagree: the policy says the
+// route is there (fetched up to 10 minutes ago, or adopted from disk at startup)
+// while the backend in front of us has rolled back and 404s. Believing the
+// policy on every pass would mean one wasted round-trip per chunk, forever. The
+// latch is a COOLDOWN and not a permanent kill so a redeploy recovers on its own
+// — an unrecoverable-until-restart optimisation is how a fleet quietly stays on
+// the slow path for weeks.
+var (
+	batchSuppressMu    sync.Mutex
+	batchSuppressUntil time.Time
+)
+
+func batchSuppressed(now time.Time) bool {
+	batchSuppressMu.Lock()
+	defer batchSuppressMu.Unlock()
+	return now.Before(batchSuppressUntil)
+}
+
+func suppressBatch(now time.Time) {
+	batchSuppressMu.Lock()
+	defer batchSuppressMu.Unlock()
+	batchSuppressUntil = now.Add(batchProbeCooldown)
+}
+
+// resolveBatch collapses the capability and the latch into the one question
+// drainOnce asks: batch this chunk, or send it an event at a time?
+func resolveBatch(caps BatchCapability) (endpoint string, maxSize int, ok bool) {
+	if caps == nil || batchSuppressed(time.Now()) {
+		return "", 0, false
+	}
+	return caps()
+}
+
 // StartDrain launches the drain in the background, AT MOST ONCE PER PROCESS.
 //
 // The singleton is load-bearing, not defensive. The supervisor runs the claude
@@ -308,9 +372,10 @@ var startOnce sync.Once
 // context: whichever watcher happens to start first must not own delivery for
 // the others, and a watcher exiting must not silently stop the queue. Tests
 // call Drain directly for a cancellable, blocking drain.
-func StartDrain(client *http.Client, apiKey string) {
+// caps may be nil, which means per-event delivery.
+func StartDrain(client *http.Client, apiKey string, caps BatchCapability) {
 	startOnce.Do(func() {
-		go Drain(context.Background(), client, apiKey)
+		go Drain(context.Background(), client, apiKey, caps)
 	})
 }
 
@@ -326,11 +391,15 @@ func StartDrain(client *http.Client, apiKey string) {
 //
 // Only 2xx and 400/422 advance. Everything else retries in place forever, which
 // is correct: the queue is bounded by OutboxMaxBytes, not by giving up.
-func Drain(ctx context.Context, client *http.Client, apiKey string) {
+//
+// When caps reports batch support the same rules apply PER MEMBER, read off the
+// backend's 207 — see deliverChunk. The rules do not change with the transport;
+// only how many events one round-trip carries.
+func Drain(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability) {
 	failures := 0
 	var lastWarn time.Time
 	for {
-		n, err := drainOnce(ctx, client, apiKey)
+		n, err := drainOnce(ctx, client, apiKey, caps)
 		if ctx.Err() != nil {
 			return
 		}
@@ -376,7 +445,7 @@ func Drain(ctx context.Context, client *http.Client, apiKey string) {
 
 // drainOnce delivers every event currently queued past the cursor, then
 // compacts. Returns how many events it delivered (or permanently skipped).
-func drainOnce(ctx context.Context, client *http.Client, apiKey string) (int, error) {
+func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps BatchCapability) (int, error) {
 	cursor := readCursor()
 	p := state.OutboxPath()
 
@@ -413,6 +482,77 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string) (int, er
 
 	reader := bufio.NewReader(f)
 	delivered := 0
+
+	// Batch path. One round-trip carries up to maxSize events; the cursor still
+	// advances only over members the backend has answered for.
+	if endpoint, maxSize, ok := resolveBatch(caps); ok {
+		for {
+			if ctx.Err() != nil {
+				return delivered, nil
+			}
+			// Re-asked every chunk, because deliverChunk's fallback latches batch
+			// OFF and the rest of this pass must then run on the per-event loop
+			// below. Without this the pass would spend one wasted round-trip per
+			// chunk re-discovering a route the backend has already said is absent.
+			if _, _, stillBatching := resolveBatch(caps); !stillBatching {
+				break
+			}
+			chunk, desynced := readChunk(reader, maxSize)
+			if len(chunk) == 0 {
+				break // queue drained, or a partial trailing line — next pass
+			}
+			advance, count, fellBack := deliverChunk(ctx, client, apiKey, endpoint, chunk)
+			if fellBack {
+				// The backend cannot answer a batch. Deliver THIS chunk one event
+				// at a time rather than dropping it or re-reading it: the bytes are
+				// already in hand and the per-event path works against every
+				// backend. This is the boundary the acceptance names, and nothing
+				// crosses it unsent.
+				for _, ln := range chunk {
+					if ctx.Err() != nil {
+						return delivered, nil
+					}
+					if ln.body != nil && !deliver(ctx, client, apiKey, ln.body) {
+						return delivered, nil // ctx cancelled mid-retry
+					}
+					cursor += ln.size
+					if err := writeCursor(cursor); err != nil {
+						return delivered, fmt.Errorf("persist cursor: %w", err)
+					}
+					delivered++
+				}
+				continue
+			}
+			delivered += count
+			if advance > 0 {
+				cursor += advance
+				if err := writeCursor(cursor); err != nil {
+					// Same reasoning as the per-event path below: without a durable
+					// cursor every further send is one we cannot prove.
+					return delivered, fmt.Errorf("persist cursor: %w", err)
+				}
+			}
+			if advance < chunkBytes(chunk) {
+				// Some member was neither accepted nor rejected (403, 500, or an
+				// index the backend did not answer for), or ctx was cancelled. The
+				// cursor now points AT it. End the pass so the next one re-reads
+				// from there with that member at the head, where deliverChunk's
+				// backoff applies to it directly.
+				return delivered, nil
+			}
+			if desynced {
+				// readChunk consumed a line it did not hand us, so this reader can
+				// no longer be trusted to sit where the cursor does. The cursor
+				// itself is correct and durable; ending the pass reopens the file
+				// there. See readChunk.
+				return delivered, nil
+			}
+		}
+		// Falls through to the per-event loop, which shares this reader and this
+		// cursor. Normally it finds the queue exhausted and goes straight to
+		// compact; after a fallback it delivers whatever is left of the pass.
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return delivered, nil
@@ -438,6 +578,241 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string) (int, er
 	}
 	compact(cursor)
 	return delivered, nil
+}
+
+// --- batch delivery ----------------------------------------------------------
+
+// chunkLine is one line read from the queue, kept alongside the exact number of
+// bytes it occupies there.
+//
+// size is tracked separately from len(body) and that is load-bearing: body is
+// TRIMMED (it is the signed payload, and trailing whitespace was never signed)
+// while the cursor must advance by the untrimmed length including the newline.
+// Deriving one from the other would drift the cursor by a byte per line and
+// re-send the tail of the queue forever.
+type chunkLine struct {
+	size int64
+	// body is the trimmed bytes to send, or nil for a line that must never be
+	// sent — blank, or unparseable. Those still occupy queue bytes and are still
+	// advanced past; they are simply not the backend's problem.
+	body []byte
+}
+
+// chunkBytes is how far the cursor moves if every line in the chunk clears.
+func chunkBytes(chunk []chunkLine) int64 {
+	var n int64
+	for _, ln := range chunk {
+		n += ln.size
+	}
+	return n
+}
+
+// readChunk reads up to maxSize SENDABLE lines, plus any unsendable ones
+// interleaved among them.
+//
+// It stops early on a partial trailing line (an append is mid-flight — same rule
+// as the per-event loop) and on batchMaxBodyBytes. One event larger than that
+// cap is still admitted when it would otherwise be the only member, because a
+// chunk of zero sendable members makes no progress and the queue would wedge on
+// it permanently — the same reasoning that makes the backend's budget admit an
+// oversized batch against an empty window.
+// It returns `desynced` when it consumed a line it did not include — the byte
+// cap is the only way that happens. bufio cannot put a whole line back, so the
+// reader is then positioned PAST a line the cursor has not accounted for, and
+// the caller MUST end the pass rather than keep reading: the next chunk would
+// otherwise start after the dropped line, so its bytes would be added to a
+// cursor that never covered the dropped one, leaving the cursor misaligned in
+// the middle of a later line. That loses the skipped event outright and then
+// truncates its neighbour. Ending the pass reopens the file at the cursor, where
+// the skipped line is the head of a fresh chunk and `sendable == 0` admits it
+// alone. Caught in review on #152; the first version returned silently and the
+// comment claimed a re-read that could not happen.
+func readChunk(reader *bufio.Reader, maxSize int) (chunk []chunkLine, desynced bool) {
+	chunk = make([]chunkLine, 0, maxSize)
+	sendable := 0
+	var bodyBytes int
+
+	for sendable < maxSize {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			break
+		}
+		ln := chunkLine{size: int64(len(line))}
+		body := []byte(strings.TrimSpace(string(line)))
+
+		switch {
+		case len(body) == 0:
+			// Blank line: nothing to send, advance past it.
+		case !json.Valid(body):
+			// An unparseable queue line can never become sendable. Skipping it is
+			// the only way to avoid wedging the queue head forever — and in a
+			// batch it would poison every member alongside it, since the backend
+			// rejects a malformed ENVELOPE wholesale.
+			warnf("skipping unparseable queued line")
+		default:
+			if sendable > 0 && bodyBytes+len(body) > batchMaxBodyBytes {
+				return chunk, true
+			}
+			ln.body = body
+			bodyBytes += len(body)
+			sendable++
+		}
+		chunk = append(chunk, ln)
+	}
+	return chunk, false
+}
+
+// memberAdvanceable reports whether a per-member status proves the member is
+// done with, in either direction.
+//
+// Exactly the per-event rule from Drain's doc, applied per member: 2xx stored or
+// already-known, 400/422 permanently unsendable. A 403 (device pubkey refused)
+// and a 5xx are NOT advanceable — they are the same "retry in place forever"
+// case single delivery gives them, and treating either as done would silently
+// drop events on a key rotation or a backend fault.
+func memberAdvanceable(status int) bool {
+	if status >= 200 && status < 300 {
+		return true
+	}
+	return status == http.StatusBadRequest || status == http.StatusUnprocessableEntity
+}
+
+// advanceOver walks the chunk in order against the backend's per-member results
+// and returns how far the cursor may move, plus how many lines that covers.
+//
+// It stops at the FIRST member it cannot prove is done, and the prefix rule is
+// forced by the medium: the cursor is a single byte offset, so there is no way
+// to record "members 4-10 landed but 3 did not". Members after a stuck one are
+// therefore re-sent on the next pass, which per-member idempotency on the
+// backend makes free.
+//
+// A member with no result row is treated as unproven rather than as accepted.
+// A truncated or reordered results array is a backend we do not understand, and
+// the only safe reading of silence is that the event did not land.
+func advanceOver(chunk []chunkLine, results []ingest.BatchMemberResult) (advance int64, lines int) {
+	byIndex := make(map[int]ingest.BatchMemberResult, len(results))
+	for _, r := range results {
+		byIndex[r.Index] = r
+	}
+
+	member := 0
+	for _, ln := range chunk {
+		if ln.body == nil {
+			advance += ln.size
+			lines++
+			continue
+		}
+		r, ok := byIndex[member]
+		if !ok || !memberAdvanceable(r.Status) {
+			return advance, lines
+		}
+		member++
+		advance += ln.size
+		lines++
+	}
+	return advance, lines
+}
+
+// deliverChunk delivers one chunk as a single batch request.
+//
+// Returns how many bytes the cursor may advance, how many lines that covers, and
+// whether the caller must fall back to per-event delivery for this same chunk.
+//
+// It returns the MOMENT it has any provable progress rather than retrying until
+// the chunk fully clears. That is deliberate: progress the caller has not been
+// told about is progress the cursor has not recorded, and a kill in that window
+// re-sends every member of the chunk. Returning early bounds the duplicate
+// window to the members genuinely in flight.
+//
+// With zero progress it retries in place — the head member is a 403 or a 5xx, or
+// the whole request failed — under the same backoff and the same never-give-up
+// rule as single delivery.
+func deliverChunk(
+	ctx context.Context,
+	client *http.Client,
+	apiKey string,
+	endpoint string,
+	chunk []chunkLine,
+) (advance int64, lines int, fellBack bool) {
+	bodies := make([][]byte, 0, len(chunk))
+	for _, ln := range chunk {
+		if ln.body != nil {
+			bodies = append(bodies, ln.body)
+		}
+	}
+	if len(bodies) == 0 {
+		// Every line was blank or unparseable. There is nothing to ask the
+		// backend, and advancing is the whole answer.
+		return chunkBytes(chunk), len(chunk), false
+	}
+
+	attempt := 0
+	started := time.Now()
+	var lastWarn time.Time
+	for {
+		results, err := ingest.IngestBatchWithClient(client, endpoint, bodies, apiKey)
+
+		switch {
+		case err == nil:
+			adv, n := advanceOver(chunk, results)
+			if adv > 0 {
+				if attempt >= stuckAttemptThreshold {
+					warnf("recovered — delivered %d event(s) after %d attempt(s) over %s",
+						n, attempt+1, time.Since(started).Round(time.Second))
+				}
+				return adv, n, false
+			}
+			// The head member was answered for, and the answer was neither
+			// acceptance nor rejection (403, 500, or no row at all). Nothing can
+			// advance past it, so this is the retry-in-place case.
+
+		case ingest.IsBatchUnsupported(err):
+			// The policy advertises a route this backend does not serve — a
+			// rollback, a proxy, or a stale cached capability. Stop asking for a
+			// while and deliver the chunk one event at a time. NOT a failure:
+			// per-event is the contract every backend honours.
+			suppressBatch(time.Now())
+			state.HookDebugf("outbox: backend does not support batch ingest, "+
+				"falling back to per-event delivery for %s: %v", batchProbeCooldown, err)
+			return 0, 0, true
+
+		case ingest.IsIngestRejection(err):
+			// A 400 on the ENVELOPE, not on a member — the backend could not read
+			// the batch at all, so no member has an answer. Retrying the same
+			// bytes cannot help, and skipping the chunk would DROP every event in
+			// it. Falling back sends each event on the path that gives it its own
+			// verdict, so a genuinely bad event is skipped alone and the rest land.
+			suppressBatch(time.Now())
+			warnf("backend refused the batch envelope (%v) — falling back to per-event "+
+				"delivery for %s; no events were dropped.", err, batchProbeCooldown)
+			return 0, 0, true
+		}
+
+		var wait time.Duration
+		if retryAfter, limited := ingest.IsRateLimited(err); limited {
+			wait = retryAfter
+			if wait <= 0 {
+				wait = backoffFor(attempt)
+			}
+		} else {
+			wait = backoffFor(attempt)
+		}
+		attempt++
+
+		if attempt >= stuckAttemptThreshold && time.Since(lastWarn) >= stuckRepeatInterval {
+			warnf("STUCK on a %d-event batch for %s (%d attempts): %v — events are being captured "+
+				"and queued but are NOT reaching the backend. Check that this device's engineer key "+
+				"is still valid and the API is reachable; %d event(s) are waiting.",
+				len(bodies), time.Since(started).Round(time.Second), attempt, err, PendingCount())
+			lastWarn = time.Now()
+		} else {
+			state.HookDebugf("outbox: batch delivery failed (%d events), retrying in %s: %v",
+				len(bodies), wait, err)
+		}
+		if !sleepCtx(ctx, wait) {
+			return 0, 0, false
+		}
+	}
 }
 
 // deliver POSTs one queued line, retrying per the rules in Drain's doc. Returns

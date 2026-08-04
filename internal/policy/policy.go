@@ -66,11 +66,38 @@ func policyPath() string {
 // from an explicit false — unknown must fail OPEN (auto-update stays on), the
 // deliberate OPPOSITE of the fail-closed CaptureAssistantProse rule, because a
 // network/parse blip must never STRAND the fleet on an old binary.
+// Ingest is the backend's advertised ingest capabilities — the `ingest` block on
+// GET /v1/teams/policy. Absent on any backend older than the batch route, which
+// is exactly why every field is optional and the zero value means "send events
+// one at a time".
+//
+// FAIL-CLOSED, and in the useful direction: per-event delivery works against
+// every backend that has ever existed, batch delivery works only against one
+// that advertises it. Guessing wrong toward per-event costs throughput; guessing
+// wrong toward batch would POST to a route that isn't there. The drain still
+// carries its own runtime fallback (ingest.ErrBatchUnsupported) because an
+// advertisement can go stale — a rollback between the fetch and the send — but
+// that fallback is the second line, not the first.
+type Ingest struct {
+	// Batch reports whether POST <BatchEndpoint> exists.
+	Batch bool `json:"batch"`
+	// BatchEndpoint is the route, sent by the backend rather than hardcoded here
+	// so the path can move without stranding the fleet on a 404.
+	BatchEndpoint string `json:"batchEndpoint"`
+	// MaxBatchSize is the largest member count the backend will accept.
+	MaxBatchSize int `json:"maxBatchSize"`
+}
+
 type apiResponse struct {
 	CaptureAssistantProse bool   `json:"captureAssistantProse"`
 	AutoUpdate            *bool  `json:"autoUpdate"`
 	PinnedCliVersion      string `json:"pinnedCliVersion"`
 	MinCliVersion         string `json:"minCliVersion"`
+	// Ingest is a POINTER so an absent block ("this backend predates batch") is
+	// distinguishable from one that explicitly advertises batch:false. Both
+	// resolve to per-event delivery today, but only one of them is a backend
+	// that could ever say yes, and a future probe may want to tell them apart.
+	Ingest *Ingest `json:"ingest"`
 }
 
 // diskCache is the on-disk shape: the resolved flags plus when they were
@@ -81,6 +108,7 @@ type diskCache struct {
 	AutoUpdate            *bool     `json:"autoUpdate"`
 	PinnedCliVersion      string    `json:"pinnedCliVersion"`
 	MinCliVersion         string    `json:"minCliVersion"`
+	Ingest                *Ingest   `json:"ingest"`
 	FetchedAt             time.Time `json:"fetchedAt"`
 }
 
@@ -104,6 +132,10 @@ type Resolver struct {
 	// It does not change WHAT gets installed — only how soon the updater looks
 	// (see selfupdate.runAutoUpdate).
 	minCliVersion string
+
+	// ingest is the backend's advertised ingest capability. Nil until a fetch (or
+	// an adopted disk cache) supplies one, and nil resolves to per-event.
+	ingest *Ingest
 }
 
 // NewResolver builds a Resolver for the given PSE engineer key. If a recent
@@ -119,6 +151,12 @@ func NewResolver(apiKey string) *Resolver {
 		if time.Since(c.FetchedAt) < cacheTTL {
 			r.value = c.CaptureAssistantProse
 			r.fetchedAt = c.FetchedAt
+			// TTL-gated like prose, not TTL-free like the self-update fields. An
+			// aged-out capability resolves to per-event, which every backend
+			// accepts, so the conservative branch costs throughput and nothing
+			// else. The self-update fields cannot do that — reverting them to a
+			// default would strand the fleet — which is why they age differently.
+			r.ingest = c.Ingest
 		}
 		if c.AutoUpdate != nil {
 			r.autoUpdate = *c.AutoUpdate
@@ -175,6 +213,26 @@ func (r *Resolver) MinCliVersion() string {
 	return r.minCliVersion
 }
 
+// BatchIngest reports the backend's batch-ingest capability, WITHOUT any network
+// call — the last fetched (or adopted) value.
+//
+// Returns endpoint and maxSize only when all three of batch, a non-empty
+// endpoint, and a positive size are present. A half-advertised capability
+// resolves to "unsupported": there is no useful way to batch against a backend
+// that says yes but will not say where or how many, and inventing a default for
+// the missing half is how a client ends up POSTing to a route that isn't there.
+func (r *Resolver) BatchIngest() (endpoint string, maxSize int, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.ingest == nil || !r.ingest.Batch {
+		return "", 0, false
+	}
+	if r.ingest.BatchEndpoint == "" || r.ingest.MaxBatchSize <= 0 {
+		return "", 0, false
+	}
+	return r.ingest.BatchEndpoint, r.ingest.MaxBatchSize, true
+}
+
 // StartBackground runs policy refreshes OFF the caller's hot path: it fires an
 // immediate refresh, then one every RefreshInterval, in a goroutine that exits
 // when ctx is cancelled. The capture loop only ever reads CaptureAssistantProse
@@ -225,12 +283,18 @@ func (r *Resolver) Refresh() {
 	r.autoUpdate = autoUpdate
 	r.pinnedCliVersion = parsed.PinnedCliVersion
 	r.minCliVersion = parsed.MinCliVersion
+	// Assigned unconditionally, INCLUDING to nil. A backend that stops
+	// advertising batch (a rollback) must retract the capability here rather
+	// than leave the last good one in place — the opposite of the self-update
+	// fields' retain-on-anything rule, because the safe direction is reversed.
+	r.ingest = parsed.Ingest
 	r.mu.Unlock()
 	writeDiskCache(diskCache{
 		CaptureAssistantProse: parsed.CaptureAssistantProse,
 		AutoUpdate:            parsed.AutoUpdate,
 		PinnedCliVersion:      parsed.PinnedCliVersion,
 		MinCliVersion:         parsed.MinCliVersion,
+		Ingest:                parsed.Ingest,
 		FetchedAt:             now,
 	})
 }

@@ -183,3 +183,89 @@ func TestResolverAdoptsDiskCache(t *testing.T) {
 		t.Fatal("resolver #2: expected true adopted from the disk cache without Refresh")
 	}
 }
+
+// TestBatchIngestCapability pins the probe §4.1 relies on. The interesting cases
+// are the ones that must resolve to "no": an old backend that has never heard of
+// batching, and a backend that says yes without saying where or how many.
+// Per-event delivery is correct against all of them, so "no" is the only answer
+// that cannot be wrong.
+func TestBatchIngestCapability(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		wantOK   bool
+		wantPath string
+		wantMax  int
+	}{
+		{
+			name:     "advertised in full",
+			body:     `{"ingest":{"batch":true,"batchEndpoint":"/v1/teams/ingest/batch","maxBatchSize":500}}`,
+			wantOK:   true,
+			wantPath: "/v1/teams/ingest/batch",
+			wantMax:  500,
+		},
+		{
+			name: "block absent — a backend older than the route",
+			body: `{"captureAssistantProse":false}`,
+		},
+		{
+			name: "explicitly disabled",
+			body: `{"ingest":{"batch":false,"batchEndpoint":"/v1/teams/ingest/batch","maxBatchSize":500}}`,
+		},
+		{
+			name: "yes but no endpoint — half an advertisement is not one",
+			body: `{"ingest":{"batch":true,"maxBatchSize":500}}`,
+		},
+		{
+			name: "yes but no size — same",
+			body: `{"ingest":{"batch":true,"batchEndpoint":"/v1/teams/ingest/batch"}}`,
+		},
+		{
+			name: "yes with a nonsensical size",
+			body: `{"ingest":{"batch":true,"batchEndpoint":"/v1/teams/ingest/batch","maxBatchSize":0}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setup(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			})
+			r := NewResolver("PSE-TEST")
+			r.Refresh()
+			endpoint, maxSize, ok := r.BatchIngest()
+			if ok != tc.wantOK {
+				t.Fatalf("BatchIngest ok = %v, want %v", ok, tc.wantOK)
+			}
+			if ok && (endpoint != tc.wantPath || maxSize != tc.wantMax) {
+				t.Errorf("got (%q, %d), want (%q, %d)", endpoint, maxSize, tc.wantPath, tc.wantMax)
+			}
+		})
+	}
+}
+
+// TestBatchIngestRetractedOnRollback pins that a backend which STOPS advertising
+// batch retracts the capability rather than leaving the last good one in place.
+// This is the opposite of how the self-update fields age, and deliberately so:
+// there the safe direction is to keep the old value, here it is to drop it.
+func TestBatchIngestRetractedOnRollback(t *testing.T) {
+	advertise := true
+	setup(t, func(w http.ResponseWriter, _ *http.Request) {
+		if advertise {
+			_, _ = w.Write([]byte(`{"ingest":{"batch":true,"batchEndpoint":"/b","maxBatchSize":10}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"captureAssistantProse":false}`))
+	})
+
+	r := NewResolver("PSE-TEST")
+	r.Refresh()
+	if _, _, ok := r.BatchIngest(); !ok {
+		t.Fatal("expected batch support after the first fetch")
+	}
+
+	advertise = false
+	r.Refresh()
+	if _, _, ok := r.BatchIngest(); ok {
+		t.Error("capability survived a backend that stopped advertising it — " +
+			"the CLI would keep POSTing to a route that is no longer there")
+	}
+}

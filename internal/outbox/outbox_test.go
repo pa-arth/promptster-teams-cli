@@ -46,7 +46,7 @@ func runDrain(t *testing.T, srv *httptest.Server, done <-chan struct{}, timeout 
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
-	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 	defer func() { cancel(); <-finished }()
 
 	select {
@@ -328,7 +328,7 @@ func TestFreshInstallWithLargeLedgerDrainsNothing(t *testing.T) {
 	// Run the drain briefly; it must send NOTHING.
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
-	Drain(ctx, srv.Client(), "PSE-TEST")
+	Drain(ctx, srv.Client(), "PSE-TEST", nil)
 
 	if got := atomic.LoadInt32(&hits); got != 0 {
 		t.Errorf("drain sent %d request(s) on a fresh install — the ledger backlog must NEVER be replayed (this is the 429 storm)", got)
@@ -384,7 +384,7 @@ func TestCompactionResetsQueue(t *testing.T) {
 	// drain alive and polls until compaction lands.
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
-	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 	defer func() { cancel(); <-finished }()
 
 	deadline := time.Now().Add(5 * time.Second)
@@ -452,7 +452,7 @@ func TestDrainShipsQueuedBytesVerbatim(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
-	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 	defer func() { cancel(); <-finished }()
 
 	var got []byte
@@ -532,7 +532,7 @@ func TestDrainWarnsLoudlyWhenStuck(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			finished := make(chan struct{})
-			go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+			go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 			defer func() { cancel(); <-finished }()
 
 			deadline := time.Now().Add(5 * time.Second)
@@ -700,7 +700,7 @@ func TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond(t *testing.T)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
-	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 	time.Sleep(12 * time.Second)
 	cancel()
 	<-finished
@@ -799,7 +799,7 @@ func TestCursorPersistRecovers(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	finished := make(chan struct{})
-	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST") }()
+	go func() { defer close(finished); Drain(ctx, srv.Client(), "PSE-TEST", nil) }()
 	defer func() { cancel(); <-finished }()
 
 	deadline := time.Now().Add(5 * time.Second)

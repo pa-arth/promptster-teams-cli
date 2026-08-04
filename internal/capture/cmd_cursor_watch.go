@@ -245,17 +245,19 @@ func RunCursorWatcher() error {
 	// EOF; every later poll tails a newly-appeared transcript from 0.
 	firstPoll := true
 
-	// Process-wide singleton shared with the Claude and Codex watchers — one
-	// device-wide queue, one drain. See outbox.StartDrain.
-	outbox.StartDrain(client, session.SessionToken)
-
 	// Org capture policy, fail-closed and refreshed off the hot path. This
 	// watcher emits no assistant prose at all — a Cursor transcript carries no
 	// model and this rail mints no `ai_response` (the hook rail does, but it
 	// carries only a model name, never prose) — so the gate cannot change what
 	// ships here. It is threaded through anyway so every capture path reaches the
 	// buffer by the identical call, and a future kind cannot quietly bypass it.
+	//
+	// Built BEFORE the drain because the drain reads its batch-ingest capability.
 	policyResolver := policy.NewResolver(session.SessionToken)
+
+	// Process-wide singleton shared with the Claude and Codex watchers — one
+	// device-wide queue, one drain. See outbox.StartDrain.
+	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	policyResolver.StartBackground(policyCtx)
