@@ -356,10 +356,10 @@ type updater struct {
 	saveGuard    func(catchupGuard)
 	reexec       func(path string) error
 
-	// lastProbed is the fileStamp of the binary we last spawned `--version` on.
-	// In-memory by design: after a restart one extra probe costs nothing, and
-	// persisting it would be a second thing that can go stale.
-	lastProbed string
+	// lastProbed maps a candidate path to the fileStamp we last spawned
+	// `--version` on. In-memory by design: after a restart one extra probe costs
+	// nothing, and persisting it would be a second thing that can go stale.
+	lastProbed map[string]string
 
 	logf func(format string, args ...any)
 	now  func() time.Time

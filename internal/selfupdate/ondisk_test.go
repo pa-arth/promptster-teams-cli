@@ -211,9 +211,9 @@ func TestCatchupIsNotGatedOnTheAutoUpdateSwitchOrThePin(t *testing.T) {
 	}
 }
 
-// pickCatchupPath answers "which file on disk should this daemon be running",
-// and each branch is a state observed in the field.
-func TestPickCatchupPathFollowsOwnPathThenFallsBackWhenOrphaned(t *testing.T) {
+// catchupCandidates answers "which files on disk may this daemon re-exec into",
+// in the order they win. Each row is a state observed in the field.
+func TestCatchupCandidatesPreferOwnPathThenTheManagedOne(t *testing.T) {
 	const (
 		self      = "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64"
 		local     = "/Users/dev/work/app/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64"
@@ -223,29 +223,74 @@ func TestPickCatchupPathFollowsOwnPathThenFallsBackWhenOrphaned(t *testing.T) {
 		name   string
 		self   string
 		on     []string
-		want   string
+		want   []string
 		reason string
 	}{
-		{"own path exists — it is the answer", self, []string{self, canonical}, self,
-			"an installer that replaced our own file in place is telling us to run it"},
-		{"orphaned — fall back to the managed path", self, []string{canonical}, canonical,
+		{"both present — own path first, managed as fallback", self, []string{self, canonical}, []string{self, canonical},
+			"an in-place replacement wins, but a stale baked path must not trap the daemon forever"},
+		{"orphaned — only the managed path is left", self, []string{canonical}, []string{canonical},
 			"npm dropped the layout we were started from; nothing will ever replace that file again"},
-		{"orphaned with nothing to fall back to", self, []string{}, "",
-			"no candidate at all"},
-		{"orphaned project-local install stays put", local, []string{canonical}, "",
+		{"nothing on disk at all", self, []string{}, nil,
+			"no candidate"},
+		{"project-local never reaches the managed binary", local, []string{local, canonical}, []string{local},
 			"jumping a lockfile-pinned copy into the shared binary is what the lockfile refuses"},
-		{"we ARE the managed path and it is gone", canonical, []string{}, "",
-			"the fallback is the same file — following it is following a corpse"},
+		{"we ARE the managed path", canonical, []string{canonical}, []string{canonical},
+			"the fallback is the same file — listing it twice would just double the probes"},
 	}
 	for _, c := range cases {
 		on := map[string]bool{}
 		for _, p := range c.on {
 			on[p] = true
 		}
-		got := pickCatchupPath(c.self, canonical, func(p string) bool { return on[p] })
-		if got != c.want {
-			t.Errorf("%s: pickCatchupPath = %q, want %q (%s)", c.name, got, c.want, c.reason)
+		got := catchupCandidates(c.self, canonical, func(p string) bool { return on[p] })
+		if len(got) != len(c.want) {
+			t.Errorf("%s: candidates = %v, want %v (%s)", c.name, got, c.want, c.reason)
+			continue
 		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("%s: candidates = %v, want %v (%s)", c.name, got, c.want, c.reason)
+				break
+			}
+		}
+	}
+}
+
+// THE SHAPE THAT WAS ACTUALLY REPORTED. autostart bakes an absolute path at
+// enable time and nothing revisits it, so launchd keeps starting the daemon from
+// a file that still exists, is stale, and that no installer will ever touch
+// again — while the managed binary on the same machine is current. Following
+// only our own path leaves that daemon stale forever.
+func TestCatchupFollowsTheManagedBinaryWhenOurOwnPathIsStaleButPresent(t *testing.T) {
+	const baked = "/usr/local/lib/node_modules/@promptster/teams-cli/binaries/promptster-teams-darwin-arm64"
+	w := newDiskWorld("0.12.2", "0.12.2")
+	w.self = baked
+	w.versions = map[string]string{baked: "0.12.2", w.canon: "0.13.0"}
+	w.stamps = map[string]string{baked: "s-baked", w.canon: "s-canon"}
+
+	if got := w.updater("0.12.2", nil, false).catchUpToDisk(); got != catchupGo {
+		t.Fatalf("verdict = %v, want catchupGo", got)
+	}
+	if len(w.execd) != 1 || w.execd[0] != w.canon {
+		t.Fatalf("re-exec calls = %v, want [%s] — the stale baked path trapped the daemon", w.execd, w.canon)
+	}
+}
+
+// Our own path still wins when IT is the newer one: an installer that replaced
+// our file in place is the most direct statement of intent on the machine.
+func TestCatchupPrefersOurOwnPathWhenItIsTheNewerOne(t *testing.T) {
+	const other = "/opt/promptster/bin/promptster-teams"
+	w := newDiskWorld("0.12.2", "0.13.0")
+	w.self = other
+	w.versions = map[string]string{other: "0.13.0", w.canon: "0.14.0"}
+	w.stamps = map[string]string{other: "s-self", w.canon: "s-canon"}
+
+	w.updater("0.12.2", nil, false).catchUpToDisk()
+	if len(w.execd) != 1 || w.execd[0] != other {
+		t.Fatalf("re-exec calls = %v, want [%s]", w.execd, other)
+	}
+	if len(w.probed) != 1 {
+		t.Errorf("probed %v — the managed path should not be probed once our own path already wins", w.probed)
 	}
 }
 

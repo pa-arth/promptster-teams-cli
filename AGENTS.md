@@ -367,13 +367,22 @@ that file before changing it. Four things there are decisions, not implementatio
   (`parseVersion`), so without it a developer's watcher execs any release binary in the
   managed path, and a released daemon execs a local `dev` build and strands itself there
   permanently — nothing can ever look newer than 0.0.0 again.
-- **`pickCatchupPath` follows OUR OWN path, falling back to the managed one only when our
-  path is GONE.** Anything wider is a policy call about which install wins. An installer
-  that replaced our file in place is telling us to run it (including a `npm ci`'d
-  project-local copy — the project-local gate in `checkAndApply` blocks US overwriting THEIR
-  pin, not us executing what they installed). An orphan holding a deleted inode has nothing
-  to follow, so it takes the managed path — unless it is project-local, where jumping into
-  the shared binary is exactly what the lockfile refuses.
+- **`catchupCandidates` is OUR OWN path first, then the MANAGED path**, and the caller takes
+  the first that is strictly newer — so the ordering IS the policy. Own path first because an
+  installer that replaced our file in place is the most direct statement of intent on the
+  machine (including a `npm ci`'d project-local copy: the project-local gate in
+  `checkAndApply` blocks US overwriting THEIR pin, not us executing what they installed).
+  The managed path second because two observed states are unreachable without it, and both
+  were the customer-reported shape rather than hypotheses: **autostart bakes an absolute
+  path** at enable time, so launchd keeps starting the daemon from a stale file that still
+  exists and that no installer will ever touch again; and a daemon whose own dir is **not
+  writable** cannot self-update at all — but exec needs no write permission, so this is the
+  only repair available to it, and afterwards its `os.Executable()` IS the managed path so
+  self-update starts working too. A **project-local** install never gets the second rule in
+  either direction: substituting the shared binary for a lockfile-pinned copy is precisely
+  what the lockfile refuses. An earlier revision of this section described the fallback as
+  firing only when our own path was GONE — that is the tidier invariant and it MISSES the
+  reported case, which is the one where the stale file is still sitting there.
 - **The `last-catchup` guard is anti-LOOP, not anti-repeat.** Termination normally holds by
   construction (after the exec our version IS the disk version), but only while a binary's
   `--version` agrees with what it comes up as. When it does not, the process re-execs every

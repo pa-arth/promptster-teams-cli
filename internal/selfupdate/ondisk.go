@@ -121,39 +121,42 @@ func stampedVersion(v string) bool {
 	return v != "" && v != "dev"
 }
 
-// pickCatchupPath chooses WHICH file on disk this daemon ought to be running.
+// catchupCandidates lists the binaries this daemon may re-exec into, in priority
+// order. The caller takes the FIRST one that is strictly newer than the running
+// version, so the ordering is the policy:
 //
-// The invariant is deliberately narrow — "run the binary at your own path" —
-// because anything wider is a policy decision about which install wins, and this
-// code is in no position to make one:
+//  1. OUR OWN PATH. An installer that replaced our file in place is telling us
+//     to run it, and that includes a project-local copy someone just `npm ci`'d
+//     — the project-local gate in checkAndApply blocks US overwriting THEIR pin;
+//     it has no bearing on executing the pinned version they installed
+//     themselves.
+//  2. THE MANAGED PATH. It is the one location install.sh, npm's postinstall,
+//     the npm launcher and self-update all write, so when it is newer it is the
+//     machine's current build by every definition the machine has. Two observed
+//     states need this and neither is reachable from rule 1 alone:
+//     autostart bakes an ABSOLUTE path at enable time (see AGENTS.md), so
+//     launchd routinely starts the daemon from a stale file that still exists
+//     and that nothing will ever update; and a daemon whose own dir is not
+//     writable cannot self-update at all — but exec needs no write permission,
+//     so this is the one repair available to it. After the exec its
+//     os.Executable() IS the managed path, so self-update starts working too.
 //
-//   - our own path still exists: it is the answer, whatever else is on the
-//     machine. An installer that replaced it in place is telling us to run it,
-//     and that includes a project-local copy someone just `npm ci`'d. The
-//     project-local gate in checkAndApply blocks US overwriting THEIR pin; it has
-//     no bearing on executing the pinned version they installed themselves.
-//   - our own path is GONE: we are an orphan holding a deleted inode, which is a
-//     real and observed state (an `npm i -g` that drops the layout the daemon was
-//     started from — see the autostart section of AGENTS.md). Nothing will ever
-//     replace that file, so following it is following a corpse. The managed path
-//     is the one place every installer agrees on, so fall back to it.
-//   - orphaned AND project-local: no fallback. Jumping from a lockfile-pinned
-//     copy into the shared managed binary is exactly the version the lockfile
-//     exists to refuse.
-func pickCatchupPath(self, canonical string, exists func(string) bool) string {
+// A PROJECT-LOCAL install never gets rule 2 in either direction: jumping from a
+// lockfile-pinned copy into the shared managed binary is exactly the version
+// substitution the lockfile exists to refuse. Neither does the case where the
+// two are the same file — there is nothing to fall back to.
+func catchupCandidates(self, canonical string, exists func(string) bool) []string {
+	var out []string
 	if self == "" {
-		return ""
+		return nil
 	}
 	if exists(self) {
-		return self
+		out = append(out, self)
 	}
-	if canonical == "" || samePath(self, canonical) || isProjectLocalInstall(self) {
-		return ""
+	if canonical == "" || samePath(self, canonical) || isProjectLocalInstall(self) || !exists(canonical) {
+		return out
 	}
-	if !exists(canonical) {
-		return ""
-	}
-	return canonical
+	return append(out, canonical)
 }
 
 // decideCatchup is the whole policy, as a pure function.
@@ -240,25 +243,38 @@ func (u *updater) catchUpToDisk() catchupVerdict {
 		u.logf("selfupdate: catch-up: cannot resolve own path: %v", err)
 		return catchupNone
 	}
-	path := pickCatchupPath(self, u.canonicalBin(), u.fileExists)
-	if path == "" {
+	var target catchupTarget
+	for _, path := range catchupCandidates(self, u.canonicalBin(), u.fileExists) {
+		// Cheap gate, per candidate: probing costs a subprocess and the answer is
+		// "unchanged" approximately always, so an unchanged file must not buy one
+		// every five minutes.
+		stamp := u.fileStamp(path)
+		if stamp != "" && stamp == u.lastProbed[path] {
+			continue
+		}
+		diskVer, err := u.binVersionOf(path)
+		if err != nil {
+			u.logf("selfupdate: catch-up: cannot read version of %s: %v", path, err)
+			continue
+		}
+		// Recorded whatever we decide: a file we have judged does not need judging
+		// again until it changes, and that includes one we decided not to run.
+		if u.lastProbed == nil {
+			u.lastProbed = map[string]string{}
+		}
+		u.lastProbed[path] = stamp
+
+		if stampedVersion(u.currentVersion) && stampedVersion(diskVer) && IsNewer(u.currentVersion, diskVer) {
+			target = catchupTarget{Path: path, Version: diskVer}
+			break
+		}
+	}
+	if target.Path == "" {
 		return catchupNone
 	}
 
-	stamp := u.fileStamp(path)
-	if stamp != "" && stamp == u.lastProbed {
-		return catchupNone
-	}
-	diskVer, err := u.binVersionOf(path)
-	if err != nil {
-		u.logf("selfupdate: catch-up: cannot read version of %s: %v", path, err)
-		return catchupNone
-	}
-	// Recorded whatever the verdict: a file we have judged does not need judging
-	// again until it changes, and that includes one we decided not to run.
-	u.lastProbed = stamp
-
-	target := catchupTarget{Path: path, Version: diskVer}
+	path := target.Path
+	diskVer := target.Version
 	switch decideCatchup(u.currentVersion, target, u.loadGuard(), u.now()) {
 	case catchupBlockedRetry:
 		u.logf("selfupdate: catch-up to %s (%s) was already attempted and did not take — not retrying for %s", path, diskVer, catchupCooldown)
