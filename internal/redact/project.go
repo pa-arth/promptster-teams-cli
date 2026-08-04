@@ -210,6 +210,13 @@ var projectFieldAllowlist = map[string][]string{
 		"skillListingTokens", "skillCount", "skills",
 		"pluginListingTokens", "pluginCount", "plugins",
 		"mcpServers", "mcpDeferred",
+		// WHICH agent config roots existed on this machine: a closed set of tool
+		// names ("claude-code"|"codex"|"cursor"), never a path. It lets the
+		// backend tell "we looked and this engineer has no Codex skills" from "we
+		// never looked at Codex" — an empty list cannot say which, and reading the
+		// first as the second is how a tool gets declared unused on the strength
+		// of never having been measured. Same LOCKSTEP caveat as above.
+		"toolsExamined",
 		// Capture-health counts: integers only (files on disk vs active in 7d),
 		// never a transcript path/filename/slug. Content-free by construction.
 		"claudeTranscriptsTotal", "claudeTranscriptsActive7d",
@@ -266,10 +273,17 @@ var projectFieldAllowlist = map[string][]string{
 // source nested inside. Every array-of-object field in projectFieldAllowlist
 // must have an entry here.
 var projectArrayElementAllowlist = map[string]map[string][]string{
+	// `tool` on every asset is WHICH agent owns it, from the closed
+	// "claude-code"|"codex"|"cursor" set — the same spellings event.Source uses,
+	// so a census asset joins to sessions.source_service with no mapping table.
+	// It is the field that stops a Codex skill named `review` and a Claude Code
+	// skill named `review` folding into one identity in the backend's ROI join
+	// (which keys on the case-folded slug), which would price one asset's carry
+	// against the other's invocations.
 	"config_census": {
-		"skills":     {"slug", "name", "descTokens"},
-		"plugins":    {"name", "listingTokens"},
-		"mcpServers": {"name", "deferred"},
+		"skills":     {"slug", "name", "descTokens", "tool"},
+		"plugins":    {"name", "listingTokens", "tool"},
+		"mcpServers": {"name", "deferred", "tool"},
 	},
 	// lineRanges elements are content-free by construction (ints + one enum), but
 	// this allowlist is the LOAD-BEARING privacy line: it strips every element to
