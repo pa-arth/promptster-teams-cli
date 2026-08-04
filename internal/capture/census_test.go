@@ -192,6 +192,9 @@ func TestConfigCensusCarriesNoFileContents(t *testing.T) {
 		"skills", "skillListingTokens", "skillCount",
 		"plugins", "pluginListingTokens", "pluginCount",
 		"mcpServers", "mcpDeferred",
+		// Which agent config roots existed on this machine. Tool NAMES from a
+		// closed set, never a path — see configCensusData.ToolsExamined.
+		"toolsExamined",
 		"claudeTranscriptsTotal", "claudeTranscriptsActive7d",
 	}
 	if len(round) != len(want) {

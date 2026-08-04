@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -42,13 +43,37 @@ const (
 	configCensusCheckInterval = time.Hour
 )
 
-// censusSkill is one entry of ~/.claude/skills — identity + listing cost only.
+// Tool identifiers stamped on every inventoried asset. They name WHICH agent an
+// asset belongs to, and they are what lets one census describe several tools
+// without the entries merging.
+//
+// Without them a Codex skill called `review` and a Claude Code skill called
+// `review` fold to one identity in the backend's ROI join (which keys on the
+// case-folded slug alone), so one asset's carry is priced against the other's
+// invocations and a slash row can be promoted to the skills board on the
+// strength of a skill belonging to a tool that cannot run it.
+// THESE ARE THE event.Source SPELLINGS, deliberately — "claude-code", not
+// "claude_code". The same three strings already ride every event and land in
+// sessions.source_service, so a census asset's tool joins to that engineer's
+// observed activity with no mapping table between them. Minting a second
+// vocabulary for the same three tools is how a join silently returns nothing.
+const (
+	toolClaudeCode = "claude-code"
+	toolCodex      = "codex"
+	toolCursor     = "cursor"
+)
+
+// censusSkill is one skill on disk — identity + listing cost only.
 type censusSkill struct {
 	Slug string `json:"slug"` // directory name
 	Name string `json:"name"` // frontmatter `name:`, else slug
 	// DescTokens estimates (chars/4) what the skill's `description:` costs in
 	// the always-loaded skill listing.
 	DescTokens int `json:"descTokens"`
+	// Tool is which agent this skill belongs to. omitempty so a census from a CLI
+	// predating the field stays byte-identical and the backend keeps folding
+	// those on slug alone rather than silently re-attributing stored data.
+	Tool string `json:"tool,omitempty"`
 }
 
 // censusPlugin is one enabled plugin — name + listing cost only.
@@ -58,6 +83,12 @@ type censusPlugin struct {
 	// always-loaded context: the names + descriptions of the skills, commands,
 	// and agents it ships. 0 when the install layout isn't enumerable.
 	ListingTokens int `json:"listingTokens"`
+	// Tool — see censusSkill.Tool. Claude Code only today: neither Codex nor
+	// Cursor has an established plugin layout to enumerate (Codex's
+	// ~/.codex/plugins holds a cache dir and an install-staging dir, and no
+	// registry naming what is enabled). Enumerating those directories would
+	// invent asset names, which is worse than reporting none.
+	Tool string `json:"tool,omitempty"`
 }
 
 // censusMCPServer is one configured MCP server — name + load mode only.
@@ -68,6 +99,8 @@ type censusMCPServer struct {
 	// currently always false; the field is kept so the shape doesn't change
 	// when detection lands.
 	Deferred bool `json:"deferred"`
+	// Tool — see censusSkill.Tool.
+	Tool string `json:"tool,omitempty"`
 }
 
 // configCensusData is the CLOSED payload of a config_census event. Counts and
@@ -122,6 +155,19 @@ type configCensusData struct {
 	// tree" — the counts are unreliable, so the backend must read UNKNOWN, not a
 	// false zero that would look like "not using Claude Code". A present 0 is a
 	// definite zero (dir absent = genuinely no local transcripts).
+	// ToolsExamined names the agent config roots that EXIST on this machine, so
+	// the backend can tell "we looked and this engineer has no Codex skills" from
+	// "we never looked at Codex" — which an empty skills list cannot distinguish.
+	//
+	// This is the census's own instance of the standing rule that an instrument
+	// which never ran reports the same zero as a real zero. It is the observation
+	// that turns "nobody uses X" from a claim about the world into a fact about
+	// the machine, and it is cheap: three os.Stat calls.
+	//
+	// omitempty: absent means an older CLI, which is "unknown", not "none
+	// examined".
+	ToolsExamined []string `json:"toolsExamined,omitempty"`
+	// ClaudeTranscriptsTotal / ClaudeTranscriptsActive7d — see below.
 	ClaudeTranscriptsTotal    *int `json:"claudeTranscriptsTotal,omitempty"`
 	ClaudeTranscriptsActive7d *int `json:"claudeTranscriptsActive7d,omitempty"`
 }
@@ -133,6 +179,11 @@ type censusEnv struct {
 	claudeDir      string   // Claude Code config root (claudeConfigDir())
 	claudeJSONPath string   // ~/.claude.json (global MCP server registry)
 	workspaceRoots []string // the same roots the transcript watcher matches
+	// codexDir / cursorDir are the other two agents' config roots (~/.codex,
+	// ~/.cursor). Empty disables that tool's walk entirely, which is how a test
+	// builds a single-tool census.
+	codexDir  string
+	cursorDir string
 }
 
 func defaultCensusEnv(workspace string) censusEnv {
@@ -145,6 +196,8 @@ func defaultCensusEnv(workspace string) censusEnv {
 		claudeDir:      claudeConfigDir(),
 		claudeJSONPath: filepath.Join(home, ".claude.json"),
 		workspaceRoots: roots,
+		codexDir:       filepath.Join(home, ".codex"),
+		cursorDir:      filepath.Join(home, ".cursor"),
 	}
 }
 
@@ -542,21 +595,68 @@ func buildConfigCensus(env censusEnv) configCensusData {
 	// is covered but latent, and pricing it as always-on overstates the config tax.
 	data.ProjectClaudeMdTokens, data.ProjectClaudeMdPosition = projectClaudeMdTokens(env.workspaceRoots)
 
-	data.Skills = censusSkills(filepath.Join(env.claudeDir, "skills"))
+	// SKILLS — one walk per tool, each entry stamped with the tool it belongs to.
+	// The three lists are concatenated, never merged: the same slug under two
+	// tools is two assets, and folding them is the misattribution this field
+	// exists to prevent.
+	data.Skills = censusSkills(filepath.Join(env.claudeDir, "skills"), toolClaudeCode)
+	if env.codexDir != "" {
+		data.Skills = append(data.Skills, censusSkills(filepath.Join(env.codexDir, "skills"), toolCodex)...)
+	}
+	if env.cursorDir != "" {
+		// Cursor spells its skills root `skills-cursor`, not `skills`.
+		data.Skills = append(data.Skills, censusSkills(filepath.Join(env.cursorDir, "skills-cursor"), toolCursor)...)
+	}
 	for _, s := range data.Skills {
 		data.SkillListingTokens += s.DescTokens
 	}
 	data.SkillCount = len(data.Skills)
 
+	// PLUGINS — Claude Code only, deliberately. Neither Codex nor Cursor has an
+	// enumerable "these plugins are enabled" registry: ~/.codex/plugins holds a
+	// download cache and an install-staging directory, neither of which is a
+	// plugin. Listing those directories would put invented names on the asset
+	// boards, and a fabricated asset is worse than a missing one.
 	data.Plugins = censusPlugins(env.claudeDir)
 	for _, p := range data.Plugins {
 		data.PluginListingTokens += p.ListingTokens
 	}
 	data.PluginCount = len(data.Plugins)
 
-	data.MCPServers = censusMCPServers(env.claudeJSONPath, env.workspaceRoots)
+	// MCP — Claude Code's ~/.claude.json + workspace .mcp.json, Cursor's
+	// ~/.cursor/mcp.json (identical `mcpServers` object shape, verified on disk),
+	// and Codex's config.toml, which is the one new parse.
+	data.MCPServers = censusMCPServers(env.claudeJSONPath, env.workspaceRoots, toolClaudeCode)
+	if env.cursorDir != "" {
+		data.MCPServers = append(data.MCPServers,
+			censusMCPServers(filepath.Join(env.cursorDir, "mcp.json"), nil, toolCursor)...)
+	}
+	if env.codexDir != "" {
+		data.MCPServers = append(data.MCPServers,
+			censusCodexMCPServers(filepath.Join(env.codexDir, "config.toml"))...)
+	}
+	sort.Slice(data.MCPServers, func(i, j int) bool {
+		if data.MCPServers[i].Tool != data.MCPServers[j].Tool {
+			return data.MCPServers[i].Tool < data.MCPServers[j].Tool
+		}
+		return data.MCPServers[i].Name < data.MCPServers[j].Name
+	})
 	// No config-level deferred-loading indicator is detectable today.
 	data.MCPDeferred = false
+
+	// Which roots we actually looked at — recorded, not inferred from emptiness.
+	for _, t := range []struct {
+		name string
+		dir  string
+	}{
+		{toolClaudeCode, env.claudeDir},
+		{toolCodex, env.codexDir},
+		{toolCursor, env.cursorDir},
+	} {
+		if dirExists(t.dir) {
+			data.ToolsExamined = append(data.ToolsExamined, t.name)
+		}
+	}
 
 	data.ClaudeTranscriptsTotal, data.ClaudeTranscriptsActive7d = countClaudeTranscripts()
 
@@ -618,7 +718,20 @@ func countClaudeTranscripts() (total *int, active7d *int) {
 // frontmatter `name:` (else slug), descTokens = chars/4 of the frontmatter
 // `description:` value. The skill BODY is never measured or sent — only the
 // description contributes to the always-loaded listing.
-func censusSkills(skillsDir string) []censusSkill {
+// A skill directory holding no SKILL.md but holding skill SUBdirectories — the
+// layout Codex uses for its bundled set (skills/.system/<slug>/SKILL.md).
+// Descended exactly one level: bundled skills are skills the engineer reached
+// for, and a real invocation of one is indistinguishable from a user skill's.
+// One level only, so an arbitrary tree cannot be walked in the name of a census.
+const censusSkillNestDepth = 1
+
+func censusSkills(skillsDir, tool string) []censusSkill {
+	skills := collectSkills(skillsDir, tool, censusSkillNestDepth)
+	sort.Slice(skills, func(i, j int) bool { return skills[i].Slug < skills[j].Slug })
+	return skills
+}
+
+func collectSkills(skillsDir, tool string, depth int) []censusSkill {
 	entries, err := os.ReadDir(skillsDir)
 	if err != nil {
 		return []censusSkill{}
@@ -631,6 +744,11 @@ func censusSkills(skillsDir string) []censusSkill {
 		slug := entry.Name()
 		fm := readFrontmatter(filepath.Join(skillsDir, slug, "SKILL.md"))
 		if fm == nil {
+			// Not a skill itself — it may be a container of skills (Codex's
+			// `.system`). Recurse once, then stop.
+			if depth > 0 {
+				skills = append(skills, collectSkills(filepath.Join(skillsDir, slug), tool, depth-1)...)
+			}
 			continue
 		}
 		name := fm["name"]
@@ -641,9 +759,9 @@ func censusSkills(skillsDir string) []censusSkill {
 			Slug:       slug,
 			Name:       name,
 			DescTokens: approxTokens(len(fm["description"])),
+			Tool:       tool,
 		})
 	}
-	sort.Slice(skills, func(i, j int) bool { return skills[i].Slug < skills[j].Slug })
 	return skills
 }
 
@@ -666,6 +784,9 @@ func censusPlugins(claudeDir string) []censusPlugin {
 		plugins = append(plugins, censusPlugin{
 			Name:          name,
 			ListingTokens: pluginListingTokens(installPaths[name]),
+			// Stamped even though every plugin is Claude Code's today: an entry
+			// with no tool means "a CLI too old to say", and these are not that.
+			Tool: toolClaudeCode,
 		})
 	}
 	sort.Slice(plugins, func(i, j int) bool { return plugins[i].Name < plugins[j].Name })
@@ -776,7 +897,7 @@ func pluginListingTokens(installPath string) int {
 // censusMCPServers collects MCP server NAMES from the global ~/.claude.json
 // `mcpServers` map plus each workspace root's .mcp.json. Only the keys are
 // read — commands, URLs, env, and headers stay on the machine.
-func censusMCPServers(claudeJSONPath string, workspaceRoots []string) []censusMCPServer {
+func censusMCPServers(claudeJSONPath string, workspaceRoots []string, tool string) []censusMCPServer {
 	seen := map[string]bool{}
 	servers := []censusMCPServer{}
 	add := func(path string) {
@@ -797,7 +918,7 @@ func censusMCPServers(claudeJSONPath string, workspaceRoots []string) []censusMC
 			}
 			seen[name] = true
 			// Deferred loading is not indicated anywhere in config today.
-			servers = append(servers, censusMCPServer{Name: name, Deferred: false})
+			servers = append(servers, censusMCPServer{Name: name, Deferred: false, Tool: tool})
 		}
 	}
 	add(claudeJSONPath)
@@ -808,6 +929,69 @@ func censusMCPServers(claudeJSONPath string, workspaceRoots []string) []censusMC
 	}
 	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
 	return servers
+}
+
+// censusCodexMCPServers collects MCP server NAMES from Codex's config.toml.
+//
+// TOML, not JSON — the one new parse this census takes on, and it is kept as
+// narrow as the JSON one deliberately. It reads SECTION HEADERS ONLY:
+// `[mcp_servers.<name>]` yields `<name>`. It never reads a key/value line, so
+// `command`, `args`, `env`, `headers` and any URL stay on the machine by
+// construction rather than by an allowlist applied afterwards.
+//
+// A quoted name (`[mcp_servers."my server"]`) is unquoted; a dotted sub-table
+// under a server (`[mcp_servers.foo.env]`) yields `foo`, not `foo.env`.
+func censusCodexMCPServers(configPath string) []censusMCPServer {
+	// #nosec G304 -- configPath is ~/.codex/config.toml under the config dir, not
+	// user input; only section-header names are read, never a value.
+	f, err := os.Open(configPath)
+	if err != nil {
+		return []censusMCPServer{}
+	}
+	defer func() { _ = f.Close() }()
+
+	seen := map[string]bool{}
+	servers := []censusMCPServer{}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "[") {
+			continue
+		}
+		// Strip the brackets. `[[x]]` (array-of-tables) is not a shape Codex uses
+		// for mcp_servers; trimming both is harmless and keeps the parse total.
+		header := strings.TrimSpace(strings.Trim(line, "[]"))
+		if !strings.HasPrefix(header, "mcp_servers.") {
+			continue
+		}
+		name := codexTOMLFirstSegment(strings.TrimPrefix(header, "mcp_servers."))
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		servers = append(servers, censusMCPServer{Name: name, Deferred: false, Tool: toolCodex})
+	}
+	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
+	return servers
+}
+
+// codexTOMLFirstSegment takes the first dot-separated segment of a TOML key
+// path, honoring quotes so a name containing a dot survives intact.
+func codexTOMLFirstSegment(path string) string {
+	if path == "" {
+		return ""
+	}
+	if path[0] == '"' || path[0] == '\'' {
+		quote := path[0]
+		if end := strings.IndexByte(path[1:], quote); end >= 0 {
+			return strings.TrimSpace(path[1 : 1+end])
+		}
+		return ""
+	}
+	if dot := strings.IndexByte(path, '.'); dot >= 0 {
+		return strings.TrimSpace(path[:dot])
+	}
+	return strings.TrimSpace(path)
 }
 
 // readFrontmatter parses the YAML frontmatter block (--- ... ---) at the top
