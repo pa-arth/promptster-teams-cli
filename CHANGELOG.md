@@ -6,6 +6,52 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.12.4] — 2026-08-04
+
+**If you are still on 0.12.2 or earlier, install this one BEFORE you next
+restart capture.** 0.12.3 raised the transcript progress-schema version, and
+crossing that bump clears every stored byte offset so the watchers re-read the
+last 28 days of transcripts from the beginning. That import is intentional. What
+was not intentional is the order it ran in: the upload queue is strictly
+first-in first-out, so three weeks of history went out ahead of the work you
+were doing right now, and on a machine with a lot of history that could take
+hours. The whole time, your dashboard would show you as having no active
+sessions — the daemon was healthy, uploads were succeeding, and every event
+arriving was correctly dated three weeks ago. This release fixes the ordering,
+so the same import happens with today's work at the front of the line.
+
+### Fixed
+
+- **History replay no longer puts live capture last in line.** Both the Claude
+  Code and Codex watchers now walk candidate transcripts newest-first — ordered
+  by each file's most recent modification, with a stable tie-break so two files
+  touched in the same instant do not reorder between runs. Reading *inside* a
+  file is still oldest-to-newest, so turn correlation is untouched. The
+  practical difference is what an interrupted backfill leaves behind:
+  previously it left the recent window unread, which is the only window anyone
+  is looking at.
+
+### Added
+
+- **The heartbeat now reports how far behind its own upload queue is.** Every
+  presence beat carries `pendingEvents` (undelivered events still queued) and
+  `pendingOldestEventAt` (the timestamp of the oldest one). The device is the
+  only party that can know this, and without it a machine that is connected and
+  hours behind is indistinguishable on the wire from one that is connected and
+  idle — which is exactly how a working engineer showed up as inactive. A
+  measured zero is sent as a zero and never omitted, so "caught up" and "too old
+  to tell you" stay different answers.
+
+  The age is the load-bearing half. 62,000 events queued from the last five
+  minutes is a busy afternoon; 62,000 whose oldest is dated three weeks ago is
+  an outage, and the count alone cannot tell them apart. The reported age is the
+  **oldest** pending event, not the one at the head of the queue — because with
+  replay now running newest-first, the head is recent work and the old events
+  sit behind it.
+
+  No transcript content is involved. These are two numbers about the queue, and
+  nothing about what is in it.
+
 ## [0.12.3] — 2026-08-04
 
 **Upgrade this one by restarting capture, not just by installing it.** Several
@@ -1368,7 +1414,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.3...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.4...HEAD
+[0.12.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...v0.12.3
 [0.12.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.1...v0.12.2
 [0.12.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.0...v0.12.1
