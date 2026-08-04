@@ -81,7 +81,7 @@ func printStatusStatic() {
 	fmt.Println()
 	fmt.Println(brandBar("status"))
 	fmt.Println()
-	fmt.Println(indent(kvPanel("capture",
+	pairs := []string{
 		"key", keyDisplay(token, source),
 		"ingest", hostOf(apiURL),
 		"watch", root,
@@ -91,7 +91,14 @@ func printStatusStatic() {
 		"identity", "anonymous — device hash + team key, no email",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", humanInterval(capture.PresenceHeartbeatInterval)),
 		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
-	)))
+	}
+	// Only while a replay is actually running. A permanent "reconstructing: no"
+	// row teaches the reader to skip that line by the third time they see it,
+	// and this panel's value is that every row in it is worth reading.
+	if row := statusReconstructionRow(); len(row) == 2 {
+		pairs = append(pairs, row...)
+	}
+	fmt.Println(indent(kvPanel("capture", pairs...)))
 	fmt.Println()
 }
 
@@ -141,6 +148,13 @@ func cmdTeamsDoctor() {
 	// queue is not a login problem, and `ok` only chooses between the "run watch"
 	// and "run login" closing lines.
 	for _, l := range checkQueueHealth(gatherQueueInputs(time.Now(), capture.Snapshot())) {
+		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
+	}
+
+	// History replay, when there is any. Printed right after the queue because
+	// the two answer one question together: a backlog with a replay running is
+	// expected and finite, the same backlog without one is not.
+	for _, l := range reconstructionLines(capture.ReconstructionNow(), time.Now()) {
 		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
 	}
 

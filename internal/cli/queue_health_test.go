@@ -614,3 +614,51 @@ func TestGatherQueueInputsIgnoresAnEmptyLanesOldCursor(t *testing.T) {
 			levelName(got), allText(lines))
 	}
 }
+
+// --- history reconstruction --------------------------------------------------
+
+// The line is an OK, not a warning. A replay is a normal, deliberate thing this
+// product does; reporting it as a fault would train people to ignore it, and the
+// failure being fixed is that it was INVISIBLE, not insufficiently alarming.
+func TestReconstructionLineIsInformationalNotAWarning(t *testing.T) {
+	r := capture.ReconstructionState{
+		Running: true, Files: 12, Bytes: 48 << 20,
+		Oldest: time.Now().Add(-15 * 24 * time.Hour),
+	}
+	lines := reconstructionLines(r, time.Now())
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	if lines[0].level != queueOK {
+		t.Errorf("a running replay reported %s; it is expected behaviour, not a fault",
+			levelName(lines[0].level))
+	}
+	for _, want := range []string{"reconstructing history", "12 transcripts", "backfill"} {
+		if !strings.Contains(lines[0].text, want) {
+			t.Errorf("line missing %q: %s", want, lines[0].text)
+		}
+	}
+}
+
+// Nothing to say when nothing is replaying. A permanent "not reconstructing" row
+// teaches the reader to skip that line by the third time they see it.
+func TestNoReconstructionMeansNoLine(t *testing.T) {
+	if lines := reconstructionLines(capture.ReconstructionState{}, time.Now()); len(lines) != 0 {
+		t.Errorf("an idle machine printed a reconstruction line: %s", allText(lines))
+	}
+}
+
+// The DATE the replay has reached, not a percentage: the window is bounded by
+// date, so a date says both how far along it is and how far it has to go.
+func TestTheReconstructionLineReportsHowFarBackItHasReached(t *testing.T) {
+	oldest := time.Now().Add(-15 * 24 * time.Hour)
+	lines := reconstructionLines(capture.ReconstructionState{
+		Running: true, Files: 1, Bytes: 1024, Oldest: oldest,
+	}, time.Now())
+	if len(lines) != 1 {
+		t.Fatalf("want 1 line, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0].text, oldest.Format("2006-01-02")) {
+		t.Errorf("line must name the date the replay has reached: %s", lines[0].text)
+	}
+}
