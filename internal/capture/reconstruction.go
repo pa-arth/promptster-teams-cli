@@ -3,6 +3,8 @@ package capture
 import (
 	"os"
 	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 )
 
 // HISTORY RECONSTRUCTION IS THE LONGEST-RUNNING THING THIS DAEMON DOES, AND
@@ -68,7 +70,9 @@ type reconstructionScan struct {
 // `doctor`, which are one-shot, never from the poll loop.
 func ReconstructionNow() ReconstructionState {
 	cutoff := transcriptHistoryCutoff(time.Now().UTC())
-	stale := time.Now().Add(-reconstructionLiveGrace)
+	// outbox.LiveHorizon itself, read here rather than copied into a local
+	// constant — see reconstructionLiveGrace.
+	stale := time.Now().Add(-reconstructionLiveGrace())
 
 	scans := []reconstructionScan{
 		scanClaudeReconstruction(cutoff, stale),
@@ -93,10 +97,22 @@ func ReconstructionNow() ReconstructionState {
 // reconstructionLiveGrace is how recently a transcript must have been written to
 // count as LIVE rather than as history awaiting replay.
 //
-// Deliberately outbox.LiveHorizon's value rather than a second opinion about the
-// same boundary — see the file header. Kept as its own name so the dependency is
-// visible at the use site instead of an unexplained 30 minutes.
-const reconstructionLiveGrace = 30 * time.Minute
+// It RETURNS outbox.LiveHorizon rather than restating its value, and review
+// caught the difference. The first draft was `const reconstructionLiveGrace = 30
+// * time.Minute` under a comment claiming it was deliberately the same boundary
+// — which is exactly the drift the comment warned about, one edit away: moving
+// the outbox horizon would have left this at 30 minutes with nothing failing, and
+// the two reports would then disagree about the same file, one calling it live
+// while the other counted it as history awaiting replay.
+//
+// A function and not `var x = outbox.LiveHorizon`, because that is an init-time
+// copy: LiveHorizon is a var, so anything that sets it after init (a test, a
+// future flag) would diverge from the copy silently. Reading it per call is the
+// only form that cannot drift.
+//
+// Kept as a named wrapper rather than inlining outbox.LiveHorizon at the use
+// site so the dependency stays visible where the value is used.
+func reconstructionLiveGrace() time.Duration { return outbox.LiveHorizon }
 
 func scanClaudeReconstruction(cutoff, stale time.Time) reconstructionScan {
 	progress := loadClaudeWatchProgress()

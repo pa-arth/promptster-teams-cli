@@ -57,8 +57,13 @@ func transcriptCount(n int) string {
 //
 // Terser than doctor's line on purpose: `status` is a glanceable panel and
 // doctor is where an explanation belongs.
+// reconNow is capture.ReconstructionNow. A var because the dashboard refreshes
+// it on a schedule rather than on every render, and a scheduling claim nobody
+// can count the calls behind is a claim, not a guarantee.
+var reconNow = capture.ReconstructionNow
+
 func statusReconstructionRow() []string {
-	r := capture.ReconstructionNow()
+	r := reconNow()
 	if !r.Running {
 		return nil
 	}

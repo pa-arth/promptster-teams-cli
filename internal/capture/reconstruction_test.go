@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 )
 
 // reconstructionFixture stands up an isolated state dir plus a Claude projects
@@ -91,6 +93,37 @@ func TestALiveTailIsNotReconstruction(t *testing.T) {
 
 	if got := ReconstructionNow(); got.Running {
 		t.Errorf("a transcript written 30s ago is being TAILED, not reconstructed; got %+v", got)
+	}
+}
+
+// THE LIVE/HISTORY BOUNDARY IS OUTBOX.LIVEHORIZON ITSELF, not a second copy of
+// its current value. Review caught the first draft hardcoding `30 * time.Minute`
+// under a comment claiming they were deliberately the same number.
+//
+// This has to be BEHAVIOURAL. Asserting `reconstructionLiveGrace() ==
+// outbox.LiveHorizon` would pass against the hardcoded constant too — both are
+// 30 minutes today, which is precisely why the drift is invisible. So move the
+// outbox boundary and require the classification to move with it: a file that
+// was history under a 30-minute horizon must read as live under a two-hour one.
+func TestTheLiveGraceFollowsTheOutboxLaneBoundary(t *testing.T) {
+	root := reconstructionFixture(t)
+	ws := t.TempDir()
+	path, _ := writeClaudeHistory(t, root, resolvePath(ws), "aged.jsonl", 20)
+	ageFile(t, path, 45*time.Minute)
+	seedClaudeProgress(t, path, 0)
+
+	if got := ReconstructionNow(); !got.Running {
+		t.Fatalf("45m old is past the default 30m horizon — expected reconstruction, got %+v", got)
+	}
+
+	prev := outbox.LiveHorizon
+	outbox.LiveHorizon = 2 * time.Hour
+	t.Cleanup(func() { outbox.LiveHorizon = prev })
+
+	if got := ReconstructionNow(); got.Running {
+		t.Errorf("the outbox now calls a 45m-old event live, so this must too; got %+v.\n"+
+			"A hardcoded grace leaves the two disagreeing about the same file — one queues it "+
+			"on the live lane while the other reports it as history awaiting replay.", got)
 	}
 }
 
