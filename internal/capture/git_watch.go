@@ -477,6 +477,71 @@ func gitFirstParentSet(root, rev string) (map[string]struct{}, bool) {
 	return set, true
 }
 
+// gitNewDefaultBranchCommits lists the DEFAULT BRANCH's own new commits — the
+// first-parent chain of lastSeen..tip, newest-first, bounded to
+// gitWatchMaxCommitsPerPoll. It is the durability ledger's enumerator and
+// nothing else calls it.
+//
+// IT IS A SEPARATE ENUMERATOR RATHER THAN A FILTER OVER gitNewCommits, AND THAT
+// IS THE WHOLE FIX. Durability used to take gitNewCommits' full range and discard
+// its foldable subset, so `git merge feature` onto the default branch folded the
+// merge — whose `-m --first-parent` diff already carries everything the branch
+// brought in — PLUS that branch's own commits, applying the same hunks twice, in
+// a coordinate space no checkout ever had. The rework ledger fixed the same
+// double fold by filtering at the fold. Durability cannot copy that, because
+// pollDurabilityCommit advances the cursor to each commit inside that commit's
+// OWN ledger transaction, and a filter at the fold leaves that cursor with no
+// safe place to land:
+//
+//   - advance it on a SKIPPED commit and it parks off the chain, where
+//     `cursor..tip` re-includes chain commits already folded — so a crash between
+//     two commits re-applies hunks the ledger already holds;
+//   - do NOT advance it and a batch holding no chain commit never moves it at
+//     all. clampCommitBurst keeps the OLDEST cap commits of `cursor..tip`, so
+//     merging a branch longer than the cap fills the entire batch with
+//     second-parent commits; the next poll enumerates the identical batch and
+//     durability stalls for that root forever.
+//
+// Narrowing HERE dissolves the question instead of answering it: every commit
+// returned is one durability folds, so THE CURSOR ONLY EVER LANDS ON A COMMIT
+// THAT WAS FOLDED, `cursor..tip` always means exactly "the chain commits not yet
+// folded", and the root always drains. That is also why this returns no foldable
+// subset — there is no second class of commit here to disagree about.
+//
+// --topo-order for the same reason gitBranchCommitsSinceDefault takes it: the
+// caller folds the list oldest-first, and rev-list's default is reverse
+// COMMIT-DATE order, which git does not promise is topological. One skewed
+// committer clock sorts a parent past its own descendants and the reversed fold
+// applies it after its child.
+//
+// The two-tier shape mirrors gitNewCommits and means the same things: a resolving
+// lastSeen gives the range; an unreachable one (gc'd/pruned after an aggressive
+// rewrite) falls back to a bounded recovery window over the tip's chain rather
+// than skipping it forever; and only a failing recovery is ok=false, which keeps
+// the cursor where it is and retries next poll. Spawn budget is one rev-list,
+// two in the rare gc'd case — strictly cheaper than the enumerator it replaces,
+// which spent a second spawn on the chain probe.
+func gitNewDefaultBranchCommits(root, lastSeen, tip string) ([]string, bool) {
+	// #nosec G204 -- constant argv; root is a discovered workspace/worktree dir and both SHAs come from git rev-parse output, not user input. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", lastSeen+".."+tip).Output()
+	if err == nil {
+		return clampCommitBurst(parseRevListShas(out), root), true
+	}
+	// lastSeen is unreachable: recover the tip region rather than skip it. If even
+	// that errors, keep the cursor and retry.
+	// #nosec G204 -- see above; read-only.
+	out, rerr := exec.Command("git", "-C", root, "rev-list",
+		"--topo-order", "--first-parent", "-n", strconv.Itoa(gitWatchMaxCommitsPerPoll), tip).Output()
+	if rerr != nil {
+		return nil, false
+	}
+	shas := parseRevListShas(out)
+	state.HookDebugf("durability: cursor %s unreachable on %s; recovered newest %d default-branch commit(s) from the tip",
+		lastSeen, gitWatchRootKey(root), len(shas))
+	return shas, true
+}
+
 // gitBranchCommitsSinceDefault lists the commits a root's checked-out branch
 // holds that the default branch does not — the branch's own pre-merge range,
 // newest-first. It is the replay range for a cold-started root (see
