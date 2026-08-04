@@ -114,12 +114,6 @@ type codexWatchProgress struct {
 	RootsFP string `json:"roots_fp"`
 }
 
-// codexProgressSchemaV is the current progress-file schema version. v1 dropped
-// stale timestamp-based "no" decisions. v2 reopens previously matched files so
-// the new bounded history policy gets exactly one chance to replay the last 28
-// days. Mirrors claudeProgressSchemaV.
-const codexProgressSchemaV = 2
-
 func codexWatchProgressPath() string {
 	return filepath.Join(state.StateDir(), "codex-watcher-progress.json")
 }
@@ -169,6 +163,8 @@ func loadCodexWatchProgress() codexWatchProgress {
 	if p.ClassifyScanned == nil {
 		p.ClassifyScanned = map[string]int{}
 	}
+	// Announce BEFORE migrating — same terms as the Claude loader.
+	announceProgressReplay("codex", codexProgressMigrations, p.V)
 	// v1: drop cached "no" decisions written by the old timestamp gate.
 	if p.V < 1 {
 		for k, v := range p.Match {
