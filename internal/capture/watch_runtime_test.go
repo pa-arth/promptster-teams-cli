@@ -76,6 +76,30 @@ func TestRunningCaptureIsEmptyWhenNothingHoldsTheLock(t *testing.T) {
 	}
 }
 
+// `start` announces a restart before it performs one, so it has to prove the
+// stale process actually died. StopTeamsDaemon prints a survivor on stderr but
+// still returns nil, and it clears the runtime record on the way out — so a
+// survivor reads as "unknown build" and a version re-check would call it fixed.
+// Identity is the only signal left.
+func TestRestartConfirmedRequiresTheStaleProcessToBeGone(t *testing.T) {
+	const stale = 71770
+	cases := []struct {
+		name string
+		res  StartResult
+		want bool
+	}{
+		{"spawned a fresh watcher", StartResult{PID: 74045}, true},
+		{"another process took over (launchd respawn)", StartResult{PID: 80000, AlreadyRunning: true}, true},
+		{"the same stale process survived", StartResult{PID: stale, AlreadyRunning: true}, false},
+		{"the lock holder cannot be identified", StartResult{PID: 0, AlreadyRunning: true}, false},
+	}
+	for _, c := range cases {
+		if got := restartConfirmed(stale, c.res); got != c.want {
+			t.Errorf("%s: restartConfirmed = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
 // isOlderVersion decides whether `start` restarts a live daemon, so both false
 // directions are load-bearing: restarting on equal versions churns capture on
 // every start, and restarting on an unstamped build kills a developer's own

@@ -257,13 +257,27 @@ func StartTeamsDaemon(args []string) error {
 	// it is gated on a recorded version being strictly older than ours, and it is
 	// exactly what the engineer would do by hand next.
 	if res.AlreadyRunning && res.StaleVersion != "" {
-		fmt.Fprintf(os.Stderr, "promptster-teams: capture (pid %d) is running %s but this binary is %s — restarting it\n", res.PID, res.StaleVersion, version.Version)
+		stalePID := res.PID
+		fmt.Fprintf(os.Stderr, "promptster-teams: capture (pid %d) is running %s but this binary is %s — restarting it\n", stalePID, res.StaleVersion, version.Version)
 		if err := StopTeamsDaemon(); err != nil {
 			fmt.Fprintf(os.Stderr, "promptster-teams: warning: could not stop the stale capture process: %v\n", err)
 		}
 		res, err = StartDaemon(args)
 		if err != nil {
 			return err
+		}
+		// Verify the restart actually happened. StopTeamsDaemon reports a survivor
+		// on stderr but still returns nil, so without this the second StartDaemon
+		// finds the SAME stale process holding the lock, reports "already running",
+		// and exits 0 — announcing a restart it did not perform and leaving the
+		// build we just told the engineer we were replacing. That is the exact lie
+		// `stop`'s own post-check exists to prevent.
+		//
+		// Identity, not version: StopTeamsDaemon clears the runtime record, so a
+		// survivor reads as "unknown build" on the second pass and a version
+		// re-check would call it fixed.
+		if !restartConfirmed(stalePID, res) {
+			return fmt.Errorf("capture is STILL running as pid %d on the old build — stop it manually (`pgrep -fl promptster-teams`, then kill it) and run `promptster-teams start` again", stalePID)
 		}
 	}
 	// Re-arm the OS supervisor if it is installed but not loaded. `stop` disarms
@@ -294,6 +308,26 @@ func StartTeamsDaemon(args []string) error {
 	printWatchedRoots(os.Stderr)
 	fmt.Fprintf(os.Stderr, "promptster-teams: logs at %s · stop with `promptster-teams stop`\n", daemonLogPath())
 	return nil
+}
+
+// restartConfirmed reports whether the stale watcher really went away, given
+// what the follow-up StartDaemon found.
+//
+// Three outcomes, and the third is the one worth naming:
+//   - we spawned a fresh watcher: done.
+//   - a DIFFERENT process holds the lock: also fine, and not hypothetical —
+//     launchd/systemd can respawn the job between the stop and the spawn, which
+//     is a legitimate restart by someone else. Failing here would report a
+//     problem on a machine that just fixed itself.
+//   - the SAME pid still holds it, or the holder cannot be identified at all:
+//     unconfirmed. An unreadable pid counts as unconfirmed on purpose — we
+//     deliberately stopped everything a moment ago, so an anonymous lock holder
+//     is exactly the state we must not paper over.
+func restartConfirmed(stalePID int, res StartResult) bool {
+	if !res.AlreadyRunning {
+		return true
+	}
+	return res.PID > 0 && res.PID != stalePID
 }
 
 // rearmAutostart re-registers an autostart unit that is installed but not

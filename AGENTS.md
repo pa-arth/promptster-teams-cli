@@ -328,7 +328,15 @@ reported as **unknown**, never attributed to whatever holds the lock now. Consum
 - `start` — a live daemon on a strictly older recorded version is **restarted** instead of
   getting the old "already running" no-op. Gated on `isOlderVersion`, which refuses to
   compare unstamped builds (`dev`/`""` parse as 0.0.0, so without the guard a release
-  binary kills a developer's own watcher mid-test).
+  binary kills a developer's own watcher mid-test). It then **verifies the restart by
+  process IDENTITY** (`restartConfirmed`) and fails loudly if the same pid still holds
+  capture: `StopTeamsDaemon` prints a survivor on stderr but returns nil, so the follow-up
+  `StartDaemon` would otherwise find the stale process, print "already running" and exit 0
+  — announcing a restart it never performed. Identity, not version, because that stop also
+  clears the runtime record, so a survivor reads as "unknown build" and a version re-check
+  would call it fixed. A DIFFERENT pid is success (launchd may legitimately respawn the job
+  in between); an unreadable pid is a failure, since we deliberately stopped everything a
+  moment earlier. Caught by review on PR #137.
 
 **A recorded version is proof; an absent one is not evidence of health.** Never infer the
 daemon's build from the foreground version — that inference IS the bug.
