@@ -254,7 +254,10 @@ jobs:
       # sandboxed HOME and fixture binaries; they are pure node, no Go build.
       - name: npm install-module tests
         working-directory: npm
-        run: node --test 'test/*.test.js'
+        # The glob is UNQUOTED so bash expands it. node 20's test runner does not
+        # expand globs itself (that landed in 21) and passes the pattern through
+        # as a literal path, which fails with "Could not find test/*.test.js".
+        run: node --test test/*.test.js
 
   # Static application security testing. All findings (any severity) are
   # published to the GitHub Security tab as SARIF so reviewers can see them;
