@@ -94,25 +94,44 @@ follows [Semantic Versioning](https://semver.org/).
 
   A lookup now falls through to the repository's other worktrees, own checkout
   first. It is scoped **to** the checkouts `git worktree list` reports for that
-  one repository *that stand on the commit's own line of history* — the sibling's
-  HEAD reaches the commit, or the commit descends from it — and **against**
-  everything else: a different repository cannot contribute evidence, two
-  unrelated files that merely share a relative path cannot collide, neither can a
-  *clone* of the same upstream (its own object store, its own worktree list), and
-  neither can a worktree parked on a **divergent branch**. That last one is the
-  reason for the history check rather than a plain path match: worktrees are how
-  one repository holds several branches at once, so matching on the relative path
-  alone would hand an agent's write in the feature worktree to a human's commit
-  on the default branch. The widening is over checkouts, never over paths: the
-  committed path must still match exactly, so a path no agent wrote in any
-  checkout stays `unknown`. Evidence already on disk is read exactly as before and
-  is never invalidated.
+  one repository *whose HEAD reaches the commit* — that checkout holds it — and
+  **against** everything else: a different repository cannot contribute evidence,
+  two unrelated files that merely share a relative path cannot collide, neither
+  can a *clone* of the same upstream (its own object store, its own worktree
+  list), and neither can a worktree parked on a **divergent branch** or on the
+  commit's own **branch point**. The gate runs in that one direction only. "The
+  commit descends from the sibling's HEAD" looks like the same fact from the other
+  side and gates nothing: `git worktree add -b feat` leaves the new checkout
+  sitting on the branch point, and evidence is recorded the moment the agent
+  writes a file, so every later commit on every branch descends from it — which
+  would hand an agent's write in the feature worktree to a human's commit on the
+  default branch. The widening is over checkouts, never over paths: the committed
+  path must still match exactly, so a path no agent wrote in any checkout stays
+  `unknown`. Evidence already on disk is read exactly as before and is never
+  invalidated.
 
-  **What it deliberately does not recover:** evidence held by a checkout whose
-  HEAD has since moved off the commit's history — the agent's worktree switched
-  branches before the commit was polled. Those commits keep reading `unknown`.
-  That is a conservative under-count on purpose; an invented number is the failure
-  this product cannot afford, a missing one is not.
+  **What it deliberately does not recover:** evidence held by a checkout that does
+  not hold the commit — the agent's worktree switched branches, was reset, or
+  never committed what it wrote. Those commits keep reading `unknown`. That is a
+  conservative under-count on purpose; an invented number is the failure this
+  product cannot afford, a missing one is not.
+
+  The reachability answers are computed **once per sibling per poll** over the
+  whole range being processed and then read from memory — one `git rev-list` per
+  sibling per commit loop, a number that does not grow with the commit count.
+
+- **A seed tombstone is no longer dropped, or written empty, because a sibling
+  worktree moved.** Tombstones record which AI-write evidence has already been
+  *spent* on a path, and only a strictly newer write may re-authorize seeding.
+  They were being read through the same commit-gated view as the seed gate itself,
+  which is the wrong question for bookkeeping that can only ever suppress: a
+  sibling checkout moving onto its own branch pruned tombstones whose evidence
+  lived there — re-arming first-touch seeding, so the next purely human commit to
+  that path was recorded as fresh AI — and a path leaving the ledger was
+  tombstoned at "no evidence", letting the write already spent on it clear the
+  gate and seed the path a second time. Both ledgers (durability and rework) now
+  read every checkout for that bookkeeping while the seed gate keeps the narrow
+  view, and a tombstone may only ever rise.
 
 ## [0.12.2] — 2026-08-03
 

@@ -135,7 +135,7 @@ func TestDurabilitySquashMergeTransfersAttribution(t *testing.T) {
 	git("commit", "-m", "ai adds feature.go")
 	featureSha := gitOut("rev-parse", "HEAD")
 	// Capture fingerprints exactly as the attribution watcher would on the branch.
-	attributeCommit(sess, ws, featureSha, t0+dayMs)
+	attributeCommit(sess, ws, featureSha, t0+dayMs, siblingLineage{})
 
 	// Squash-merge feature into main: one NEW commit, no ancestry to featureSha.
 	git("checkout", "main")
@@ -187,7 +187,7 @@ func TestDurabilityCherryPickFollowsLineage(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "ai adds feature.go")
 	featureSha := gitOut("rev-parse", "HEAD")
-	attributeCommit(sess, ws, featureSha, t0+dayMs)
+	attributeCommit(sess, ws, featureSha, t0+dayMs, siblingLineage{})
 
 	// main advances so the cherry-pick lands on a different parent — otherwise git
 	// recreates a byte-identical commit (same tree+parent) and reuses the sha.
@@ -247,7 +247,7 @@ func TestDurabilityRebaseFollowsLineage(t *testing.T) {
 	git("add", "-A")
 	git("commit", "-m", "ai adds feature.go")
 	featureSha := gitOut("rev-parse", "HEAD")
-	attributeCommit(sess, ws, featureSha, t0+dayMs)
+	attributeCommit(sess, ws, featureSha, t0+dayMs, siblingLineage{})
 
 	// main advances independently, so the feature commit cannot fast-forward as-is.
 	git("checkout", "main")

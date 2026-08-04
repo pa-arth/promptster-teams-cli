@@ -116,14 +116,14 @@ type ledgerScope struct {
 	aiKey   string // the root key the ai-paths / bash-windows ledgers are stored under
 	prefix  string // POSIX rel(taskRoot, root) when root is UNDER taskRoot ("" == taskRoot)
 	absRoot string // resolved root, set when root is OUTSIDE taskRoot (evidence stored absolute)
-	root    string // resolved checkout this scope maps; an alt is probed here for lineage
-	// alts are the polled repository's OTHER worktrees that stand on the SAME LINE
-	// OF HISTORY as the commit being reconciled, each mapped into the ledger's path
-	// space by the identical rule (see resolveLedgerScope). They exist because the
-	// ledger records a path relative to the checkout the agent actually edited in,
-	// while attribution asks about a commit — and a commit belongs to the
-	// REPOSITORY, not to one of its checkouts. Always nil on an alt itself: the
-	// expansion is exactly one level deep.
+	root    string // resolved checkout this scope maps; what a lineage answer is keyed by
+	// alts are the polled repository's OTHER worktrees whose HEAD REACHES the commit
+	// being reconciled, each mapped into the ledger's path space by the identical
+	// rule (see resolveLedgerScope). They exist because the ledger records a path
+	// relative to the checkout the agent actually edited in, while attribution asks
+	// about a commit — and a commit belongs to the REPOSITORY, not to one of its
+	// checkouts. Always nil on an alt itself: the expansion is exactly one level
+	// deep.
 	alts []ledgerScope
 }
 
@@ -147,8 +147,8 @@ type ledgerScope struct {
 // taskRoot == "" (no workspace, e.g. a malformed session) falls back to the
 // per-root key.
 //
-// SIBLING WORKTREES, AND THE LINEAGE GATE ON THEM. The rule above resolves ONE
-// checkout, but the ledger records a path relative to whichever checkout the
+// SIBLING WORKTREES, AND THE REACHABILITY GATE ON THEM. The rule above resolves
+// ONE checkout, but the ledger records a path relative to whichever checkout the
 // agent actually edited in, and a commit belongs to the repository rather than to
 // a checkout of it. So a machine running several worktrees against one repository
 // read every commit made in another worktree as `unknown` — a silent under-count
@@ -162,61 +162,73 @@ type ledgerScope struct {
 // worktree, a human hand-edits internal/x.go in the default-branch checkout
 // inside the 7-day ai-paths TTL and commits it there, and the human's commit
 // picks the agent's evidence up off the shared relative path. So a sibling's
-// evidence counts ONLY while that checkout stands on the SAME LINE OF HISTORY as
-// the commit — commitInCheckoutLineage. Where it does not, the lookup MISSES; it
-// never falls through to a bare path match. A wrong number is disqualifying, a
-// missing one is merely a conservative under-count.
+// evidence counts ONLY WHEN THAT CHECKOUT'S HEAD REACHES THE COMMIT — the commit
+// is an ancestor-or-self of its HEAD, which is the same thing as "this checkout
+// holds this commit". Where it does not, the lookup MISSES; it never falls
+// through to a bare path match. A wrong number is disqualifying, a missing one is
+// merely a conservative under-count.
+//
+// ONE DIRECTION, AND ONLY ONE. "The commit DESCENDS from the sibling's HEAD" is
+// deliberately NOT accepted, though it looks like the same fact from the other
+// side. `git worktree add -b feat` leaves the new checkout sitting at the base
+// commit and the agent's evidence is recorded the moment it writes a file, with
+// no commit of its own; every subsequent commit on the default branch descends
+// from that HEAD, so the descends-from direction would hand each of them the
+// agent's evidence for any path they happen to share. It cannot tell "the agent's
+// checkout has not moved since it wrote" from "somebody else committed on top of
+// where it is parked", so there is no safe version of it.
 //
 // What the gated lookup GUARANTEES, scoped TO and AGAINST:
 //   - TO: the checkouts `git worktree list` reports for THIS repository — one
-//     object store, one file namespace — AND, of those, only the ones whose HEAD
-//     shares a line of history with the commit. That covers every genuine
-//     recovery: the same branch observed from another checkout, the branch-adoption
-//     replay, and the cold-start worktree replay all reconcile a commit that the
-//     evidence-holding checkout's own HEAD reaches (or that descends from it).
+//     object store, one file namespace — AND, of those, only the ones that
+//     actually contain the commit. That covers every genuine recovery, all of
+//     which observe a commit the evidence-holding checkout itself holds: the same
+//     branch read from another checkout, the branch-adoption replay, and the
+//     cold-start worktree replay.
 //   - AGAINST: everything else. Another repository never appears in this repo's
 //     worktree list, so two unrelated files that merely share a relative path
 //     cannot collide. Neither can a CLONE of the same upstream: it has its own
-//     object store and its own worktree list. And a sibling parked on a DIVERGENT
-//     branch contributes nothing, however exactly its paths line up.
+//     object store and its own worktree list. And a sibling that does not hold the
+//     commit contributes nothing, however exactly its paths line up — including
+//     one parked on the commit's own PARENT.
 //
-// What it deliberately does NOT recover: evidence held by a checkout whose HEAD
-// has moved off the commit's line of history — the agent's worktree switched
-// branches, or was reset elsewhere, before the commit was polled. That reads
-// `unknown`. It is an under-count on purpose, not a bug.
+// What it deliberately does NOT recover: evidence held by a checkout that does
+// not hold the commit — the agent's worktree switched branches, was reset, or
+// never committed what it wrote. That reads `unknown`. It is an under-count on
+// purpose, not a bug.
 //
 // It does NOT widen which PATHS count either: the committed path must match
-// exactly, in a checkout of this same repository standing on this same history.
+// exactly, in a checkout of this same repository that holds this same commit.
 // The residual it inherits is the one path-level attribution already documents
 // (reconcileCommitAttribution note 2) — a file AI-touched and later human-edited
 // inside the 7-day TTL still reads likely_ai — now reachable from a sibling that
-// shares the commit's history rather than from the polled directory alone.
+// holds the commit rather than from the polled directory alone.
 //
-// commitSha == "" yields NO alts: a caller with no commit in hand cannot be given
-// evidence it has no way to gate. resolveLedgerScopeAllCheckouts is the one
-// deliberate exception and documents why it is safe there.
-func resolveLedgerScope(root, taskRoot, commitSha string) ledgerScope {
+// The reachability answers come from `lin`, computed ONCE PER SIBLING PER POLL
+// over the poll's whole commit range (see siblingLineage). A zero siblingLineage
+// answers "no sibling reaches anything", so a caller that resolves a scope without
+// one gets the polled checkout alone — the safe direction, and the reason the
+// parameter is not optional.
+func resolveLedgerScope(root, taskRoot, commitSha string, lin siblingLineage) ledgerScope {
 	return ledgerScopeWithAlts(root, taskRoot, func(alt ledgerScope) bool {
-		// SPAWN BUDGET, concretely: at most two `git merge-base --is-ancestor`
-		// probes per sibling per call (the second only when the first says no), and
-		// only for a repository that actually HAS a sibling — repoHasLinkedWorktrees
-		// keeps every other repo at zero. Bounded per poll by
-		// gitWatchMaxCommitsPerPollTotal commits x 3 scope resolutions x siblings.
-		// Same order as the read-only probe #132 already spends per poll.
-		return commitSha != "" && commitInCheckoutLineage(alt.root, commitSha)
+		return lin.reaches(alt.root, commitSha)
 	})
 }
 
-// resolveLedgerScopeAllCheckouts is resolveLedgerScope for the ONE caller that
-// holds no commit: harvestDurable, which ages spans out on a clock rather than
-// folding a commit. Its alts are ungated because there is nothing to gate them
-// against, and that is safe HERE and only here — both things it reads the scope
-// for can merely SUPPRESS seeding, never authorize it. A wider aiPathKnown keeps
-// MORE seed tombstones alive (pruneSeedTombstones only ever deletes what the gate
-// can no longer fire on), and a wider write stamp tombstones a harvested path
-// HIGHER, which the strictly-newer evidence rule then demands more to lift. A
-// NARROWER view here would be the unsafe direction: it would tombstone a departing
-// path at stamp 0 and let evidence already spent on it re-authorize seeding.
+// resolveLedgerScopeAllCheckouts takes EVERY checkout of the repository, ungated.
+// It answers a different question from the seed gate and it is used only where a
+// wider view can merely SUPPRESS seeding, never authorize it:
+//
+//   - harvestDurable, which ages spans out on a clock and holds no commit at all;
+//   - the tombstone bookkeeping in pollDurabilityCommit and foldReworkCommit —
+//     pruning marks, and stamping a path that LEAVES the ledger.
+//
+// The narrow view is the unsafe direction there, and both halves are live defects
+// when it is used: pruneSeedTombstones walks every mark for the root, so a commit
+// processed while a sibling is off-lineage would DELETE the marks whose evidence
+// lives in that sibling and re-arm first-touch seeding; and a path that churns
+// out would be tombstoned at stamp 0, letting the very write already spent on it
+// clear the strictly-newer gate and seed it a second time.
 func resolveLedgerScopeAllCheckouts(root, taskRoot string) ledgerScope {
 	return ledgerScopeWithAlts(root, taskRoot, func(ledgerScope) bool { return true })
 }
@@ -275,11 +287,12 @@ func (s ledgerScope) ledgerPath(committedRel string) string {
 
 // ledgerLookup resolves one repo-relative committed path against a ledger map
 // keyed the way capture records paths, trying the polled checkout first and then
-// each alt scope — the repository's other worktrees that resolveLedgerScope
-// already gated onto the commit's own line of history. A checkout parked on a
-// divergent branch is not among them, so its evidence is never reached: this
-// falls through to a repo-relative path in a SIBLING OF THIS COMMIT'S HISTORY,
-// never to a bare repo-relative path.
+// each alt scope — whichever of the repository's other worktrees the caller's
+// resolveLedgerScope kept. A checkout that does not hold the commit is not among
+// them, so its evidence is never reached: this falls through to a repo-relative
+// path in a CHECKOUT THAT HOLDS THIS COMMIT, never to a bare repo-relative path.
+// (The one caller that widens further is resolveLedgerScopeAllCheckouts, which
+// documents the two bookkeeping questions where a wider view can only suppress.)
 //
 // OWN CHECKOUT FIRST, and the order is load-bearing twice over. It makes the
 // deployed single-checkout case identical to the pre-sibling behavior — evidence
@@ -302,37 +315,103 @@ func ledgerLookup[T any](s ledgerScope, m map[string]T, committedRel string) (T,
 	return zero, false
 }
 
-// commitInCheckoutLineage reports whether `checkout` stands on the SAME LINE OF
-// HISTORY as sha — either its HEAD reaches the commit, or the commit descends
-// from its HEAD. That is the gate that keeps a sibling worktree's AI-path
-// evidence from attributing human code:
+// siblingLineage is ONE POLL's answer to "which of this repository's other
+// checkouts hold each of these commits". It is the data the sibling-evidence gate
+// runs on, and it exists in this shape for cost: the gate is asked once per commit
+// in three places, so a per-commit `git merge-base --is-ancestor` per sibling cost
+// up to gitWatchMaxCommitsPerPollTotal x 3 x siblings x 2 processes — ~1,200 per
+// sibling on a burst poll, tens of seconds of subprocess time inside a 60s
+// interval, landing exactly on the bursts (cold start, adoption replay, a large
+// pull) the recovery paths exist for.
 //
-//   - HEAD reaches sha: the checkout holds the commit, which is every genuine
-//     cross-checkout recovery — the branch the agent worked on, observed from
-//     another copy (adoption replay, cold-start replay, a shared branch).
-//   - sha descends from HEAD: the commit is built directly on top of what this
-//     checkout has out, so the agent's working-tree writes recorded there sit in
-//     the commit's own lineage. This is the direction a worktree that has not
-//     moved since the agent wrote lands in.
-//   - NEITHER: the histories have diverged — the classic feature-worktree /
-//     default-branch pair — and the evidence is dropped. Under-count, on purpose.
+// ASKED ONCE PER SIBLING PER POLL, over the whole range being processed, then
+// answered from memory: ONE `git rev-list` per sibling per commit loop. A poll
+// spends 2N reads per root with N siblings (the attribution loop and the
+// durability loop each build one), plus one per cold-start replay, and that number
+// does NOT grow with the number of commits.
 //
-// Read-only, and every failure (git missing, an object not present, a checkout
-// with no HEAD) returns false, so an inconclusive probe drops the evidence rather
-// than widening on it.
-func commitInCheckoutLineage(checkout, sha string) bool {
+// The zero value answers false for everything. That is deliberate: a caller with
+// no lineage in hand gets the polled checkout's own evidence and nothing else.
+type siblingLineage struct {
+	// reach is resolved sibling checkout -> the shas of the range its HEAD holds.
+	reach map[string]map[string]bool
+}
+
+// newSiblingLineage asks each of root's sibling worktrees which of `shas` its HEAD
+// reaches. A repo with no linked worktrees short-circuits inside
+// gitSiblingWorktrees and spends nothing at all.
+func newSiblingLineage(root string, shas []string) siblingLineage {
+	siblings := gitSiblingWorktrees(root)
+	if len(siblings) == 0 || len(shas) == 0 {
+		return siblingLineage{}
+	}
+	lin := siblingLineage{reach: make(map[string]map[string]bool, len(siblings))}
+	for _, sibling := range siblings {
+		lin.reach[sibling] = commitsHeldBy(sibling, shas)
+	}
+	return lin
+}
+
+// reaches reports whether that checkout holds that commit.
+func (l siblingLineage) reaches(checkout, sha string) bool {
 	if checkout == "" || sha == "" {
 		return false
 	}
-	return gitIsAncestor(checkout, sha, "HEAD") || gitIsAncestor(checkout, "HEAD", sha)
+	return l.reach[checkout][sha]
 }
 
-// gitIsAncestor runs one `git merge-base --is-ancestor`, whose exit status IS the
-// answer: 0 for yes, non-zero for no or for any error. A commit is its own
-// ancestor, so a checkout sitting exactly on sha answers yes.
-func gitIsAncestor(dir, ancestor, descendant string) bool {
-	// #nosec G204 -- constant argv; dir is a checkout of a repo this install already polls and the revs are git object names read from that same repo, not attacker input. Read-only: it resolves objects and returns an exit code.
-	return exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", ancestor, descendant).Run() == nil
+// commitsHeldBy returns the subset of shas that are ancestors-or-self of
+// `checkout`'s HEAD, in ONE read.
+//
+// `git rev-list <shas...> --not HEAD` lists what is reachable from the shas and
+// NOT from HEAD, so a sha absent from that output is one HEAD holds. The
+// interpretation is inverted from the output, so every way of being wrong is
+// handled explicitly rather than defaulting to "held":
+//
+//   - a failed read (git missing, no HEAD, an object the checkout cannot see)
+//     returns nil, so that sibling holds nothing and its evidence is dropped;
+//   - a sha that is not a full object name is never entered in the result, since
+//     rev-list prints full names and a short one could not match the output it
+//     must be compared against.
+func commitsHeldBy(checkout string, shas []string) map[string]bool {
+	args := make([]string, 0, len(shas)+5)
+	args = append(args, "-C", checkout, "rev-list")
+	args = append(args, shas...)
+	args = append(args, "--not", "HEAD")
+	// #nosec G204 -- constant flags; checkout is a worktree of a repo this install already polls and the revs are git object names read from that same repo, not attacker input. Read-only: it walks history and prints object names.
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return nil
+	}
+	notHeld := map[string]bool{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if sha := strings.TrimSpace(line); sha != "" {
+			notHeld[sha] = true
+		}
+	}
+	held := make(map[string]bool, len(shas))
+	for _, sha := range shas {
+		if isFullObjectName(sha) && !notHeld[sha] {
+			held[sha] = true
+		}
+	}
+	return held
+}
+
+// isFullObjectName reports whether s is a full-length hex object name — the form
+// `git rev-list` prints, and therefore the only form commitsHeldBy can compare.
+// 40 is SHA-1, 64 is a SHA-256 repository; anything else is not comparable and is
+// left out of the answer.
+func isFullObjectName(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // siblingLedgerScopes maps root's sibling worktrees onto the ledger's path space,
@@ -402,8 +481,9 @@ func samePaths(a, b []string) bool {
 // (commitAttributionFromDiff, pollDurabilityCommit, foldReworkCommit), so an
 // unmemoized spawn here would scale with commits — 3 per commit, and a burst poll
 // is bounded at gitWatchMaxCommitsPerPollTotal. The cache below holds it to at
-// most one spawn per root per poll, the same order as the `git rev-parse HEAD`
-// the detection loop already spends.
+// most one spawn per root per poll. The reachability answers those scopes are
+// gated on are held to the same order by being computed per POLL rather than per
+// commit — see siblingLineage.
 func gitSiblingWorktrees(root string) []string {
 	if root == "" {
 		return nil
@@ -1325,6 +1405,12 @@ func pollGitWatchWorkspace(session Session) {
 			replayReworkForColdStartBranch(session, root, coldStart[rootKey], attributed, nowMs)
 		}
 
+		// Which of this repository's OTHER checkouts hold these commits, asked once
+		// per sibling for the whole range rather than once per commit per consumer —
+		// one `git rev-list` per sibling, and nothing at all for a repo that has no
+		// linked worktrees. Every consumer below gates a sibling's AI-path evidence
+		// on it (see siblingLineage and resolveLedgerScope).
+		lineage := newSiblingLineage(root, commits)
 		if len(commits) == 0 {
 			// A root with no commits this poll either has nothing left to replay
 			// (drained) or was deferred with its whole range still owed. Only the
@@ -1360,11 +1446,11 @@ func pollGitWatchWorkspace(session Session) {
 				// adoption emptied, and skipping it outright is what left an adopted
 				// branch looking like it held no AI work.
 				if foldRework && adopting {
-					replayReworkForAdoptedCommit(session, root, sha, nowMs)
+					replayReworkForAdoptedCommit(session, root, sha, nowMs, lineage)
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs) {
+			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs, lineage) {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

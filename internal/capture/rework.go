@@ -119,12 +119,20 @@ type reworkLedger struct {
 // path, so no later read of that same write can re-authorize seeding. A zero
 // stamp is meaningful: it records "there was no per-write AI evidence here",
 // which only inference could have seeded, and inference stays blocked.
+//
+// A mark only ever RISES. Lowering one hands back evidence that was already
+// spent: a checkout that has since moved, or a TTL eviction, would drop the
+// recorded stamp and let the very write this tombstone was written for clear the
+// strictly-newer gate a second time.
 func tombstoneReworkSeededPath(led *reworkLedger, rootKey, path string, writeMs int64) {
 	if led.Seeded == nil {
 		led.Seeded = map[string]map[string]int64{}
 	}
 	if led.Seeded[rootKey] == nil {
 		led.Seeded[rootKey] = map[string]int64{}
+	}
+	if prior, ok := led.Seeded[rootKey][path]; ok && prior > writeMs {
+		return
 	}
 	led.Seeded[rootKey][path] = writeMs
 }
@@ -164,34 +172,54 @@ func reworkSeedAuthorized(led *reworkLedger, rootKey, path string, writeMs int64
 // It is a snapshot taken once per commit rather than a per-path lookup because
 // the ai-paths ledger has its OWN lock: reading it lazily from inside the rework
 // ledger's read-modify-write would nest two locks.
+// IT HOLDS TWO VIEWS OF THE SAME MARKS, because the two questions asked of them
+// are not the same question (the durability header states the rule; this ledger
+// obeys it identically):
+//
+//   - seeded: the checkouts that HOLD this commit. Authorizing a seed off a
+//     checkout that does not hold the commit is the fabrication the gate exists
+//     to stop, so seedStampFor reads this one.
+//   - recorded: EVERY checkout of the repository. Writing down which evidence has
+//     been SPENT on a path is bookkeeping, not authorization — it can only ever
+//     make a later seed harder — and the narrow view is the dangerous one there:
+//     it would stamp a departing path at 0 while a sibling still held the real
+//     write, letting that same spent write clear the strictly-newer gate later.
 type reworkSeedEvidence struct {
-	scope ledgerScope
-	marks map[string]aiPathMark
+	seeded   ledgerScope
+	recorded ledgerScope
+	marks    map[string]aiPathMark
 }
 
-func newReworkSeedEvidence(root, taskRoot, sha string) reworkSeedEvidence {
-	scope := resolveLedgerScope(root, taskRoot, sha)
-	return reworkSeedEvidence{scope: scope, marks: readAiPathMarks(scope.aiKey)}
+func newReworkSeedEvidence(root, taskRoot, sha string, lin siblingLineage) reworkSeedEvidence {
+	seeded := resolveLedgerScope(root, taskRoot, sha, lin)
+	recorded := resolveLedgerScopeAllCheckouts(root, taskRoot)
+	return reworkSeedEvidence{seeded: seeded, recorded: recorded, marks: readAiPathMarks(seeded.aiKey)}
 }
 
-// writeStampFor is when an agent last WROTE path — a value that advances when,
-// and only when, the file is written again. 0 means no per-write evidence exists
-// for the path at all (never recorded, recorded before per-path stamps existed,
-// or aged out of the ai-paths TTL), which reads as inference and is refused on a
-// tombstoned path.
+// seedStampFor is when an agent last WROTE path, counting only the checkouts that
+// hold this commit — the value the seed gate is authorized against. 0 means no
+// such per-write evidence exists (never recorded, recorded before per-path stamps
+// existed, aged out of the ai-paths TTL, or held only by a checkout that does not
+// hold this commit), which reads as inference and is refused on a tombstoned path.
 //
 // The path is translated through the ledger scope, exactly as attribution does,
 // so a repo discovered under the daemon's HOME workspace looks its evidence up
 // under the same key it was recorded with — and, through the same lookup, under
-// the key a SIBLING WORKTREE of the repository would have recorded it with, while
-// that worktree stands on this commit's own line of history. That second half is
-// what makes the cross-checkout replays (adoption, cold start) find AI ranges to
-// seed instead of replaying the right commits over no evidence; the lineage gate
-// on it is what keeps a sibling parked on a divergent branch from lending its
-// write stamp to a commit it never contained.
-func (e reworkSeedEvidence) writeStampFor(path string) int64 {
-	m, _ := ledgerLookup(e.scope, e.marks, path)
+// the key a SIBLING WORKTREE of the repository would have recorded it with. That
+// second half is what makes the cross-checkout replays (adoption, cold start) find
+// AI ranges to seed instead of replaying the right commits over no evidence.
+func (e reworkSeedEvidence) seedStampFor(path string) int64 {
+	m, _ := ledgerLookup(e.seeded, e.marks, path)
 	return m.WriteMs
+}
+
+// writeStampFor is the stamp a TOMBSTONE is written with: the latest write either
+// view can see. Taking the later of the two is what keeps a record of spent
+// evidence from being weakened by a checkout that has moved — a tombstone may only
+// ever rise (tombstoneReworkSeededPath enforces that too).
+func (e reworkSeedEvidence) writeStampFor(path string) int64 {
+	m, _ := ledgerLookup(e.recorded, e.marks, path)
+	return max(m.WriteMs, e.seedStampFor(path))
 }
 
 func reworkLedgerPath() string {
@@ -306,7 +334,13 @@ func releaseReworkSpans(session Session, root, rootKey string) {
 	}
 	// Resolved BEFORE the ledger lock, matching foldReworkCommit: the ai-paths
 	// ledger has its own, and the rework read-modify-write must never nest one.
-	evidence := newReworkSeedEvidence(root, session.TaskRoot)
+	//
+	// No commit and an empty lineage: a release holds no commit to gate a sibling
+	// against, so the seed view stays on the polled checkout alone. Only the
+	// TOMBSTONE stamp is taken here, and writeStampFor reads that through the
+	// all-checkouts view — which is the side the two-view rule requires, since a
+	// wider view here can only ever raise a mark and suppress a later seed.
+	evidence := newReworkSeedEvidence(root, session.TaskRoot, "", siblingLineage{})
 	mutateReworkLedger(func(led *reworkLedger) {
 		tracked := led.Roots[rootKey]
 		if len(tracked) == 0 {
@@ -497,8 +531,8 @@ func aiRangesForSeeding(files []attrFile) map[string][]durTrackedRange {
 // dropped; (2) seed the AI-authored paths this commit introduces, subject to the
 // evidence rule in the file header. Returns (and emits) one verdict per
 // (commit, path) that had a churn.
-func pollReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64) []event.Event {
-	verdicts := foldReworkCommit(session, root, sha, diff, files, nowMs)
+func pollReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64, lin siblingLineage) []event.Event {
+	verdicts := foldReworkCommit(session, root, sha, diff, files, nowMs, lin)
 	for i := range verdicts {
 		emitReworkVerdict(verdicts[i])
 	}
@@ -515,7 +549,7 @@ func pollReworkCommit(session Session, root, sha, diff string, files []attrFile,
 // their verdicts have already been emitted once. Re-emitting them is exactly the
 // double-count the attribution skip exists to prevent, which is why the split is
 // at emission rather than at the ledger write.
-func foldReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64) []event.Event {
+func foldReworkCommit(session Session, root, sha, diff string, files []attrFile, nowMs int64, lin siblingLineage) []event.Event {
 	hunks := parseUnifiedDiffHunks(diff)
 	renames := parseUnifiedDiffRenames(diff)
 	seedable := aiRangesForSeeding(files)
@@ -525,7 +559,7 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 	// Resolved BEFORE the ledger lock, matching pollDurabilityCommit: the ai-paths
 	// ledger has its own lock and the rework ledger's read-modify-write must never
 	// nest another one.
-	evidence := newReworkSeedEvidence(root, session.TaskRoot, sha)
+	evidence := newReworkSeedEvidence(root, session.TaskRoot, sha, lin)
 	rootKey := gitWatchRootKey(root)
 
 	var verdicts []event.Event
@@ -567,7 +601,7 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 			if remapped[path] || len(tracked[path]) > 0 {
 				continue
 			}
-			if !reworkSeedAuthorized(led, rootKey, path, evidence.writeStampFor(path)) {
+			if !reworkSeedAuthorized(led, rootKey, path, evidence.seedStampFor(path)) {
 				continue
 			}
 			lineage := durLineageID(sha, path)
@@ -635,8 +669,8 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 //
 // Costs one `git show` per replayed commit, on adoption polls only; a steady-state
 // poll on an unchanged branch replays nothing.
-func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64) {
-	diff, files, _, ok := commitAttributionFromDiff(root, session.TaskRoot, sha)
+func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64, lin siblingLineage) {
+	diff, files, _, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
 	if diff == "" {
 		return // nothing this commit can contribute (merge commit, empty diff)
 	}
@@ -646,7 +680,7 @@ func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64
 		// may seed — removing a file is not evidence that anyone wrote anything.
 		files = nil
 	}
-	foldReworkCommit(session, root, sha, diff, files, nowMs)
+	foldReworkCommit(session, root, sha, diff, files, nowMs, lin)
 }
 
 // replayReworkForColdStartBranch rebuilds the rework state a BRAND-NEW root — an
@@ -729,8 +763,11 @@ func replayReworkForColdStartBranch(session Session, root, head string, attribut
 	}
 	state.HookDebugf("git-watch: cold-start root %s adopted a branch this device already attributed; replaying %d commit(s) for rework state",
 		gitWatchRootKey(root), len(shas))
+	// This range is the caller's, not pollGitWatchWorkspace's, so it asks the
+	// siblings about its own commits — once for the whole replay, not per commit.
+	lin := newSiblingLineage(root, shas)
 	for i := len(shas) - 1; i >= 0; i-- { // oldest-first: rework is stateful
-		replayReworkForAdoptedCommit(session, root, shas[i], nowMs)
+		replayReworkForAdoptedCommit(session, root, shas[i], nowMs, lin)
 	}
 }
 

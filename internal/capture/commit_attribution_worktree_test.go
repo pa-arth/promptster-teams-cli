@@ -45,14 +45,15 @@ func gitIn(t *testing.T, dir string) (run func(args ...string), out func(args ..
 // several worktrees against one repository is the ordinary move that hits it, and
 // every one of them under-reported.
 //
-// The recovery is GATED ON LINEAGE, because worktrees are how one repository
-// holds several branches at once: a sibling's evidence counts only while that
-// checkout stands on the same line of history as the commit. Matching on the
-// relative path alone would hand a feature worktree's AI write to a human's
-// commit on the default branch — see
-// TestCommitAttributionDoesNotCrossADivergentSiblingBranch, which is the
-// fabrication case and asserts absence on all three of attribution, session and
-// durability spans.
+// The recovery is GATED ON LINEAGE, IN ONE DIRECTION ONLY: a sibling's evidence
+// counts while that checkout's HEAD REACHES the commit, and never because the
+// commit descends from that HEAD. The descendant direction is the ordinary state
+// of a worktree — `git worktree add -b feat` leaves the new checkout sitting on
+// the branch point, and evidence is recorded when the agent WRITES, with no commit
+// needed — so it admits every later commit on every branch and gates nothing. See
+// TestCommitAttributionDoesNotCrossADivergentSiblingBranch and
+// TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom, both of
+// which assert absence on all three of attribution, session and durability spans.
 //
 // EVERY TEST IN THIS FILE USES A GENUINE SECOND DIRECTORY (`git worktree add`).
 // That is not incidental: the pre-existing
@@ -102,7 +103,9 @@ func worktreeAttributionRepo(t *testing.T) (home, primary, wt, sha, sessionID st
 // per-path attribution plus the representative session.
 func attributionOf(t *testing.T, root, taskRoot, sha string) (map[string]string, string) {
 	t.Helper()
-	_, files, primarySession, ok := commitAttributionFromDiff(root, taskRoot, sha)
+	// The lineage is resolved exactly as the watcher resolves it: one batched read
+	// per sibling for the range being polled, never a per-commit probe.
+	_, files, primarySession, ok := commitAttributionFromDiff(root, taskRoot, sha, newSiblingLineage(root, []string{sha}))
 	if !ok {
 		t.Fatalf("commitAttributionFromDiff(%s) reported no attributable change", root)
 	}
@@ -232,10 +235,9 @@ func TestCommitAttributionDoesNotCrossIntoASeparateClone(t *testing.T) {
 // hands an agent's write in the feature worktree to a human's commit on the
 // default branch — an invented number, which outranks any under-count.
 //
-// The commit is not reachable from the agent worktree's HEAD and does not descend
-// from it, so the lookup MISSES: `unknown`, no session, and no durability span.
-// Absence on all three, so a wrong answer and a missing answer cannot pass the
-// same assertion.
+// The commit is not reachable from the agent worktree's HEAD, so the lookup
+// MISSES: `unknown`, no session, and no durability span. Absence on all three, so
+// a wrong answer and a missing answer cannot pass the same assertion.
 func TestCommitAttributionDoesNotCrossADivergentSiblingBranch(t *testing.T) {
 	home, primary, wt, _, _ := worktreeAttributionRepo(t)
 	const t0 int64 = 1_000_000_000_000
@@ -269,7 +271,8 @@ func TestCommitAttributionDoesNotCrossADivergentSiblingBranch(t *testing.T) {
 	}
 
 	primaryKey := gitWatchRootKey(primary)
-	pollDurabilityCommit(primary, primaryKey, Session{DeviceID: "dev-primary", TaskRoot: home}, humanSha, t0)
+	pollDurabilityCommit(primary, primaryKey, Session{DeviceID: "dev-primary", TaskRoot: home}, humanSha, t0,
+		newSiblingLineage(primary, []string{humanSha}))
 	if n := trackedLineCount(t, primaryKey, "internal/x.go"); n != 0 {
 		t.Fatalf("a human's lines were seeded as AI off a divergent worktree's evidence: %d lines tracked, want 0 (ranges %+v)",
 			n, ledgerRanges(t, primaryKey, "internal/x.go"))
@@ -328,19 +331,21 @@ func TestGitSiblingWorktreesIsScopedToOneRepository(t *testing.T) {
 }
 
 // The DURABILITY ledger reads the same evidence through the same scope, so the
-// sibling-worktree lookup reaches its path-level seed gate too. Both directions
-// have to hold, and they are asserted in ONE test against ONE ledger so a fix
-// that opened the gate for everything could not pass half of it:
+// sibling-worktree lookup reaches its path-level seed gate too. Both halves are
+// asserted in ONE test against ONE ledger so a fix that opened the gate for
+// everything could not pass half of it:
 //
-//	positive — a path an agent wrote in the sibling checkout IS seeded here
-//	           (this half fails before the fix: 0 lines tracked);
+//	positive — a path an agent wrote in the sibling checkout IS seeded here, for
+//	           a commit that sibling's HEAD REACHES (this half fails before the
+//	           sibling lookup existed: 0 lines tracked);
 //	negative — a path NO agent wrote anywhere is NOT, even though the very same
 //	           commit carries a path that is. Absence, not a count.
 //
-// It is also the lineage gate's descends-from direction: the sibling holding the
-// evidence has not moved, so this commit is built directly on top of its HEAD.
-// That is the shape a worktree the agent last worked in is normally left in —
-// distinct from the divergent-branch shape, which must miss.
+// The commit is made in the checkout that holds the evidence and polled from the
+// other one, which is the ONLY shape the gate admits: the evidence-holding
+// checkout's HEAD is the commit. A sibling the commit merely descends from is the
+// separate, and forbidden, shape — see
+// TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom.
 func TestDurabilitySeedsFromSiblingWorktreeEvidenceButNotUntouchedPaths(t *testing.T) {
 	home, primary, wt, _, _ := worktreeAttributionRepo(t)
 	const t0 int64 = 1_000_000_000_000
@@ -349,19 +354,21 @@ func TestDurabilitySeedsFromSiblingWorktreeEvidenceButNotUntouchedPaths(t *testi
 	// would record it: workspace root key, path relative to that checkout.
 	recordAiTouchedPath("sess-wt", gitWatchRootKey(home), "repos/proj/agent.go")
 
-	// One commit made from the SIBLING worktree carrying both files: agent.go,
-	// which the agent wrote in the other checkout, and human.go, which no agent
-	// ever touched in any checkout.
-	git, gitOut := gitIn(t, wt)
-	git("checkout", "-b", "wt-durability")
-	writeCommitFile(t, wt, "agent.go", "a1\na2\na3\n")
-	writeCommitFile(t, wt, "human.go", "h1\nh2\nh3\n")
+	// One commit made in the checkout the agent worked in, carrying both files:
+	// agent.go, which the agent wrote here, and human.go, which no agent ever
+	// touched in any checkout. The primary's HEAD is therefore this commit.
+	git, gitOut := gitIn(t, primary)
+	writeCommitFile(t, primary, "agent.go", "a1\na2\na3\n")
+	writeCommitFile(t, primary, "human.go", "h1\nh2\nh3\n")
 	git("add", "-A")
 	git("commit", "-m", "agent.go plus an untouched human.go")
+	sha := gitOut("rev-parse", "HEAD")
 
+	// Polled from the OTHER checkout, whose own ledger key holds nothing for
+	// either path.
 	wtKey := gitWatchRootKey(wt)
 	sess := Session{DeviceID: "dev-wt", TaskRoot: home}
-	pollDurabilityCommit(wt, wtKey, sess, gitOut("rev-parse", "HEAD"), t0)
+	pollDurabilityCommit(wt, wtKey, sess, sha, t0, newSiblingLineage(wt, []string{sha}))
 
 	if got := trackedLineCount(t, wtKey, "agent.go"); got != 3 {
 		t.Errorf("agent.go tracked = %d, want 3 — evidence recorded in %s must seed a commit polled from %s",
@@ -370,5 +377,168 @@ func TestDurabilitySeedsFromSiblingWorktreeEvidenceButNotUntouchedPaths(t *testi
 	if got := trackedLineCount(t, wtKey, "human.go"); got != 0 {
 		t.Errorf("a path NO agent wrote in ANY checkout was seeded as AI: %d lines tracked, want 0 (ranges %+v)",
 			got, ledgerRanges(t, wtKey, "human.go"))
+	}
+}
+
+// THE FABRICATION THE ONE-DIRECTIONAL GATE EXISTS FOR, in the state a worktree is
+// ORDINARILY left in — not a corner case, the common case.
+//
+// `git worktree add -b feat` leaves the new checkout standing on the branch point,
+// and AI evidence is recorded when the agent WRITES a file, with no commit needed.
+// So the agent worktree's HEAD is the base commit, and EVERY later commit on EVERY
+// branch of the repository descends from it. A gate that also accepted "the commit
+// descends from this sibling's HEAD" would therefore admit that sibling's evidence
+// for a human's commit on the default branch — which is a human's lines reported
+// as AI, the one error class that outranks any under-count.
+//
+// Absence on all three of attribution, session and durability spans, so a wrong
+// answer and a missing answer cannot pass the same assertion.
+func TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom(t *testing.T) {
+	home, primary, wt, base, _ := worktreeAttributionRepo(t)
+	const t0 int64 = 1_000_000_000_000
+
+	// The agent's checkout: a branch of its own, still parked on the branch point,
+	// with NO commit of its own. This is what `git worktree add -b` produces.
+	wtGit, wtOut := gitIn(t, wt)
+	wtGit("checkout", "-b", "feat")
+	if head := wtOut("rev-parse", "HEAD"); head != base {
+		t.Fatalf("sibling HEAD = %s, want the branch point %s — this test is only meaningful while the sibling has no commit of its own", head, base)
+	}
+	recordAiTouchedPath("sess-feat", gitWatchRootKey(home), "work/proj-wt/internal/x.go")
+
+	// A human hand-writes the SAME relative path in the OTHER checkout, on the
+	// default branch, on top of that same branch point.
+	git, gitOut := gitIn(t, primary)
+	writeCommitFile(t, primary, "internal/x.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "human writes internal/x.go on the default branch")
+	humanSha := gitOut("rev-parse", "HEAD")
+
+	got, sess := attributionOf(t, primary, home, humanSha)
+	if got["internal/x.go"] != attributionUnknown {
+		t.Fatalf("descendant sibling: internal/x.go = %q, want %q — a worktree the commit merely descends from is not evidence about that commit",
+			got["internal/x.go"], attributionUnknown)
+	}
+	if sess != "" {
+		t.Fatalf("descendant sibling: session = %q, want no session at all", sess)
+	}
+
+	primaryKey := gitWatchRootKey(primary)
+	pollDurabilityCommit(primary, primaryKey, Session{DeviceID: "dev-primary", TaskRoot: home}, humanSha, t0,
+		newSiblingLineage(primary, []string{humanSha}))
+	if n := trackedLineCount(t, primaryKey, "internal/x.go"); n != 0 {
+		t.Fatalf("a human's lines were seeded as AI off a worktree the commit merely descends from: %d lines tracked, want 0 (ranges %+v)",
+			n, ledgerRanges(t, primaryKey, "internal/x.go"))
+	}
+}
+
+// THE SEED GATE AND THE TOMBSTONE BOOKKEEPING READ THE SAME MARKS THROUGH
+// DIFFERENT VIEWS, and this is the first of the two defects that collapsing them
+// into one produces.
+//
+// A tombstone records evidence already SPENT on a path. Pruning it is only safe
+// while the gate it guards can never fire again, so the pruner must ask whether
+// ANY checkout of the repository still holds that path's evidence — not whether
+// the checkout being polled right now happens to hold the commit. Judged by the
+// narrow view, an agent worktree moving onto its own branch DELETES a live
+// tombstone, and the next purely-human commit to that path is seeded as fresh AI.
+func TestDurabilityTombstoneSurvivesASiblingThatMovedOffTheCommit(t *testing.T) {
+	home, primary, wt, _, _ := worktreeAttributionRepo(t)
+	const t0 int64 = 1_000_000_000_000
+
+	// The ONLY evidence for p.go lives under the sibling's path space...
+	recordAiTouchedPath("sess-feat", gitWatchRootKey(home), "work/proj-wt/p.go")
+	// ...and that sibling then moves onto a branch of its own, so it no longer
+	// holds anything the polled checkout commits.
+	wtGit, _ := gitIn(t, wt)
+	wtGit("checkout", "-b", "feat")
+	writeCommitFile(t, wt, "feat.go", "f1\n")
+	wtGit("add", "-A")
+	wtGit("commit", "-m", "feat work")
+
+	primaryKey := gitWatchRootKey(primary)
+	mutateDurabilityLedger(func(led *durabilityLedger) {
+		tombstoneSeededPath(led, primaryKey, "p.go", 500)
+	})
+
+	// Any commit at all in the polled checkout runs the pruner.
+	git, gitOut := gitIn(t, primary)
+	writeCommitFile(t, primary, "other.go", "o1\n")
+	git("add", "-A")
+	git("commit", "-m", "an unrelated commit")
+	sha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(primary, primaryKey, Session{DeviceID: "dev-primary", TaskRoot: home}, sha, t0,
+		newSiblingLineage(primary, []string{sha}))
+
+	led := loadDurabilityLedger()
+	if _, ok := led.Seeded[primaryKey]["p.go"]; !ok {
+		t.Fatalf("the tombstone for p.go was pruned while a sibling worktree still held its evidence: Seeded = %+v", led.Seeded)
+	}
+}
+
+// The SECOND defect of that collapse, and the one that fabricates: a tombstone
+// written through the narrow view records 0 — "there was never any per-write
+// evidence here" — while a sibling still holds the real write stamp. The gate is
+// STRICTLY NEWER, so that same already-spent write then clears it and seeds the
+// path a second time, with a fresh lineage and a fresh birth stamp.
+//
+// The sibling deliberately moves off the commit for the churn-out and back onto
+// it for the re-entry: that is exactly the window in which the two views disagree,
+// and asserting the ABSENCE of the second seed is what distinguishes a blocked
+// re-entry from a merely smaller one.
+func TestDurabilitySpentEvidenceCannotSeedTwiceAcrossASiblingThatMoved(t *testing.T) {
+	home, primary, _, _, _ := worktreeAttributionRepo(t)
+	const t0 int64 = 1_000_000_000_000
+
+	git, gitOut := gitIn(t, primary)
+	writeCommitFile(t, primary, "p.go", "a1\na2\na3\n")
+	git("add", "-A")
+	git("commit", "-m", "p.go enters")
+	seedSha := gitOut("rev-parse", "HEAD")
+
+	// A second worktree created AT that commit, holding the only evidence for p.go.
+	agentWt := filepath.Join(home, "work", "proj-agent")
+	git("worktree", "add", "--detach", agentWt, seedSha)
+	recordAiTouchedPath("sess-agent", gitWatchRootKey(home), "work/proj-agent/p.go")
+
+	primaryKey := gitWatchRootKey(primary)
+	sess := Session{DeviceID: "dev-primary", TaskRoot: home}
+	pollDurabilityCommit(primary, primaryKey, sess, seedSha, t0, newSiblingLineage(primary, []string{seedSha}))
+	if got := trackedLineCount(t, primaryKey, "p.go"); got != 3 {
+		t.Fatalf("setup: p.go tracked = %d, want 3 — the sibling's evidence must seed the commit its HEAD holds", got)
+	}
+
+	// The agent worktree moves onto its own branch: from here on it does not hold
+	// the polled checkout's commits, and only the WIDE view can see its stamp.
+	agentGit, _ := gitIn(t, agentWt)
+	agentGit("checkout", "-b", "feat")
+	writeCommitFile(t, agentWt, "feat.go", "f1\n")
+	agentGit("add", "-A")
+	agentGit("commit", "-m", "feat work")
+
+	// p.go is rewritten end to end, so every seeded span churns out and the path
+	// leaves the ledger — the route that writes the tombstone.
+	writeCommitFile(t, primary, "p.go", "x1\nx2\nx3\n")
+	git("add", "-A")
+	git("commit", "-m", "p.go fully rewritten")
+	churnSha := gitOut("rev-parse", "HEAD")
+	pollDurabilityCommit(primary, primaryKey, sess, churnSha, t0+1, newSiblingLineage(primary, []string{churnSha}))
+	if got := trackedLineCount(t, primaryKey, "p.go"); got != 0 {
+		t.Fatalf("setup: p.go tracked = %d after a full rewrite, want 0", got)
+	}
+
+	// A purely human append, and the agent worktree back on this line of history —
+	// so the gate CAN see the sibling's stamp again. Nothing new was written by any
+	// agent, so the tombstone must still hold.
+	writeCommitFile(t, primary, "p.go", "x1\nx2\nx3\nh4\n")
+	git("add", "-A")
+	git("commit", "-m", "a human appends to p.go")
+	reentrySha := gitOut("rev-parse", "HEAD")
+	agentGit("checkout", "--detach", reentrySha)
+
+	pollDurabilityCommit(primary, primaryKey, sess, reentrySha, t0+2, newSiblingLineage(primary, []string{reentrySha}))
+	if n := trackedLineCount(t, primaryKey, "p.go"); n != 0 {
+		t.Fatalf("already-spent AI evidence seeded p.go a second time: %d lines tracked, want 0 (ranges %+v)",
+			n, ledgerRanges(t, primaryKey, "p.go"))
 	}
 }

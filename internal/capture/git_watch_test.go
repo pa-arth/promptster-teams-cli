@@ -77,7 +77,7 @@ func TestGitWatchDetectsNewCommits(t *testing.T) {
 // @@ span. Reuses the PR3 filesByPath helper (same package).
 func assertLikelyAI(t *testing.T, root, sha, path string, wantStart, wantEnd float64) {
 	t.Helper()
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev", TaskRoot: root}, root, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev", TaskRoot: root}, root, sha, siblingLineage{})
 	if !ok {
 		t.Fatalf("expected an emittable event for %s", sha)
 	}

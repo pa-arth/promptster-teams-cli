@@ -72,7 +72,7 @@ func TestCommitAttributionHappyPath(t *testing.T) {
 	// scoped to this workspace's root key.
 	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(ws), "foo.go")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event for a commit with changed files")
 	}
@@ -123,7 +123,7 @@ func TestCommitAttributionAiTokensCounted(t *testing.T) {
 
 	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(ws), "foo.go")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -151,7 +151,7 @@ func TestCommitAttributionAiTokensZeroWhenNoAI(t *testing.T) {
 
 	// Record NOTHING in the AI-paths ledger.
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -173,7 +173,7 @@ func TestCommitAttributionUnknownNeverHuman(t *testing.T) {
 
 	// Deliberately record NOTHING in the AI-paths ledger.
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -217,7 +217,7 @@ func TestCommitAttributionFormatterRobust(t *testing.T) {
 	git("commit", "-m", "ai appends, reflowed")
 	sha := gitOut("rev-parse", "HEAD")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -250,7 +250,7 @@ func TestCommitAttributionFirstCommitAgainstEmptyTree(t *testing.T) {
 	git("commit", "-m", "the very first commit")
 	sha := gitOut("rev-parse", "HEAD")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("first commit must still be attributable (diffed vs empty tree)")
 	}
@@ -283,7 +283,7 @@ func TestCommitAttributionSurvivesEmitPath(t *testing.T) {
 	sha := gitOut("rev-parse", "HEAD")
 	recordAiTouchedPath("ai-sess-3", gitWatchRootKey(ws), "svc/handler.go")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-emit", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-emit", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -363,7 +363,7 @@ func TestCommitAttributionCrossWorkspaceNoBleed(t *testing.T) {
 	gitB("commit", "-m", "human edit in repo B")
 	shaB := gitBOut("rev-parse", "HEAD")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-b", TaskRoot: wsB}, wsB, shaB)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-b", TaskRoot: wsB}, wsB, shaB, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -391,7 +391,7 @@ func TestCommitAttributionNonASCIIPath(t *testing.T) {
 
 	recordAiTouchedPath("ai-sess-utf8", gitWatchRootKey(ws), "café.go")
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -433,7 +433,7 @@ func TestBashRecoveryHappyPath(t *testing.T) {
 	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
 	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-500, m+500) // window spans the file mtime
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -470,7 +470,7 @@ func TestBashRecoveryOutsideWindowStaysUnknown(t *testing.T) {
 	// A window a full minute before the file mtime — well outside the 3s tolerance.
 	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-60000, m-59000)
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -511,7 +511,7 @@ func TestBashRecoveryNeverOverridesPrimaryAI(t *testing.T) {
 	m := statMtimeMs(t, filepath.Join(ws, "gen.go"))
 	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-500, m+500) // also matches, must be ignored
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
@@ -548,7 +548,7 @@ func TestBashRecoveryNearestWindowChosen(t *testing.T) {
 	recordBashWindow("near-sess", gitWatchRootKey(ws), m-200, m-100)
 	recordBashWindow("far-sess", gitWatchRootKey(ws), m+2000, m+2500)
 
-	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha)
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
