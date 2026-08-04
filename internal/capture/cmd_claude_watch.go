@@ -570,20 +570,22 @@ func RunClaudeWatcher() error {
 	// window_usage.go and statusline_shim.go.
 	var windowEmitter claudeWindowEmitter
 
-	// Delivery runs off the poll loop, so a slow or rate-limited backend can no
-	// longer stall parsing, advance transcript offsets past undelivered events,
-	// or (via the old send-derived count) masquerade as a broken parser.
-	// StartDrain is a process-wide singleton — the codex watcher shares this
-	// queue and calls it too (see its doc comment).
-	outbox.StartDrain(client, session.SessionToken)
-
 	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
 	// successful fetch says otherwise. Refreshed in the background (immediate +
 	// every RefreshInterval) so the poll loop never blocks on the 15s-timeout
 	// policy fetch; each iteration just reads the lock-guarded cached bool and
 	// threads it into every projected event via ingestClaudeWatchEvent ->
 	// AppendEventToLocalBuffer.
+	//
+	// Built BEFORE the drain because the drain reads its batch-ingest capability.
 	policyResolver := policy.NewResolver(session.SessionToken)
+
+	// Delivery runs off the poll loop, so a slow or rate-limited backend can no
+	// longer stall parsing, advance transcript offsets past undelivered events,
+	// or (via the old send-derived count) masquerade as a broken parser.
+	// StartDrain is a process-wide singleton — the codex watcher shares this
+	// queue and calls it too (see its doc comment).
+	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	policyResolver.StartBackground(policyCtx)

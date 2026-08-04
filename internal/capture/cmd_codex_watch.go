@@ -303,19 +303,21 @@ func RunCodexWatcher() error {
 	// is account-global, not workspace-scoped). See window_usage.go.
 	var windowEmitter codexWindowEmitter
 
-	// Delivery runs off the poll loop — see the claude watcher for the full
-	// rationale. Both watchers share ONE device-wide queue and run as goroutines
-	// in the same supervisor process, so StartDrain is a process-wide singleton:
-	// whichever watcher gets there first starts the only drain, and it delivers
-	// both watchers' events.
-	outbox.StartDrain(client, session.SessionToken)
-
 	// Org capture policy (opt-in assistant prose), fail-closed. Refreshed in the
 	// background (immediate + every RefreshInterval) so the poll loop never
 	// blocks on the 15s-timeout policy fetch; each iteration reads the
 	// lock-guarded cached bool and threads it into every projected event via
 	// tailCodexRollout -> AppendEventToLocalBuffer.
+	//
+	// Built BEFORE the drain because the drain reads its batch-ingest capability.
 	policyResolver := policy.NewResolver(session.SessionToken)
+
+	// Delivery runs off the poll loop — see the claude watcher for the full
+	// rationale. Both watchers share ONE device-wide queue and run as goroutines
+	// in the same supervisor process, so StartDrain is a process-wide singleton:
+	// whichever watcher gets there first starts the only drain, and it delivers
+	// both watchers' events.
+	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	policyResolver.StartBackground(policyCtx)

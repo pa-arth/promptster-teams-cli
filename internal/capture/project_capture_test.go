@@ -97,7 +97,7 @@ func TestWireBodyCarriesNoSource(t *testing.T) {
 	// that dir would race the RemoveAll.
 	ctx, cancel := context.WithCancel(context.Background())
 	drained := make(chan struct{})
-	go func() { defer close(drained); outbox.Drain(ctx, srv.Client(), session.SessionToken) }()
+	go func() { defer close(drained); outbox.Drain(ctx, srv.Client(), session.SessionToken, nil) }()
 	defer func() { cancel(); <-drained }()
 
 	var received []byte
