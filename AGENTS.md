@@ -914,12 +914,14 @@ Two things about it that are easy to get wrong, both learned the expensive way:
   the source's spent stamp and the destination's own, since a mark holding only the
   source's is read against a different path's clock and the agent that renamed the
   file usually recorded the new name too. Durability's marks are pruned by EVIDENCE
-  rather than by a TTL, and the pruner must read the SEED GATE'S OWN predicate —
-  presence in the AI-paths ledger, shared as one `aiPathKnown` func value, never a
-  second expression that merely looks compatible. Judging a mark by its write stamp
-  is what re-opens the hole: a ledger written before per-path stamps carries its
-  paths with a 0 stamp for the full 7-day TTL, so every tombstone on a deployed
-  install is deleted while the gate is still consulting the path.
+  rather than by a TTL, and the pruner must ask the SEED GATE'S OWN QUESTION —
+  presence in the AI-paths ledger, never a second expression that merely looks
+  compatible — but over EVERY checkout of the repository, a WIDER domain than the
+  gate itself is authorized against (the two-view rule below, stated in full in
+  `durability.go`'s header). Judging a mark by its write stamp is what re-opens
+  the hole: a ledger written before per-path stamps carries its paths with a 0
+  stamp for the full 7-day TTL, so every tombstone on a deployed install is
+  deleted while the gate is still consulting the path.
 - **Its state is scoped to a BRANCH, and `reworkLedger.Branches` is what enforces
   that.** The clear on `scope == scopeDefault` alone is not a bound: `git switch
   -c` off a feature branch and a per-branch worktree never stand on the default
@@ -1125,8 +1127,8 @@ tombstoned at. Under the narrow view a sibling moving off the commit PRUNES a
 live tombstone (re-arming first-touch seeding) and tombstones a departing path at
 0, so the write already spent on it clears the strictly-newer gate and seeds it
 again. Both are pinned by tests, and both tombstone writers are additionally
-MONOTONIC — a mark may only ever rise. The durability header states the two-view
-rule; the "one shared `aiPathKnown` func value" convention yields to it.
+MONOTONIC — a mark may only ever rise. `durability.go`'s header states the
+two-view rule in full.
 
 **COST: one `git rev-list` per sibling per commit-loop, per poll — NOT per
 commit.** `siblingLineage` asks each sibling once, for the poll's whole range,
