@@ -765,7 +765,7 @@ func TestBatchBodyCapDoesNotSkipEvents(t *testing.T) {
 		t.Errorf("queue not drained: %d pending", PendingCount())
 	}
 	// A misaligned cursor shows up here: it would sit mid-line rather than at EOF.
-	cursor := readCursor()
+	cursor := readCursor(LaneLive())
 	fi, err := os.Stat(state.OutboxPath())
 	if err != nil {
 		t.Fatalf("stat outbox: %v", err)

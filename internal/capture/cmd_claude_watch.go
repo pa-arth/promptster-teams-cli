@@ -1343,7 +1343,14 @@ func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: buffer error: %v\n", err)
 	}
-	if err := outbox.Append(ev); err != nil {
+	// AppendFromDurableSource, not Append: the transcript is on disk and this
+	// funnel's read offset has not advanced, so an event this queue defers is
+	// never one it loses. That is the property that earns the backfill lane —
+	// outbox classifies by the EVENT's own age (outbox.LiveHorizon), so the live
+	// tail of an actively-running session still goes down the live lane. See the
+	// `replay` flag above: same input, but a different question and a different
+	// window, so they are deliberately not the same call.
+	if err := outbox.AppendFromDurableSource(ev); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: queue error (%s): %v\n", ev.Kind, err)
 	}
 }

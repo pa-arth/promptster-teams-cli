@@ -955,7 +955,9 @@ func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
 	}
-	if err := outbox.Append(ev); err != nil {
+	// Durable source — the rollout file is on disk and the offset has not moved.
+	// Same terms as queueClaudeWatchEvent; see the note there.
+	if err := outbox.AppendFromDurableSource(ev); err != nil {
 		fmt.Fprintf(os.Stderr, "codex-watcher: queue error (%s): %v\n", ev.Kind, err)
 		return 0
 	}

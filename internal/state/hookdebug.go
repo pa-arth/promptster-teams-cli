@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 func hookDebugEnabled() bool {
@@ -66,11 +67,38 @@ func BufferLockPath() string {
 // Do not merge them. The ledger's value is that nothing mutates it; the
 // outbox's value is that the drain can.
 
+// THE QUEUE IS SPLIT IN TWO, and the split is the point.
+//
+// `outbox.jsonl` carries LIVE events — work happening now. `outbox-backfill.jsonl`
+// carries replayed history, which is the only producer that can genuinely wait:
+// its source bytes are already durable on disk and its read offset has not
+// advanced, so deferring it loses nothing.
+//
+// One FIFO could not express that. A schema bump enqueues tens of thousands of
+// replayed events ahead of the next live one, so a prompt typed now is delivered
+// after all of them — measured at 20,761 deep with the head 15 days old, while
+// the dashboard reported the engineer idle. Worse, a permanently-failing event
+// at the head blocked everything behind it. Two files, two cursors, two
+// independent heads: neither of those can happen across lanes.
+//
+// The LIVE path keeps `outbox.jsonl` unchanged so a device upgrading mid-backlog
+// keeps draining what it already queued, rather than stranding it under a new
+// name.
+
 func OutboxPath() string {
 	if p := os.Getenv("PROMPTSTER_OUTBOX_PATH"); p != "" {
 		return p
 	}
 	return filepath.Join(StateDir(), "outbox.jsonl")
+}
+
+// OutboxBackfillPath is the replay lane. Derived from OutboxPath so the two
+// lanes always live in the same directory and one env override relocates both —
+// a test or a sandbox that moved only one would silently write the other into
+// the developer's real state dir.
+func OutboxBackfillPath() string {
+	p := OutboxPath()
+	return strings.TrimSuffix(p, ".jsonl") + "-backfill.jsonl"
 }
 
 // OutboxCursorPath holds the byte offset of the next undelivered event. Derived
@@ -87,6 +115,12 @@ func OutboxCursorPath() string {
 func OutboxLockPath() string {
 	return OutboxPath() + ".lock"
 }
+
+// OutboxCursorPathFor and OutboxLockPathFor derive a lane's cursor and lock from
+// its queue path, so a new lane cannot be given a queue without also getting the
+// matching pair. Same identity-not-position reasoning as OutboxCursorPath.
+func OutboxCursorPathFor(queuePath string) string { return queuePath + ".cursor" }
+func OutboxLockPathFor(queuePath string) string   { return queuePath + ".lock" }
 
 // LedgerRetainedSegments is how many rotated segments are kept alongside the
 // live buffer, bounding the ledger to (1+N) * the rotation threshold.

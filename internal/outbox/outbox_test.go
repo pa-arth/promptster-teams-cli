@@ -255,7 +255,7 @@ func TestCursorPersistsAcrossRestart(t *testing.T) {
 	}
 	srv1.Close()
 
-	cursorAfterFirst := readCursor()
+	cursorAfterFirst := readCursor(LaneLive())
 	if cursorAfterFirst <= 0 {
 		t.Fatal("cursor must be durably persisted after a delivery")
 	}
@@ -390,13 +390,13 @@ func TestCompactionResetsQueue(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		fi, err := os.Stat(state.OutboxPath())
-		if err == nil && fi.Size() == 0 && readCursor() == 0 {
+		if err == nil && fi.Size() == 0 && readCursor(LaneLive()) == 0 {
 			return // compacted
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	fi, _ := os.Stat(state.OutboxPath())
-	t.Errorf("queue was not compacted after full delivery: size=%d cursor=%d", fi.Size(), readCursor())
+	t.Errorf("queue was not compacted after full delivery: size=%d cursor=%d", fi.Size(), readCursor(LaneLive()))
 }
 
 // TestBackoffForIsBoundedAndJittered guards the retry schedule: bounded by
@@ -629,9 +629,9 @@ func failCursorAfter(t *testing.T, n int32) *int32 {
 	t.Helper()
 	var calls int32
 	prev := writeCursor
-	writeCursor = func(v int64) error {
+	writeCursor = func(lane Lane, v int64) error {
 		if atomic.AddInt32(&calls, 1) <= n {
-			return prev(v)
+			return prev(lane, v)
 		}
 		return errors.New("write /outbox.jsonl.cursor.tmp: no space left on device")
 	}
@@ -724,7 +724,9 @@ func TestCursorPersistFailureBacksOffInsteadOfResendingEverySecond(t *testing.T)
 	if len(stamps) > 10 {
 		t.Errorf("too many duplicate re-sends in 12s: %d (un-backed-off is ~14, backed-off is ~6-8)", len(stamps))
 	}
-	if w := warnings.String(); !strings.Contains(w, "cannot record delivery progress") {
+	// Lane-qualified: with two queues, "which cursor is unwritable" is the first
+	// thing an operator needs, and a lane-less message no longer names it.
+	if w := warnings.String(); !strings.Contains(w, "cannot record live delivery progress") {
 		t.Errorf("a cursor-write failure is a local disk fault the user can act on and must be surfaced loudly; warnings = %q", w)
 	}
 }
@@ -787,11 +789,11 @@ func TestCursorPersistRecovers(t *testing.T) {
 	// Fail the first few cursor writes, then let them through.
 	var calls int32
 	prev := writeCursor
-	writeCursor = func(v int64) error {
+	writeCursor = func(lane Lane, v int64) error {
 		if atomic.AddInt32(&calls, 1) <= 2 {
 			return errors.New("no space left on device")
 		}
-		return prev(v)
+		return prev(lane, v)
 	}
 	t.Cleanup(func() { writeCursor = prev })
 
