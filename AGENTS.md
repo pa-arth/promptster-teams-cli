@@ -1161,6 +1161,10 @@ a session, and of a durability span:
 `TestCommitAttributionDoesNotCrossADivergentSiblingBranch` (sibling on another
 branch) and `TestCommitAttributionDoesNotCrossToASiblingTheCommitMerelyDescendsFrom`
 (sibling parked on the branch point with no commit of its own).
+`TestSiblingLineageSeparatesHeldFromUnheldWithinOneRange` carries that same
+absence through a MIXED range — one lineage, two commits, the sibling's HEAD
+sitting between them — which is what keeps the gate's answer per COMMIT and not
+per range; `resolveLedgerScope`'s header states that invariant.
 
 ## Maintaining this file
 
