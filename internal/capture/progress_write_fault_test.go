@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -199,6 +200,91 @@ func TestTheWatchersReportWriteFaultsIndependently(t *testing.T) {
 	if got := ProgressWriteFaulted(); len(got) != 1 || got[0] != "codex" {
 		t.Errorf("ProgressWriteFaulted() = %v, want [codex] only", got)
 	}
+}
+
+// THIS IS THE P1 REGRESSION, and it is the one test that matters most here.
+//
+// The first version of this change stored the fault in a process-local map and
+// read that map from `status` and `doctor`. But `claude-watch` and `codex-watch`
+// are SEPARATE PROCESSES — cli.go dispatches them as their own commands — so the
+// CLI's map was always empty and every surface stayed silent while the watcher
+// failed to save on every poll. The reporting existed and could not fire.
+//
+// So the assertion is deliberately made with NO save having run in this process:
+// the in-process map is empty here, exactly as it is in the CLI, and the answer
+// must come out right anyway.
+func TestThePersistenceProbeAnswersWithoutAnyInProcessState(t *testing.T) {
+	dir := writeFaultFixture(t)
+
+	if got := ProgressWriteFaulted(); len(got) != 0 {
+		t.Fatalf("fixture leaked in-process state %v — this test is worthless unless the map is empty", got)
+	}
+
+	if err := ProgressPersistenceFault(); err != nil {
+		t.Fatalf("a healthy state dir probed as faulted: %v", err)
+	}
+
+	sealDir(t, dir)
+
+	if err := ProgressPersistenceFault(); err == nil {
+		t.Error("a sealed state dir probed as healthy, with an empty in-process map — " +
+			"which is precisely the situation `status` and `doctor` are in on every run")
+	}
+}
+
+// The probe must exercise the COMMIT, not just the write. A probe that stopped
+// after writing would miss exactly the failure the discarded `_ = os.Rename(...)`
+// was hiding.
+func TestThePersistenceProbeCleansUpAfterItself(t *testing.T) {
+	dir := writeFaultFixture(t)
+
+	before := dirEntries(t, dir)
+	if err := ProgressPersistenceFault(); err != nil {
+		t.Fatal(err)
+	}
+	if after := dirEntries(t, dir); after != before {
+		t.Errorf("the probe left %d files behind (was %d) — status and doctor run often, "+
+			"and a probe that litters the state dir is worse than the fault it reports",
+			after-before, before)
+	}
+}
+
+// The probe must check the COMMIT, not just the write.
+//
+// This needs an injected failure and there is no way around it: a sealed
+// directory fails at CreateTemp long before the rename is reached, so a probe
+// that never renamed at all would pass every other test in this file. It matters
+// because the rename is the step a real save commits with, and the step whose
+// discarded error is the bug this whole change started from.
+func TestThePersistenceProbeChecksTheCommitStep(t *testing.T) {
+	writeFaultFixture(t)
+
+	prev := progressProbeRename
+	progressProbeRename = func(_, _ string) error { return errors.New("rename refused") }
+	t.Cleanup(func() { progressProbeRename = prev })
+
+	err := ProgressPersistenceFault()
+	if err == nil {
+		t.Fatal("the probe reported a healthy device while the commit step failed — a probe " +
+			"that stops at the write misses exactly the failure that started this change")
+	}
+	if !strings.Contains(err.Error(), "rename refused") {
+		t.Errorf("err = %v, want the rename's own error", err)
+	}
+
+	if n := dirEntries(t, filepath.Dir(claudeWatchProgressPath())); n != 0 {
+		t.Errorf("a failed commit left %d files behind; the probe must clean up on its "+
+			"error paths too", n)
+	}
+}
+
+func dirEntries(t *testing.T, dir string) int {
+	t.Helper()
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(es)
 }
 
 // ProgressWriteFaultedHas is a test-side convenience over the exported slice.

@@ -101,7 +101,7 @@ func printStatusStatic() {
 	// Unlike the replay row, this one is a fault, so it appears on both status
 	// surfaces and in doctor. §2.4 shipped to this static path only and review
 	// had to catch it — `status` opens the TUI by default.
-	if row := statusProgressWriteFaultRow(writeFaultsNow()); len(row) == 2 {
+	if row := statusProgressWriteFaultRow(persistFaultNow()); len(row) == 2 {
 		pairs = append(pairs, row...)
 	}
 	fmt.Println(indent(kvPanel("capture", pairs...)))
@@ -168,9 +168,13 @@ func cmdTeamsDoctor() {
 	// persist its offsets re-reads the window every restart, so this is the line
 	// that turns "one-time replay" above into a standing fault — it warns where
 	// the replay line does not.
-	for _, l := range progressWriteFaultLines(writeFaultsNow()) {
+	// Deliberately does NOT clear `ok`. Review caught that it did: `ok` selects
+	// doctor's closing line, and false prints "run promptster-teams login" — which
+	// contradicts the permissions-and-disk-space diagnosis one line above and
+	// sends the operator to a command that cannot fix a full disk. The warn glyph
+	// carries the severity; `ok` is about setup, not about storage.
+	for _, l := range progressWriteFaultLines(persistFaultNow()) {
 		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
-		ok = false
 	}
 
 	// Which build is actually capturing, and which one runs at the next login.

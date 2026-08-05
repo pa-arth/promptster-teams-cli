@@ -2,7 +2,6 @@ package cli
 
 import (
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
@@ -57,25 +56,24 @@ func reconstructionLines(r capture.ReconstructionState, now time.Time) []queueLi
 //
 // It also says the part the operator cannot see: the replay they are watching is
 // not one-time after all, and will run again at the next start.
-func progressWriteFaultLines(faulted []string) []queueLine {
-	if len(faulted) == 0 {
+func progressWriteFaultLines(fault error) []queueLine {
+	if fault == nil {
 		return nil
 	}
 	return []queueLine{{queueWarn, fmt.Sprintf(
-		"cannot save capture progress (%s) — read offsets are not being recorded, so this "+
+		"cannot save capture progress (%v) — read offsets are not being recorded, so this "+
 			"device re-reads its full history window on EVERY restart. Check permissions and "+
 			"free space on %s",
-		strings.Join(faulted, ", "), state.StateDir())}}
+		fault, state.StateDir())}}
 }
 
 // statusProgressWriteFaultRow is the `status` panel's row for the same fault, or
 // nil when progress is persisting normally.
-func statusProgressWriteFaultRow(faulted []string) []string {
-	if len(faulted) == 0 {
+func statusProgressWriteFaultRow(fault error) []string {
+	if fault == nil {
 		return nil
 	}
-	return []string{"progress", fmt.Sprintf("NOT SAVING (%s) — replays every restart",
-		strings.Join(faulted, ", "))}
+	return []string{"progress", "NOT SAVING — replays all history every restart"}
 }
 
 func transcriptCount(n int) string {
@@ -90,8 +88,12 @@ func transcriptCount(n int) string {
 // can count the calls behind is a claim, not a guarantee.
 var reconNow = capture.ReconstructionNow
 
-// writeFaultsNow is capture.ProgressWriteFaulted, a var for the same reason.
-var writeFaultsNow = capture.ProgressWriteFaulted
+// persistFaultNow probes whether progress can be saved. A var so tests can
+// stand in for a read-only disk without one.
+//
+// NOT capture.ProgressWriteFaulted: that map lives in the watcher process, and
+// `status`/`doctor` run in their own. See capture.ProgressPersistenceFault.
+var persistFaultNow = capture.ProgressPersistenceFault
 
 // statusReconstructionRow is the `status` panel's key/value pair for a running
 // replay, or nil when none is running.

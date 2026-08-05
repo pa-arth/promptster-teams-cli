@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -372,8 +373,11 @@ func markProgressWriteFault(watcher string, faulted bool) {
 	delete(writeFaulted, watcher)
 }
 
-// ProgressWriteFaulted names the watchers that cannot persist progress right
-// now, sorted. Empty on a healthy device.
+// ProgressWriteFaulted names the watchers that have failed to persist progress
+// IN THIS PROCESS, sorted. Empty on a healthy device.
+//
+// Only the watcher process can answer this, which is exactly why the operator
+// surfaces do not use it — see ProgressPersistenceFault.
 func ProgressWriteFaulted() []string {
 	writeFaultMu.Lock()
 	defer writeFaultMu.Unlock()
@@ -391,3 +395,66 @@ var (
 	// and a restart is precisely when the question is asked again from scratch.
 	writeFaulted = map[string]bool{}
 )
+
+// ProgressPersistenceFault reports whether this device can persist capture
+// progress RIGHT NOW, by trying it. nil means it can.
+//
+// IT RE-DERIVES THE ANSWER RATHER THAN PROPAGATING IT, and review is why. The
+// first version of this change recorded the fault in the process-local map above
+// and read that map from `status` and `doctor`. But `claude-watch` and
+// `codex-watch` are SEPARATE PROCESSES — `internal/cli/cli.go` dispatches them
+// as their own commands, spawned detached by the daemon — so the CLI's map was
+// always empty, and every operator surface stayed silent while the watcher
+// failed to save on every poll. The reporting existed and could not fire.
+//
+// Sharing state across that boundary would mean writing a marker file into the
+// directory whose unwritability IS the fault. Asking the question directly has
+// no such catch-22 and no staleness: the probe runs the same syscalls, against
+// the same directory, that a real save runs.
+//
+// It DOES write, which is why it is called from `status` and `doctor` only and
+// never from a poll loop. It creates and removes one scratch file and touches no
+// capture state — cursor, queue and ledger are untouched, so doctor's
+// read-only-toward-capture guarantee holds.
+//
+// Known limit, stated rather than papered over: this answers "can the state
+// directory be written now", which covers the persistent faults that matter —
+// permissions, a full disk, a read-only mount. A transient failure the watcher
+// hit and the probe cannot reproduce is reported by the watcher's own stderr
+// line and not here.
+func ProgressPersistenceFault() error {
+	dir := filepath.Dir(claudeWatchProgressPath())
+
+	f, err := os.CreateTemp(dir, ".progress-probe-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write([]byte("probe")); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+
+	// The rename is what COMMITS a real save, and it fails independently of the
+	// write — a probe that stopped at the write would miss precisely the case the
+	// discarded `_ = os.Rename(...)` was hiding.
+	dst := tmp + ".committed"
+	if err := progressProbeRename(tmp, dst); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	os.Remove(dst)
+	return nil
+}
+
+// progressProbeRename is os.Rename. A var because a probe that silently skipped
+// the commit step would pass every black-box test — a sealed directory fails at
+// CreateTemp long before the rename is reached, so nothing else can tell the two
+// implementations apart. Injecting a rename failure is the only way to prove the
+// probe checks the step that the discarded `_ = os.Rename(...)` was hiding.
+var progressProbeRename = os.Rename
