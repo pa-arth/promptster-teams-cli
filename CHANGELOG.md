@@ -6,6 +6,75 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-08-05
+
+**The census was still only looking where skills are kept by hand.** 0.13.0
+taught it to walk Codex and Cursor, but all three walks stopped at the personal
+root — `~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills-cursor`. On one
+real machine that missed the two largest sources outright: skills installed by a
+plugin, which live under `plugins/cache/<marketplace>/<plugin>/<version>/skills`,
+and the cross-client `~/.agents/skills` root that the Agent Skills convention
+gives every tool. Twenty skills that engineer uses constantly were inventoried
+nowhere, while twenty-five he rarely touches were the whole of his ledger.
+
+Minor, not patch: like 0.13.0, this version READS directories no previous
+version opened. What leaves the machine is unchanged in kind — skill names,
+description token counts, and now which plugin a skill came from; never a path,
+never a file body.
+
+### Added
+
+- **Plugin-cache skills** are censused for both Claude Code and Codex, folded to
+  the newest installed version. Several versions of one plugin routinely sit on
+  disk at once; without the fold a single skill inventories two, four or six
+  times and its always-on carry is billed once per copy.
+- **`~/.agents/skills`**, the client-neutral root, is walked and recorded with no
+  tool attributed — because no one tool owns it. Naming a client there would
+  invent the very attribution the census exists to establish.
+- Every skill now carries its **provenance** (`user`, `agents`, `plugin`,
+  `plugin-cache`) and, where one applies, the **plugin** that installed it. A
+  skill's carry is only actionable if you can tell someone where it came from:
+  "uninstall this plugin" is an action, "you have a skill called review" is not.
+- Enablement is honored where it is knowable. Claude Code records which plugins
+  are enabled, and a disabled plugin's skills are excluded — they cost no tokens
+  because the model never sees them. Codex publishes no equivalent, so its cache
+  is reported as installed and marked `plugin-cache` rather than guessed at.
+
+### Fixed
+
+- **Symlinked skill directories were skipped entirely.** `os.ReadDir` reports a
+  symlink as a link, not a directory, so a skill linked into a client's root
+  was invisible — 4 of 17 on the machine this was found on. Linking a shared
+  skill into a per-tool root is a documented workflow, not an edge case. All
+  four walks now resolve links, and the resolved path deduplicates the same
+  skill reached by two routes.
+- **Plugin skills were billed twice.** Their description tokens counted toward
+  both the skill-listing line and the plugin-listing line, which the rollup sums
+  as two always-on costs. Skills sourced from a plugin are now excluded from the
+  skill-listing tally, where the plugin line already accounts for them.
+- Two plugins shipping the same skill slug collapsed into one entry, silently
+  attributing the second plugin's activity to the first.
+
+## [0.14.0] — 2026-08-04
+
+Recorded after the fact: 0.14.0 shipped as a version bump with no changelog
+entry. It carried six merged changes, none of them capture-format changes.
+
+### Added
+
+- Batch ingest, probed and fallen back from losslessly (#152).
+- Delivery is split into **live** and **backfill** lanes with separate durable
+  queues, so a device replaying history no longer delays what is happening now
+  (#154). The live queue deliberately keeps its old filename, so a device
+  upgrading mid-backlog drains what it already queued instead of stranding it.
+- Progress-schema migrations declare their replay cost, and a bump is documented
+  as a fleet-wide replay event (#153, #155).
+
+### Fixed
+
+- History reconstruction is observable, and a lost progress file reports itself
+  rather than silently restarting (#156, #157).
+
 ## [0.13.0] — 2026-08-04
 
 **If you work in Codex or Cursor, this is the release where Promptster starts
@@ -1467,7 +1536,9 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.14.0...v0.15.0
+[0.14.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.4...v0.13.0
 [0.12.4]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.3...v0.12.4
 [0.12.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.2...v0.12.3
