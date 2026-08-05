@@ -75,10 +75,42 @@ type censusSkill struct {
 	// DescTokens estimates (chars/4) what the skill's `description:` costs in
 	// the always-loaded skill listing.
 	DescTokens int `json:"descTokens"`
-	// Tool is which agent this skill belongs to. omitempty so a census from a CLI
-	// predating the field stays byte-identical and the backend keeps folding
-	// those on slug alone rather than silently re-attributing stored data.
+	// Tool names the ROOT this skill was found under — NOT the client that loads
+	// it, which is not knowable from disk. `~/.claude/skills` is documented as a
+	// read location by GitHub Copilot, VS Code, Amp and OpenCode as well as by
+	// Claude Code, so "found under the Claude root" is the strongest true claim
+	// available. It is still the right join key: two skills sharing a slug under
+	// two different roots are two assets, and folding them prices one's carry
+	// against the other's invocations.
+	//
+	// omitempty so a census from a CLI predating the field stays byte-identical
+	// and the backend keeps folding those on slug alone rather than silently
+	// re-attributing stored data.
 	Tool string `json:"tool,omitempty"`
+	// Source is where the skill came from, which is what lets a reader act on a
+	// finding: twenty unused skills that arrived in ONE plugin install are one
+	// decision, not twenty.
+	//
+	//	""             — a CLI predating this field. Unknown, never assume "user".
+	//	"user"         — the tool's own personal root (~/.<tool>/skills).
+	//	"agents"       — ~/.agents/skills, the cross-client convention root. Any
+	//	                 spec-compliant client may have installed it.
+	//	"plugin"       — shipped by a plugin CONFIRMED enabled (Claude Code has a
+	//	                 registry + an enabledPlugins gate; we read both).
+	//	"plugin-cache" — found in a plugin cache with NO enablement registry to
+	//	                 check (Codex has none: not in plugins/, not in
+	//	                 config.toml, not in the sqlite state). Presence is the
+	//	                 only signal, so this skill's carry is an UPPER BOUND and
+	//	                 must not be presented as a settled cost.
+	Source string `json:"source,omitempty"`
+	// Plugin is the owning plugin's name when Source is plugin/plugin-cache.
+	Plugin string `json:"plugin,omitempty"`
+	// absPath is the skill directory with symlinks resolved. UNEXPORTED, so
+	// encoding/json cannot emit it — the payload carries names and counts, never
+	// a filesystem path, and that guarantee is enforced by the language here
+	// rather than by a reviewer noticing. Used only to recognise one physical
+	// skill reached by two routes; see dedupeSkills.
+	absPath string
 }
 
 // censusPlugin is one enabled plugin — name + listing cost only.
@@ -189,6 +221,10 @@ type censusEnv struct {
 	// builds a single-tool census.
 	codexDir  string
 	cursorDir string
+	// homeDir roots the vendor-neutral `~/.agents/skills`. Separate from the
+	// three above because it belongs to no tool — see sharedSkillsRoot. Empty
+	// disables that walk, the same way an empty codexDir disables Codex's.
+	homeDir string
 }
 
 func defaultCensusEnv(workspace string) censusEnv {
@@ -207,6 +243,7 @@ func defaultCensusEnv(workspace string) censusEnv {
 		// and report `toolsExamined` for a directory nobody is working in.
 		codexDir:  codexHome(),
 		cursorDir: cursorHome(),
+		homeDir:   home,
 	}
 }
 
@@ -616,7 +653,52 @@ func buildConfigCensus(env censusEnv) configCensusData {
 		// Cursor spells its skills root `skills-cursor`, not `skills`.
 		data.Skills = append(data.Skills, censusSkills(filepath.Join(env.cursorDir, "skills-cursor"), toolCursor)...)
 	}
+	// The personal roots above are the MINORITY of what is installed. On the one
+	// machine surveyed they held 37 skills against ~81 in the roots below, and on
+	// the one Codex-heavy customer engineer every skill he actually runs is in a
+	// plugin cache. Inventory without the plugin roots is not a small undercount;
+	// it is a list of the skills someone is least likely to be using.
+	// Registry FIRST, cache second, and the CACHE stamped `plugin-cache` even for
+	// Claude. A cached plugin is a download, not an installation: Claude's cache
+	// keeps versions and marketplaces that `enabledPlugins` does not enable, so
+	// stamping those `plugin` would assert an enablement nobody checked — the
+	// same false claim this change refuses to make about Codex. Dedupe's
+	// first-writer-wins then UPGRADES the genuinely enabled ones to `plugin`: the
+	// stronger evidence survives, the weaker only fills gaps.
+	data.Skills = append(data.Skills, censusPluginSkills(env.claudeDir)...)
+	data.Skills = append(data.Skills,
+		censusPluginCacheSkills(filepath.Join(env.claudeDir, "plugins", "cache"), toolClaudeCode, skillSourcePluginCache)...)
+	if env.codexDir != "" {
+		// Codex ships no enablement registry at all — not in plugins/, not in
+		// config.toml, not in the sqlite state — so the cache walk is the only
+		// route and `plugin` is never reachable here. See censusSkill.Source.
+		data.Skills = append(data.Skills,
+			censusPluginCacheSkills(filepath.Join(env.codexDir, "plugins", "cache"), toolCodex, skillSourcePluginCache)...)
+	}
+	data.Skills = append(data.Skills, censusSharedSkills(env.homeDir)...)
+	// One skill reachable by two routes is ONE carried skill. Claude's registry
+	// installPath points INTO plugins/cache, so the two Claude walks above overlap
+	// by construction; counting both would bill the same listing twice.
+	data.Skills = dedupeSkills(data.Skills)
 	for _, s := range data.Skills {
+		// A skill from a CONFIRMED-enabled plugin is ALREADY inside
+		// PluginListingTokens — pluginListingTokens walks the same installPath's
+		// skills/, commands/ and agents/. The backend prices `skill_listings` and
+		// `plugin_listings` as two separate always-on lines and SUMS them, so
+		// counting the skill here as well bills one listing twice and inflates the
+		// engineer's config tax by exactly the overlap.
+		//
+		// The identity still ships — that is the point of this change, and what an
+		// invocation joins to. Only its contribution to the aggregate is withheld,
+		// because something else already made that contribution.
+		//
+		// `plugin-cache` entries DO count: no plugin line covers them (Codex has no
+		// registry to enumerate, and a cached Claude plugin absent from
+		// `enabledPlugins` is not in the plugin list either), so excluding them
+		// would zero a real cost rather than avoid a duplicated one.
+		if s.Source == skillSourcePlugin {
+			continue
+		}
 		data.SkillListingTokens += s.DescTokens
 	}
 	data.SkillCount = len(data.Skills)
@@ -664,6 +746,10 @@ func buildConfigCensus(env censusEnv) configCensusData {
 		{toolClaudeCode, env.claudeDir},
 		{toolCodex, env.codexDir},
 		{toolCursor, env.cursorDir},
+		// Not a tool — the vendor-neutral root. Recorded by the same rule and for
+		// the same reason: an empty skills list from a root nobody walked is
+		// indistinguishable from a root that is genuinely empty.
+		{sharedSkillsRoot, sharedRootPath(env.homeDir)},
 	} {
 		if dirExists(t.dir) {
 			data.ToolsExamined = append(data.ToolsExamined, t.name)
@@ -739,6 +825,9 @@ const censusSkillNestDepth = 1
 
 func censusSkills(skillsDir, tool string) []censusSkill {
 	skills := collectSkills(skillsDir, tool, censusSkillNestDepth)
+	for i := range skills {
+		skills[i].Source = skillSourceUser
+	}
 	sort.Slice(skills, func(i, j int) bool { return skills[i].Slug < skills[j].Slug })
 	return skills
 }
@@ -750,7 +839,14 @@ func collectSkills(skillsDir, tool string, depth int) []censusSkill {
 	}
 	skills := []censusSkill{}
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		// os.Stat, not entry.IsDir(): ReadDir does not follow symlinks, so a
+		// SYMLINKED skill directory reports ModeSymlink and was being skipped
+		// entirely. That is not a corner case — linking a shared skill into a
+		// client's own root is a documented workflow (Gemini CLI ships
+		// `/skills link` for it), and 4 of 17 skills under ~/.claude/skills on the
+		// machine this was found on are symlinks into ~/.agents/skills. Each one
+		// was an asset the engineer has, uses, and we reported as absent.
+		if !isDirFollowingLinks(filepath.Join(skillsDir, entry.Name())) {
 			continue
 		}
 		slug := entry.Name()
@@ -772,7 +868,225 @@ func collectSkills(skillsDir, tool string, depth int) []censusSkill {
 			Name:       name,
 			DescTokens: approxTokens(len(fm["description"])),
 			Tool:       tool,
+			absPath:    resolvedPath(filepath.Join(skillsDir, slug)),
 		})
+	}
+	return skills
+}
+
+// isDirFollowingLinks reports whether path is a directory, resolving symlinks.
+func isDirFollowingLinks(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+// resolvedPath returns path with symlinks resolved, or the path itself when it
+// cannot be resolved. Never emitted — see censusSkill.absPath.
+func resolvedPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+// dedupeSkills keeps one entry per (tool, slug). The census reaches the same
+// skill by more than one route on purpose — Claude's plugin registry resolves an
+// installPath that lives inside the very cache directory the cache walk covers —
+// and a skill listed twice is carried twice, which inflates the config tax by
+// exactly the amount of the duplication.
+//
+// Two keys, because there are two distinct ways to reach one skill twice:
+//
+//  1. (tool, slug) — NOT slug alone. The same slug under two different roots is
+//     two real assets, which is the distinction censusSkill.Tool exists to
+//     preserve; deduping across tools would undo it one function later.
+//  2. resolved path — the SAME physical directory reached under two tools. A
+//     symlink from ~/.claude/skills into ~/.agents/skills (a documented
+//     workflow, and 4 of 17 skills on the machine this was written against)
+//     otherwise arrives twice with different tools, passes key 1, and bills one
+//     skill's listing tokens twice.
+//
+// First writer wins, and the call order in buildConfigCensus is what that means:
+// a personal root beats a plugin, and a CONFIRMED-enabled plugin beats a bare
+// cache hit. That ordering is deliberate — it keeps the more specific provenance
+// and never downgrades `plugin` to `plugin-cache`.
+func dedupeSkills(skills []censusSkill) []censusSkill {
+	type key struct{ tool, slug string }
+	seen := make(map[key]bool, len(skills))
+	seenPath := make(map[string]bool, len(skills))
+	out := make([]censusSkill, 0, len(skills))
+	for _, s := range skills {
+		k := key{s.Tool, strings.ToLower(s.Slug)}
+		if seen[k] || (s.absPath != "" && seenPath[s.absPath]) {
+			continue
+		}
+		seen[k] = true
+		if s.absPath != "" {
+			seenPath[s.absPath] = true
+		}
+		out = append(out, s)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Tool != out[j].Tool {
+			return out[i].Tool < out[j].Tool
+		}
+		return out[i].Slug < out[j].Slug
+	})
+	return out
+}
+
+// Source values for censusSkill.Source — see the field's doc comment for what
+// each one licenses a reader to conclude.
+const (
+	skillSourceUser        = "user"
+	skillSourceAgents      = "agents"
+	skillSourcePlugin      = "plugin"
+	skillSourcePluginCache = "plugin-cache"
+	// sharedSkillsRoot is the Agent Skills specification's cross-client root
+	// (`~/.agents/skills`). It belongs to no vendor: the spec's own integration
+	// guide names it alongside `~/.<client>/skills` precisely so a skill
+	// installed by one compliant client is visible to the others. Skills found
+	// here carry NO tool, which is the truth — any of them may have put it there.
+	sharedSkillsRoot = ".agents"
+)
+
+// sharedRootPath is `<home>/.agents`, or "" when there is no home to root it in
+// (which must read as "not examined", never as "examined and absent").
+func sharedRootPath(home string) string {
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, sharedSkillsRoot)
+}
+
+// censusSharedSkills walks the cross-client `~/.agents/skills` root. Uncensused
+// until now and not small: 31 skills on the one machine surveyed, none of which
+// appeared under any per-tool root.
+func censusSharedSkills(home string) []censusSkill {
+	if home == "" {
+		return []censusSkill{}
+	}
+	// Tool deliberately empty — see sharedSkillsRoot. A tool-less entry joins on
+	// slug alone in the backend, which is the right behaviour for an asset whose
+	// owning client genuinely cannot be determined from disk.
+	skills := censusSkills(filepath.Join(home, sharedSkillsRoot, "skills"), "")
+	for i := range skills {
+		skills[i].Source = skillSourceAgents
+	}
+	return skills
+}
+
+// censusPluginCacheSkills walks a plugin cache laid out as
+//
+//	<cacheDir>/<marketplace>/<plugin>/<version>/skills/<name>/SKILL.md
+//
+// which is the shape Claude Code and Codex both use. This is where the skills
+// people actually run live: on the one Codex-heavy engineer measured, 912 of
+// 1,180 observed skill activations were under a single plugin's cache directory
+// and NONE of his censused skills was ever activated.
+//
+// The version segment is the trap. The cache KEEPS old versions — superpowers at
+// 6.1.1 and 6.2.0 simultaneously, one plugin at four versions, another at both a
+// commit SHA and the literal string "unknown". Walking it naively inventories one
+// skill four times and quadruples its carry, which would manufacture dead weight
+// out of a stale download. So: newest version directory only, by mtime, because
+// the version strings are not comparable (semver, SHA, and "unknown" all occur).
+//
+// A directory only counts when it contains a parseable SKILL.md. That is what
+// keeps a download cache from putting invented names on an asset board — the
+// original and correct reason this walk was skipped, now answered rather than
+// inherited.
+func censusPluginCacheSkills(cacheDir, tool, source string) []censusSkill {
+	skills := []censusSkill{}
+	marketplaces, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return skills
+	}
+	for _, marketplace := range marketplaces {
+		if !marketplace.IsDir() {
+			continue
+		}
+		mktDir := filepath.Join(cacheDir, marketplace.Name())
+		plugins, err := os.ReadDir(mktDir)
+		if err != nil {
+			continue
+		}
+		for _, plugin := range plugins {
+			if !plugin.IsDir() {
+				continue
+			}
+			versionDir := newestSubdir(filepath.Join(mktDir, plugin.Name()))
+			if versionDir == "" {
+				continue
+			}
+			for _, s := range censusSkills(filepath.Join(versionDir, "skills"), tool) {
+				s.Source = source
+				s.Plugin = plugin.Name()
+				skills = append(skills, s)
+			}
+		}
+	}
+	return skills
+}
+
+// newestSubdir returns the most recently modified subdirectory of dir, or "" if
+// it has none. mtime rather than name: version directory names are not sortable
+// into an order (semver, bare commit SHAs and the literal "unknown" all appear
+// side by side in real caches).
+func newestSubdir(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	newest, newestAt := "", time.Time{}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if newest == "" || info.ModTime().After(newestAt) {
+			newest, newestAt = filepath.Join(dir, entry.Name()), info.ModTime()
+		}
+	}
+	return newest
+}
+
+// censusPluginSkills inventories the skills shipped by Claude Code's ENABLED
+// plugins, reading the same registry + enabledPlugins gate censusPlugins already
+// uses to price them. Those skills were being token-counted and then discarded
+// as identities, so they could never join an invocation.
+//
+// Enablement is checkable here and is not for Codex, which is the whole reason
+// the two have different Source values.
+func censusPluginSkills(claudeDir string) []censusSkill {
+	installPaths := pluginInstallPaths(filepath.Join(claudeDir, "plugins", "installed_plugins.json"))
+	names := enabledPluginNames(filepath.Join(claudeDir, "settings.json"))
+	if names == nil {
+		for name := range installPaths {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+
+	skills := []censusSkill{}
+	for _, name := range names {
+		installPath := installPaths[name]
+		if installPath == "" {
+			continue
+		}
+		for _, s := range censusSkills(filepath.Join(installPath, "skills"), toolClaudeCode) {
+			s.Source = skillSourcePlugin
+			// The registry key is `<plugin>@<marketplace>`; the plugin is the
+			// actionable unit, so report that half.
+			s.Plugin = name
+			if at := strings.Index(name, "@"); at > 0 {
+				s.Plugin = name[:at]
+			}
+			skills = append(skills, s)
+		}
 	}
 	return skills
 }
