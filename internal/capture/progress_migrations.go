@@ -430,25 +430,37 @@ func ProgressPersistenceFault() error {
 		return err
 	}
 	tmp := f.Name()
+
+	// EVERY `_ =` BELOW IS A CLEANUP, AND THAT IS THE DISTINCTION THIS WHOLE
+	// CHANGE IS ABOUT. Scan flagged them, correctly, as discarded errors — the
+	// same shape as the `_ = os.Rename(...)` that started all of this. The
+	// difference is what the call is FOR: the rename was the operation whose
+	// success is the answer, so discarding it discarded the answer. These remove a
+	// scratch file after the answer is already known, and their failure changes no
+	// verdict. Discarding the returned `err` in an error path, in particular,
+	// would replace a specific diagnosis with a less useful one.
+	//
+	// Written as explicit `_ =` rather than left bare so the intent is legible and
+	// the next scan does not have to guess.
 	if _, err := f.Write([]byte("probe")); err != nil {
-		f.Close()
-		os.Remove(tmp)
+		_ = f.Close()
+		_ = os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
 
 	// The rename is what COMMITS a real save, and it fails independently of the
 	// write — a probe that stopped at the write would miss precisely the case the
-	// discarded `_ = os.Rename(...)` was hiding.
+	// discarded `_ = os.Rename(...)` was hiding. So THIS one is checked.
 	dst := tmp + ".committed"
 	if err := progressProbeRename(tmp, dst); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return err
 	}
-	os.Remove(dst)
+	_ = os.Remove(dst)
 	return nil
 }
 
