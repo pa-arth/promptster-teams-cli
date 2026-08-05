@@ -100,12 +100,24 @@ var kindsNotEmittedOnDevice = map[string]string{
 // The legitimate shape of an entry is narrow: a field the device CANNOT source.
 // "The device does not populate it yet" is a gap, and belongs in an issue rather
 // than here — the whole point of this table is that it stays small enough to read.
+//
+// A field the device CAN source and deliberately does not is a DIFFERENT fact and
+// lives in deviceDeclinesToEmit below. Filing one here would be the same class of
+// error as a prose reason that outruns its evidence: it reads as a capability we
+// lack, so nobody ever revisits it, and the open question is retired by filing
+// rather than by deciding. The two tables are asserted disjoint.
 var serverOnlyFields = map[string]map[string]string{
 	"ai_response": {
 		"costUsd": "The CLI has no cost figure to send — it emits tokens and the backend prices " +
 			"them. This is the provider's own per-request number off the OTel wire " +
 			"(claude_code.cost.usage), which no transcript carries. Kept out of USAGE_FIELDS " +
 			"server-side for exactly this reason.",
+		"speed": "No CLI rail sources it. `speed` is a Claude Code OTel `api_request` attribute; " +
+			"no transcript, rollout or hook payload this CLI reads carries it. Cursor's " +
+			"neighbouring `model_params` entry `{fast false}` is a DIFFERENT vocabulary — a " +
+			"boolean about Cursor's own fast-mode, not Claude's speed token — and mapping one " +
+			"onto the other would invent a fact. Unlike `effort` beside it, there is nothing " +
+			"here to decide: the value does not exist on this side.",
 		"cachedInputTokens": "Codex OTel only (`cached_input`). No Codex rail on this device reports " +
 			"it: the rollout token_count this CLI parses carries no cached-input breakdown.",
 		"cacheWriteInputTokens": "Codex OTel only (`cache_write_input`). Same rail gap as " +
@@ -179,6 +191,38 @@ var serverOnlyFields = map[string]map[string]string{
 		"mcpServerName": "OTel only — the Claude Code spelling of the same fact. Cursor's MCP identity " +
 			"work (#148) lands on tool_use, not tool_result.",
 		"mcpToolName": "OTel only — see mcpServerName.",
+	},
+}
+
+// deviceDeclinesToEmit — the server allowlists it, a device rail CAN source it,
+// and this CLI deliberately does not emit it. Kind → field → reason.
+//
+// A separate table from serverOnlyFields on purpose, and the separation is the
+// point rather than tidiness. Those entries say "we cannot"; these say "we chose
+// not to, and here is the choice". Collapsing the two would file a live decision
+// under a heading that reads as a capability gap — after which nobody revisits
+// it, because there is apparently nothing to revisit. That is how an open
+// question gets retired by filing instead of by deciding, and it is the same
+// class of error as a prose reason that outruns its evidence.
+//
+// So an entry here is a QUESTION someone is expected to answer eventually, not a
+// closed fact. It must name the site that declines, so the next reader can go and
+// look rather than take this table's word for it.
+var deviceDeclinesToEmit = map[string]map[string]string{
+	"ai_response": {
+		"effort": "AVAILABLE ON THE CURSOR RAIL, DELIBERATELY UNEMITTED — a choice, not a gap. " +
+			"Cursor's afterAgentThought hook carries a reasoning-effort parameter in " +
+			"`model_params` ({effort high|medium|low}); normalize_cursor_hook.go:48 parses " +
+			"model_params into cursorHookModelParm and the emitter declines to put it on the " +
+			"event. The reason is written at normalize_cursor_hook.go:249 and is exactly this " +
+			"test's subject: `effort` was allowlisted on NEITHER side, so emitting it would be " +
+			"stripped silently on one and read as 'an older CLI'. Half of that is now false — " +
+			"the server allowlists it as of promptster-backend#634 — so the question 'should " +
+			"the Cursor rail emit effort?' is OPEN and belongs to whoever next touches Cursor " +
+			"capture. NOTE the grain (design.md §5): Claude reports effort per api_request and " +
+			"it can change mid-session, so it must ride on ai_response and must never be " +
+			"flattened onto the session. Contrast `speed` in serverOnlyFields: that one has no " +
+			"device source at all and nothing to decide.",
 	},
 }
 
@@ -442,11 +486,15 @@ func TestCaptureAllowlistFieldsAreInLockstep(t *testing.T) {
 			if _, declared := serverOnlyFields[kind][field]; declared {
 				continue
 			}
+			if _, declined := deviceDeclinesToEmit[kind][field]; declined {
+				continue
+			}
 			findings = append(findings, fmt.Sprintf(
 				"%s.%s — SERVER-only. The CLI rail will never deliver it, and the absence is "+
-					"indistinguishable from an old CLI. Add it to projectFieldAllowlist, or declare "+
-					"serverOnlyFields[%q][%q] with the reason the device cannot source it.",
-				kind, field, kind, field))
+					"indistinguishable from an old CLI. Add it to projectFieldAllowlist; or declare "+
+					"serverOnlyFields[%q][%q] if the device CANNOT source it; or "+
+					"deviceDeclinesToEmit[%q][%q] if a rail can source it and we choose not to.",
+				kind, field, kind, field, kind, field))
 		}
 
 		for _, field := range deviceFields {
@@ -622,20 +670,47 @@ func TestCaptureAllowlistExceptionsAreStillReal(t *testing.T) {
 		}
 	}
 
-	for _, kind := range sortedKeys(serverOnlyFields) {
-		for _, field := range sortedKeys(serverOnlyFields[kind]) {
-			if strings.TrimSpace(serverOnlyFields[kind][field]) == "" {
-				findings = append(findings, fmt.Sprintf("serverOnlyFields[%q][%q] carries no reason.", kind, field))
+	// Both server-side exception tables carry the same two staleness obligations —
+	// the server must still allowlist the field, and the device must still not.
+	// Walked together so the newer table cannot be added without inheriting them.
+	serverSideExceptionTables := []struct {
+		name  string
+		table map[string]map[string]string
+	}{
+		{"serverOnlyFields", serverOnlyFields},
+		{"deviceDeclinesToEmit", deviceDeclinesToEmit},
+	}
+	for _, entry := range serverSideExceptionTables {
+		for _, kind := range sortedKeys(entry.table) {
+			for _, field := range sortedKeys(entry.table[kind]) {
+				if strings.TrimSpace(entry.table[kind][field]) == "" {
+					findings = append(findings, fmt.Sprintf("%s[%q][%q] carries no reason.", entry.name, kind, field))
+				}
+				if !set(artifact.Kinds[kind].Fields)[field] {
+					findings = append(findings, fmt.Sprintf(
+						"%s[%q][%q] is stale: the server no longer allowlists it.", entry.name, kind, field))
+				}
+				if set(projectFieldAllowlist[kind])[field] {
+					findings = append(findings, fmt.Sprintf(
+						"%s[%q][%q] is stale: the device allowlists it now, so the two sides agree. "+
+							"Delete the exception — leaving it would stop this test noticing the day one "+
+							"side drops it again.", entry.name, kind, field))
+				}
 			}
-			if !set(artifact.Kinds[kind].Fields)[field] {
+		}
+	}
+
+	// The two tables mean opposite things about our capability, so a field in both
+	// asserts we can and cannot source it at once. Left unchecked, the weaker
+	// reading ("cannot") is the one a reader takes, and the decision recorded in
+	// the other table stops being visible.
+	for _, kind := range sortedKeys(deviceDeclinesToEmit) {
+		for _, field := range sortedKeys(deviceDeclinesToEmit[kind]) {
+			if _, alsoServerOnly := serverOnlyFields[kind][field]; alsoServerOnly {
 				findings = append(findings, fmt.Sprintf(
-					"serverOnlyFields[%q][%q] is stale: the server no longer allowlists it.", kind, field))
-			}
-			if set(projectFieldAllowlist[kind])[field] {
-				findings = append(findings, fmt.Sprintf(
-					"serverOnlyFields[%q][%q] is stale: the device allowlists it now, so the two sides "+
-						"agree. Delete the exception — leaving it would stop this test noticing the day "+
-						"one side drops it again.", kind, field))
+					"%s.%s is in BOTH serverOnlyFields (the device cannot source it) and "+
+						"deviceDeclinesToEmit (it can, and we decline). Those cannot both be true. "+
+						"Keep the one that matches the emitters.", kind, field))
 			}
 		}
 	}
