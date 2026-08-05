@@ -311,10 +311,16 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 		// one-time migration on a fresh install (which drops the whole mismatch
 		// cache for no reason, and would mask a broken RootsFP check by
 		// rescanning anyway).
+		// A MISSING file is a fresh install and stays silent; anything else is a
+		// fault that silently costs the whole window. See reportProgressFileFault.
+		reportProgressFileFault("claude", claudeWatchProgressPath(), err, nil)
 		p.V = claudeProgressSchemaV
 		return p
 	}
-	_ = json.Unmarshal(data, &p)
+	parseErr := json.Unmarshal(data, &p)
+	// §2.5. A progress file that exists but cannot be used costs the same full
+	// re-read as a schema bump, except nobody chose it and nothing announced it.
+	reportProgressFileFault("claude", claudeWatchProgressPath(), nil, parseErr)
 	if p.Offsets == nil {
 		p.Offsets = map[string]int64{}
 	}

@@ -45,11 +45,27 @@ type statusModel struct {
 	// directory a later `start` registered. The dashboard is what an engineer
 	// sees by default, so it has to answer "is my second checkout covered?" —
 	// the static --once view is not where anyone looks first.
-	watch    string
+	watch string
+	// recon is the history-replay state, cached because scanning it walks the
+	// transcript trees — see reconEveryTicks.
+	recon    capture.ReconstructionState
 	now      time.Time
 	tick     int
 	quitting bool
 }
+
+// reconEveryTicks is how many one-second ticks pass between reconstruction
+// scans.
+//
+// ReconstructionNow walks both transcript trees and stats every in-window file,
+// which is fine for one-shot `status --once` and `doctor` but not for a
+// dashboard that re-renders every second on a machine holding weeks of history.
+// The same reasoning that keeps autostartLine off the render path applies here.
+//
+// Ten seconds is far more often than the number needs: a replay moves over
+// hours. It is that frequent only so the panel visibly changes while someone
+// watches it, which is the whole reason they left the dashboard open.
+const reconEveryTicks = 10
 
 func newStatusModel() statusModel {
 	token, source := ingest.ResolveToken("")
@@ -63,6 +79,7 @@ func newStatusModel() statusModel {
 	m.snap = capture.Snapshot()
 	m.watch = liveWatchScope(m.snap)
 	m.buffered = countBufferedEvents()
+	m.recon = reconNow()
 	m.autostart = autostartLine()
 	return m
 }
@@ -100,8 +117,10 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			m.snap = capture.Snapshot()
 			m.watch = liveWatchScope(m.snap)
-			m.watch = liveWatchScope(m.snap)
 			m.buffered = countBufferedEvents()
+			// An explicit refresh means "tell me now", so this one does not wait
+			// for the tick schedule.
+			m.recon = reconNow()
 			m.autostart = autostartLine()
 			return m, nil
 		}
@@ -110,6 +129,9 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tick++
 		m.snap = capture.Snapshot()
 		m.buffered = countBufferedEvents()
+		if m.tick%reconEveryTicks == 0 {
+			m.recon = reconNow()
+		}
 		return m, statusTick()
 	}
 	return m, nil
@@ -198,6 +220,15 @@ func watcherLine(w capture.WatcherStat, now time.Time, showBytes bool) string {
 	return dot + " " + label + dimStyle.Render(" · ") + strings.Join(parts, dimStyle.Render(" · "))
 }
 
+// bufferPanel shows the local upload backlog and, while a replay is running,
+// what is causing it.
+//
+// The explanation lives in THIS panel rather than one of its own, because the
+// deep backlog and its cause have to be read together. The #140 symptom was a
+// warn dot next to a five-figure pending count with nothing on screen saying
+// why, and an engineer who sees the number without the reason concludes their
+// machine is broken. Splitting them into separate panels reintroduces the gap
+// for anyone who reads one and not the other.
 func (m statusModel) bufferPanel() string {
 	pending := fmt.Sprintf("%d events pending upload", m.buffered)
 	if m.buffered == 0 {
@@ -205,7 +236,32 @@ func (m statusModel) bufferPanel() string {
 	} else {
 		pending = dotWarn.Render("●") + " " + pending
 	}
-	return kvPanel("buffer", "local", pending)
+	rows := []string{"local", pending}
+	// Only while a replay is actually running — a permanent "replaying: no" row
+	// on a dashboard that redraws every second is a row nobody reads twice.
+	if line := tuiReconstructionLine(m.recon); line != "" {
+		rows = append(rows, "replaying", line)
+	}
+	return kvPanel("buffer", rows...)
+}
+
+// tuiReconstructionLine is the dashboard's one-line replay summary, or "" when
+// nothing is being replayed.
+//
+// An OK dot, not a warn one, sitting directly under a warn-dotted backlog: the
+// backlog is worth flagging, the replay causing it is normal, deliberate,
+// one-time behaviour. Dotting it as a fault would teach people to dismiss the
+// row that contains the answer.
+func tuiReconstructionLine(r capture.ReconstructionState) string {
+	if !r.Running {
+		return ""
+	}
+	s := fmt.Sprintf("%s of history left across %s",
+		humanizeBytes(r.Bytes), transcriptCount(r.Files))
+	if !r.Oldest.IsZero() {
+		s += ", back to " + r.Oldest.Format("2006-01-02")
+	}
+	return dotOK.Render("●") + " " + s + dimStyle.Render(" · one-time replay, on the backfill lane")
 }
 
 func (m statusModel) footer() string {

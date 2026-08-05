@@ -232,3 +232,76 @@ func findMigration(ms []progressMigration, v int) (progressMigration, bool) {
 	}
 	return progressMigration{}, false
 }
+
+// --- §2.5: a lost or unreadable progress file --------------------------------
+
+// reportProgressFileFault warns when a progress file EXISTS but could not be
+// used, and reports how much history that costs.
+//
+// The three outcomes are not equally interesting and were previously all
+// silent:
+//
+//   - MISSING is a fresh install. Silent, correctly: there is no history to
+//     lose and nothing was reconstructed that should not have been.
+//   - UNREADABLE (permissions, IO) or UNPARSEABLE (a truncated write, a disk
+//     that returned garbage) means every offset this device had recorded is
+//     gone. The consequence is identical to a schema bump — the full window is
+//     re-read — except that nobody chose it, nothing announced it, and it
+//     REPEATS ON EVERY POLL, because the load fails again three seconds later
+//     and the save that would fix it writes to the same broken path.
+//
+// That last part is why this is separate from announceProgressReplay and why it
+// is not latched the same way: the schema replay is a one-time cost that a latch
+// correctly reports once, while this is a persistent fault the operator has to
+// fix. It is rate-limited rather than latched, so it keeps saying so without
+// becoming the log.
+func reportProgressFileFault(watcher, path string, readErr error, parseErr error) {
+	switch {
+	case readErr != nil && os.IsNotExist(readErr):
+		return // fresh install
+	case readErr != nil:
+		warnProgressFault(watcher, path, "cannot be READ", readErr)
+	case parseErr != nil:
+		warnProgressFault(watcher, path, "is CORRUPT", parseErr)
+	}
+}
+
+func warnProgressFault(watcher, path, what string, err error) {
+	progressFaultMu.Lock()
+	last, seen := progressFaultLastWarn[watcher]
+	now := progressFaultClock()
+	if seen && now.Sub(last) < progressFaultRepeatInterval {
+		progressFaultMu.Unlock()
+		return
+	}
+	progressFaultLastWarn[watcher] = now
+	progressFaultMu.Unlock()
+
+	fmt.Fprintf(progressReplayOut,
+		"%s-watcher: the capture progress file %s %s (%v) — every recorded read offset is "+
+			"LOST, so up to %s of local transcripts will be re-read and re-uploaded, and this "+
+			"repeats on every poll until it is fixed. Check permissions and free space on the "+
+			"state directory.\n",
+		watcher, path, what, err, humanizeReplayHorizon(transcriptHistoryWindow))
+}
+
+// progressFaultRepeatInterval bounds how often the fault repeats. Long enough
+// not to become the log, short enough that an operator who arrives an hour into
+// the problem still sees it — the failure mode being addressed is silence, and
+// a warning that scrolled past once an hour ago is close to silent.
+const progressFaultRepeatInterval = 15 * time.Minute
+
+var (
+	progressFaultMu       sync.Mutex
+	progressFaultLastWarn = map[string]time.Time{}
+	// progressFaultClock is time.Now. A var so tests can advance it without
+	// sleeping fifteen minutes.
+	progressFaultClock = time.Now
+)
+
+// resetProgressFaultReports clears the rate limiter. Tests only.
+func resetProgressFaultReports() {
+	progressFaultMu.Lock()
+	defer progressFaultMu.Unlock()
+	progressFaultLastWarn = map[string]time.Time{}
+}

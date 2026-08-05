@@ -141,10 +141,12 @@ func loadCodexWatchProgress() codexWatchProgress {
 		// one-time migration on a fresh install (which drops the whole mismatch
 		// cache for no reason, and would mask a broken RootsFP check by
 		// rescanning anyway).
+		reportProgressFileFault("codex", codexWatchProgressPath(), err, nil)
 		p.V = codexProgressSchemaV
 		return p
 	}
-	_ = json.Unmarshal(data, &p)
+	parseErr := json.Unmarshal(data, &p)
+	reportProgressFileFault("codex", codexWatchProgressPath(), nil, parseErr)
 	if p.Offsets == nil {
 		p.Offsets = map[string]int64{}
 	}
