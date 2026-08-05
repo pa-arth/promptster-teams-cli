@@ -21,10 +21,21 @@ import (
 // the product claim from "source is never stored" to "source never leaves the
 // engineer's machine".
 //
-// LOCKSTEP: this allowlist mirrors TEAMS_FIELD_ALLOWLIST in the backend's
-// packages/shared/src/eventFieldProjection.ts. Any change there must land here
-// (and vice versa) in the same release. A new event kind or field persists
-// NOTHING until it is added on both sides — the safe default is exclusion.
+// LOCKSTEP, AND IT IS NOW CHECKED. This allowlist mirrors
+// CANONICAL_KIND_ALLOWLIST in the backend's packages/shared/src/captureAllowlist.ts
+// — NOT eventFieldProjection.ts, which this header used to name and which is now
+// a derived view over that table. Any change there must land here (and vice
+// versa) in the same release. A new event kind or field persists NOTHING until it
+// is added on both sides — the safe default is exclusion.
+//
+// Until 2026-08-05 both files asserted that lockstep in prose and nothing
+// performed it; the backend's header even claimed this table was "GENERATED" from
+// its manifest, which no generator ever did. `promptLength` sat allowlisted
+// server-side and absent here for ten days as a result. It is now machine-checked
+// by allowlist_lockstep_test.go against a committed copy of the backend's
+// artifact — including the legitimate asymmetries, which are declared there with
+// reasons rather than assumed away. Fix a failure with
+// `make sync-capture-allowlist`, never by editing this table to make a test pass.
 
 // projectUsageFields — per-request token usage: numbers plus a model id, no
 // source. Shared between ai_response (main chain) and subagent_usage
