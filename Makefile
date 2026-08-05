@@ -2,7 +2,13 @@ VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BINARY  := promptster-teams
 LDFLAGS := -ldflags="-s -w -X github.com/pa-arth/promptster-teams-cli/internal/version.Version=$(VERSION)"
 
-.PHONY: build install release clean test
+.PHONY: build install release clean test sync-capture-allowlist
+
+# Where promptster-backend is checked out. Override for a worktree:
+#   make sync-capture-allowlist BACKEND=~/repos/promptster-backend/.claude/worktrees/xyz
+BACKEND         ?= ../promptster-backend
+CAPTURE_SRC     := $(BACKEND)/packages/shared/artifacts/capture-allowlist-canonical.json
+CAPTURE_DEST    := internal/redact/testdata/capture-allowlist-canonical.json
 
 build:
 	go build $(LDFLAGS) -o bin/$(BINARY) ./cmd/promptster-teams
@@ -25,3 +31,22 @@ release:
 
 clean:
 	rm -rf bin/ dist/
+
+# Re-copy the backend's capture-allowlist artifact, which
+# internal/redact/allowlist_lockstep_test.go diffs projectFieldAllowlist against.
+#
+# This is the mechanical half of that test's failure message: a guard whose fix is
+# "hand-edit some JSON until it's green" gets forged instead of followed, so the
+# fix is one command and the artifact carries a checksum that makes hand-editing
+# obvious. Regenerate on the backend side FIRST (`pnpm gen:capture-manifest`) —
+# this target only copies, and a stale source copies a stale artifact.
+sync-capture-allowlist:
+	@test -f "$(CAPTURE_SRC)" || { \
+	  echo "✗ $(CAPTURE_SRC) not found."; \
+	  echo "  Point BACKEND at your promptster-backend checkout and regenerate there first:"; \
+	  echo "    (cd \$$BACKEND && pnpm gen:capture-manifest)"; \
+	  echo "    make sync-capture-allowlist BACKEND=/path/to/promptster-backend"; \
+	  exit 1; }
+	cp "$(CAPTURE_SRC)" "$(CAPTURE_DEST)"
+	@echo "✓ synced $(CAPTURE_DEST)"
+	go test ./internal/redact/ -run CaptureAllowlist
