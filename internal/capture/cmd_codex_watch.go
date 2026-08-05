@@ -193,16 +193,25 @@ func loadCodexWatchProgress() codexWatchProgress {
 	return p
 }
 
+// saveCodexWatchProgress mirrors saveClaudeWatchProgress, including why it
+// reports rather than returns an error. See that function.
 func saveCodexWatchProgress(p codexWatchProgress) {
+	path := codexWatchProgressPath()
 	data, err := json.Marshal(p)
 	if err != nil {
+		reportProgressWriteFault("codex", path, "cannot be SERIALISED", err)
 		return
 	}
-	tmp := codexWatchProgressPath() + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		reportProgressWriteFault("codex", path, "cannot be WRITTEN", err)
 		return
 	}
-	_ = os.Rename(tmp, codexWatchProgressPath())
+	if err := os.Rename(tmp, path); err != nil {
+		reportProgressWriteFault("codex", path, "cannot be COMMITTED (rename failed)", err)
+		return
+	}
+	markProgressWriteFault("codex", false)
 }
 
 func loadCodexWatcherState() (codexWatcherState, error) {

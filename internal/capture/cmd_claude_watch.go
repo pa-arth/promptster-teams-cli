@@ -377,16 +377,32 @@ func loadClaudeWatchProgress() claudeWatchProgress {
 	return migrated
 }
 
+// saveClaudeWatchProgress persists the read offsets. It returns nothing on
+// purpose — its callers are poll loops with nothing useful to do with an error —
+// so every failure REPORTS here, at the point it happens. Returning silently is
+// what let an unwritable state dir replay the full window on every restart with
+// no evidence anywhere; see reportProgressWriteFault.
 func saveClaudeWatchProgress(p claudeWatchProgress) {
+	path := claudeWatchProgressPath()
 	data, err := json.Marshal(p)
 	if err != nil {
+		reportProgressWriteFault("claude", path, "cannot be SERIALISED", err)
 		return
 	}
-	tmp := claudeWatchProgressPath() + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		reportProgressWriteFault("claude", path, "cannot be WRITTEN", err)
 		return
 	}
-	_ = os.Rename(tmp, claudeWatchProgressPath())
+	// The rename is the commit, and it was the failure this function discarded
+	// with `_ =`. A successful temp write followed by a failed rename leaves the
+	// OLD file in place — indistinguishable from a healthy save everywhere else,
+	// and the offsets are just as unpersisted as if nothing had been written.
+	if err := os.Rename(tmp, path); err != nil {
+		reportProgressWriteFault("claude", path, "cannot be COMMITTED (rename failed)", err)
+		return
+	}
+	markProgressWriteFault("claude", false)
 }
 
 func loadClaudeWatcherState() (claudeWatcherState, error) {

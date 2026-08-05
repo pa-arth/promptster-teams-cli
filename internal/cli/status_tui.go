@@ -48,10 +48,14 @@ type statusModel struct {
 	watch string
 	// recon is the history-replay state, cached because scanning it walks the
 	// transcript trees — see reconEveryTicks.
-	recon    capture.ReconstructionState
-	now      time.Time
-	tick     int
-	quitting bool
+	recon capture.ReconstructionState
+	// writeFault is non-nil when this device cannot persist capture progress.
+	// Probed on the same schedule as recon: it touches the disk, so it is not a
+	// per-render question.
+	writeFault error
+	now        time.Time
+	tick       int
+	quitting   bool
 }
 
 // reconEveryTicks is how many one-second ticks pass between reconstruction
@@ -80,6 +84,7 @@ func newStatusModel() statusModel {
 	m.watch = liveWatchScope(m.snap)
 	m.buffered = countBufferedEvents()
 	m.recon = reconNow()
+	m.writeFault = persistFaultNow()
 	m.autostart = autostartLine()
 	return m
 }
@@ -121,6 +126,7 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// An explicit refresh means "tell me now", so this one does not wait
 			// for the tick schedule.
 			m.recon = reconNow()
+			m.writeFault = persistFaultNow()
 			m.autostart = autostartLine()
 			return m, nil
 		}
@@ -129,8 +135,13 @@ func (m statusModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tick++
 		m.snap = capture.Snapshot()
 		m.buffered = countBufferedEvents()
+		// On the same schedule as recon, and for a sharper reason: the persistence
+		// check is a real create-and-rename on disk. An earlier draft ran it every
+		// tick, when it was a map lookup; as a probe that would be one scratch file
+		// per second for as long as the dashboard is open.
 		if m.tick%reconEveryTicks == 0 {
 			m.recon = reconNow()
+			m.writeFault = persistFaultNow()
 		}
 		return m, statusTick()
 	}
@@ -241,6 +252,13 @@ func (m statusModel) bufferPanel() string {
 	// on a dashboard that redraws every second is a row nobody reads twice.
 	if line := tuiReconstructionLine(m.recon); line != "" {
 		rows = append(rows, "replaying", line)
+	}
+	// Directly beneath, because it is the qualifier on the line above: the replay
+	// is only "one-time" if the offsets it produces can be saved. A warn dot here
+	// against the replay's OK dot, since this one has a fix.
+	if m.writeFault != nil {
+		rows = append(rows, "progress", dotWarn.Render("●")+" NOT SAVING"+
+			dimStyle.Render(" · re-reads all history on every restart — check permissions and disk space"))
 	}
 	return kvPanel("buffer", rows...)
 }

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // History reconstruction is the longest-running thing the daemon does and, until
@@ -45,6 +46,36 @@ func reconstructionLines(r capture.ReconstructionState, now time.Time) []queueLi
 		humanizeBytes(r.Bytes), transcriptCount(r.Files), back)}}
 }
 
+// progressWriteFaultLines warns that a device cannot persist capture progress.
+//
+// A WARNING, unlike the reconstruction line directly above it, and the contrast
+// is the point: a replay is deliberate behaviour that happens to be slow, while
+// an unwritable state directory is a fault with a fix. Reporting them at the
+// same level would make the actionable one indistinguishable from the one whose
+// correct response is to wait.
+//
+// It also says the part the operator cannot see: the replay they are watching is
+// not one-time after all, and will run again at the next start.
+func progressWriteFaultLines(fault error) []queueLine {
+	if fault == nil {
+		return nil
+	}
+	return []queueLine{{queueWarn, fmt.Sprintf(
+		"cannot save capture progress (%v) — read offsets are not being recorded, so this "+
+			"device re-reads its full history window on EVERY restart. Check permissions and "+
+			"free space on %s",
+		fault, state.StateDir())}}
+}
+
+// statusProgressWriteFaultRow is the `status` panel's row for the same fault, or
+// nil when progress is persisting normally.
+func statusProgressWriteFaultRow(fault error) []string {
+	if fault == nil {
+		return nil
+	}
+	return []string{"progress", "NOT SAVING — replays all history every restart"}
+}
+
 func transcriptCount(n int) string {
 	if n == 1 {
 		return "1 transcript"
@@ -52,16 +83,23 @@ func transcriptCount(n int) string {
 	return fmt.Sprintf("%d transcripts", n)
 }
 
-// statusReconstructionRow is the `status` panel's key/value pair for a running
-// replay, or nil when none is running.
-//
-// Terser than doctor's line on purpose: `status` is a glanceable panel and
-// doctor is where an explanation belongs.
 // reconNow is capture.ReconstructionNow. A var because the dashboard refreshes
 // it on a schedule rather than on every render, and a scheduling claim nobody
 // can count the calls behind is a claim, not a guarantee.
 var reconNow = capture.ReconstructionNow
 
+// persistFaultNow probes whether progress can be saved. A var so tests can
+// stand in for a read-only disk without one.
+//
+// NOT capture.ProgressWriteFaulted: that map lives in the watcher process, and
+// `status`/`doctor` run in their own. See capture.ProgressPersistenceFault.
+var persistFaultNow = capture.ProgressPersistenceFault
+
+// statusReconstructionRow is the `status` panel's key/value pair for a running
+// replay, or nil when none is running.
+//
+// Terser than doctor's line on purpose: `status` is a glanceable panel and
+// doctor is where an explanation belongs.
 func statusReconstructionRow() []string {
 	r := reconNow()
 	if !r.Running {

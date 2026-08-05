@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -267,16 +269,12 @@ func reportProgressFileFault(watcher, path string, readErr error, parseErr error
 }
 
 func warnProgressFault(watcher, path, what string, err error) {
-	progressFaultMu.Lock()
-	last, seen := progressFaultLastWarn[watcher]
-	now := progressFaultClock()
-	if seen && now.Sub(last) < progressFaultRepeatInterval {
-		progressFaultMu.Unlock()
+	// Keyed "-read", separately from the write fault below. A state dir can fail
+	// both ways at once, and one fault silencing the other is the same silence
+	// this reporting exists to end.
+	if !faultWarnAllowed(watcher + "-read") {
 		return
 	}
-	progressFaultLastWarn[watcher] = now
-	progressFaultMu.Unlock()
-
 	fmt.Fprintf(progressReplayOut,
 		"%s-watcher: the capture progress file %s %s (%v) — every recorded read offset is "+
 			"LOST, so up to %s of local transcripts will be re-read and re-uploaded, and this "+
@@ -299,9 +297,176 @@ var (
 	progressFaultClock = time.Now
 )
 
-// resetProgressFaultReports clears the rate limiter. Tests only.
-func resetProgressFaultReports() {
+// faultWarnAllowed reports whether `key` may warn now, and records it if so.
+// One rate limiter, many keys — see the callers for why they must not share one.
+func faultWarnAllowed(key string) bool {
 	progressFaultMu.Lock()
 	defer progressFaultMu.Unlock()
-	progressFaultLastWarn = map[string]time.Time{}
+	last, seen := progressFaultLastWarn[key]
+	now := progressFaultClock()
+	if seen && now.Sub(last) < progressFaultRepeatInterval {
+		return false
+	}
+	progressFaultLastWarn[key] = now
+	return true
 }
+
+// resetProgressFaultReports clears the rate limiter and the write-fault state.
+// Tests only.
+func resetProgressFaultReports() {
+	progressFaultMu.Lock()
+	progressFaultLastWarn = map[string]time.Time{}
+	progressFaultMu.Unlock()
+
+	writeFaultMu.Lock()
+	writeFaulted = map[string]bool{}
+	writeFaultMu.Unlock()
+}
+
+// --- the WRITE side: a device that cannot SAVE its progress ------------------
+
+// reportProgressWriteFault warns when progress could not be PERSISTED.
+//
+// This is the worse half of the progress-file fault, and the read-side report
+// cannot cover it. A state directory that is read-only or full still SERVES the
+// existing file perfectly: the read succeeds, it parses, and it returns stale
+// offsets. Nothing is corrupt, so nothing on the read path has anything to
+// complain about — the machine with the problem is exactly the machine that
+// looks healthy.
+//
+// The cost is also worse. A device that cannot READ replays the window ONCE and
+// then writes a good file. A device that cannot WRITE replays it on EVERY
+// RESTART, forever: in-memory progress still advances, so the run in front of
+// you is correct and looks fine, and the bill arrives at the next start. Self
+// update re-execs, so restarts are routine rather than rare.
+//
+// Saying "up to 28 days will be re-read" would duplicate the read-side report
+// and omit the one fact that makes this fault different, so the message leads
+// with the repeat.
+func reportProgressWriteFault(watcher, path, what string, err error) {
+	markProgressWriteFault(watcher, true)
+	if !faultWarnAllowed(watcher + "-write") {
+		return
+	}
+	fmt.Fprintf(progressReplayOut,
+		"%s-watcher: cannot SAVE capture progress — %s %s (%v). Read offsets are not being "+
+			"recorded, so this device will re-read up to %s of local transcripts AGAIN ON THE "+
+			"NEXT RESTART, and on every restart until this is fixed. Check permissions and free "+
+			"space on the state directory.\n",
+		watcher, path, what, err, humanizeReplayHorizon(transcriptHistoryWindow))
+}
+
+// markProgressWriteFault records (or clears) a watcher's inability to persist.
+//
+// A successful save CLEARS it, and that is not bookkeeping tidiness: once
+// progress lands on disk the replay-on-restart cost is genuinely gone, so a
+// transient full disk that recovers must stop warning. A flag that only ever
+// sets would leave doctor red on a machine that fixed itself, which is how a
+// warning becomes furniture.
+func markProgressWriteFault(watcher string, faulted bool) {
+	writeFaultMu.Lock()
+	defer writeFaultMu.Unlock()
+	if faulted {
+		writeFaulted[watcher] = true
+		return
+	}
+	delete(writeFaulted, watcher)
+}
+
+// ProgressWriteFaulted names the watchers that have failed to persist progress
+// IN THIS PROCESS, sorted. Empty on a healthy device.
+//
+// Only the watcher process can answer this, which is exactly why the operator
+// surfaces do not use it — see ProgressPersistenceFault.
+func ProgressWriteFaulted() []string {
+	writeFaultMu.Lock()
+	defer writeFaultMu.Unlock()
+	out := make([]string, 0, len(writeFaulted))
+	for w := range writeFaulted {
+		out = append(out, w)
+	}
+	sort.Strings(out)
+	return out
+}
+
+var (
+	writeFaultMu sync.Mutex
+	// writeFaulted is process-scoped: it describes what this daemon has observed,
+	// and a restart is precisely when the question is asked again from scratch.
+	writeFaulted = map[string]bool{}
+)
+
+// ProgressPersistenceFault reports whether this device can persist capture
+// progress RIGHT NOW, by trying it. nil means it can.
+//
+// IT RE-DERIVES THE ANSWER RATHER THAN PROPAGATING IT, and review is why. The
+// first version of this change recorded the fault in the process-local map above
+// and read that map from `status` and `doctor`. But `claude-watch` and
+// `codex-watch` are SEPARATE PROCESSES — `internal/cli/cli.go` dispatches them
+// as their own commands, spawned detached by the daemon — so the CLI's map was
+// always empty, and every operator surface stayed silent while the watcher
+// failed to save on every poll. The reporting existed and could not fire.
+//
+// Sharing state across that boundary would mean writing a marker file into the
+// directory whose unwritability IS the fault. Asking the question directly has
+// no such catch-22 and no staleness: the probe runs the same syscalls, against
+// the same directory, that a real save runs.
+//
+// It DOES write, which is why it is called from `status` and `doctor` only and
+// never from a poll loop. It creates and removes one scratch file and touches no
+// capture state — cursor, queue and ledger are untouched, so doctor's
+// read-only-toward-capture guarantee holds.
+//
+// Known limit, stated rather than papered over: this answers "can the state
+// directory be written now", which covers the persistent faults that matter —
+// permissions, a full disk, a read-only mount. A transient failure the watcher
+// hit and the probe cannot reproduce is reported by the watcher's own stderr
+// line and not here.
+func ProgressPersistenceFault() error {
+	dir := filepath.Dir(claudeWatchProgressPath())
+
+	f, err := os.CreateTemp(dir, ".progress-probe-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+
+	// EVERY `_ =` BELOW IS A CLEANUP, AND THAT IS THE DISTINCTION THIS WHOLE
+	// CHANGE IS ABOUT. Scan flagged them, correctly, as discarded errors — the
+	// same shape as the `_ = os.Rename(...)` that started all of this. The
+	// difference is what the call is FOR: the rename was the operation whose
+	// success is the answer, so discarding it discarded the answer. These remove a
+	// scratch file after the answer is already known, and their failure changes no
+	// verdict. Discarding the returned `err` in an error path, in particular,
+	// would replace a specific diagnosis with a less useful one.
+	//
+	// Written as explicit `_ =` rather than left bare so the intent is legible and
+	// the next scan does not have to guess.
+	if _, err := f.Write([]byte("probe")); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	// The rename is what COMMITS a real save, and it fails independently of the
+	// write — a probe that stopped at the write would miss precisely the case the
+	// discarded `_ = os.Rename(...)` was hiding. So THIS one is checked.
+	dst := tmp + ".committed"
+	if err := progressProbeRename(tmp, dst); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	_ = os.Remove(dst)
+	return nil
+}
+
+// progressProbeRename is os.Rename. A var because a probe that silently skipped
+// the commit step would pass every black-box test — a sealed directory fails at
+// CreateTemp long before the rename is reached, so nothing else can tell the two
+// implementations apart. Injecting a rename failure is the only way to prove the
+// probe checks the step that the discarded `_ = os.Rename(...)` was hiding.
+var progressProbeRename = os.Rename

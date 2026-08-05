@@ -98,6 +98,12 @@ func printStatusStatic() {
 	if row := statusReconstructionRow(); len(row) == 2 {
 		pairs = append(pairs, row...)
 	}
+	// Unlike the replay row, this one is a fault, so it appears on both status
+	// surfaces and in doctor. §2.4 shipped to this static path only and review
+	// had to catch it — `status` opens the TUI by default.
+	if row := statusProgressWriteFaultRow(persistFaultNow()); len(row) == 2 {
+		pairs = append(pairs, row...)
+	}
 	fmt.Println(indent(kvPanel("capture", pairs...)))
 	fmt.Println()
 }
@@ -154,7 +160,20 @@ func cmdTeamsDoctor() {
 	// History replay, when there is any. Printed right after the queue because
 	// the two answer one question together: a backlog with a replay running is
 	// expected and finite, the same backlog without one is not.
-	for _, l := range reconstructionLines(capture.ReconstructionNow(), time.Now()) {
+	for _, l := range reconstructionLines(reconNow(), time.Now()) {
+		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
+	}
+
+	// And whether that replay is going to happen AGAIN. A device that cannot
+	// persist its offsets re-reads the window every restart, so this is the line
+	// that turns "one-time replay" above into a standing fault — it warns where
+	// the replay line does not.
+	// Deliberately does NOT clear `ok`. Review caught that it did: `ok` selects
+	// doctor's closing line, and false prints "run promptster-teams login" — which
+	// contradicts the permissions-and-disk-space diagnosis one line above and
+	// sends the operator to a command that cannot fix a full disk. The warn glyph
+	// carries the severity; `ok` is about setup, not about storage.
+	for _, l := range progressWriteFaultLines(persistFaultNow()) {
 		printlnIndent(fmt.Sprintf("%s %s", l.glyph(), l.text))
 	}
 
