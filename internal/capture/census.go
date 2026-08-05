@@ -889,7 +889,7 @@ func resolvedPath(path string) string {
 	return path
 }
 
-// dedupeSkills keeps one entry per (tool, slug). The census reaches the same
+// dedupeSkills keeps one entry per (tool, plugin, slug). The census reaches one
 // skill by more than one route on purpose — Claude's plugin registry resolves an
 // installPath that lives inside the very cache directory the cache walk covers —
 // and a skill listed twice is carried twice, which inflates the config tax by
@@ -897,9 +897,14 @@ func resolvedPath(path string) string {
 //
 // Two keys, because there are two distinct ways to reach one skill twice:
 //
-//  1. (tool, slug) — NOT slug alone. The same slug under two different roots is
-//     two real assets, which is the distinction censusSkill.Tool exists to
-//     preserve; deduping across tools would undo it one function later.
+//  1. (tool, plugin, slug) — NOT slug alone, and not (tool, slug) either. The
+//     same slug under two different roots is two real assets, which is the
+//     distinction censusSkill.Tool exists to preserve; deduping across tools
+//     would undo it one function later. `plugin` belongs in the key for the
+//     identical reason one scope in: two Codex plugins can each ship a `review`,
+//     and folding them hands one plugin's carry to the other's invocations and
+//     erases the loser from the inventory entirely. Personal-root skills all
+//     carry an empty plugin, so this is a no-op for them.
 //  2. resolved path — the SAME physical directory reached under two tools. A
 //     symlink from ~/.claude/skills into ~/.agents/skills (a documented
 //     workflow, and 4 of 17 skills on the machine this was written against)
@@ -911,12 +916,12 @@ func resolvedPath(path string) string {
 // cache hit. That ordering is deliberate — it keeps the more specific provenance
 // and never downgrades `plugin` to `plugin-cache`.
 func dedupeSkills(skills []censusSkill) []censusSkill {
-	type key struct{ tool, slug string }
+	type key struct{ tool, plugin, slug string }
 	seen := make(map[key]bool, len(skills))
 	seenPath := make(map[string]bool, len(skills))
 	out := make([]censusSkill, 0, len(skills))
 	for _, s := range skills {
-		k := key{s.Tool, strings.ToLower(s.Slug)}
+		k := key{s.Tool, s.Plugin, strings.ToLower(s.Slug)}
 		if seen[k] || (s.absPath != "" && seenPath[s.absPath]) {
 			continue
 		}
@@ -930,7 +935,10 @@ func dedupeSkills(skills []censusSkill) []censusSkill {
 		if out[i].Tool != out[j].Tool {
 			return out[i].Tool < out[j].Tool
 		}
-		return out[i].Slug < out[j].Slug
+		if out[i].Slug != out[j].Slug {
+			return out[i].Slug < out[j].Slug
+		}
+		return out[i].Plugin < out[j].Plugin
 	})
 	return out
 }
@@ -1003,7 +1011,7 @@ func censusPluginCacheSkills(cacheDir, tool, source string) []censusSkill {
 		return skills
 	}
 	for _, marketplace := range marketplaces {
-		if !marketplace.IsDir() {
+		if !isDirFollowingLinks(filepath.Join(cacheDir, marketplace.Name())) {
 			continue
 		}
 		mktDir := filepath.Join(cacheDir, marketplace.Name())
@@ -1012,7 +1020,7 @@ func censusPluginCacheSkills(cacheDir, tool, source string) []censusSkill {
 			continue
 		}
 		for _, plugin := range plugins {
-			if !plugin.IsDir() {
+			if !isDirFollowingLinks(filepath.Join(mktDir, plugin.Name())) {
 				continue
 			}
 			versionDir := newestSubdir(filepath.Join(mktDir, plugin.Name()))
@@ -1040,11 +1048,11 @@ func newestSubdir(dir string) string {
 	}
 	newest, newestAt := "", time.Time{}
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
+		// os.Stat, not entry.Info(): it resolves a symlinked version directory
+		// (skipped outright by IsDir) AND reports the TARGET's mtime, which is
+		// the one that says how recent this version actually is.
+		info, err := os.Stat(filepath.Join(dir, entry.Name()))
+		if err != nil || !info.IsDir() {
 			continue
 		}
 		if newest == "" || info.ModTime().After(newestAt) {
@@ -1189,7 +1197,14 @@ func pluginListingTokens(installPath string) int {
 	// skills/*/SKILL.md — same layout as user skills.
 	if entries, err := os.ReadDir(filepath.Join(installPath, "skills")); err == nil {
 		for _, entry := range entries {
-			if !entry.IsDir() {
+			// isDirFollowingLinks for the same reason collectSkills uses it, and it
+			// MUST agree with it: this function and collectSkills walk the same
+			// directory, and buildConfigCensus excludes a `plugin` skill from
+			// SkillListingTokens precisely because this line already counted it.
+			// Skipping a symlinked skill here while collectSkills keeps it drops
+			// that skill's carry from BOTH aggregates — the rule written twice,
+			// drifting.
+			if !isDirFollowingLinks(filepath.Join(installPath, "skills", entry.Name())) {
 				continue
 			}
 			fm := readFrontmatter(filepath.Join(installPath, "skills", entry.Name(), "SKILL.md"))

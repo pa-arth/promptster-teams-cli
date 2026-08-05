@@ -251,6 +251,68 @@ func TestCensusNeverSerializesASkillPath(t *testing.T) {
 	}
 }
 
+// Two plugins for the SAME tool can each ship a skill called `review`. Folding
+// them on (tool, slug) hands one plugin's carry to the other's invocations and
+// erases the loser from the inventory — the exact misattribution the `tool`
+// discriminator exists to prevent, one scope further in.
+func TestCensusKeepsTwoPluginsSameSlugApart(t *testing.T) {
+	env, _ := skillRootsEnv(t)
+	home := filepath.Dir(env.claudeDir)
+	codexCache := filepath.Join(home, ".codex", "plugins", "cache")
+	pluginSkill(t, codexCache, "openai-curated-remote", "superpowers", "6.2.0", "review")
+	pluginSkill(t, codexCache, "openai-curated-remote", "linear", "5.0.0", "review")
+
+	owners := map[string]bool{}
+	for _, s := range buildConfigCensus(env).Skills {
+		if s.Slug == "review" {
+			owners[s.Plugin] = true
+		}
+	}
+	for _, want := range []string{"superpowers", "linear"} {
+		if !owners[want] {
+			t.Errorf("`review` from plugin %q was folded away; owners = %v", want, owners)
+		}
+	}
+}
+
+// pluginListingTokens and collectSkills WALK THE SAME DIRECTORY, and
+// buildConfigCensus excludes a `plugin` skill from SkillListingTokens precisely
+// because pluginListingTokens already counted it. If only one of them follows
+// symlinks, a symlinked plugin skill is counted by NEITHER and its carry
+// vanishes from both aggregate lines. One rule, two implementations, drifting.
+func TestCensusCountsASymlinkedPluginSkillOnExactlyOneLine(t *testing.T) {
+	env, home := skillRootsEnv(t)
+	claude := filepath.Join(home, ".claude")
+	installPath := filepath.Join(claude, "plugins", "cache", "official", "kit", "1.0.0")
+
+	// The plugin's skill is a symlink into the shared root, as a skill manager
+	// leaves it.
+	writeSkill(t, filepath.Join(home, ".agents", "skills"), "linked-plugin-skill", "linked-plugin-skill", strings.Repeat("d", 40))
+	if err := os.MkdirAll(filepath.Join(installPath, "skills"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(
+		filepath.Join(home, ".agents", "skills", "linked-plugin-skill"),
+		filepath.Join(installPath, "skills", "linked-plugin-skill"),
+	); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	registry := `{"version":1,"plugins":{"kit@official":[{"installPath":` + jsonString(installPath) + `}]}}`
+	if err := os.WriteFile(filepath.Join(claude, "plugins", "installed_plugins.json"), []byte(registry), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claude, "settings.json"),
+		[]byte(`{"enabledPlugins":{"kit@official":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	data := buildConfigCensus(env)
+	if data.PluginListingTokens <= 0 {
+		t.Errorf("pluginListingTokens = %d: the symlinked skill was skipped there, and buildConfigCensus withholds it from skillListingTokens on the promise that it was counted here",
+			data.PluginListingTokens)
+	}
+}
+
 func skillKeys(m map[string]censusSkill) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
