@@ -280,8 +280,16 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	// skill named `review` folding into one identity in the backend's ROI join
 	// (which keys on the case-folded slug), which would price one asset's carry
 	// against the other's invocations.
+	// `source` and `plugin` are a skill's PROVENANCE: a closed enum
+	// ("user"|"agents"|"plugin"|"plugin-cache") and a plugin NAME. Neither is a
+	// path — the census resolves paths internally to recognise one skill reached
+	// twice and never serializes them (censusSkill.absPath is unexported, pinned
+	// by TestCensusNeverSerializesASkillPath). Provenance is what makes a finding
+	// actionable: twenty unused skills that arrived in ONE plugin install are one
+	// decision, not twenty, and `plugin-cache` is what marks a carry figure as an
+	// upper bound rather than a settled cost.
 	"config_census": {
-		"skills":     {"slug", "name", "descTokens", "tool"},
+		"skills":     {"slug", "name", "descTokens", "tool", "source", "plugin"},
 		"plugins":    {"name", "listingTokens", "tool"},
 		"mcpServers": {"name", "deferred", "tool"},
 	},

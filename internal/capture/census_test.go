@@ -82,19 +82,29 @@ func TestBuildConfigCensusFromFixture(t *testing.T) {
 		t.Errorf("projectClaudeMdTokens = %d", data.ProjectClaudeMdTokens)
 	}
 
-	if data.SkillCount != 2 || len(data.Skills) != 2 {
+	// THREE skills now, not two: the enabled plugin's `sk` was always on disk and
+	// was always token-counted into pluginListingTokens — it just had no identity,
+	// so no invocation could ever join to it. Sorted by (tool, slug).
+	if data.SkillCount != 3 || len(data.Skills) != 3 {
 		t.Fatalf("skills = %+v", data.Skills)
 	}
 	if data.Skills[0].Slug != "deploy-check" || data.Skills[0].Name != "deploy-check" || data.Skills[0].DescTokens != 10 {
 		t.Errorf("skill[0] = %+v", data.Skills[0])
 	}
+	if data.Skills[1].Slug != "sk" || data.Skills[1].Source != skillSourcePlugin || data.Skills[1].Plugin != "listed" {
+		t.Errorf("skill[1] = %+v, want the plugin skill with its provenance", data.Skills[1])
+	}
 	// Frontmatter without name: falls back to slug; wrapped description folds
 	// to 40 chars → 10 tokens.
-	if data.Skills[1].Slug != "wrapped" || data.Skills[1].Name != "wrapped" || data.Skills[1].DescTokens != 10 {
-		t.Errorf("skill[1] = %+v", data.Skills[1])
+	if data.Skills[2].Slug != "wrapped" || data.Skills[2].Name != "wrapped" || data.Skills[2].DescTokens != 10 {
+		t.Errorf("skill[2] = %+v", data.Skills[2])
 	}
+	// STILL 20, not 30. `sk`'s 10 tokens are already inside pluginListingTokens,
+	// and the backend prices skill_listings and plugin_listings as two separate
+	// always-on lines and sums them — so counting it here too would bill one
+	// listing twice and silently raise this engineer's config tax.
 	if data.SkillListingTokens != 20 {
-		t.Errorf("skillListingTokens = %d", data.SkillListingTokens)
+		t.Errorf("skillListingTokens = %d, want 20 — a plugin skill must not be billed on both lines", data.SkillListingTokens)
 	}
 
 	if data.PluginCount != 2 || len(data.Plugins) != 2 {
