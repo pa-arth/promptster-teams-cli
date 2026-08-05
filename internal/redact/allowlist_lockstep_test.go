@@ -190,21 +190,36 @@ var serverOnlyFields = map[string]map[string]string{
 // never appears, for no visible reason. An entry here needs a positive account of
 // where the value IS consumed, not merely a note that it is dropped.
 var deviceOnlyFields = map[string]map[string]string{
-	"heartbeat": {
+	"presence": {
 		"pendingEvents": "Consumed at ingest BEFORE projection, then deliberately not persisted onto " +
 			"the timeline row. teams-ingest.ts reads event.data.pendingEvents off the raw beat and " +
 			"denormalizes it to engineer_keys.latest_pending_events / latest_pending_reported_at " +
 			"(the 2026-08-04 'connected and idle vs. connected and hours behind' fix). The stored " +
-			"heartbeat row keeps device/CLI metadata only, so the backlog reading lives in exactly " +
-			"one place instead of two that can disagree. NOT a silent drop — but nothing in " +
-			"captureAllowlist.ts says so, which is why it is written down here.",
-		"pendingOldestEventAt": "Same pre-projection path as pendingEvents; lands in " +
+			"row keeps device/CLI metadata only, so the backlog reading lives in exactly one place " +
+			"instead of two that can disagree. NOT a silent drop — but nothing in " +
+			"captureAllowlist.ts says so, which is why it is written down here. Emitted at " +
+			"internal/capture/presence.go:139.",
+		"pendingOldestEventAt": "Same beat, same pre-projection path; lands in " +
 			"engineer_keys.latest_pending_oldest_event_at. The two move as one — the count alone " +
 			"cannot tell 62k-queued-five-minutes-ago from 62k-queued-three-weeks-ago.",
 	},
-	"presence": {
-		"pendingEvents":        "Same beat, same pre-projection consumer as heartbeat.pendingEvents.",
-		"pendingOldestEventAt": "Same beat, same pre-projection consumer as heartbeat.pendingOldestEventAt.",
+	// `heartbeat` is NOT a kind this CLI mints. The emitter walk finds zero
+	// construction sites for it; the only beat built here is `presence`
+	// (presence.go:139), and "heartbeat" is merely the prose name for that beat —
+	// which is exactly why this entry read as an emitter until the walk was
+	// written and said otherwise. First correction it produced.
+	//
+	// The table entry stays, because the SERVER accepts both spellings
+	// (LIVENESS_BEAT_KINDS = {presence, heartbeat}, teams-ingest.ts:382), so
+	// another or older client can send one and this projection must not strip its
+	// payload. The divergence is therefore real at the table level and carries no
+	// live bytes from THIS binary — a distinction the reason has to make, because
+	// "these bytes leave the machine" is the entire argument for treating the
+	// device-only direction as the dangerous one.
+	"heartbeat": {
+		"pendingEvents": "Mirrors presence.pendingEvents for the server's other accepted beat " +
+			"spelling. This CLI constructs no `heartbeat` event, so no bytes leave here for it today.",
+		"pendingOldestEventAt": "Mirrors presence.pendingOldestEventAt, same reason.",
 	},
 }
 
