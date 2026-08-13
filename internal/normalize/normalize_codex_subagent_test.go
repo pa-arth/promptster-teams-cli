@@ -179,6 +179,48 @@ func TestCodexSubagentSpendSurvivesAsUsage(t *testing.T) {
 	}
 }
 
+// TestCodexSubagentCacheWriteSurvives: a delegate pays the GPT-5.6 cache-write
+// fee (1.25x the uncached input rate, GA 2026-07-09) exactly as the main chain
+// does, so the count has to reach the backend from THIS emitter too. It rides a
+// different path than ai_response on both legs — subagentUsage builds its own
+// data map, and the projector allowlists the kind by its own entry rather than
+// through projectUsageFields — so the main-chain test passing says nothing about
+// this one. A delegated turn whose write count is dropped prices at $0 and looks
+// identical to a delegate that never wrote to cache.
+//
+// Its own fixture rather than a cache_write field added to codexSubagentLines:
+// that slice is the pre-5.6 capture those other tests assert real numbers
+// against, and a 5.6-era field does not belong in it.
+func TestCodexSubagentCacheWriteSurvives(t *testing.T) {
+	lines := []string{
+		codexSubagentMeta,
+		`{"timestamp":"2026-07-30T15:17:12.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":17718,"cached_input_tokens":9000,"cache_write_input_tokens":4200,"output_tokens":237,"total_tokens":17955}}}}`,
+		`{"timestamp":"2026-07-30T15:17:13.000Z","type":"event_msg","payload":{"type":"agent_message","message":"allow","phase":"final_answer"}}`,
+	}
+	var found bool
+	for _, e := range runCodexRollout(t, codexSubThreadID, lines) {
+		if e.Kind != "subagent_usage" {
+			continue
+		}
+		found = true
+		d := codexData(e)
+		if d["cacheWriteInputTokens"] != int64(4200) {
+			t.Errorf("subagent_usage cacheWriteInputTokens = %v, want int64(4200) — a delegate's cache writes are billed too", d["cacheWriteInputTokens"])
+		}
+		// The Anthropic addend key must stay clear here as well: a Codex delegate
+		// row carrying it would be priced beside inputTokens rather than out of it.
+		if _, present := d["cacheWriteTokens"]; present {
+			t.Errorf("cacheWriteTokens present (%v) on a Codex subagent row; that key is the Anthropic addend", d["cacheWriteTokens"])
+		}
+		if d["inputTokens"] != int64(17718) {
+			t.Errorf("inputTokens = %v, want int64(17718) — the INCLUSIVE total both cache counts are carved out of", d["inputTokens"])
+		}
+	}
+	if !found {
+		t.Errorf("delegated thread emitted no subagent_usage — its cache-write spend went missing")
+	}
+}
+
 // TestCodexOneSessionStartPerConversation: parent and subagent each open with
 // their own session_meta, but one logical session begins exactly once. The
 // deterministic id must collapse them rather than stack N starts on one session.

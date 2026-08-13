@@ -1057,6 +1057,12 @@ func TestCodexSubagentUsageSurvivesProjection(t *testing.T) {
 		"model":        "gpt-5",
 		"inputTokens":  int64(17718),
 		"outputTokens": int64(237),
+		// A delegate pays the GPT-5.6 cache-write fee at the same 1.25x the main
+		// chain does, and this kind reaches the allowlist by a DIFFERENT entry
+		// than ai_response — its own append, not projectUsageFields. So passing
+		// on the main chain proves nothing here: the two lists are edited
+		// separately and one can gain the key while the other does not.
+		"cacheWriteInputTokens": int64(250),
 		// prose must never reach here, but prove projection would drop it anyway
 		"lastAssistantMessage": "allow",
 	}
@@ -1067,11 +1073,12 @@ func TestCodexSubagentUsageSurvivesProjection(t *testing.T) {
 		t.Fatalf("data projected to %T", e.Data)
 	}
 	for k, want := range map[string]interface{}{
-		"sidechain":    true,
-		"agentId":      "019fb396-9280-7710-91d4-f36e7797376b",
-		"model":        "gpt-5",
-		"inputTokens":  int64(17718),
-		"outputTokens": int64(237),
+		"sidechain":             true,
+		"agentId":               "019fb396-9280-7710-91d4-f36e7797376b",
+		"model":                 "gpt-5",
+		"inputTokens":           int64(17718),
+		"outputTokens":          int64(237),
+		"cacheWriteInputTokens": int64(250),
 	} {
 		if got[k] != want {
 			t.Errorf("projected %s = %v, want %v", k, got[k], want)

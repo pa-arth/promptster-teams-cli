@@ -828,6 +828,36 @@ func (p *CodexRolloutProcessor) attachTokenUsage(data map[string]interface{}) {
 		if _, ok := u["reasoning_output_tokens"].(float64); ok {
 			data["reasoningTokens"] = intField(u, "reasoning_output_tokens")
 		}
+		// cache_write_input_tokens — prompt tokens written to cache. Free on every
+		// OpenAI model before the GPT-5.6 GA (2026-07-09) and billed at 1.25x the
+		// uncached input rate from 5.6 onward, so a turn we do not capture is a
+		// turn the backend prices at $0. Discarding it was correct while the fee
+		// did not exist and became an under-count the day it did.
+		//
+		// Emitted under its OWN key, never folded into cacheWriteTokens: that key
+		// is the Anthropic ADDEND beside inputTokens, while this count is a SUBSET
+		// of Codex's input. Same inversion as cached_input vs cacheReadTokens.
+		//
+		// Absent-by-omission, like reasoningTokens above — and here the absence
+		// carries information the value cannot. Every record of the pre-5.6 corpus
+		// reported this field as 0, which is why subset-vs-addend was never
+		// settled; a real nonzero row is the first evidence either way, and a
+		// fabricated 0 on a provider that never reported one would look exactly
+		// like that evidence.
+		// TWO spellings accepted, because the rollout name is an INFERENCE and a
+		// wrong guess here fails silently in the worst direction: the key simply
+		// never appears and reads as "the vendor doesn't send it," which is
+		// indistinguishable from the real pre-5.6 zeros. `cache_write_input_tokens`
+		// follows the rollout's own convention (OTel `cached_input` arrives here as
+		// `cached_input_tokens`); `cache_write_tokens` is the name OpenAI's caching
+		// guide uses for the Responses API. Delete whichever one a real 5.6 rollout
+		// disproves — do not leave both standing once the answer is observed.
+		for _, k := range []string{"cache_write_input_tokens", "cache_write_tokens"} {
+			if _, ok := u[k].(float64); ok {
+				data["cacheWriteInputTokens"] = intField(u, k)
+				break
+			}
+		}
 	}
 }
 

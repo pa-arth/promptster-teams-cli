@@ -42,6 +42,11 @@ import (
 // (sidechains). reasoningTokens is OpenAI's reasoning_output_tokens (Codex) — a
 // content-free integer the backend uses for reasoning-model pricing; absent on
 // providers that don't report it (dropped-by-omission, never leaked).
+//
+// cacheWriteInputTokens is Codex's cache_write_input_tokens — likewise a
+// content-free integer. Kept distinct from cacheWriteTokens because that key is
+// the Anthropic ADDEND beside inputTokens while this one is a SUBSET of Codex's
+// input; the backend prices the two on different legs.
 var projectUsageFields = []string{
 	"model",
 	"usageScope",
@@ -115,13 +120,18 @@ var projectFieldAllowlist = map[string][]string{
 	"interrupt": {"subtype", "cutTool", "variant"},
 	// ai_response deliberately carries NO text: assistant messages routinely
 	// embed source (patches, file bodies). Usage/model metadata only.
-	"ai_response": projectUsageFields,
+	// cacheWriteInputTokens rides per-kind rather than in projectUsageFields:
+	// that slice is byte-for-byte lockstep with the backend's USAGE_FIELDS, which
+	// is itself frozen in field ORDER by the server's historical-allowlist test.
+	// Both usage kinds carry it — a Codex delegate pays the GPT-5.6 cache-write
+	// fee the same as the main chain.
+	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens"),
 	// `sidechain` marks work done by a subagent. Its events roll up to the
 	// PARENT session's id (a subagent transcript records its parent's sessionId),
 	// so without this flag subagent work is indistinguishable from the main
 	// chain's. The normalizer has always set it; it was silently dropped here.
 	// Keep in lockstep with the backend's TEAMS_FIELD_ALLOWLIST.
-	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain"),
+	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain", "cacheWriteInputTokens"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
