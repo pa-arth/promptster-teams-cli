@@ -120,8 +120,16 @@ var serverOnlyFields = map[string]map[string]string{
 			"here to decide: the value does not exist on this side.",
 		"cachedInputTokens": "Codex OTel only (`cached_input`). No Codex rail on this device reports " +
 			"it: the rollout token_count this CLI parses carries no cached-input breakdown.",
-		"cacheWriteInputTokens": "Codex OTel only (`cache_write_input`). Same rail gap as " +
-			"cachedInputTokens, and server-side it is 0 on every corpus record.",
+		// cacheWriteInputTokens was here until 2026-08-12, filed as "Codex OTel only,
+		// and server-side it is 0 on every corpus record." Both halves expired at the
+		// GPT-5.6 GA (2026-07-09), which introduced a 1.25x-input cache-write fee: the
+		// zeros were a fact about a corpus predating the charge, not about the rail,
+		// and the device DOES source it — internal/normalize reads it off the rollout
+		// token_count now. Worth noting how this exception aged, since the table is
+		// full of ones that could age the same way: the reason was true when written
+		// and said nothing about what would make it false. A "0 on every record"
+		// justification is the fragile kind — it is evidence of absence only for as
+		// long as nobody starts sending the field.
 		"sseKind": "Codex OTel only — the SSE frame kind (`response.completed`). This CLI reads " +
 			"completed rollout lines from disk; there are no SSE frames on the device rail.",
 		"ttftMs": "Codex OTel only — per-request time to first token. A wire-timing measurement " +

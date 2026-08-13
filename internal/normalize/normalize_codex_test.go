@@ -644,6 +644,77 @@ func TestCodexAiResponseCarriesReasoningTokens(t *testing.T) {
 	t.Fatal("no ai_response event")
 }
 
+// TestCodexAiResponseCarriesCacheWriteInputTokens: cache_write_input_tokens is
+// what OpenAI bills at 1.25x the uncached input rate on GPT-5.6 and later (GA
+// 2026-07-09). The normalizer discarded it — correct while no such fee existed,
+// an under-count the day it did, and unrecoverable afterwards because a field we
+// never captured cannot be backfilled from stored rows.
+//
+// Emitted under its own key rather than cacheWriteTokens: that key is the
+// Anthropic ADDEND beside inputTokens, while Codex's write count is a SUBSET of
+// its input. Reusing the name would hand the backend a number whose meaning
+// depends on already knowing the provider.
+func TestCodexAiResponseCarriesCacheWriteInputTokens(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":250,"output_tokens":20,"total_tokens":1020}}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-cw")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		data := e.Data.(map[string]interface{})
+		if got := data["cacheWriteInputTokens"]; got != int64(250) {
+			t.Fatalf("ai_response cacheWriteInputTokens = %v (%T), want int64(250)", got, got)
+		}
+		// The Anthropic addend key must stay clear — the two are different axes.
+		if _, present := data["cacheWriteTokens"]; present {
+			t.Fatalf("cacheWriteTokens present (%v) on a Codex row; that key is the Anthropic addend", data["cacheWriteTokens"])
+		}
+		// total_tokens == input + output is what proves both cache counts are
+		// SUBSETS of input rather than buckets beside it. 1000 + 20 == 1020 here
+		// even though 600 were cached and 250 written, and the backend's pricing
+		// leg carves both out of input on the strength of exactly this identity.
+		if got := data["inputTokens"]; got != int64(1000) {
+			t.Fatalf("inputTokens = %v, want int64(1000) — the INCLUSIVE total", got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
+// TestCodexCacheWriteInputOmittedWhenUnreported: same absent-by-omission rule as
+// reasoningTokens, and here the absence is load-bearing evidence. Every record of
+// the pre-5.6 corpus reported this field as 0, which is precisely why
+// subset-vs-addend could never be settled from it. A fabricated 0 on a provider
+// that reported none would be indistinguishable from that real zero.
+func TestCodexCacheWriteInputOmittedWhenUnreported(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-nocw")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if _, present := e.Data.(map[string]interface{})["cacheWriteInputTokens"]; present {
+			t.Fatal("cacheWriteInputTokens present when the usage payload reported none; want omitted")
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
 // TestCodexReasoningTokensOmittedWhenUnreported (§10.2): a usage payload that
 // reports input/output tokens but NO reasoning_output_tokens must OMIT
 // reasoningTokens entirely rather than emit 0. Emitting 0 would conflate an
