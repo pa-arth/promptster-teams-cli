@@ -6,6 +6,72 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-18
+
+**The config census was reporting one instruction file as forty.**
+`projectClaudeMdTokens` summed one `CLAUDE.md` per linked git worktree, because
+it reused the root set the transcript *watcher* needs. Those two callers want
+opposite things from one list: the watcher asks *which paths belong to this
+repo*, and every worktree does; the census asks *what standing context does a
+session here load*, and the answer is exactly one. Nothing said so, and no test
+spanned the seam.
+
+Measured on one machine, 2026-08-18:
+
+| repo | worktrees | one checkout | reported | over |
+|---|---|---|---|---|
+| promptster-backend | 42 | 5,856 | 239,088 | **40.8x** |
+| promptster-teams-cli | 17 | 2,436 | 122,689 | **50.4x** |
+| cc-audit | 1 | 2,247 | 2,247 | 1.0x |
+
+Every inflated repo is multi-worktree; every exact one is a single checkout,
+which is why this was invisible on a demo machine and fired hardest on the
+worktree-per-session workflow. Downstream it is `configTax`, and it made the
+console tell one manager that **90.9% of their AI bill was recoverable** — with
+"delete your CLAUDE.md" as the implied action.
+
+Minor, not patch. Two reasons an operator is entitled to read in the version
+number: the census now emits a **materially different number** for the same
+disk, and Codex capture carries a **new usage field** it did not before.
+
+**Upgrading is the only fix.** A census is summed on-device before the event is
+signed, so no backend re-derivation can repair a stored one. Until a device
+runs 0.16.0 its config tax stays inflated.
+
+### Fixed
+
+- **Always-loaded project memory is sized from ONE checkout, never the worktree
+  set** (#164). Sizing takes `primaryWorkspaceRoot` and nowhere else — the
+  nested-package fallback included, which had the same defect one level down.
+  That fallback already took the MAX and never a sum, on the argument that
+  sibling packages' memories don't co-load on one request; worktrees are that
+  identical argument one level up, and the root branch simply never received it.
+  `workspaceMatchRoots` keeps its worktree expansion — the watcher is right to
+  want it — and now records in its own doc comment that it is **not a sizing
+  input**, naming this defect.
+
+### Added
+
+- **Codex `cache_write_input_tokens` is captured** (#163). OpenAI began charging
+  for cache writes at the GPT-5.6 GA (2026-07-09) at 1.25x the uncached input
+  rate; the normalizer read input/output/cached and discarded the write count.
+  A field never captured cannot be backfilled from stored rows, so this is an
+  under-count that only stops accruing forward. Emitted as
+  `cacheWriteInputTokens` and deliberately never folded into `cacheWriteTokens`:
+  that key is the Anthropic ADDEND beside `inputTokens`, while Codex's write
+  count is a SUBSET of its input — the same inversion that, for
+  `cached_input`, double-counted 89% of a cache-heavy session. Absent by
+  omission rather than defaulted to 0, because on this field the absence carries
+  information a fabricated zero would erase.
+
+### Internal
+
+- The on-device redaction allowlist is diffed against the server's **in both
+  directions** (#161). A translator/allowlist name mismatch strips 100% of a
+  field and reads as "the vendor doesn't send it"; checking one direction only
+  cannot see the half where the server admits a key the device never emits.
+- GitHub Actions dependencies bumped (#138).
+
 ## [0.15.0] — 2026-08-05
 
 **The census was still only looking where skills are kept by hand.** 0.13.0
@@ -1536,7 +1602,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.12.4...v0.13.0
