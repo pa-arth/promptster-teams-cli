@@ -1028,6 +1028,16 @@ const (
 //
 // Re-read every poll (both the file and the worktree lists) so a directory
 // registered mid-session is picked up without restarting the daemon.
+//
+// NOT A SIZING INPUT. This list answers "which paths belong to this repo", and
+// every worktree does. It does NOT answer "what standing context does a session
+// here load", where the answer is exactly one — the checkout the session runs
+// in. The config census reused it for the second question and summed one
+// CLAUDE.md per checkout, reporting a 5,856-token instruction file as 239,088
+// on a 42-worktree repo (2026-08-18) and pricing the difference as recoverable
+// spend. Anything that SIZES always-loaded context takes a single root; see
+// projectClaudeMdTokens in census.go and openspec
+// `changes/recoverable-spend-overstated` §1.
 func workspaceMatchRoots(workspace string) []string {
 	seeds := []string{workspace}
 	seeds = append(seeds, RegisteredCaptureRoots()...)

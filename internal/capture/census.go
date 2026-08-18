@@ -298,42 +298,47 @@ var projectClaudeMdSkipDirs = map[string]bool{
 }
 
 // projectClaudeMdTokens estimates the tokens of project CLAUDE.md Claude Code
-// loads for work in the given workspace roots.
+// loads for work in ONE workspace — the checkout this census entry is keyed on.
 //
-// It reports the ALWAYS-LOADED memory first: the CLAUDE.md at a workspace root,
-// which every request in that repo pays for (summed across the watched roots, as
-// the config-tax framing intends). ONLY when no root carries one does it fall
-// back to the largest CLAUDE.md nested in a sub-package — the monorepo shape
-// (e.g. my-clerk-next-app/CLAUDE.md) that otherwise reported 0 and scored the
-// whole workspace 0% on the cc-audit coverage check.
+// It reports the ALWAYS-LOADED memory first: the CLAUDE.md at that root, which
+// every request in that repo pays for. ONLY when the root carries none does it
+// fall back to the largest CLAUDE.md nested in a sub-package — the monorepo
+// shape (e.g. my-clerk-next-app/CLAUDE.md) that otherwise reported 0 and scored
+// the whole workspace 0% on the cc-audit coverage check.
+//
+// ONE ROOT, NEVER A SET, and this used to be a sum. `defaultCensusEnv` builds
+// its roots with workspaceMatchRoots, which expands a repo to EVERY linked
+// worktree because that is what the transcript WATCHER needs — a claude process
+// running in `../fix` must still match. Sizing then summed one instruction file
+// per checkout. A session loads exactly one. Measured on the audited machine
+// 2026-08-18: promptster-backend has 42 worktrees, a 5,856-token CLAUDE.md, and
+// was reporting 239,088 tokens — 40.8x — which priced $5,593/mo of "recoverable"
+// config tax and told the manager to delete their CLAUDE.md. Repos with one
+// checkout reported exactly right, which is why it was invisible in a demo.
+//
+// The number of checkouts on disk is a property of the engineer's workflow, not
+// of the context any request carries. See openspec
+// `changes/recoverable-spend-overstated` §1.
 //
 // The fallback takes the MAX single nested file, never a sum: sibling packages'
 // memories don't co-load on one request (a request under packages/a never loads
 // packages/b/CLAUDE.md), so summing them would overstate always-loaded context.
-// Preferring the root also means every repo that already had a root CLAUDE.md
-// reports exactly what it did before — this change only lifts the false 0 for
-// repos whose memory lives in a sub-directory. Content is never read —
-// fileTokens stats size only, preserving the no-file-contents guarantee.
+// That is the SAME argument one level down, and the root branch simply never
+// received it. Preferring the root also means every repo that already had a root
+// CLAUDE.md reports exactly what a single-checkout machine always reported.
+// Content is never read — fileTokens stats size only, preserving the
+// no-file-contents guarantee.
 //
 // The second return is WHICH branch supplied the count. The fallback made this
 // function answer two questions with one number, and for a nested file the right
 // answers are opposite: covered (yes, memory exists) but not always-loaded (no,
 // it isn't standing context). Reporting position lets each consumer read the one
 // it actually asked about instead of both reading the same integer wrong.
-func projectClaudeMdTokens(roots []string) (int, string) {
-	seenRoots := map[string]bool{}
-	rootTokens := 0
-	for _, root := range roots {
-		if root == "" || seenRoots[root] {
-			continue
-		}
-		seenRoots[root] = true
-		rootTokens += fileTokens(filepath.Join(root, "CLAUDE.md"))
-	}
-	if rootTokens > 0 {
+func projectClaudeMdTokens(root string) (int, string) {
+	if rootTokens := fileTokens(filepath.Join(root, "CLAUDE.md")); rootTokens > 0 {
 		return rootTokens, claudeMdPositionRoot
 	}
-	if nested := maxNestedClaudeMdTokens(roots); nested > 0 {
+	if nested := maxNestedClaudeMdTokens(root); nested > 0 {
 		return nested, claudeMdPositionNested
 	}
 	// Position describes where the reported TOKENS came from, not what exists on
@@ -357,60 +362,61 @@ func isGitRepoRoot(root string) bool {
 }
 
 // maxNestedClaudeMdTokens returns the token cost of the LARGEST CLAUDE.md nested
-// below any of the workspace roots, or 0 when none is found. Bounded by
+// below ONE workspace root, or 0 when none is found. Bounded by
 // claudeMdMaxDepth and projectClaudeMdSkipDirs (+ hidden dirs); every branch is
 // best-effort — an unreadable subtree is skipped, never surfaced as an error.
-func maxNestedClaudeMdTokens(roots []string) int {
+//
+// Scoped to the same single root as its caller, and for the same reason: a
+// worktree's copy of a sub-package memory is not additional standing context,
+// and ranging over the worktree set here would reinstate one half of the defect
+// the root branch just lost.
+func maxNestedClaudeMdTokens(root string) int {
+	if root == "" {
+		return 0
+	}
+	// Only ever descend into an actual git repository. The autostart daemon's
+	// workspace falls back to the user's HOME dir (launchd
+	// WorkingDirectory=home, no PROMPTSTER_TEAMS_WATCH_DIR set), and a 5-level
+	// WalkDir of home enumerates ~/Documents, ~/Downloads, ~/Music — every
+	// macOS TCC-protected folder — firing "wants to access your Downloads"
+	// consent prompts from a capture tool. A non-repo root has no project
+	// CLAUDE.md to find anyway, so gating the walk on .git presence both fixes
+	// the prompt storm and matches the census's per-repo intent.
+	if !isGitRepoRoot(root) {
+		return 0
+	}
 	best := 0
-	seenRoots := map[string]bool{}
-	for _, root := range roots {
-		if root == "" || seenRoots[root] {
-			continue
-		}
-		seenRoots[root] = true
-		// Only ever descend into an actual git repository. The autostart daemon's
-		// workspace falls back to the user's HOME dir (launchd
-		// WorkingDirectory=home, no PROMPTSTER_TEAMS_WATCH_DIR set), and a 5-level
-		// WalkDir of home enumerates ~/Documents, ~/Downloads, ~/Music — every
-		// macOS TCC-protected folder — firing "wants to access your Downloads"
-		// consent prompts from a capture tool. A non-repo root has no project
-		// CLAUDE.md to find anyway, so gating the walk on .git presence both fixes
-		// the prompt storm and matches the census's per-repo intent.
-		if !isGitRepoRoot(root) {
-			continue
-		}
-		rootDepth := strings.Count(filepath.Clean(root), string(os.PathSeparator))
-		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				// Unreadable entry: skip its subtree if a dir, else the file —
-				// never abort the whole scan.
-				if d != nil && d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.IsDir() {
-				if path == root {
-					return nil
-				}
-				name := d.Name()
-				if strings.HasPrefix(name, ".") || projectClaudeMdSkipDirs[name] {
-					return filepath.SkipDir
-				}
-				if strings.Count(filepath.Clean(path), string(os.PathSeparator))-rootDepth > claudeMdMaxDepth {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.Name() != "CLAUDE.md" {
-				return nil
-			}
-			if t := fileTokens(path); t > best {
-				best = t
+	rootDepth := strings.Count(filepath.Clean(root), string(os.PathSeparator))
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			// Unreadable entry: skip its subtree if a dir, else the file —
+			// never abort the whole scan.
+			if d != nil && d.IsDir() {
+				return filepath.SkipDir
 			}
 			return nil
-		})
-	}
+		}
+		if d.IsDir() {
+			if path == root {
+				return nil
+			}
+			name := d.Name()
+			if strings.HasPrefix(name, ".") || projectClaudeMdSkipDirs[name] {
+				return filepath.SkipDir
+			}
+			if strings.Count(filepath.Clean(path), string(os.PathSeparator))-rootDepth > claudeMdMaxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.Name() != "CLAUDE.md" {
+			return nil
+		}
+		if t := fileTokens(path); t > best {
+			best = t
+		}
+		return nil
+	})
 	return best
 }
 
@@ -627,8 +633,12 @@ func normalizeRemoteHost(authority string) string {
 // buildConfigCensus inventories the config surfaces under env. Every branch is
 // best-effort: a missing file/dir contributes zeros, never an error.
 func buildConfigCensus(env censusEnv) configCensusData {
+	// THE checkout this census entry describes. One root, used for both the key
+	// and the size, so the number and the identity it is filed under cannot
+	// describe different trees.
+	censusRoot := primaryWorkspaceRoot(env.workspaceRoots)
 	data := configCensusData{
-		WorkspaceKey:         workspaceKey(primaryWorkspaceRoot(env.workspaceRoots)),
+		WorkspaceKey:         workspaceKey(censusRoot),
 		GlobalClaudeMdTokens: fileTokens(filepath.Join(env.claudeDir, "CLAUDE.md")),
 		Skills:               []censusSkill{},
 		Plugins:              []censusPlugin{},
@@ -639,7 +649,10 @@ func buildConfigCensus(env censusEnv) configCensusData {
 	// when the repo keeps its memory in a sub-package (see projectClaudeMdTokens).
 	// Position rides along so the backend can tell those two apart — a nested file
 	// is covered but latent, and pricing it as always-on overstates the config tax.
-	data.ProjectClaudeMdTokens, data.ProjectClaudeMdPosition = projectClaudeMdTokens(env.workspaceRoots)
+	// From censusRoot, NEVER env.workspaceRoots: that set holds every linked
+	// worktree (the watcher needs it) and summing their instruction files
+	// multiplied this figure by the checkout count. See projectClaudeMdTokens.
+	data.ProjectClaudeMdTokens, data.ProjectClaudeMdPosition = projectClaudeMdTokens(censusRoot)
 
 	// SKILLS — one walk per tool, each entry stamped with the tool it belongs to.
 	// The three lists are concatenated, never merged: the same slug under two
