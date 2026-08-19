@@ -183,7 +183,7 @@ func recordCursorGenerationModel(generationID, model string) {
 	if generationID == "" || model == "" {
 		return
 	}
-	_ = sign.WithBufferLock(cursorGenerationsPath(), func() error {
+	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
 		if prev, ok := c.Entries[generationID]; ok && prev.Model == model {
 			return nil
@@ -235,7 +235,7 @@ func recordCursorUsageObservations(conversationID, model string, events []event.
 }
 
 func recordCursorUsageObservation(conversationID, model string, outputTokens *int64) {
-	_ = sign.WithBufferLock(cursorGenerationsPath(), func() error {
+	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
 		now := time.Now()
 		c.UsageRows++

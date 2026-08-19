@@ -440,7 +440,7 @@ func recordCursorHookClaim(transcriptPath, sessionID string) {
 		return
 	}
 	key := cursorProgressKey(transcriptPath)
-	_ = sign.WithBufferLock(cursorHookClaimsPath(), func() error {
+	_ = sign.WithBufferLock(cursorHookClaimsPath()+".lock", func() error {
 		c := loadCursorHookClaims()
 		now := time.Now()
 		if prev, ok := c.Claims[key]; ok && prev.SessionID == sessionID &&
