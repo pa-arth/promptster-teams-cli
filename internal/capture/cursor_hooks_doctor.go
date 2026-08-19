@@ -91,7 +91,7 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 
 	// EVERY REMAINING ENTRY IS VALIDATED, INCLUDING UNDER A PARTIAL ENROLLMENT.
 	// Completeness and runnability are independent facts, and returning early on
-	// the incomplete one hides the worse one: a machine with three of seven steps
+	// the incomplete one hides the worse one: a machine with three of eight steps
 	// registered against a deleted binary still execs a missing command inside the
 	// agent loop on those three steps' events. Reporting only "some steps are
 	// missing" there describes the least of that machine's problems. Raised by
@@ -135,18 +135,71 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 	canonical := cursorHookCommandBinary(cursorHookCommand())
 	for bin := range bins {
 		if filepath.Clean(bin) != filepath.Clean(canonical) {
-			return []CursorHookDoctorLine{{
+			lines = append(lines, CursorHookDoctorLine{
 				OK: true,
 				Text: fmt.Sprintf("Cursor hook enrolled, pointed at %s (not the managed path) — capture restart re-points it",
 					state.HomeRelative(bin)),
-			}}
+			})
+			if l, ok := cursorUsageCoverageLine(); ok {
+				lines = append(lines, l)
+			}
+			return lines
 		}
 	}
 
-	return []CursorHookDoctorLine{{
+	lines = append(lines, CursorHookDoctorLine{
 		OK:   true,
 		Text: fmt.Sprintf("Cursor hook enrolled for all %d steps in ~/.cursor/hooks.json", len(cursorHookSteps)),
-	}}
+	})
+	if l, ok := cursorUsageCoverageLine(); ok {
+		lines = append(lines, l)
+	}
+	return lines
+}
+
+// cursorUsageCoverageLine reports what a probe measured, after the probe is gone.
+//
+// TWO NUMBERS, BOTH OF WHICH ARE PREMISES THIS RAIL RESTS ON RATHER THAN
+// STATISTICS ABOUT IT.
+//
+//  1. MODEL COVERAGE. A usage row whose generation never produced an
+//     afterAgentThought is emitted with tokens and no model, and the backend
+//     declines to price it. How often that happens was measured once, by a probe
+//     that gets torn down; counting it here means the answer stays available on
+//     any enrolled machine instead of expiring into a sentence in a spec.
+//
+//  2. THE PER-REQUEST PREMISE. usageEvent tags every row `usageScope:
+//     "request"`, which is a MEASUREMENT (Cursor 3.12.17, 2026-08-18: output
+//     fell 902 -> 525 across consecutive generations) and not an invariant. A
+//     cumulative counter cannot decrease, so each observed decrease is evidence
+//     for the tag. The sibling premise on the codex rail was verified true,
+//     recorded only as prose, and was 18.89% false four days later — with a live
+//     customer's published spend as the cost. Prose has no expiry; a counter
+//     does.
+//
+//     REFUTED IF this machine reports many comparisons and zero decreases after
+//     a Cursor upgrade. That is the signal to re-probe before trusting any
+//     per-turn figure, not a reason to keep asserting the tag.
+func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
+	c := loadCursorGenerations()
+	if c.UsageRows == 0 {
+		// Nothing captured yet. Saying "0 of 0 rows" would read as a problem.
+		return CursorHookDoctorLine{}, false
+	}
+	text := fmt.Sprintf("Cursor usage rows captured: %d (%d with no model to price)",
+		c.UsageRows, c.ModellessRows)
+	if c.PerRequestComparisons > 0 {
+		text += fmt.Sprintf("; per-turn counts confirmed by %d of %d output decreases",
+			c.PerRequestDecreases, c.PerRequestComparisons)
+	}
+	// Modelless rows are a WARNING past a third of the traffic: at that point the
+	// device join is not carrying the rail and the fix is a different step, not a
+	// bigger cache.
+	warn := c.ModellessRows*3 > c.UsageRows
+	if warn {
+		text += " — most rows cannot be priced; the generation model join is not covering this machine"
+	}
+	return CursorHookDoctorLine{OK: !warn, Warn: warn, Text: text}, true
 }
 
 // cursorHookCommandBinary extracts the program from a registered hook command.

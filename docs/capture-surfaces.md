@@ -84,24 +84,47 @@ the other rails use, because the payload holds file bodies, command output and
 the engineer's email.
 
 **Two facts that cost real time, both settled empirically — do not re-derive
-them from documentation:**
+them from documentation. The second one was settled WRONG for two weeks, and its
+correction is the reusable lesson on this page:**
 
 - **`duration` is fractional MILLISECONDS.** Read as seconds, a 2-second
   `go build ./...` (`duration: 2021.129`) reported as **33 minutes**. Nothing
   downstream can tell that a duration is implausible.
   `TestCursorHookCommandDurationIsMilliseconds` pins it.
-- **Promptster does not capture Cursor token counts.** Transcripts,
-  `state.vscdb`, `conversation-search.db`, and per-session `chats/*/store.db`
-  expose none. Cursor's bundle *constructs* token fields for `stop` /
-  `afterAgentResponse`; headless `cursor-agent -p` never fires those steps.
-  IDE `stop` *is* requested and other enrolled hooks (claude-user →
-  `presence.sh`) have been seen with nonzero `input_tokens` in Cursor's own
-  hooks log — but a logger enrolled in **our** `~/.cursor/hooks.json` got
-  **zero** stop scratch files in a 2026-08-03 IDE probe, so we do not register
-  `stop` and do not claim those tokens. `afterAgentResponse`: zero platform
-  requests in that session. Token fields stay **ABSENT, never zero**.
-  `model` / `model_id: "default"` is a routing sentinel and is rejected (omit
-  the field), including on `afterAgentThought`.
+- **Cursor token counts ARE captured, via `stop` — and the two years of "it
+  exposes none" is the part worth keeping.** Transcripts, `state.vscdb`,
+  `conversation-search.db` and per-session `chats/*/store.db` genuinely expose
+  none; that half was right and stands. The hook half was wrong. A 2026-08-03
+  probe enrolled our own logger, saw no `stop` payloads, and concluded the vendor
+  declined us — but Cursor's dispatcher **early-returns on any step nobody
+  registered** (`hasHookForStep`, `workbench.desktop.main.js` @25399531, 3.12.17),
+  and `stop` was not in `cursorHookSteps`. The probe measured our configuration
+  and filed the result under Cursor's capabilities. **A probe that never ran and
+  a vendor that sends nothing produce byte-identical evidence**; the 2026-08-18
+  re-probe added `beforeSubmitPrompt` as a POSITIVE CONTROL to tell them apart,
+  and `stop` then delivered all four counts per generation.
+
+  What that buys and what it costs:
+  - One `ai_response` **per generation**, `usageScope: "request"`, carrying
+    `input/output/cacheRead/cacheWrite`. Per-turn, not cumulative — output FELL
+    902 → 525 across consecutive generations, which no running total can do. The
+    scope tag is mandatory: absent, the backend differences the row against a
+    running maximum and drops the first turn as a baseline.
+  - An **aborted** turn arrives with the token keys ABSENT, not zero, and they
+    stay absent. There is deliberately no `status == "completed"` filter — an
+    unenumerated status that does bill is then kept for free.
+  - `stop` reports `model`/`model_id: "default"`, so the model is joined **on
+    device by `generation_id`** from `afterAgentThought` (`cursor_generations.go`,
+    bounded by count and age). No entry ⇒ the row ships with tokens and **no
+    model**, which the backend declines to price. It is never defaulted and never
+    inherited from another turn: Cursor auto-routes and switches models
+    mid-conversation.
+  - `afterAgentResponse` stays **unregistered**. It reads the same
+    `turnTokenUsage` object, so registering both double-counts every generation,
+    and it carries the assistant's full message where `stop` carries none.
+  - `stop` is a **GATING** step: Cursor submits a `followup_message` found on the
+    handler's stdout as a new chat turn. `RunCursorHook` therefore prints a
+    compile-time constant and serialises no part of the payload.
 
 **Cursor transcripts carry no cwd and no timestamp.** Both gaps are worked around
 in ways that are easy to "simplify" back into bugs:
