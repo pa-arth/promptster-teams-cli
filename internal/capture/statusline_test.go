@@ -241,9 +241,74 @@ func TestStatuslineDoctorActive(t *testing.T) {
 		map[string]interface{}{"statusLine": statusLineToMap(statusLineConfig{Type: "command", Command: shimCommand()})})
 	_ = saveStatuslinePrior(statuslinePriorRecord{Wrapped: true})
 
+	// TWO lines when the shim wins: the config claim, then the observation.
+	// Asserted by count as well as content, because a doctor that silently
+	// stops reporting the observation is the same class of regression the
+	// observation exists to catch.
 	lines := StatuslineDoctor("")
-	if len(lines) != 1 || !lines[0].OK {
-		t.Errorf("doctor should report OK when the shim wins, got %+v", lines)
+	if len(lines) != 2 {
+		t.Fatalf("doctor should report the config line AND the observation line, got %+v", lines)
+	}
+	if !lines[0].OK {
+		t.Errorf("doctor should report OK when the shim wins, got %+v", lines[0])
+	}
+	// No spool has been written in this test's state dir, so the observation
+	// line must WARN rather than claim a reading that does not exist.
+	if !lines[1].Warn || !strings.Contains(lines[1].Text, "not observed yet") {
+		t.Errorf("observation line should warn that nothing has been observed, got %+v", lines[1])
+	}
+}
+
+// TestStatuslineDoctorReportsObservedWindow: the other half — a spool that
+// exists must be REPORTED, so "configured" and "producing readings" can be told
+// apart from the same command.
+func TestStatuslineDoctorReportsObservedWindow(t *testing.T) {
+	claudeDir, _ := statuslineTestEnv(t)
+	writeSettings(t, filepath.Join(claudeDir, "settings.json"),
+		map[string]interface{}{"statusLine": statusLineToMap(statusLineConfig{Type: "command", Command: shimCommand()})})
+	_ = saveStatuslinePrior(statuslinePriorRecord{Wrapped: true})
+	if err := writeClaudeContextSpool("11111111-0000-0000-0000-000000000001",
+		claudeContextSpool{ContextWindowTokens: 1_000_000, ObservedAt: 10}); err != nil {
+		t.Fatal(err)
+	}
+
+	lines := StatuslineDoctor("")
+	if len(lines) != 2 {
+		t.Fatalf("expected two lines, got %+v", lines)
+	}
+	if !lines[1].OK || !strings.Contains(lines[1].Text, "1.0M") {
+		t.Errorf("observation line should report the observed window, got %+v", lines[1])
+	}
+}
+
+// TestShimContextSpoolPrivacy: the context spool is TWO INTEGERS. The blob it is
+// lifted from also carries a transcript path, a cwd, a workspace and a running
+// cost total, and none of them may reach disk here — the point of a narrow
+// projection is lost if the file it writes is wide.
+func TestShimContextSpoolPrivacy(t *testing.T) {
+	_, stateDir := statuslineTestEnv(t)
+	const secretPath = "/home/me/.claude/projects/secret-repo/transcript.jsonl"
+	const secretCwd = "/home/me/secret-repo"
+	blob := []byte(`{"session_id":"22222222-0000-0000-0000-000000000002",` +
+		`"transcript_path":"` + secretPath + `","cwd":"` + secretCwd + `",` +
+		`"model":{"id":"claude-secret-model"},` +
+		`"cost":{"total_cost_usd":41.55},` +
+		`"context_window":{"context_window_size":200000,"total_input_tokens":184577}}`)
+	id, reading, ok := parseClaudeContextWindow(blob, 1700000000)
+	if !ok {
+		t.Fatal("expected a reading")
+	}
+	if err := writeClaudeContextSpool(id, reading); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "claude-context", id+".json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{secretPath, secretCwd, "claude-secret-model", "41.55", "transcript", "184577"} {
+		if bytes.Contains(data, []byte(leak)) {
+			t.Fatalf("content leaked into the context spool (%q): %s", leak, data)
+		}
 	}
 }
 

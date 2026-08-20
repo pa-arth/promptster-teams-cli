@@ -36,9 +36,21 @@ import (
 const priorCommandTimeout = 2500 * time.Millisecond
 
 // statuslineStdin is the MINIMAL projection of Claude Code's status-line blob we
-// parse. Only rate_limits is named; the surrounding session/model/workspace
-// fields are deliberately not lifted into our struct.
+// parse. Only rate_limits, the context window, and the session id that keys it
+// are named; the surrounding transcript path, workspace and cost fields are
+// deliberately not lifted into our struct.
 type statuslineStdin struct {
+	// SessionID keys the per-session context spool. It is the SAME id the
+	// transcript filename carries — Claude Code builds both from one value
+	// (`session_id: e.id, transcript_path: J4(e.id)`), which is what makes the
+	// join to a tailed transcript exact rather than heuristic.
+	SessionID string `json:"session_id"`
+	// ContextWindow is the ONLY channel that reports a Claude session's window;
+	// the transcript carries no such field. Documented by Claude Code itself as
+	// "Context window size for current model (e.g., 200000)".
+	ContextWindow *struct {
+		ContextWindowSize *float64 `json:"context_window_size"`
+	} `json:"context_window"`
 	RateLimits *struct {
 		FiveHour *struct {
 			UsedPercentage *float64 `json:"used_percentage"`
@@ -60,9 +72,19 @@ func RunStatuslineShim() int {
 	// balloon memory.
 	blob, _ := io.ReadAll(io.LimitReader(os.Stdin, 1<<20))
 
-	// (2) Spool the window reading — best-effort, never blocks the render.
-	if reading, ok := parseClaudeStatuslineBlob(blob, time.Now().Unix()); ok {
+	now := time.Now().Unix()
+
+	// (2) Spool the rate-limit window reading — best-effort, never blocks the render.
+	if reading, ok := parseClaudeStatuslineBlob(blob, now); ok {
 		_ = writeClaudeWindowSpool(reading)
+	}
+
+	// (2b) Spool the CONTEXT window, keyed by session. Separate spool, separate
+	// key, separate lifecycle — see claude_context_window.go. Also best-effort:
+	// a missing denominator degrades a downstream tile to "ceiling unknown",
+	// which is a far cheaper failure than a status line that does not render.
+	if sessionID, reading, ok := parseClaudeContextWindow(blob, now); ok {
+		_ = writeClaudeContextSpool(sessionID, reading)
 	}
 
 	// (3) Run the prior command with the same blob and pass its stdout through.
@@ -182,4 +204,30 @@ func renderOwnStatusline(blob []byte) []byte {
 		week = fmt.Sprintf("%.0f%%", *reading.WeeklyPct)
 	}
 	return []byte(fmt.Sprintf("promptster · 5h %s · wk %s\n", five, week))
+}
+
+// parseClaudeContextWindow lifts the session id and the vendor-reported context
+// window from a status-line blob. observedAt is the tick time.
+//
+// ok=false unless BOTH are usable: a window with no session id cannot be joined
+// to a transcript, and a session id with no window has nothing to carry. The
+// window is dropped rather than coerced when it is non-finite or non-positive —
+// absent is never 0 here, because a 0 window downstream is a division by zero or
+// a session drawn as completely full, not a small one.
+func parseClaudeContextWindow(blob []byte, observedAt int64) (string, claudeContextSpool, bool) {
+	var in statuslineStdin
+	if err := json.Unmarshal(blob, &in); err != nil {
+		return "", claudeContextSpool{}, false
+	}
+	if in.SessionID == "" || in.ContextWindow == nil {
+		return "", claudeContextSpool{}, false
+	}
+	size := in.ContextWindow.ContextWindowSize
+	if size == nil || math.IsNaN(*size) || math.IsInf(*size, 0) || *size <= 0 {
+		return "", claudeContextSpool{}, false
+	}
+	return in.SessionID, claudeContextSpool{
+		ContextWindowTokens: int64(*size),
+		ObservedAt:          observedAt,
+	}, true
 }
