@@ -6,6 +6,75 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-08-20
+
+**Three rails gained a number they had been generating all along.** Cursor turns
+were captured without their token counts, Codex stated its context window into a
+field the allowlist dropped, and the Claude rail had no window at all — so the
+console divided a peak by a hardcoded 160,000 and called it a share.
+
+Minor, not patch: three new fields leave the machine, and one of them changes
+what the statusline shim discloses.
+
+**Upgrading is the only fix for all three.** Each of these is read on-device and
+folded into the event before it is signed, so a session captured by 0.16.0 has no
+window and no Cursor tokens, and no backend re-derivation puts them back. The
+under-count stops accruing forward; it does not heal backward.
+
+### Added
+
+- **Cursor turns carry their token counts** (#166). `stop` is now registered, and
+  it delivers `input`/`output`/`cache_read`/`cache_write` per generation. The
+  step was never declining us — Cursor's dispatcher early-returns on any step
+  nobody registered, so "Cursor requested zero stop steps" measured OUR
+  configuration and got filed under the vendor's capabilities. A probe that never
+  ran and a vendor that sends nothing produce byte-identical evidence; the
+  re-probe added `beforeSubmitPrompt` as a positive control to tell them apart.
+  Measured 2026-08-18, one live org held 3,579 `cursor-hook` `ai_response` events
+  and **not one** carried a token count.
+
+  Tagged `usageScope: "request"`, because absent that tag the backend reads a row
+  as cumulative and differences it against a running maximum — which drops the
+  first row as a baseline. Output FELL 902 → 525 between consecutive generations,
+  which no running total can do. The model is joined on-device by
+  `generation_id` against `afterAgentThought`, since `stop` reports the routing
+  sentinel rather than the resolved id; no join entry means the row ships with
+  tokens and no model, and the backend declines to price it. Never defaulted,
+  never inherited — Cursor auto-routes, so an inherited model id is a fabricated
+  price.
+
+- **Codex's `model_context_window` reaches the wire** (#167). The rollout log
+  states it; the on-device allowlist was dropping it. Emitted as
+  `contextWindowTokens` on `ai_response` and `subagent_usage`.
+
+- **The Claude rail has a context window for the first time** (#168). The
+  transcript does not carry one — measured, not assumed — and the statusline
+  stdin blob is the only channel that does. The shim spools the reading per
+  session; the watcher pairs it onto `ai_response` within a **15-minute skew
+  bound** and refuses the pairing outside it, because a window read hours later
+  may describe a different model. Deliberately not stamped on `subagent_usage`:
+  a subagent's window is not the parent's.
+
+  A model-id lookup table cannot substitute for this, in principle and not merely
+  in staleness: `claude-opus-5` reports **both** 1,000,000 and 200,000 depending
+  on the session.
+
+  **This changes the shim's disclosure.** Three things now leave the machine
+  where two did before — your two usage percentages, their reset times, and your
+  model's context-window size. `login` and `statusline` say so, and that sentence
+  is required to stay exhaustive.
+
+### Internal
+
+- Per-session spool files with atomic temp-and-rename, and a 24h TTL with an
+  hourly prune (#168). A single fixed `.tmp` path is shared state between two
+  shim processes: the payload lands in one write syscall, so the failure is a
+  **stale** reading and a dropped update, never a torn file — which is why the
+  test asserts that no concurrent write returns an error rather than asserting
+  torn content. The content assertion passed against the broken code.
+- `staticcheck` pinned to `@v0.7.0` in CI (#167). `@latest` began resolving to
+  v0.8.0, which requires Go ≥ 1.26 against this module's 1.25 floor.
+
 ## [0.16.0] — 2026-08-18
 
 **The config census was reporting one instruction file as forty.**
@@ -1602,7 +1671,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.13.0...v0.14.0
