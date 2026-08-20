@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 )
 
 // Real rollout lines captured from codex-cli 0.137.0 (`codex exec`).
@@ -768,4 +769,97 @@ func TestCodexCommandStringForms(t *testing.T) {
 	if got := codexCommandString(arr); got != "bash -lc echo hi" {
 		t.Errorf("command array form = %q", got)
 	}
+}
+
+// TestCodexCarriesContextWindow: `token_count.info.model_context_window` is the
+// DENOMINATOR every context figure downstream has been missing. A peak of 84k
+// tokens is unreadable on its own — it is 42% of a 200k window and 33% of
+// Codex's — and the backend's compaction line was a flat 160k applied to both
+// rails, which is 80% of the first and 62% of the second.
+//
+// The literal below is copied off a real rollout log (codex, gpt-5.5 /
+// gpt-5.6-sol): 258400, i.e. 272000 net of reserved output. That exact number is
+// the argument for reading the vendor's field instead of a model-id table — no
+// table would have produced it, and a table has no subscriber to the next
+// release.
+func TestCodexCarriesContextWindow(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-08-03T20:34:59.495Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":22291,"cached_input_tokens":11008,"output_tokens":198,"total_tokens":22489},"model_context_window":258400}}}`,
+		`{"timestamp":"2026-08-03T20:35:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-cwin")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if got := e.Data.(map[string]interface{})["contextWindowTokens"]; got != int64(258400) {
+			t.Fatalf("contextWindowTokens = %v (%T), want int64(258400)", got, got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
+// TestCodexContextWindowAbsentNotZero: a rollout that reports no window must
+// OMIT the key, never send 0. Absent means unknown; 0 downstream is either a
+// division by zero or a session rendered as 100% full. This is the same
+// absent-vs-zero contract reasoningTokens and cacheWriteInputTokens hold.
+func TestCodexContextWindowAbsentNotZero(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120}}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-nowin")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if _, present := e.Data.(map[string]interface{})["contextWindowTokens"]; present {
+			t.Fatal("contextWindowTokens must be ABSENT when codex reports none, not 0")
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
+// TestCodexContextWindowSurvivesProjection: the on-device allowlist is
+// default-deny, so a field the normalizer emits and the allowlist does not name
+// is stripped SILENTLY — and downstream that is indistinguishable from "the
+// vendor doesn't send it". That failure mode has already cost this file two
+// fields for ten days each, so the emitter and the boundary are asserted
+// together rather than one at a time.
+func TestCodexContextWindowSurvivesProjection(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-08-03T20:34:59.495Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":22291,"output_tokens":198,"total_tokens":22489},"model_context_window":258400}}}`,
+		`{"timestamp":"2026-08-03T20:35:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-proj")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		ev := e
+		redact.ProjectEvent(&ev, false)
+		got, present := ev.Data.(map[string]interface{})["contextWindowTokens"]
+		if !present {
+			t.Fatal("contextWindowTokens was STRIPPED by the on-device allowlist — the silent-strip failure this test exists for")
+		}
+		if got != int64(258400) {
+			t.Fatalf("contextWindowTokens = %v (%T) after projection, want int64(258400)", got, got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
 }

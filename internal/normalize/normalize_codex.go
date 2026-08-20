@@ -49,6 +49,17 @@ type CodexRolloutProcessor struct {
 	pending        map[string]codexPendingCall
 	running        map[string]codexRunningCall
 	lastTokenUsage map[string]interface{}
+	// lastContextWindow is codex's `token_count.info.model_context_window` — the
+	// size of the window the session is running against, restated on every
+	// token_count line. Stashed beside lastTokenUsage and attached to the same
+	// events, because a context size without its ceiling is not a reading: a
+	// peak of 84k means one thing against 200k and another against 258400.
+	//
+	// It is the VENDOR's number and must stay that way. Codex reports 258400 for
+	// gpt-5.5 / gpt-5.6-sol — 272000 net of reserved output — which no model-id
+	// lookup table would have produced, and a table has no subscriber to the
+	// vendor's next release. 0 means "not reported"; never emitted as 0.
+	lastContextWindow int64
 	// workdir is the session's cwd, home-collapsed to "~/…", captured from the
 	// session_meta header (the ONLY codex rollout line that carries cwd). It is
 	// stamped onto each prompt event so the teams dashboard can show where the
@@ -583,6 +594,14 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 			if usage, ok := info["total_token_usage"].(map[string]interface{}); ok {
 				p.lastTokenUsage = usage
 			}
+			// Tracked independently of total_token_usage: the two are separate
+			// keys on `info` and a line can carry either without the other.
+			// Latest-wins rather than sticky — a mid-session model switch moves
+			// the window, and the last line before a turn is the one that turn
+			// ran against.
+			if w := intField(info, "model_context_window"); w > 0 {
+				p.lastContextWindow = w
+			}
 		}
 		return nil
 
@@ -858,6 +877,17 @@ func (p *CodexRolloutProcessor) attachTokenUsage(data map[string]interface{}) {
 				break
 			}
 		}
+	}
+	// OUTSIDE the input>0||output>0 gate on purpose. The window is a property of
+	// the SESSION, not of this turn's counters: a turn whose usage is missing or
+	// unparseable still ran against a real ceiling, and dropping the ceiling with
+	// the counters would blind the denominator exactly where the numerator is
+	// already weakest.
+	//
+	// Absent, never 0. A 0 window is not a small window — downstream it is either
+	// a division by zero or a session reported as 100% full.
+	if p.lastContextWindow > 0 {
+		data["contextWindowTokens"] = p.lastContextWindow
 	}
 }
 
