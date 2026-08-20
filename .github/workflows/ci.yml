@@ -211,7 +211,17 @@ jobs:
             exit 1
           fi
       - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+        # PINNED, not @latest. staticcheck v0.8.0 (released 2026-08-20) requires
+        # Go >= 1.26.0, and this job takes its toolchain from go.mod (1.25.8)
+        # under GOTOOLCHAIN=local — so `@latest` turned red on every PR in the
+        # repo on the day it shipped, without a line of our code changing.
+        #
+        # Pinning is the right shape independently of that break: `@latest` in
+        # CI means the lint verdict depends on the DATE the job ran, so a green
+        # from yesterday says nothing about today. Bump this deliberately,
+        # together with go.mod, rather than letting a linter release decide the
+        # language floor of a binary we ship.
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
 
   # The binary ships as six per-platform npm packages pinned to the wrapper's
   # exact version. The platform set is written out in FOUR files that nothing
