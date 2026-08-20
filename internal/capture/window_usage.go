@@ -434,11 +434,11 @@ func writeClaudeWindowSpool(r windowReading) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := claudeWindowSpoolPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, claudeWindowSpoolPath())
+	// Same fix as the context spool, and this instance was the worse of the two:
+	// its `claude-window.json.tmp` is a SINGLE path shared by every session on
+	// the machine, not one per session, so any two concurrent shim processes
+	// interleave into it — not just two ticks of one session.
+	return writeFileAtomic(dir, claudeWindowSpoolPath(), data)
 }
 
 // readClaudeWindowSpool loads and REMOVES the spool (drain semantics): a reading

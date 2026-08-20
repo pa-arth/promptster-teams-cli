@@ -126,11 +126,50 @@ func writeClaudeContextSpool(sessionID string, s claudeContextSpool) error {
 	if err := os.MkdirAll(claudeContextSpoolDir(), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	return writeFileAtomic(claudeContextSpoolDir(), path, data)
+}
+
+// writeFileAtomic writes data to a UNIQUE temporary file in dir and renames it
+// over path.
+//
+// The uniqueness is the point. A fixed `<path>.tmp` is shared by every process
+// that writes it, and the shim is not a singleton: Claude Code invokes it per
+// tick, and our own step (3) runs the engineer's prior status-line command under
+// a 2.5s timeout, so a slow one leaves tick N still resident when tick N+1
+// fires. Two processes writing one tmp file interleave into a file that is
+// neither reading — the rename then publishes corrupt JSON, not a stale value.
+//
+// What remains, and why it is acceptable: two renames microseconds apart may
+// land in either order, so an older reading can still win. Both readings are
+// then from the same second of the same session and carry the same window, so
+// the value is identical and only `observedAt` differs. Closing that would need
+// a read-compare-rename, which is a TOCTOU race dressed up as a fix — worse
+// than the thing it replaces.
+func writeFileAtomic(dir, path string, data []byte) error {
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		// Leaving the temp behind would accumulate one file per failed tick.
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // readClaudeContextSpool loads one session's reading WITHOUT removing it — the
@@ -185,7 +224,11 @@ func pruneClaudeContextSpools(now time.Time) {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".json.tmp") {
+		// Both the published readings and any temp file orphaned by a crash
+		// between CreateTemp and Rename. The temp prefix is swept here because
+		// nothing else ever will: writeFileAtomic only cleans up the paths it
+		// can still see fail.
+		if !strings.HasSuffix(name, ".json") && !strings.HasPrefix(name, ".tmp-") {
 			continue
 		}
 		info, err := e.Info()

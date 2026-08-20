@@ -3,6 +3,8 @@ package capture
 import (
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -239,5 +241,70 @@ func TestStatuslineShimSpoolsContextWindow(t *testing.T) {
 	// Same tick, both spools — the rate-limit handoff must not have regressed.
 	if _, ok := readClaudeWindowSpool(); !ok {
 		t.Fatal("the shim stopped spooling the rate-limit reading")
+	}
+}
+
+// TestClaudeContextSpoolConcurrentWrites: the shim is NOT a singleton. Claude
+// Code invokes it per tick, and our own step (3) runs the engineer's prior
+// status-line command under a 2.5s timeout — so a slow one leaves tick N still
+// resident when tick N+1 fires.
+//
+// With a fixed `<path>.tmp` the two share one temp path, and the loser's rename
+// finds nothing there: the winner already renamed it away. That write returns
+// ENOENT and is DROPPED — and the shim ignores the error by design (it must
+// never fail a status-line render), so the reading disappears in silence.
+//
+// This asserts the write never fails, which is the property that actually
+// differs. It is deliberately NOT asserting torn CONTENT: the payload is ~60
+// bytes and lands in one write syscall, so the old code goes stale rather than
+// corrupt, and a content assertion would pass against it — a green proving
+// nothing.
+func TestClaudeContextSpoolConcurrentWrites(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const id = "99999999-0000-0000-0000-000000000009"
+
+	var mu sync.Mutex
+	var failures []error
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < 100; i++ {
+				err := writeClaudeContextSpool(id, claudeContextSpool{
+					ContextWindowTokens: 200_000,
+					ObservedAt:          int64(i + 1),
+				})
+				if err != nil {
+					mu.Lock()
+					failures = append(failures, err)
+					mu.Unlock()
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	if len(failures) > 0 {
+		t.Fatalf("%d concurrent write(s) failed and would be silently dropped by the shim; first: %v",
+			len(failures), failures[0])
+	}
+
+	got, ok := readClaudeContextSpool(id)
+	if !ok || got.ContextWindowTokens != 200_000 {
+		t.Fatalf("spool = %+v (ok=%v) after concurrent writes", got, ok)
+	}
+
+	// No temp may survive a clean run: one orphan per tick would grow the
+	// directory without bound, which is why prune sweeps the prefix too.
+	entries, err := os.ReadDir(claudeContextSpoolDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
 	}
 }
