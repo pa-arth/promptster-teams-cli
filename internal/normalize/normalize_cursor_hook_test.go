@@ -46,7 +46,7 @@ func TestCursorHookFileEdit_CountsOnlyNeverCode(t *testing.T) {
 		},
 	})
 
-	res, ok := NormalizeCursorHook(raw)
+	res, ok := NormalizeCursorHook(raw, CursorHookOptions{})
 	if !ok {
 		t.Fatal("afterFileEdit produced no events")
 	}
@@ -93,7 +93,7 @@ func TestCursorHookDropsUserEmailAndOtherUnallowlistedFields(t *testing.T) {
 		{"postToolUseFailure", map[string]interface{}{"tool_name": "Write", "failure_type": "permission_denied", "error_message": "/abs/path/leaks.go denied"}},
 	}
 	for _, s := range steps {
-		res, ok := NormalizeCursorHook(hookPayload(s.step, s.extra))
+		res, ok := NormalizeCursorHook(hookPayload(s.step, s.extra), CursorHookOptions{})
 		if !ok {
 			t.Fatalf("%s produced no events", s.step)
 		}
@@ -122,10 +122,7 @@ func TestCursorHookDropsUserEmailAndOtherUnallowlistedFields(t *testing.T) {
 func TestCursorHookModelComesFromModelIDNotTheDefaultLabel(t *testing.T) {
 	// A step whose only model signal is "default" must report no model at all —
 	// emitting "default" as a model would poison any model-mix metric.
-	res, _ := NormalizeCursorHook(hookPayload("sessionStart", nil))
-	if _, found := firstOfKind(res.Events, "ai_response"); found {
-		t.Fatal(`model "default" must not be reported as a model`)
-	}
+	res, _ := NormalizeCursorHook(hookPayload("sessionStart", nil), CursorHookOptions{})
 	if res.Model != "" {
 		t.Fatalf("Model = %q, want empty", res.Model)
 	}
@@ -134,49 +131,184 @@ func TestCursorHookModelComesFromModelIDNotTheDefaultLabel(t *testing.T) {
 	res, ok := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{
 		"model_id": "default",
 		"text":     "reasoning that must never be emitted",
-	}))
+	}), CursorHookOptions{})
 	if ok {
-		t.Fatal(`model_id "default" must produce no events (would claim the transcript for nothing)`)
+		t.Fatal("afterAgentThought must produce no events")
 	}
 	if res.Model != "" {
 		t.Fatalf("Model = %q for model_id=default, want empty", res.Model)
 	}
 
+	// A resolved model is REPORTED, not EMITTED. afterAgentThought's only product
+	// is the cache entry the capture layer writes from these two fields; the
+	// ai_response it used to mint was keyed on session+model and would now
+	// collide with every usage row of the session.
 	raw := hookPayload("afterAgentThought", map[string]interface{}{
 		"model_id":     "grok-4.5",
 		"model_params": []map[string]string{{"id": "effort", "value": "high"}},
 		"text":         "internal reasoning that must never be emitted",
 	})
-	res, ok = NormalizeCursorHook(raw)
-	if !ok {
-		t.Fatal("afterAgentThought produced no events")
+	res, ok = NormalizeCursorHook(raw, CursorHookOptions{})
+	if ok || len(res.Events) != 0 {
+		t.Fatalf("afterAgentThought emitted %d event(s), want 0", len(res.Events))
 	}
-	e, found := firstOfKind(res.Events, "ai_response")
-	if !found {
-		t.Fatal("no ai_response carrying the model")
+	if res.Model != "grok-4.5" || res.GenerationID != "gen-1" {
+		t.Fatalf("Model/GenerationID = %q/%q, want grok-4.5/gen-1", res.Model, res.GenerationID)
 	}
-	if dataOf(t, e)["model"] != "grok-4.5" {
-		t.Fatalf("model = %v, want grok-4.5", dataOf(t, e)["model"])
-	}
-	// afterAgentThought is registered for the model ALONE. Its reasoning text is
-	// the agent's own prose and has no business leaving the machine.
-	if len(res.Events) != 1 {
-		t.Fatalf("afterAgentThought emitted %d events, want exactly 1 (the model)", len(res.Events))
-	}
-	blob, _ := json.Marshal(res.Events)
+	blob, _ := json.Marshal(res)
 	if strings.Contains(string(blob), "internal reasoning") {
 		t.Fatalf("afterAgentThought leaked its reasoning text:\n%s", blob)
 	}
-	// Token fields are ABSENT, not zero. Cursor exposes none, and a zero would
-	// read downstream as "this turn cost nothing" rather than "unknown".
-	for _, k := range []string{"inputTokens", "outputTokens", "cacheReadTokens"} {
-		if _, present := dataOf(t, e)[k]; present {
-			t.Fatalf("ai_response carries %s — Cursor exposes no token counts, so it must be absent, not zero", k)
+}
+
+// --- tokens ------------------------------------------------------------------
+
+// stopPayload is a `stop` payload in the shape observed on Cursor 3.12.17,
+// 2026-08-18 (generation 03d46a51 of the probe).
+func stopPayload(gen string, extra map[string]interface{}) []byte {
+	p := map[string]interface{}{
+		"generation_id": gen,
+		"status":        "completed",
+		"loop_count":    0,
+		"model":         "default",
+		"model_id":      "default",
+	}
+	for k, v := range extra {
+		p[k] = v
+	}
+	return hookPayload("stop", p)
+}
+
+// The four counts ride one ai_response per generation, tagged per-request.
+//
+// The tag is the load-bearing part. Absent, the backend reads a row as
+// CUMULATIVE, differences it against a running maximum and drops the first row
+// as a baseline: the observed pair would book 92,763 and then +3,372, losing an
+// entire turn. Output FELL 902 -> 525 between these two generations, which no
+// cumulative counter can do.
+func TestCursorHookStopEmitsPerRequestUsage(t *testing.T) {
+	raw := stopPayload("03d46a51", map[string]interface{}{
+		"input_tokens": 92763, "output_tokens": 902,
+		"cache_read_tokens": 68096, "cache_write_tokens": 0,
+	})
+	res, ok := NormalizeCursorHook(raw, CursorHookOptions{})
+	if !ok {
+		t.Fatal("stop produced no events")
+	}
+	e, found := firstOfKind(res.Events, "ai_response")
+	if !found {
+		t.Fatal("no ai_response carrying the usage")
+	}
+	d := dataOf(t, e)
+	if d["usageScope"] != "request" {
+		t.Fatalf("usageScope = %v, want request — absent means CUMULATIVE downstream", d["usageScope"])
+	}
+	for k, want := range map[string]interface{}{
+		"inputTokens": int64(92763), "outputTokens": int64(902),
+		"cacheReadTokens": int64(68096), "cacheWriteTokens": int64(0),
+	} {
+		if d[k] != want {
+			t.Fatalf("%s = %v (%T), want %v", k, d[k], d[k], want)
 		}
 	}
 }
 
-// `duration` is fractional MILLISECONDS. Read as seconds, a 2-second `go build`
+// An aborted turn carries NO token keys at all — turnTokenUsage was undefined,
+// and the payload simply lacks them. They must stay absent: a zero here reads
+// downstream as "this turn cost nothing" rather than "we were not told", and
+// this rail has already paid for that confusion twice.
+//
+// Note what is deliberately NOT here: a `status == "completed"` filter. Absent-
+// means-absent covers an unenumerated status that DOES bill (errored,
+// interrupted, max-iterations) for free, where a status allowlist would drop it
+// silently and the undercount would look like a real number.
+func TestCursorHookAbortedTurnHasAbsentCountsNotZeros(t *testing.T) {
+	raw := stopPayload("cd025d2d", map[string]interface{}{"status": "aborted"})
+	res, ok := NormalizeCursorHook(raw, CursorHookOptions{})
+	if ok || len(res.Events) != 0 {
+		t.Fatalf("an aborted turn with no model and no counts emitted %d event(s), want 0", len(res.Events))
+	}
+
+	// With a model known for the generation, the row exists and says only that.
+	res, ok = NormalizeCursorHook(raw, CursorHookOptions{
+		ResolveModel: func(string) string { return "grok-4.6" },
+	})
+	if !ok {
+		t.Fatal("an aborted turn with a known model must still report the model")
+	}
+	e, _ := firstOfKind(res.Events, "ai_response")
+	d := dataOf(t, e)
+	for _, k := range []string{"inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens"} {
+		if _, present := d[k]; present {
+			t.Fatalf("%s present on an aborted turn — absent is not zero, and zero is a claim", k)
+		}
+	}
+	if d["model"] != "grok-4.6" || d["usageScope"] != "request" || len(d) != 2 {
+		t.Fatalf("aborted-turn data = %v, want exactly {model, usageScope}", d)
+	}
+}
+
+// The model comes from the SAME generation or from nowhere.
+//
+// Cursor auto-routes by default and genuinely switches models mid-conversation,
+// so "the model this session was using" is not a fact about this turn. A row
+// whose generation resolved nothing is emitted with tokens and NO model — not
+// dropped, not defaulted, not inherited.
+func TestCursorHookUsageModelIsPerGenerationOrAbsent(t *testing.T) {
+	byGen := map[string]string{"g1": "composer-2.5", "g2": "claude-opus-5"}
+	opts := CursorHookOptions{ResolveModel: func(g string) string { return byGen[g] }}
+
+	for gen, want := range byGen {
+		res, ok := NormalizeCursorHook(stopPayload(gen, map[string]interface{}{"output_tokens": 10}), opts)
+		if !ok {
+			t.Fatalf("%s produced no events", gen)
+		}
+		e, _ := firstOfKind(res.Events, "ai_response")
+		if got := dataOf(t, e)["model"]; got != want {
+			t.Fatalf("%s model = %v, want %v — a turn must not inherit its neighbour's model", gen, got, want)
+		}
+	}
+
+	// A generation the cache never saw: tokens, no model. readUsage declines to
+	// price it, which is correct and visible, where a defaulted model would be
+	// confidently wrong.
+	res, ok := NormalizeCursorHook(stopPayload("g3", map[string]interface{}{"input_tokens": 500}), opts)
+	if !ok {
+		t.Fatal("a modelless usage row must still be emitted — it is counted, not dropped")
+	}
+	e, _ := firstOfKind(res.Events, "ai_response")
+	d := dataOf(t, e)
+	if _, present := d["model"]; present {
+		t.Fatalf("model = %v on a generation with no cache entry, want absent", d["model"])
+	}
+	if d["inputTokens"] != int64(500) {
+		t.Fatalf("inputTokens = %v, want 500 — the row is kept for its tokens", d["inputTokens"])
+	}
+}
+
+// Each turn gets its own identity. The retired model event was keyed on
+// session+model so a session's repeated model reports collapsed to ONE row;
+// reusing that here would collapse a four-turn session's usage onto one id and
+// lose three turns' spend to ordinary dedupe — silently, because the surviving
+// row looks perfectly healthy.
+func TestCursorHookFourTurnsYieldFourUsageRows(t *testing.T) {
+	ids := map[string]bool{}
+	for _, gen := range []string{"g1", "g2", "g3", "g4"} {
+		res, ok := NormalizeCursorHook(stopPayload(gen, map[string]interface{}{
+			"input_tokens": 1000, "output_tokens": 50,
+		}), CursorHookOptions{ResolveModel: func(string) string { return "grok-4.6" }})
+		if !ok {
+			t.Fatalf("%s produced no events", gen)
+		}
+		e, _ := firstOfKind(res.Events, "ai_response")
+		ids[e.ID] = true
+	}
+	if len(ids) != 4 {
+		t.Fatalf("four turns produced %d distinct ids, want 4 — the rest are lost to dedupe", len(ids))
+	}
+}
+
+// `duration` is fractional MILLISECONDS.// `duration` is fractional MILLISECONDS. Read as seconds, a 2-second `go build`
 // reported as 33 minutes — caught only by a live run, because nothing downstream
 // can tell that a duration is implausible.
 func TestCursorHookCommandDurationIsMilliseconds(t *testing.T) {
@@ -184,7 +316,7 @@ func TestCursorHookCommandDurationIsMilliseconds(t *testing.T) {
 		"command":  "go build ./...",
 		"duration": 2021.129,
 	})
-	res, ok := NormalizeCursorHook(raw)
+	res, ok := NormalizeCursorHook(raw, CursorHookOptions{})
 	if !ok {
 		t.Fatal("afterShellExecution produced no events")
 	}
@@ -210,7 +342,7 @@ func TestCursorHookActorsAndSource(t *testing.T) {
 		{"sessionEnd", "session_end", "system", map[string]interface{}{"reason": "completed"}},
 	}
 	for _, c := range cases {
-		res, ok := NormalizeCursorHook(hookPayload(c.step, c.extra))
+		res, ok := NormalizeCursorHook(hookPayload(c.step, c.extra), CursorHookOptions{})
 		if !ok {
 			t.Fatalf("%s produced no events", c.step)
 		}
@@ -233,8 +365,8 @@ func TestCursorHookActorsAndSource(t *testing.T) {
 // payload replayed must not double-count.
 func TestCursorHookEventIDsAreDeterministic(t *testing.T) {
 	raw := hookPayload("afterShellExecution", map[string]interface{}{"command": "make test"})
-	a, _ := NormalizeCursorHook(raw)
-	b, _ := NormalizeCursorHook(raw)
+	a, _ := NormalizeCursorHook(raw, CursorHookOptions{})
+	b, _ := NormalizeCursorHook(raw, CursorHookOptions{})
 	if len(a.Events) == 0 || len(a.Events) != len(b.Events) {
 		t.Fatalf("event counts differ: %d vs %d", len(a.Events), len(b.Events))
 	}
@@ -244,23 +376,41 @@ func TestCursorHookEventIDsAreDeterministic(t *testing.T) {
 		}
 	}
 
-	// The model id must NOT vary with the hook step, so every afterAgentThought
-	// in a turn collapses to one event rather than one per thought.
-	m1, _ := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{"model_id": "grok-4.5", "text": "a"}))
-	m2, _ := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{"model_id": "grok-4.5", "text": "completely different"}))
-	if m1.Events[0].ID != m2.Events[0].ID {
-		t.Fatal("two thoughts reporting the same model minted different ids — they would not collapse")
+	// A usage row's id is derived from the generation, so Cursor redelivering one
+	// `stop` payload is idempotent while two turns stay distinct.
+	u := stopPayload("g1", map[string]interface{}{"input_tokens": 7, "output_tokens": 1})
+	u1, _ := NormalizeCursorHook(u, CursorHookOptions{})
+	u2, _ := NormalizeCursorHook(u, CursorHookOptions{})
+	if u1.Events[0].ID != u2.Events[0].ID {
+		t.Fatal("a redelivered stop payload minted a second id — it would double-count")
+	}
+
+	// And with no generation id at all, the counts and status carry the identity:
+	// a retry still collapses, two different turns still separate. Dropping the
+	// row instead would lose the turn outright, and a session-keyed id would lose
+	// every turn but one.
+	n1, _ := NormalizeCursorHook(stopPayload("", map[string]interface{}{"input_tokens": 7, "output_tokens": 1}), CursorHookOptions{})
+	n2, _ := NormalizeCursorHook(stopPayload("", map[string]interface{}{"input_tokens": 7, "output_tokens": 1}), CursorHookOptions{})
+	n3, _ := NormalizeCursorHook(stopPayload("", map[string]interface{}{"input_tokens": 9, "output_tokens": 2}), CursorHookOptions{})
+	if n1.Events[0].ID != n2.Events[0].ID {
+		t.Fatal("a retried generation-less stop payload minted a second id")
+	}
+	if n1.Events[0].ID == n3.Events[0].ID {
+		t.Fatal("two different generation-less turns collided onto one id")
 	}
 }
 
 // A step we did not register must emit nothing. Its payload has not been
 // inspected for source, so the safe answer is silence.
 func TestCursorHookUnregisteredStepsEmitNothing(t *testing.T) {
-	for _, step := range []string{"preToolUse", "postToolUse", "preCompact", "subagentStart", "afterAgentResponse", "stop"} {
+	// afterAgentResponse stays on this list ON PURPOSE. It reads the same
+	// turnTokenUsage object as `stop` and would double-count every generation,
+	// and it carries the assistant's full message where `stop` carries none.
+	for _, step := range []string{"preToolUse", "postToolUse", "preCompact", "subagentStart", "afterAgentResponse"} {
 		res, ok := NormalizeCursorHook(hookPayload(step, map[string]interface{}{
 			"tool_input":  map[string]string{"contents": "FILE BODY"},
 			"tool_output": "COMMAND OUTPUT",
-		}))
+		}), CursorHookOptions{})
 		if ok || len(res.Events) != 0 {
 			t.Fatalf("%s emitted %d event(s); unregistered steps must emit nothing", step, len(res.Events))
 		}
@@ -276,7 +426,7 @@ func TestCursorHookRejectsUnusablePayloads(t *testing.T) {
 		[]byte(`{"conversation_id":"c1"}`),                                   // no step
 		[]byte(`{"hook_event_name":"afterFileEdit","conversation_id":"c1"}`), // no file_path
 	} {
-		if _, ok := NormalizeCursorHook(raw); ok {
+		if _, ok := NormalizeCursorHook(raw, CursorHookOptions{}); ok {
 			t.Fatalf("accepted an unusable payload: %s", raw)
 		}
 	}
@@ -291,7 +441,7 @@ func TestCursorHookPromptCarriesRepoIdentityLikeTheTranscriptRail(t *testing.T) 
 		"prompt": "rename the handler",
 		"cwd":    "/Users/e/repos/thing",
 	})
-	res, ok := NormalizeCursorHook(raw)
+	res, ok := NormalizeCursorHook(raw, CursorHookOptions{})
 	if !ok {
 		t.Fatal("beforeSubmitPrompt produced no events")
 	}
@@ -327,7 +477,7 @@ func TestCursorHookWorkdirFallsBackToWorkspaceRoots(t *testing.T) {
 	res, ok := NormalizeCursorHook(hookPayload("beforeSubmitPrompt", map[string]interface{}{
 		"prompt":          "hi",
 		"workspace_roots": []string{"/repo/a", "/repo/b"},
-	}))
+	}), CursorHookOptions{})
 	if !ok {
 		t.Fatal("no events")
 	}
@@ -339,19 +489,92 @@ func TestCursorHookWorkdirFallsBackToWorkspaceRoots(t *testing.T) {
 // model_params carries a reasoning-effort token. It is NOT allowlisted on either
 // side, so emitting it would be stripped silently and read as "an older CLI".
 func TestCursorHookDoesNotEmitReasoningEffort(t *testing.T) {
-	res, _ := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{
-		"model_id":     "grok-4.5",
+	res, _ := NormalizeCursorHook(stopPayload("g1", map[string]interface{}{
 		"model_params": []map[string]string{{"id": "effort", "value": "high"}},
-	}))
+	}), CursorHookOptions{ResolveModel: func(string) string { return "grok-4.5" }})
 	e, found := firstOfKind(res.Events, "ai_response")
 	if !found {
 		t.Fatal("no ai_response")
 	}
-	// Exactly one key: the model. Asserting on the whole serialized event would
-	// be a false negative waiting to happen — "high" is also the value of
-	// provenance.observability.
+	// Exactly the model and the scope tag. Asserting on the whole serialized
+	// event would be a false negative waiting to happen — "high" is also the
+	// value of provenance.observability.
 	d := dataOf(t, e)
-	if len(d) != 1 || d["model"] != "grok-4.5" {
-		t.Fatalf("ai_response data = %v, want exactly {model}", d)
+	if len(d) != 2 || d["model"] != "grok-4.5" || d["usageScope"] != "request" {
+		t.Fatalf("ai_response data = %v, want exactly {model, usageScope}", d)
+	}
+}
+
+// --- the privacy boundary, across every step this rail registers -------------
+
+// Every `stop`, `afterAgentResponse` and `beforeSubmitPrompt` payload observed
+// carries `user_email` — the first PII field this rail has ever presented, and
+// the one the next person adding a field here will be looking at.
+//
+// The default-deny allowlists exclude it by OMISSION, which is exactly the
+// property that makes a new field vanish silently rather than leak silently. This
+// test is the one that would notice it being added: it runs the full projection
+// over one event of every kind this rail can produce and asserts that the four
+// payload fields carrying a person or their prose survive on none of them.
+//
+// The values are synthetic on purpose. A fixture copied from the real probe run
+// would put a live engineer's address and prompts into the repository to prove
+// they never leave a machine.
+func TestCursorHookNeverShipsEmailOrProse(t *testing.T) {
+	const (
+		email  = "engineer@example.com"
+		prose  = "ASSISTANT PROSE THAT MUST NOT SHIP"
+		typed  = "the engineer's own question"
+		attach = "SECRET-ATTACHMENT-PATH"
+	)
+	steps := []struct {
+		step  string
+		extra map[string]interface{}
+	}{
+		{"sessionStart", nil},
+		{"sessionEnd", map[string]interface{}{"final_status": "completed"}},
+		{"beforeSubmitPrompt", map[string]interface{}{
+			"prompt":      typed,
+			"attachments": []map[string]string{{"type": "rule", "file_path": attach}},
+		}},
+		{"afterFileEdit", map[string]interface{}{
+			"file_path": "a.go",
+			"edits":     []map[string]string{{"old_string": prose, "new_string": prose}},
+		}},
+		{"afterShellExecution", map[string]interface{}{"command": "go test ./..."}},
+		{"postToolUseFailure", map[string]interface{}{"tool_name": "read", "failure_type": "denied"}},
+		{"afterAgentThought", map[string]interface{}{"model_id": "grok-4.6", "text": prose}},
+		{"stop", map[string]interface{}{
+			"status": "completed", "input_tokens": 10, "output_tokens": 2,
+			"text": prose, "user_email": email,
+		}},
+	}
+	for _, c := range steps {
+		extra := map[string]interface{}{"user_email": email}
+		for k, v := range c.extra {
+			extra[k] = v
+		}
+		raw := redact.RedactBytes(hookPayload(c.step, extra))
+		res, _ := NormalizeCursorHook(raw, CursorHookOptions{
+			ResolveModel: func(string) string { return "grok-4.6" },
+		})
+		for i := range res.Events {
+			e := res.Events[i]
+			redact.ProjectEvent(&e, false)
+			blob, err := json.Marshal(e)
+			if err != nil {
+				t.Fatalf("%s: %v", c.step, err)
+			}
+			for _, forbidden := range []string{email, prose, attach} {
+				if strings.Contains(string(blob), forbidden) {
+					t.Fatalf("%s leaked %q past projection:\n%s", c.step, forbidden, blob)
+				}
+			}
+			// The engineer's own typed prompt is the ONE prose field this rail
+			// carries on purpose, and only on the kind that exists for it.
+			if strings.Contains(string(blob), typed) && e.Kind != "prompt" {
+				t.Fatalf("%s put the engineer's prompt on a %s event:\n%s", c.step, e.Kind, blob)
+			}
+		}
 	}
 }

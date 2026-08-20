@@ -149,7 +149,7 @@ func TestCursorHooksDoctorReportsPartialEnrollment(t *testing.T) {
 
 // A PARTIAL enrollment whose binary is also gone must still report the dangling
 // command. Completeness and runnability are independent facts, and the machine
-// with three of seven steps registered against a deleted binary still execs a
+// with three of eight steps registered against a deleted binary still execs a
 // missing command inside the agent loop on those three steps' events — reporting
 // only "some steps are missing" there describes the least of its problems.
 // Raised by review on PR #125.

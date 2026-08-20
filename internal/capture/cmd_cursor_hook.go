@@ -25,11 +25,28 @@ const cursorHookMaxPayload = 8 << 20 // 8 MiB
 // budget is small and enforced rather than assumed.
 const cursorHookBudget = 2 * time.Second
 
+// cursorHookStdout is the ENTIRE response this command ever writes to stdout.
+//
+// `stop` IS A GATING HOOK. Cursor parses the handler's stdout and, if it finds
+// `followup_message`, submits that text as a new chat turn — up to
+// stopHookLoopCount 5 times. So a handler that echoed its input, or printed a
+// debug blob that happened to contain that key, would be DRIVING THE CUSTOMER'S
+// AGENT with our telemetry. Nothing about that failure would look like a bug in
+// a hook: the agent would simply appear to talk to itself.
+//
+// Containment is structural rather than a review rule: the response is a
+// compile-time constant, no part of the payload is ever serialised to stdout,
+// and it is written from RunCursorHook — outside the goroutine — so a budget
+// overrun answers with the same constant rather than with nothing.
+const cursorHookStdout = `{"continue": true}`
+
 // RunCursorHook is the `cursor-hook` subcommand: Cursor's registered command.
 // It reads one JSON payload on stdin, normalizes it, and queues the events.
 //
-// THREE INVARIANTS, IN DESCENDING ORDER OF HOW BADLY YOU WOULD REGRET BREAKING
+// FOUR INVARIANTS, IN DESCENDING ORDER OF HOW BADLY YOU WOULD REGRET BREAKING
 // THEM:
+//
+//  0. IT NEVER PRINTS ANYTHING DERIVED FROM THE PAYLOAD. See cursorHookStdout.
 //
 //  1. IT ALWAYS EXITS 0 AND IT NEVER BLOCKS FOR LONG. It is inside the
 //     engineer's agent loop (see cursorHookBudget). A non-zero exit or a stall
@@ -62,6 +79,8 @@ func RunCursorHook() error {
 		// thing the budget exists to prevent.
 		fmt.Fprintln(os.Stderr, "promptster-teams: cursor hook exceeded its time budget, skipping")
 	}
+	// Both paths answer identically. A constant cannot say followup_message.
+	fmt.Fprintln(os.Stdout, cursorHookStdout)
 	return nil
 }
 
@@ -101,7 +120,20 @@ func runCursorHookInner() {
 	session.TaskRoot = cursorHookTaskRoot(session.TaskRoot)
 
 	redacted := redact.RedactBytes(raw)
-	res, ok := normalize.NormalizeCursorHook(redacted)
+	// The model join: `stop` reports the routing sentinel, so the tokens it
+	// carries reach the normalizer alongside whatever afterAgentThought recorded
+	// for the SAME generation. Reading is a file stat and a parse of a bounded
+	// file; it happens on `stop` alone, once per turn.
+	res, ok := normalize.NormalizeCursorHook(redacted, normalize.CursorHookOptions{
+		ResolveModel: cursorGenerationModel,
+	})
+	// The cache write comes BEFORE the ok check, deliberately. afterAgentThought
+	// now emits no event of its own, so `ok` is false for exactly the payload
+	// whose only product is this entry — returning early on it would leave every
+	// usage row modelless while every individual piece looked correct.
+	if res.Step == "afterAgentThought" {
+		recordCursorGenerationModel(res.GenerationID, res.Model)
+	}
 	if !ok {
 		return
 	}
@@ -119,18 +151,18 @@ func runCursorHookInner() {
 			res.Events, normalize.CursorSessionWorkdir(res.Workdir), root, host, tracked)
 	}
 
-	// Drop a model we have already reported for this session, so the claim's
-	// model field ends up reflecting what was actually queued.
+	// THERE IS NO LONGER A REPEAT-MODEL SUPPRESSION HERE, AND REINTRODUCING ONE
+	// WOULD DELETE SPEND. It existed because afterAgentThought minted an
+	// ai_response carrying the model, many times per turn, all identical. That
+	// event is gone; the only ai_response this rail emits now is one turn's usage
+	// row, and consecutive turns of one session legitimately report the same
+	// model. A suppression keyed on (session, model) would drop every turn after
+	// the first — silently, since the surviving row looks perfectly healthy.
 	events := res.Events
-	if cursorHookModelAlreadyReported(res.TranscriptPath, res.SessionID, res.Model) {
-		kept := events[:0]
-		for _, ev := range events {
-			if ev.Kind == "ai_response" {
-				continue
-			}
-			kept = append(kept, ev)
-		}
-		events = kept
+
+	// Count what the coverage probe measured, so the number outlives the probe.
+	if res.Step == "stop" {
+		recordCursorUsageObservations(res.SessionID, res.Model, events)
 	}
 
 	// captureProse=false unconditionally. The resolver does a network fetch, and
@@ -158,7 +190,7 @@ func runCursorHookInner() {
 	// covering records the hook already sent, which costs duplicates rather than
 	// data. Given the choice, duplicate beats gone.
 	if queued > 0 && res.TranscriptPath != "" {
-		recordCursorHookClaim(res.TranscriptPath, res.SessionID, res.Model)
+		recordCursorHookClaim(res.TranscriptPath, res.SessionID)
 	}
 }
 

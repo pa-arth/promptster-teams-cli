@@ -283,7 +283,7 @@ func TestClaimedTranscriptIsSkippedByTheWatcherButAdvancedToEOF(t *testing.T) {
 		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>the hook rail already sent this</user_query>"}]}}`,
 		cursorShellLine(ws),
 	)
-	recordCursorHookClaim(path, "a", "grok-4.5")
+	recordCursorHookClaim(path, "a")
 
 	// A prompt and a shell command are both kinds the HOOK rail emits, so the
 	// watcher must stay silent on them. (It is no longer silent about
@@ -328,45 +328,43 @@ func TestAnExpiredClaimReleasesTheTranscriptBackToTheWatcher(t *testing.T) {
 	}
 }
 
-// afterAgentThought fires many times per turn and every one resolves the same
-// model. Without suppression a five-thought turn queues five copies of one fact.
-func TestRepeatModelIsSuppressedWithinASession(t *testing.T) {
+// THE REPEAT-MODEL SUPPRESSION IS GONE, AND ITS ABSENCE IS THE ASSERTION.
+//
+// Two tests used to live here: one proving a repeated model was suppressed
+// within a session, one proving an empty-model claim did not wipe the remembered
+// model. Both described a mechanism that guarded afterAgentThought's ai_response
+// — an event that no longer exists. The event that replaced it is one turn's
+// usage row, and consecutive turns of a session legitimately report the SAME
+// model, so re-adding a (session, model) suppression would delete every turn's
+// spend after the first.
+//
+// A deletion that leaves no assertion behind is one somebody re-does in three
+// months with a straight face, so this is written as the inverse: the claim
+// carries no model at all, and nothing can key on one.
+func TestClaimCarriesNoModelSoNothingCanSuppressOnIt(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	path := "/home/u/.cursor/projects/p/agent-transcripts/a/a.jsonl"
 
-	if cursorHookModelAlreadyReported(path, "a", "grok-4.5") {
-		t.Fatal("reported before anything was recorded")
+	recordCursorHookClaim(path, "a")
+	blob, err := os.ReadFile(cursorHookClaimsPath())
+	if err != nil {
+		t.Fatalf("claims file: %v", err)
 	}
-	recordCursorHookClaim(path, "a", "grok-4.5")
-	if !cursorHookModelAlreadyReported(path, "a", "grok-4.5") {
-		t.Fatal("the same model in the same session was not suppressed")
+	if strings.Contains(string(blob), `"model"`) {
+		t.Fatalf("the claim persisted a model — a (session, model) suppression could be rebuilt on it:\n%s", blob)
 	}
-	// A model CHANGE inside one session is a real fact and must still be emitted.
-	if cursorHookModelAlreadyReported(path, "a", "claude-opus-5") {
-		t.Fatal("a model switch mid-session was suppressed — that is a real event")
+	var c cursorHookClaims
+	if err := json.Unmarshal(blob, &c); err != nil {
+		t.Fatalf("claims file does not parse: %v", err)
 	}
-	// A different session is a different fact.
-	if cursorHookModelAlreadyReported(path, "b", "grok-4.5") {
-		t.Fatal("suppressed across sessions")
-	}
-}
-
-// A later claim with an empty model (afterFileEdit etc.) must not wipe the real
-// model afterAgentThought already recorded — that field gates suppression.
-func TestCursorHookClaimPreservesModelWhenLaterStepHasNone(t *testing.T) {
-	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
-	path := "/home/u/.cursor/projects/p/agent-transcripts/a/a.jsonl"
-
-	recordCursorHookClaim(path, "a", "grok-4.5")
-	recordCursorHookClaim(path, "a", "") // file edit / shell — no model on payload
-	if !cursorHookModelAlreadyReported(path, "a", "grok-4.5") {
-		t.Fatal("empty-model claim wiped the remembered model")
+	if got := c.Claims[cursorProgressKey(path)].SessionID; got != "a" {
+		t.Fatalf("claim sessionId = %q, want a", got)
 	}
 }
 
 // The handoff used to be whole-transcript: a claimed session was seeked to EOF
 // unread. But Cursor exposes no hook for an MCP call or a subagent dispatch —
-// the seven steps we register carry neither — so on every hook-enrolled machine,
+// the eight steps we register carry neither — so on every hook-enrolled machine,
 // which is the recommended install, those two identities were captured by
 // NOTHING and the asset boards read a zero that was never a measurement.
 func TestClaimedTranscriptStillYieldsTheKindsHooksCannotSee(t *testing.T) {
@@ -387,7 +385,7 @@ func TestClaimedTranscriptStillYieldsTheKindsHooksCannotSee(t *testing.T) {
 		// transcript to this workspace and proves the filter drops it.
 		cursorShellLine(ws),
 	)
-	recordCursorHookClaim(path, "b", "grok-4.5")
+	recordCursorHookClaim(path, "b")
 
 	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 1 {
 		t.Fatalf("claimed transcript queued %d event(s), want exactly 1 (the mcp_call, not the prompt)", queued)

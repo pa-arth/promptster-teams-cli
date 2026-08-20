@@ -32,23 +32,35 @@ import (
 //   - error_message / failure_type / is_interrupt on postToolUseFailure
 //   - workspace_roots (exact cwd) and transcript_path
 //
-// TOKENS ARE NOT CAPTURED HERE — AND THAT IS DELIBERATE. Cursor's shipped
-// dispatch builds input_tokens/output_tokens/cache_*_tokens for `stop` and
-// `afterAgentResponse`. Empirically (2026-08-03):
+// TOKENS ARE CAPTURED HERE, VIA `stop`. This block used to say the opposite,
+// and the correction is the reusable part.
 //
-//   - Headless `cursor-agent -p`: neither step fires.
-//   - IDE: `stop` IS requested and other enrolled hooks (e.g. Claude's
-//     claude-user Stop → presence.sh) receive nonzero token JSON. But a
-//     logger enrolled in OUR `~/.cursor/hooks.json` did not receive any
-//     stop payload across a 20-minute IDE probe (zero `*-stop.json` scratch
-//     files; Cursor also requested zero stop steps for that window after
-//     enrollment). `afterAgentResponse` had zero `Hook step requested`
-//     lines in the same session log.
+// The 2026-08-03 verdict was: "a logger enrolled in OUR ~/.cursor/hooks.json did
+// not receive any stop payload across a 20-minute IDE probe; Cursor also
+// requested zero stop steps for that window after enrollment". Every word of
+// that observation was accurate. The conclusion drawn from it — that the vendor
+// declines to send us tokens — was not. Cursor's dispatcher early-returns on any
+// step nobody registered:
 //
-// So we do NOT register `stop` / `afterAgentResponse`, and we do not claim
-// Promptster captures Cursor tokens. Token fields stay ABSENT, never zero.
-// Re-open only with OUR enrolled logger's on-disk payloads — Cursor's own
-// hooks log for another product's command is not that bar.
+//	async triggerStopHook(e, t) {
+//	  if (!this._cursorHooksService.hasHookForStep(Nu.stop)) return;   // <—
+//	  ... input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+//	}
+//	                       (workbench.desktop.main.js @25399531, Cursor 3.12.17)
+//
+// "Cursor requested zero stop steps" is what that early return looks like from
+// outside. The probe measured OUR configuration — `stop` was absent from
+// cursorHookSteps below — and filed the result under the vendor's capabilities.
+//
+// THE MISSING PIECE WAS A POSITIVE CONTROL. A probe that never ran and a vendor
+// that sends nothing produce byte-identical evidence. The 2026-08-18 re-probe
+// registered `beforeSubmitPrompt` — a step known to fire — beside the unknowns,
+// so the two outcomes became distinguishable. The control fired three times;
+// `stop` then delivered all four token counts per generation, per turn.
+//
+// The generalised rule now lives in the change's
+// specs/vendor-capability-claims/spec.md: a recorded claim that a vendor does
+// NOT emit something SHALL record how enrollment was confirmed.
 //
 // WHY THE USER SCOPE, NOT THE PROJECT SCOPE. Cursor resolves four hook configs
 // and merges them:
@@ -74,15 +86,24 @@ func cursorUserHooksPath() string {
 // cursorHookSteps are the steps we register.
 //
 // Deliberately NOT registered:
-//   - stop / afterAgentResponse — see TOKENS note above. Do not reintroduce
-//     them without OUR enrolled logger's on-disk payloads.
+//   - afterAgentResponse — it reads the SAME turnTokenUsage object as `stop` and
+//     fires on the same path, so registering both delivers each generation's
+//     numbers twice under two hook_event_names (observed: generation 03d46a51
+//     reported {92763, 902, 68096} on each). Of the two, `stop` is strictly
+//     better: it fires on aborted and error turns as well as completed ones, it
+//     carries loop_count, and it carries NO assistant prose, where
+//     afterAgentResponse hands us the model's entire message on every turn.
+//     Deduping downstream was considered and rejected — it requires the
+//     duplicate to arrive, which means projecting and signing prose we do not
+//     want, forever, to throw half of it away.
 //   - preToolUse — it gates the tool call: a slow or wedged hook there stalls the
 //     engineer's agent before any work happens. postToolUse carries the same
 //     identity fields plus the outcome, so the blocking one buys nothing.
-//   - preCompact / subagentStart / subagentStop — real signals, but out of scope
-//     for the first slice. preCompact in particular carries
-//     context_usage_percent / context_tokens / context_window_size, which is the
-//     one context-pressure metric this surface exposes. See the spec's follow-on.
+//   - preCompact / subagentStart / subagentStop — real signals, still out of
+//     scope. preCompact carries context_usage_percent / context_tokens /
+//     context_window_size, the one context-pressure metric this rail exposes;
+//     it stays unregistered until its payload shape has been observed rather
+//     than assumed, and until the compaction model it would feed has settled.
 var cursorHookSteps = []string{
 	"sessionStart",
 	"sessionEnd",
@@ -90,6 +111,15 @@ var cursorHookSteps = []string{
 	"afterFileEdit",
 	"afterShellExecution",
 	"postToolUseFailure",
+	// The end of one generation, and the ONLY step carrying token counts. See
+	// the TOKENS block above for why it took two probes to find that out.
+	//
+	// It is also a GATING step: Cursor reads this command's stdout and, if it
+	// finds `followup_message`, SUBMITS IT AS A NEW CHAT TURN (up to
+	// stopHookLoopCount 5). RunCursorHook therefore prints a compile-time
+	// constant and never serialises any part of the payload — a structural
+	// containment, not a review rule.
+	"stop",
 	// Registered for ONE field: model_id. It is the only step that carries it —
 	// every other step says model:"default". The normalizer emits nothing else
 	// from it and never reads its reasoning text. See normalize_cursor_hook.go.
@@ -359,14 +389,14 @@ type cursorHookClaims struct {
 type cursorHookClaim struct {
 	SessionID string `json:"sessionId"`
 	TsMs      int64  `json:"tsMs"`
-	// Model is the last model reported for this session. It exists to suppress
-	// repeat ai_response events: afterAgentThought fires many times per turn and
-	// every one resolves the same model, so without this a five-thought turn
-	// queues five copies. They all carry the SAME deterministic id, so the
-	// backend would collapse them anyway — this just stops us paying to ship
-	// four redundant events per turn.
-	Model string `json:"model,omitempty"`
 }
+
+// A `model` field used to live on this claim, holding the last model reported
+// for a session so a repeat ai_response could be suppressed before it was
+// signed. Both are gone: afterAgentThought no longer mints an ai_response, and
+// the one that replaced it is a per-generation usage row whose repeats are
+// distinct turns. See the note in runCursorHookInner — a suppression keyed on
+// (session, model) would now delete every turn's spend after the first.
 
 const (
 	cursorHookClaimsVersion = 1
@@ -405,19 +435,19 @@ func loadCursorHookClaims() cursorHookClaims {
 // invocations — Cursor fires several steps per turn and does not serialise them.
 // The write goes through the shared buffer lock for the same reason the ai-paths
 // ledger does: two hooks landing at once must not truncate each other's file.
-func recordCursorHookClaim(transcriptPath, sessionID, model string) {
+func recordCursorHookClaim(transcriptPath, sessionID string) {
 	if transcriptPath == "" {
 		return
 	}
 	key := cursorProgressKey(transcriptPath)
-	_ = sign.WithBufferLock(cursorHookClaimsPath(), func() error {
+	_ = sign.WithBufferLock(cursorHookClaimsPath()+".lock", func() error {
 		c := loadCursorHookClaims()
 		now := time.Now()
 		if prev, ok := c.Claims[key]; ok && prev.SessionID == sessionID &&
-			prev.Model == model && now.Sub(time.UnixMilli(prev.TsMs)) < time.Minute {
-			// Refreshed within the last minute by another step of the same turn,
-			// with nothing new to record. Skip the write: Cursor fires several
-			// hooks per turn and rewriting this file on each one is pure churn.
+			now.Sub(time.UnixMilli(prev.TsMs)) < time.Minute {
+			// Refreshed within the last minute by another step of the same turn.
+			// Skip the write: Cursor fires several hooks per turn and rewriting
+			// this file on each one is pure churn.
 			return nil
 		}
 		for k, v := range c.Claims {
@@ -425,17 +455,7 @@ func recordCursorHookClaim(transcriptPath, sessionID, model string) {
 				delete(c.Claims, k)
 			}
 		}
-		// Preserve a previously remembered model when this step only saw the
-		// "default" sentinel (model == ""). afterFileEdit / afterShellExecution
-		// claim with an empty model and must not wipe the real one
-		// afterAgentThought already recorded — that field gates repeat-model
-		// suppression.
-		if model == "" {
-			if prev, ok := c.Claims[key]; ok && prev.SessionID == sessionID {
-				model = prev.Model
-			}
-		}
-		c.Claims[key] = cursorHookClaim{SessionID: sessionID, TsMs: now.UnixMilli(), Model: model}
+		c.Claims[key] = cursorHookClaim{SessionID: sessionID, TsMs: now.UnixMilli()}
 		c.V = cursorHookClaimsVersion
 		data, err := json.Marshal(c)
 		if err != nil {
@@ -466,15 +486,4 @@ func isCursorHookClaimed(claims cursorHookClaims, key string) bool {
 		return false
 	}
 	return time.Since(time.UnixMilli(c.TsMs)) <= cursorHookClaimTTL
-}
-
-// cursorHookModelAlreadyReported reports whether this session has already queued
-// an ai_response for this model, so the repeat can be dropped before it is
-// signed and queued rather than deduped downstream.
-func cursorHookModelAlreadyReported(transcriptPath, sessionID, model string) bool {
-	if transcriptPath == "" || model == "" {
-		return false
-	}
-	prev, ok := loadCursorHookClaims().Claims[cursorProgressKey(transcriptPath)]
-	return ok && prev.SessionID == sessionID && prev.Model == model
 }

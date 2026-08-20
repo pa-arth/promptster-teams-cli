@@ -21,17 +21,42 @@ import (
 // re-capture rather than reasoning about it: register a hook that appends stdin
 // to a file and run one turn.
 //
-// TWO THINGS THAT ARE NOT HERE AND ARE NOT COMING (without new evidence):
+// TOKENS ARE HERE NOW, AND WHY THEY WERE NOT IS THE PART WORTH KEEPING.
 //
-//   - Tokens. Cursor constructs input/output/cache token fields for `stop` /
-//     `afterAgentResponse`. Headless never fires them. IDE stop payloads with
-//     nonzero tokens appear in Cursor's hooks log for *other* enrolled commands
-//     (claude-user), but a 2026-08-03 probe that enrolled OUR user-scope logger
-//     captured zero stop scratch files — so this normalizer does not emit token
-//     fields. ABSENT, never zero.
-//   - Anything resembling source. tool_output, edits[].old_string/new_string and
-//     afterShellExecution's `output` all arrive in the payload and NONE of them
-//     is read except to count lines. See cursorHookEditLineCounts.
+// This header used to say Cursor exposed no token counts, on a 2026-08-03 probe
+// that enrolled our own logger and observed nothing. It was measuring OUR
+// configuration: Cursor's dispatcher early-returns on any step nobody
+// registered (`hasHookForStep`, workbench.desktop.main.js @25399531, Cursor
+// 3.12.17), and `stop` was not in cursorHookSteps. A probe that never ran and a
+// vendor that sends nothing produce byte-identical evidence. The 2026-08-18
+// re-probe added `beforeSubmitPrompt` as a POSITIVE CONTROL so that the two
+// outcomes are distinguishable, and `stop` then delivered all four counts per
+// generation.
+//
+// What `stop` carries, measured (raw payloads quoted in the change's design.md):
+//
+//   - input_tokens / output_tokens / cache_read_tokens / cache_write_tokens,
+//     PER TURN — not cumulative. Output FELL 902 -> 525 between consecutive
+//     generations of one conversation, which no running total can do. That is
+//     the whole reason usageEvent tags `usageScope: "request"`: with the tag
+//     absent, the backend's readUsage treats a row as CUMULATIVE, differences it
+//     against a running maximum, and drops the first row as a baseline — the
+//     observed pair would book 92,763 then +3,372, losing turn one entirely.
+//   - status (completed | aborted | ...). An ABORTED turn arrives with the token
+//     keys ABSENT, not zero. Deliberately NOT branched on: a `status ==
+//     "completed"` gate would silently drop an unenumerated status that does
+//     bill, where absent-means-absent covers that case for free.
+//   - model / model_id — both the literal "default". The resolved id lives on
+//     afterAgentThought, and the two arrive in different processes, so the join
+//     happens on device; this package takes it as CursorHookOptions.ResolveModel
+//     rather than doing any I/O of its own.
+//
+// STILL NOT HERE: anything resembling source. tool_output,
+// edits[].old_string/new_string and afterShellExecution's `output` all arrive in
+// the payload and NONE of them is read except to count lines. See
+// cursorHookEditLineCounts. `stop` additionally carries `user_email` — the first
+// PII field this rail has presented — and it survives nothing, because it is in
+// no struct here and on no allowlist.
 type cursorHookPayload struct {
 	HookEventName  string `json:"hook_event_name"`
 	ConversationID string `json:"conversation_id"`
@@ -69,6 +94,16 @@ type cursorHookPayload struct {
 	FailureType  string `json:"failure_type"`
 	IsInterrupt  bool   `json:"is_interrupt"`
 
+	// stop — one generation ended. The four counts are POINTERS so that an
+	// aborted turn's absent fields stay absent through normalization: a zero
+	// here reads downstream as "this turn cost nothing" rather than "we were
+	// not told", and that distinction is the one this rail keeps getting wrong.
+	Status           string `json:"status"`
+	InputTokens      *int64 `json:"input_tokens"`
+	OutputTokens     *int64 `json:"output_tokens"`
+	CacheReadTokens  *int64 `json:"cache_read_tokens"`
+	CacheWriteTokens *int64 `json:"cache_write_tokens"`
+
 	// sessionStart / sessionEnd
 	FinalStatus       string  `json:"final_status"`
 	Reason            string  `json:"reason"`
@@ -102,6 +137,15 @@ type CursorHookResult struct {
 	Events         []event.Event
 	SessionID      string
 	TranscriptPath string
+	// Step is the hook step this payload came from. Surfaced so the capture
+	// layer can decide what to persist WITHOUT re-parsing: the generation ->
+	// model cache is written from afterAgentThought alone, and a result carrying
+	// a model from some other step must not be allowed to write it.
+	Step string
+	// GenerationID identifies the one agent turn this payload belongs to. It is
+	// the join key between the model (afterAgentThought) and the tokens (stop),
+	// and the discriminator that gives each turn's usage row its own identity.
+	GenerationID string
 	// Model is the model this payload resolved, if any. Surfaced so the capture
 	// layer can suppress a repeat without re-parsing the events.
 	Model string
@@ -113,11 +157,26 @@ type CursorHookResult struct {
 	Workdir string
 }
 
+// CursorHookOptions carries what this package cannot obtain for itself.
+//
+// It exists for exactly one dependency: the tokens and the model arrive on two
+// DIFFERENT hook invocations — separate short-lived processes seconds apart —
+// so resolving a generation's model requires state on disk, and this package
+// does no I/O. The capture layer owns the cache and passes a lookup in.
+type CursorHookOptions struct {
+	// ResolveModel returns the model already observed for a generation, or ""
+	// when none is known. A "" answer is a real answer: the usage row is then
+	// emitted with tokens and NO model rather than inheriting one from another
+	// turn, because Cursor auto-routes and genuinely switches models mid
+	// conversation. Nil is allowed and means "no cache" — the shape a test gets.
+	ResolveModel func(generationID string) string
+}
+
 // NormalizeCursorHook turns one hook payload into events.
 //
 // `line` must already have been through redact.RedactBytes — the same
 // raw-JSON-before-parse ordering the transcript rail uses.
-func NormalizeCursorHook(line []byte) (CursorHookResult, bool) {
+func NormalizeCursorHook(line []byte, opts CursorHookOptions) (CursorHookResult, bool) {
 	var p cursorHookPayload
 	if err := json.Unmarshal(line, &p); err != nil {
 		return CursorHookResult{}, false
@@ -126,10 +185,20 @@ func NormalizeCursorHook(line []byte) (CursorHookResult, bool) {
 	if sess == "" || p.HookEventName == "" {
 		return CursorHookResult{}, false
 	}
+	// `stop` reports the routing sentinel on both model spellings, so its model
+	// comes from the cache the thought step filled. Every other step resolves its
+	// own or has none; neither is allowed to reach into the cache, because the
+	// value of a per-generation join is precisely that it cannot inherit.
+	model := p.modelLabel()
+	if model == "" && p.HookEventName == "stop" && p.GenerationID != "" && opts.ResolveModel != nil {
+		model = opts.ResolveModel(p.GenerationID)
+	}
 	res := CursorHookResult{
 		SessionID:      sess,
 		TranscriptPath: p.TranscriptPath,
-		Model:          p.modelLabel(),
+		Step:           p.HookEventName,
+		GenerationID:   p.GenerationID,
+		Model:          model,
 		Workdir:        p.workdirSource(),
 	}
 
@@ -154,29 +223,26 @@ func NormalizeCursorHook(line []byte) (CursorHookResult, bool) {
 		if e, ok := p.toolFailureEvent(); ok {
 			res.Events = append(res.Events, e)
 		}
+	case "stop":
+		if e, ok := p.usageEvent(model); ok {
+			res.Events = append(res.Events, e)
+		}
 	case "afterAgentThought":
-		// Registered ONLY to reach model_id, and it emits no event of its own.
+		// Registered ONLY to reach model_id, and it emits NO EVENT AT ALL.
 		//
-		// Measured across a live run: afterAgentThought is the ONLY step that
-		// carries model_id and model_params. Every other step reports
-		// model:"default", which describes routing rather than a model and is
-		// worth nothing downstream. Without this case the rail's headline
-		// benefit — real model attribution — is simply absent, which is what the
-		// first end-to-end run showed.
+		// It used to mint an ai_response carrying the model, keyed on
+		// session+model so a turn's eight thoughts collapsed to one row. That
+		// identity is incompatible with per-turn tokens — every generation in a
+		// session would collide onto one id and all but one turn's usage would be
+		// lost to dedupe — so the model now rides the usage row instead, and this
+		// step's only product is the cache entry the capture layer writes from
+		// res.Model / res.GenerationID.
 		//
-		// Its `text` is the agent's reasoning prose and is NEVER read. The step
-		// fires many times per turn (8 in one short run); the model event's id is
-		// derived from session+model alone, so all of those collapse to one.
+		// Its `text` is the agent's reasoning prose and is NEVER read.
 	default:
 		// An unregistered or newly-added step. Emitting nothing is correct: a
 		// step we did not opt into has not had its payload inspected for source.
 		return res, false
-	}
-	// Model identity rides alongside whatever the step produced. Payloads that
-	// only ever say "default" (sessionStart/sessionEnd do) resolve to no model and
-	// add nothing.
-	if e, ok := p.modelEvent(); ok {
-		res.Events = append(res.Events, e)
 	}
 	return res, len(res.Events) > 0
 }
@@ -400,37 +466,81 @@ func hookAiProvenance() *event.Provenance {
 	}
 }
 
-// modelEvent reports which model produced this session's work.
+// usageEvent is one generation's token usage — the only event `stop` produces.
 //
-// WHY ai_response WITH NO USAGE NUMBERS. `model` is allowlisted today on exactly
-// one kind — ai_response, via projectUsageFields — on BOTH the CLI's
-// redact/project.go and the backend's eventFieldProjection.ts. Emitting the model
-// on prompt/file_diff/command instead would require adding a field to two
-// default-deny allowlists in lockstep, and a field added to only one side is
-// stripped SILENTLY and reads as "an older CLI". Riding the kind that already
-// permits it costs nothing and needs no coordinated release.
+// WHY ai_response. `model` and the token fields are allowlisted on exactly one
+// kind — ai_response, via projectUsageFields — on BOTH the CLI's
+// redact/project.go and the backend's eventFieldProjection.ts. Riding the kind
+// that already permits them needs no coordinated release; inventing a kind would
+// persist NOTHING until both default-deny allowlists learned it in lockstep.
 //
-// The absent token fields are absent, not zero. Cursor exposes no token counts
-// (see the file header), and the projector drops fields by omission, so an
-// ai_response from this rail carries a model and nothing else — which is the
-// honest shape of what Cursor tells us.
+// THE IDENTITY IS PER GENERATION, AND THAT IS THE WHOLE POINT. The retired
+// modelEvent derived its id from session+model alone so a session's repeated
+// model reports collapsed to one row. Reusing that here would collapse a
+// four-turn session's four usage rows onto one id and lose three turns' spend to
+// ordinary dedupe — silently, since the surviving row looks perfectly healthy.
 //
-// The id is derived from session + model, so the same model reported on every
-// payload of a session collapses to ONE event through ordinary dedupe rather
-// than one per tool call.
-func (p cursorHookPayload) modelEvent() (event.Event, bool) {
-	model := p.modelLabel()
-	if model == "" {
+// ABSENT COUNTS STAY ABSENT. An aborted turn carries no token keys at all, and
+// writing zeros for them would assert that a turn we were told nothing about
+// cost nothing. Same rule for the model: no cache entry means no `model` key,
+// which the backend's readUsage declines to price — correct, and visible, where
+// a defaulted model would be confidently wrong.
+func (p cursorHookPayload) usageEvent(model string) (event.Event, bool) {
+	data := map[string]interface{}{}
+	putCount(data, "inputTokens", p.InputTokens)
+	putCount(data, "outputTokens", p.OutputTokens)
+	putCount(data, "cacheReadTokens", p.CacheReadTokens)
+	putCount(data, "cacheWriteTokens", p.CacheWriteTokens)
+	if model != "" {
+		data["model"] = model
+	}
+	if len(data) == 0 {
+		// An aborted turn whose generation never resolved a model: nothing was
+		// measured and nothing is claimed. Emitting a row carrying only a scope
+		// tag would ship bytes that say nothing and inflate this rail's response
+		// count against the rails it is compared with.
 		return event.Event{}, false
 	}
-	e := p.newEvent("ai_response", "model\x1f"+model)
-	// Derived from session+model ALONE — deliberately not from the hook step —
-	// so afterFileEdit and afterShellExecution in one session produce the same id.
-	e.ID = event.DeterministicUUID(p.sessionKey() + "\x1fai_response\x1fmodel\x1f" + model)
-	e.Actor = event.AIActor()
-	e.Provenance = hookAiProvenance()
-	e.Data = map[string]interface{}{"model": model}
+	// PER-REQUEST, ASSERTED AT THE EMITTER. See the file header: absent, this
+	// tag means CUMULATIVE downstream, and these numbers are not.
+	data["usageScope"] = "request"
+	e := p.newAIEvent("ai_response", p.usageDiscriminator())
+	e.Data = data
 	return e, true
+}
+
+// usageDiscriminator gives one turn's usage row a stable identity.
+//
+// generation_id is it, on every payload observed. The fallback exists because
+// the cost of the two failure modes is wildly asymmetric: a COLLIDING id loses
+// turns to dedupe with no trace, while a duplicate id merely costs a redundant
+// event that the backend collapses anyway. So a payload with no generation id
+// keys on its own counts and status — distinct turns differ, a retried delivery
+// of the same payload does not.
+func (p cursorHookPayload) usageDiscriminator() string {
+	if p.GenerationID != "" {
+		return "gen\x1f" + p.GenerationID
+	}
+	return "nogen\x1f" + p.Status + "\x1f" + hashDiscriminator(
+		countKey(p.InputTokens)+"/"+countKey(p.OutputTokens)+
+			"/"+countKey(p.CacheReadTokens)+"/"+countKey(p.CacheWriteTokens))
+}
+
+// putCount writes a count only when Cursor actually reported one.
+func putCount(data map[string]interface{}, key string, v *int64) {
+	if v == nil {
+		return
+	}
+	data[key] = *v
+}
+
+// countKey renders a count for an id derivation, keeping absent distinguishable
+// from zero — "-" and "0" are different turns.
+func countKey(v *int64) string {
+	if v == nil {
+		return "-"
+	}
+	return strconv.FormatInt(*v, 10)
 }
 
 // cursorHookEditLineCounts is the ONLY function in this file that reads
