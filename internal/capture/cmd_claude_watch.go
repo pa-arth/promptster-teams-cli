@@ -589,6 +589,10 @@ func RunClaudeWatcher() error {
 	// writes (latest-wins) and emit the provider-agnostic windowUsage event. See
 	// window_usage.go and statusline_shim.go.
 	var windowEmitter claudeWindowEmitter
+	// Claude CONTEXT-window spools: written per session by the same statusline
+	// shim, read (not drained) each poll by pollClaudeTranscripts, and aged out
+	// here because nothing tells the shim a session ended.
+	var contextPruner claudeContextPruner
 
 	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
 	// successful fetch says otherwise. Refreshed in the background (immediate +
@@ -631,6 +635,7 @@ func RunClaudeWatcher() error {
 		parsed, consumed := pollClaudeTranscripts(session, workspace, historyCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
 		windowEmitter.maybe(session, time.Now(), captureProse)
+		contextPruner.maybe(time.Now())
 		wasDegraded := degraded
 		degraded, bytesSinceEvent = claudeDegradationStep(degraded, parsed, consumed, bytesSinceEvent)
 		switch {
@@ -864,6 +869,22 @@ func pollClaudeTranscripts(
 				proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(transcriptCwd(path))
 			}
 			processors[key] = proc
+		}
+		// Refresh the context window on EVERY poll, not once at construction:
+		// the processor outlives many polls and the window moves when the
+		// session switches model. Main chain only — the statusline blob reports
+		// the MAIN-LOOP model's window, so stamping it on a delegate's usage
+		// would measure a subagent against a ceiling that was never its own.
+		// Absent when the session has no spool, which is every session on a
+		// machine where the statusline shim is not installed or is shadowed by a
+		// higher settings layer (see resolveEffectiveStatusLine).
+		if !proc.UsageOnly {
+			if spool, ok := readClaudeContextSpool(claudeSessionIDFromPath(path)); ok {
+				proc.ContextWindow = normalize.ClaudeContextWindow{
+					Tokens:     spool.ContextWindowTokens,
+					ObservedAt: spool.ObservedAt,
+				}
+			}
 		}
 		n, res := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget, oversizeProbe)
 		parsed += n

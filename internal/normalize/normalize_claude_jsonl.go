@@ -62,6 +62,56 @@ type claudeMsgAccum struct {
 	updatedAt time.Time // wall clock of last appended line, for stale flush
 }
 
+// ClaudeContextWindow is one status-line reading of a session's context window:
+// the vendor's own number, and when it was observed.
+//
+// The window is the DENOMINATOR every Claude-rail context figure has shipped
+// without — a peak of 84k means one thing against 200,000 and another against
+// 1,000,000, and the transcript says which nowhere. It is never inferred from
+// the model id: on Claude Code 2.1.237 the id `claude-opus-5` reports a
+// 1,000,000-token window on a 1M-context session and 200,000 elsewhere, so the
+// id is not a key a lookup table could even be built on.
+type ClaudeContextWindow struct {
+	// Tokens is the reported window. Always > 0 when set; a 0 window is a
+	// division by zero downstream, not a small window.
+	Tokens int64
+	// ObservedAt is the status-line tick time, epoch seconds.
+	ObservedAt int64
+}
+
+// claudeContextMaxSkew bounds how far a reading may sit from the turn it is
+// stamped onto. The status line redraws continuously while a session is
+// active, so a live turn's reading is seconds old and this never binds; what it
+// bounds is the case that would otherwise be silently WRONG — a watcher
+// catching up on a long backlog, or a session resumed hours later under a
+// different model, pairing today's window with a turn that ran against last
+// week's. Absent beats wrong: an unstamped turn renders as "ceiling unknown",
+// while a mis-stamped one renders a confident ratio nobody can tell is invented.
+const claudeContextMaxSkew = 15 * time.Minute
+
+// tokensFor returns the window to stamp on a turn timestamped ts (RFC3339 from
+// the transcript), or ok=false when there is no reading, the timestamp does not
+// parse, or the reading is further than claudeContextMaxSkew from the turn in
+// EITHER direction — a reading from the future is as unrelated to this turn as
+// one from the past.
+func (w ClaudeContextWindow) tokensFor(ts string) (int64, bool) {
+	if w.Tokens <= 0 || w.ObservedAt <= 0 {
+		return 0, false
+	}
+	turn, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return 0, false
+	}
+	skew := turn.Sub(time.Unix(w.ObservedAt, 0))
+	if skew < 0 {
+		skew = -skew
+	}
+	if skew > claudeContextMaxSkew {
+		return 0, false
+	}
+	return w.Tokens, true
+}
+
 // usageMaxKeys are the token counters merged across the lines of one message;
 // every other key is carried from the latest line.
 var usageMaxKeys = []string{
@@ -178,7 +228,22 @@ type ClaudeTranscriptProcessor struct {
 	// means "a CLI too old to have looked" and is treated downstream as tracked;
 	// a positive-only emit would collapse that back into the exact ambiguity this
 	// field removes. Only meaningful alongside a non-empty RepoRoot.
-	RepoTracked   bool
+	RepoTracked bool
+	// ContextWindow is the vendor-reported size of the window THIS session's
+	// main chain is running against, lifted from the Claude Code status-line
+	// blob by the shim and refreshed from the per-session spool by the watcher
+	// on every poll (see capture/claude_context_window.go).
+	//
+	// It is threaded in rather than derived here for the same reason RepoRoot is:
+	// reading it touches the filesystem, and this package stays a pure function
+	// of the transcript bytes. Unlike RepoRoot it is refreshed per poll, not
+	// resolved once — a session can switch models mid-run and the window moves
+	// with the model.
+	//
+	// Zero value = no reading, and nothing is stamped. Main-chain only: sidechain
+	// processors (UsageOnly) leave it unset, because the blob reports the
+	// MAIN-LOOP model's window and a delegate may run a different model entirely.
+	ContextWindow ClaudeContextWindow
 	pendingTools  map[string]claudePendingTool
 	emittedMsgIDs map[string]bool
 	accum         *claudeMsgAccum
@@ -608,6 +673,16 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 			data["cacheWrite5mTokens"] = intField(cc, "ephemeral_5m_input_tokens")
 			data["cacheWrite1hTokens"] = intField(cc, "ephemeral_1h_input_tokens")
 		}
+	}
+	// The window sits OUTSIDE the `u != nil` block on purpose, mirroring the
+	// Codex rail: it is a property of the SESSION, not of this turn's counters.
+	// A turn whose usage block is missing still ran against a real ceiling, and
+	// dropping the ceiling with the counters would blind the denominator exactly
+	// where the numerator is already weakest.
+	//
+	// Absent, never 0 — see ClaudeContextWindow.
+	if window, ok := p.ContextWindow.tokensFor(a.ts); ok {
+		data["contextWindowTokens"] = window
 	}
 	e.Data = data
 	e.RawPayload = strPreview(a.text.String(), 500)

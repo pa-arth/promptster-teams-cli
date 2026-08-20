@@ -35,6 +35,13 @@ func cmdStatusline(args []string) int {
 // statuslineEnable wraps (or installs) the Claude statusline shim, disclosing to
 // the engineer what changed — this is the consented install: we never touch a
 // statusline without telling them their own line still renders.
+//
+// The disclosure line below enumerates what leaves the machine and must stay
+// EXHAUSTIVE. It grew a third item when the shim started spooling the context
+// window: the blob it reads also carries a transcript path, a cwd and a cost
+// total, so "the two percentages" was a promise the code was about to stop
+// keeping. Anything new lifted out of that blob belongs in this sentence before
+// it belongs in the spool.
 func statuslineEnable() int {
 	res, err := capture.EnableStatusline()
 	if err != nil {
@@ -57,7 +64,7 @@ func statuslineEnable() int {
 	case res.InstalledFresh:
 		printlnIndent(fmt.Sprintf("%s installed a statusline that shows your 5h/weekly usage", okGlyph))
 	}
-	printlnIndent(dimStyle.Render("Only the two usage percentages + reset times leave your machine. Turn off with ") + bodyStyle.Render("promptster-teams statusline disable") + dimStyle.Render("."))
+	printlnIndent(dimStyle.Render("Only your two usage percentages, their reset times, and your model's context-window size leave your machine. Turn off with ") + bodyStyle.Render("promptster-teams statusline disable") + dimStyle.Render("."))
 	fmt.Println()
 	return 0
 }

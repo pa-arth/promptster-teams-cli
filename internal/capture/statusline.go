@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -413,11 +414,19 @@ func StatuslineDoctor(dir string) []StatuslineDoctorLine {
 			Text: "Claude window capture off — run `promptster-teams statusline enable` to track your 5h/weekly usage",
 		}}
 	case eff.IsShim:
-		// Our shim wins — capture will run.
-		return []StatuslineDoctorLine{{
-			OK:   true,
-			Text: fmt.Sprintf("Claude window capture active (statusline shim, %s layer)", eff.Layer),
-		}}
+		// Our shim wins — capture will run. Two lines, not one: the first says
+		// the CONFIG is right, the second says it has actually PRODUCED
+		// something. Those are different claims, and only the second can tell a
+		// working install from one that has simply never been ticked. A doctor
+		// that reports only the configuration is how "declared true" gets read
+		// as "observed true".
+		return []StatuslineDoctorLine{
+			{
+				OK:   true,
+				Text: fmt.Sprintf("Claude window capture active (statusline shim, %s layer)", eff.Layer),
+			},
+			claudeContextDoctorLine(time.Now()),
+		}
 	case weAreInstalled && eff.Present && !eff.IsShim && eff.Layer == "user":
 		// Our record says we wrapped, but the user-layer statusLine is no longer
 		// our shim — something overwrote it.

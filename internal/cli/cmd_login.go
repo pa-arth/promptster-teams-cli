@@ -138,7 +138,8 @@ func cmdLogin(args []string) {
 // enableStatuslineOnLogin turns on Claude rate-limit window capture as part of
 // onboarding, disclosing what it does. It WRAPS any statusline the engineer
 // already has (their line keeps rendering) and only lifts the two usage
-// percentages + reset times. A failure is a warning, not an error — the rest of
+// percentages + reset times + the model's context-window size (the denominator
+// for every context figure on the Claude rail; see claude_context_window.go). A failure is a warning, not an error — the rest of
 // capture works without it, and `statusline enable` can be re-run by hand.
 func enableStatuslineOnLogin() {
 	res, err := capture.EnableStatusline()
@@ -155,7 +156,7 @@ func enableStatuslineOnLogin() {
 	case res.AlreadyEnabled:
 		printlnIndent(fmt.Sprintf("%s Claude usage tracking already on", okGlyph))
 	}
-	printlnIndent(dimStyle.Render("Only your usage % + reset times leave the machine · off with ") + bodyStyle.Render("promptster-teams statusline disable"))
+	printlnIndent(dimStyle.Render("Only your usage % + reset times + context-window size leave the machine · off with ") + bodyStyle.Render("promptster-teams statusline disable"))
 }
 
 // enableAutostartOnLogin installs the login-time service so capture survives a
