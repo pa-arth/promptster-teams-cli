@@ -243,8 +243,15 @@ func TestCursorHookAbortedTurnHasAbsentCountsNotZeros(t *testing.T) {
 			t.Fatalf("%s present on an aborted turn — absent is not zero, and zero is a claim", k)
 		}
 	}
-	if d["model"] != "grok-4.6" || d["usageScope"] != "request" || len(d) != 2 {
-		t.Fatalf("aborted-turn data = %v, want exactly {model, usageScope}", d)
+	// Exactly {model, usageScope, generationId} and nothing else. generationId is
+	// an identifier, not a measurement, so it does not soften the rule above — the
+	// point of this test is that no COUNT is invented. It is asserted here rather
+	// than ignored because it must be written AFTER the empty-data guard: written
+	// before it, a fully aborted turn (no tokens, no model) would stop being empty
+	// and the normalizer would start emitting rows that say nothing.
+	if d["model"] != "grok-4.6" || d["usageScope"] != "request" ||
+		d["generationId"] != "cd025d2d" || len(d) != 3 {
+		t.Fatalf("aborted-turn data = %v, want exactly {model, usageScope, generationId}", d)
 	}
 }
 
@@ -500,8 +507,9 @@ func TestCursorHookDoesNotEmitReasoningEffort(t *testing.T) {
 	// event would be a false negative waiting to happen — "high" is also the
 	// value of provenance.observability.
 	d := dataOf(t, e)
-	if len(d) != 2 || d["model"] != "grok-4.5" || d["usageScope"] != "request" {
-		t.Fatalf("ai_response data = %v, want exactly {model, usageScope}", d)
+	if len(d) != 3 || d["model"] != "grok-4.5" || d["usageScope"] != "request" ||
+		d["generationId"] != "g1" {
+		t.Fatalf("ai_response data = %v, want exactly {model, usageScope, generationId}", d)
 	}
 }
 
