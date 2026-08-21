@@ -293,3 +293,133 @@ func jsonNaN(t *testing.T) float64 {
 	zero := 0.0
 	return zero / zero
 }
+
+// ── Observed absence: emitting the negative result ───────────────────────────
+//
+// The defect these pin: the capture path used to emit NOTHING when the provider
+// reported no usable window, which made "the provider reported no window"
+// byte-identical to "the shim never ran". One observation, five meanings, and
+// the manager surface printed the least likely one — a claim about how a named
+// person is BILLED — as fact.
+
+// A Codex TEAM plan reports one ~43800-minute window with `secondary: null`
+// (2,331 of 2,331 real records, findings-gate-1.md §1.3). We cannot carry that
+// span yet, and that is OUR gap, not evidence about their billing: the scan must
+// report plan_unsupported rather than staying silent.
+func TestLatestCodexWindowReading_MonthlyOnlyIsPlanUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions")
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-07-23T10-00-00-aaaaaaaa-1111-2222-3333-444444444444.jsonl"),
+		rolloutTokenCount("2026-07-23T10:00:00.000Z", 17.0, 43800.0, 1950000000))
+
+	r, _, ok := latestCodexWindowReading(sessions, time.Now().Add(-24*time.Hour))
+	if !ok {
+		t.Fatal("a monthly-only plan must yield an observed absence, not silence")
+	}
+	if r.SignalState != signalPlanUnsupported {
+		t.Errorf("signalState = %q, want %q", r.SignalState, signalPlanUnsupported)
+	}
+	// Never relabelled as a 5-hour or weekly reading, and never a 0.
+	if !r.empty() {
+		t.Errorf("the monthly window must not be carried in a named slot: %+v", r)
+	}
+}
+
+// A real reading always wins over an absence: an account can run one project on
+// a plan we carry and another on one we do not, and a gauge beats an explanation.
+func TestLatestCodexWindowReading_ReadingBeatsUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions")
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-07-23T09-00-00-aaaaaaaa-1111-2222-3333-444444444444.jsonl"),
+		rolloutTokenCount("2026-07-23T09:00:00.000Z", 41.0, 300.0, 1950000000))
+	// The monthly file is NEWER, so a naive "latest wins" would let the absence
+	// shadow the usable reading.
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-07-23T11-00-00-bbbbbbbb-1111-2222-3333-444444444444.jsonl"),
+		rolloutTokenCount("2026-07-23T11:00:00.000Z", 17.0, 43800.0, 1950000000))
+
+	r, _, ok := latestCodexWindowReading(sessions, time.Now().Add(-24*time.Hour))
+	if !ok || !r.reported() {
+		t.Fatalf("a usable reading must win over an unsupported window, got ok=%v %+v", ok, r)
+	}
+	if r.FiveHourPct == nil || *r.FiveHourPct != 41.0 {
+		t.Errorf("fiveHourPct = %v, want 41", r.FiveHourPct)
+	}
+}
+
+// No rate_limits anywhere is NOT a Codex absence. Codex reports windows on
+// subscription plans and says nothing on others, and we have not observed which
+// — so there is nothing to state, and stating one would be the same over-reading
+// this whole change removes.
+func TestLatestCodexWindowReading_NoRateLimitsIsSilence(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions")
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-07-23T10-00-00-aaaaaaaa-1111-2222-3333-444444444444.jsonl"),
+		`{"timestamp":"2026-07-23T10:00:00.000Z","type":"event_msg","payload":{"type":"agent_message"}}`)
+
+	if r, _, ok := latestCodexWindowReading(sessions, time.Now().Add(-24*time.Hour)); ok {
+		t.Errorf("no rate_limits at all must yield nothing, got %+v", r)
+	}
+}
+
+// The spool has to carry an absence, because an absence is empty BY
+// CONSTRUCTION and the drain used to throw away anything empty — which is
+// exactly the fact it now exists to carry.
+func TestClaudeWindowSpool_RoundTripsAnAbsence(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	if err := writeClaudeWindowSpool(absenceReading(signalProviderAbsent, 1700000000)); err != nil {
+		t.Fatal(err)
+	}
+	r, ok := readClaudeWindowSpool()
+	if !ok {
+		t.Fatal("the drain dropped an observed absence")
+	}
+	if r.SignalState != signalProviderAbsent || r.ObservedAt != 1700000000 || !r.empty() {
+		t.Errorf("absence did not survive the spool: %+v", r)
+	}
+}
+
+// A spool holding neither a reading nor a state is still nothing.
+func TestClaudeWindowSpool_EmptyWithNoStateIsStillNothing(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	if err := writeClaudeWindowSpool(windowReading{ObservedAt: 1700000000}); err != nil {
+		t.Fatal(err)
+	}
+	if r, ok := readClaudeWindowSpool(); ok {
+		t.Errorf("an empty reading with no state must not drain as a fact: %+v", r)
+	}
+}
+
+// The throttle. An absence's observedAt is the TICK TIME, so it moves every tick
+// and de-dup cannot bound it — unthrottled that is one event per statusline
+// render against a fact that does not change.
+func TestClaudeWindowEmitter_ThrottlesRepeatedAbsences(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	var c claudeWindowEmitter
+	start := time.Now()
+
+	emitted := 0
+	for i := 0; i < 5; i++ {
+		if err := writeClaudeWindowSpool(absenceReading(signalProviderAbsent, start.Unix()+int64(i))); err != nil {
+			t.Fatal(err)
+		}
+		before := c.lastAbsence
+		c.maybe(Session{DeviceID: "d"}, start.Add(time.Duration(i)*time.Second), false)
+		if c.lastAbsence != before {
+			emitted++
+		}
+	}
+	if emitted != 1 {
+		t.Errorf("5 ticks of the same absence emitted %d times, want 1", emitted)
+	}
+
+	// And it must NOT gate the reading that follows: a plan change has to show up
+	// immediately, not an hour later.
+	pct := 42.0
+	if err := writeClaudeWindowSpool(windowReading{FiveHourPct: &pct, ObservedAt: start.Unix() + 100}); err != nil {
+		t.Fatal(err)
+	}
+	c.maybe(Session{DeviceID: "d"}, start.Add(time.Second), false)
+	if c.lastObserved != start.Unix()+100 {
+		t.Error("a throttled absence suppressed the reading that followed it")
+	}
+}

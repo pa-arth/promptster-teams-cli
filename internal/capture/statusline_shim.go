@@ -96,14 +96,25 @@ func RunStatuslineShim() int {
 // parseClaudeStatuslineBlob lifts the 5h/weekly window scalars from a Claude Code
 // status-line blob. observedAt is the tick time (contract.md §3: Claude
 // observedAt ~= tick time). Absent/malformed fields are omitted (absent != zero;
-// NaN/Inf dropped). ok=false when nothing usable was present.
+// NaN/Inf dropped).
+//
+// A blob with NO `rate_limits` is an OBSERVED ABSENCE, not a nothing: the shim
+// demonstrably ran and Claude reported no window, which is the one and only
+// evidence that earns "this account is usage-billed". It used to return
+// ok=false, which made that indistinguishable from a shim that never ran — five
+// causes collapsed into one observation, and the surface printed the least
+// likely of them as fact. The absence carries a state and a time and NO
+// percentage, ever.
+//
+// ok=false is now reserved for "this is not a statusline blob at all" (the JSON
+// did not parse). We assert nothing from a payload we could not read.
 func parseClaudeStatuslineBlob(blob []byte, observedAt int64) (windowReading, bool) {
 	var in statuslineStdin
 	if err := json.Unmarshal(blob, &in); err != nil {
 		return windowReading{}, false
 	}
 	if in.RateLimits == nil {
-		return windowReading{}, false
+		return absenceReading(signalProviderAbsent, observedAt), true
 	}
 	r := windowReading{ObservedAt: observedAt}
 	if fh := in.RateLimits.FiveHour; fh != nil {
@@ -123,7 +134,12 @@ func parseClaudeStatuslineBlob(blob []byte, observedAt int64) (windowReading, bo
 		}
 	}
 	if r.empty() {
-		return windowReading{}, false
+		// `rate_limits` was present but carried nothing usable — no percentage and
+		// no reset on either window. Claude reports only the two windows this
+		// contract already names, so there is no third span hiding here: the
+		// provider was asked and answered with nothing. Same fact as a missing
+		// object, same state.
+		return absenceReading(signalProviderAbsent, observedAt), true
 	}
 	return r, true
 }

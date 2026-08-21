@@ -37,6 +37,22 @@ const (
 	providerCodex      = "codex"
 )
 
+// signalState — whether this event carries a window, or records that we ASKED
+// and got none (contract.md §1). Emitting nothing for an absence is what made
+// "the provider reported no window" byte-identical to "the shim never ran", and
+// those have opposite consequences on the manager surface: the first is a
+// usage-billed account, the second is anything at all, including a Cursor-only
+// engineer on a flat-fee plan. An observed absence is a positive fact.
+//
+// `signalReported` is the ABSENT value on the wire — a reported event omits the
+// key entirely, so the normal path is byte-identical to what shipped before this
+// field existed, and every stored row that predates it keeps its meaning.
+const (
+	signalReported        = "reported"
+	signalProviderAbsent  = "provider_absent"
+	signalPlanUnsupported = "plan_unsupported"
+)
+
 // windowRole classifies a rate-limit window by its DURATION. Codex's
 // primary/secondary key names are NOT a stable proxy for 5h-vs-weekly: which
 // window a plan reports as "primary" varies (a "team" plan reports a single
@@ -78,6 +94,23 @@ type windowReading struct {
 	// ObservedAt is the provider's reading time (Codex token_count ts; Claude
 	// tick time), epoch seconds. Always set — it is the freshness anchor.
 	ObservedAt int64
+	// SignalState is "" (≡ reported) for a real reading, or names the OBSERVED
+	// absence. An absence reading has every window pointer nil BY CONSTRUCTION —
+	// it is not a zero and must never acquire one. See the const block above.
+	SignalState string
+}
+
+// reported reports whether this reading carries a window the contract can render.
+// The inverse — an observed absence — is a fact we emit, not a reading we skip.
+func (r windowReading) reported() bool {
+	return r.SignalState == "" || r.SignalState == signalReported
+}
+
+// absence builds an observed-absence reading: a state and a time, and nothing
+// else. Constructed here rather than at each call site so no absence can ever be
+// assembled holding a percentage.
+func absenceReading(state string, observedAt int64) windowReading {
+	return windowReading{ObservedAt: observedAt, SignalState: state}
 }
 
 // empty reports whether the reading carries no window field at all — both pcts
@@ -198,6 +231,17 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 	var bestTs time.Time
 	found := false
 
+	// The plan_unsupported arm. A Codex TEAM plan reports one ~43800-minute
+	// window with `secondary: null` — measured, not assumed: 2,331 of 2,331 real
+	// rate_limits records (findings-gate-1.md §1.3). classifyWindowMinutes
+	// correctly refuses to call that a 5-hour window, so the reading maps to
+	// nothing and the file is skipped. Skipping it silently is what told the
+	// engineer's manager they were pay-as-you-go: they are on a capped
+	// subscription whose window we cannot yet express, which is OUR gap and not a
+	// fact about their billing. So remember that we SAW a rate_limits object.
+	var unsupportedTs time.Time
+	sawUnsupported := false
+
 	_ = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return nil
@@ -220,7 +264,12 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 		if reading.empty() {
 			// The latest rate_limits in this file mapped to nothing we carry
 			// (e.g. only a monthly window). Don't let it shadow an earlier file's
-			// usable-but-older reading — skip it.
+			// usable-but-older reading — but do record that a window EXISTED and
+			// we could not carry it.
+			if ts.After(unsupportedTs) {
+				unsupportedTs = ts
+				sawUnsupported = true
+			}
 			return nil
 		}
 		best = reading
@@ -230,6 +279,11 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 		return nil
 	})
 
+	// A real reading always wins: an account can run one project on a plan we
+	// carry and another on one we do not, and a gauge beats an explanation.
+	if !found && sawUnsupported {
+		return absenceReading(signalPlanUnsupported, unsupportedTs.Unix()), "", true
+	}
 	return best, bestSession, found
 }
 
@@ -313,16 +367,27 @@ func buildWindowUsageEvent(provider string, r windowReading, capturedAt int64, s
 	if r.WeeklyResetsAt != nil {
 		data["weeklyResetsAt"] = *r.WeeklyResetsAt
 	}
+	// Omitted on the reported path, so a normal event is byte-identical to what
+	// shipped before this field existed and the backend's absent-⇒-reported
+	// normalization covers every stored row.
+	if !r.reported() {
+		data["signalState"] = r.SignalState
+	}
 	e.Data = data
 
 	// Deterministic id keyed on provider + device + observedAt + the four window
 	// scalars: the same logical reading always yields the same id (idempotent
 	// resend), while a changed reading is a new id (latest-wins on the backend).
+	//
+	// signalState is IN the key: an absence and a reading are different facts,
+	// and without it a plan_unsupported absence could collapse onto a reading
+	// that happens to share an observedAt.
 	e.ID = event.DeterministicUUID(fmt.Sprintf(
-		"windowUsage:%s:%s:%d:%s:%s:%s:%s",
+		"windowUsage:%s:%s:%d:%s:%s:%s:%s:%s",
 		provider, deviceID, r.ObservedAt,
 		ptrFloatKey(r.FiveHourPct), ptrFloatKey(r.WeeklyPct),
 		ptrIntKey(r.FiveHourResetsAt), ptrIntKey(r.WeeklyResetsAt),
+		r.SignalState,
 	))
 	return e
 }
@@ -370,6 +435,7 @@ const codexWindowLookback = 6 * time.Hour
 type codexWindowEmitter struct {
 	lastScan     time.Time
 	lastObserved int64
+	lastAbsence  time.Time
 }
 
 // maybe emits a Codex windowUsage event if the scan interval has elapsed and a
@@ -385,10 +451,22 @@ func (c *codexWindowEmitter) maybe(session Session, now time.Time, captureProse 
 	if !ok {
 		return
 	}
-	if reading.ObservedAt <= c.lastObserved {
-		return
+	if reading.reported() {
+		if reading.ObservedAt <= c.lastObserved {
+			return
+		}
+		c.lastObserved = reading.ObservedAt
+	} else {
+		// Same reasoning as the Claude emitter: an absence's observedAt is the
+		// timestamp of the unsupported window, which does move, so de-dup alone
+		// would not bound it. Throttled by wall clock, and NEVER gated on
+		// lastObserved — a plan change must be able to produce a reading
+		// immediately after an absence.
+		if !c.lastAbsence.IsZero() && now.Sub(c.lastAbsence) < windowAbsenceInterval {
+			return
+		}
+		c.lastAbsence = now
 	}
-	c.lastObserved = reading.ObservedAt
 	sessionID := rolloutSession
 	if sessionID == "" {
 		sessionID = session.DeviceID
@@ -396,7 +474,8 @@ func (c *codexWindowEmitter) maybe(session Session, now time.Time, captureProse 
 	e := buildWindowUsageEvent(providerCodex, reading, now.Unix(), sessionID, session.DeviceID)
 	queueWindowUsageEvent(e, captureProse)
 	if verboseWatch() {
-		fmt.Fprintf(os.Stderr, "codex-watcher: emitted windowUsage (observedAt=%d)\n", reading.ObservedAt)
+		fmt.Fprintf(os.Stderr, "codex-watcher: emitted windowUsage (observedAt=%d state=%s)\n",
+			reading.ObservedAt, reading.SignalState)
 	}
 }
 
@@ -418,6 +497,9 @@ type claudeWindowSpool struct {
 	FiveHourResetsAt *int64   `json:"fiveHourResetsAt,omitempty"`
 	WeeklyResetsAt   *int64   `json:"weeklyResetsAt,omitempty"`
 	ObservedAt       int64    `json:"observedAt"`
+	// Omitted for a reading, so a spool written by this build and one written by
+	// the previous build are byte-identical on the normal path.
+	SignalState string `json:"signalState,omitempty"`
 }
 
 // writeClaudeWindowSpool atomically overwrites the spool with the latest reading
@@ -457,7 +539,10 @@ func readClaudeWindowSpool() (windowReading, bool) {
 	_ = os.Remove(path)
 	// Field-identical types (tags aside) — a direct conversion is exact and total.
 	r := windowReading(s)
-	if r.empty() {
+	// An OBSERVED ABSENCE is empty by construction, so the empty() guard would
+	// throw away exactly the fact this spool now exists to carry. Only an empty
+	// reading with no state is nothing.
+	if r.empty() && r.reported() {
 		return windowReading{}, false
 	}
 	return r, true
@@ -468,20 +553,44 @@ func readClaudeWindowSpool() (windowReading, bool) {
 // between polls is not re-emitted.
 type claudeWindowEmitter struct {
 	lastObserved int64
+	lastAbsence  time.Time
 }
+
+// windowAbsenceInterval throttles the OBSERVED-ABSENCE emission. A reading
+// de-dups on observedAt, which an absence cannot: the shim stamps it with the
+// tick time, so every tick is a new "reading" of the same unchanging fact.
+// Unthrottled that is one event per statusline render — the redundant-stream
+// problem with a new name (measured: 6,893 windowUsage events on one machine,
+// 87% carrying no new information; see
+// changes/usage-window-currency-coverage/findings-write-amplification.md).
+//
+// An hour is chosen against what the fact can DO: the backend's absence read
+// looks back 14 days and only ever asks "is there one", so a slower cadence
+// costs nothing but a longer wait for the first correct copy after enabling.
+const windowAbsenceInterval = time.Hour
 
 func (c *claudeWindowEmitter) maybe(session Session, now time.Time, captureProse bool) {
 	reading, ok := readClaudeWindowSpool()
 	if !ok {
 		return
 	}
-	if reading.ObservedAt <= c.lastObserved {
-		return
+	if reading.reported() {
+		if reading.ObservedAt <= c.lastObserved {
+			return
+		}
+		c.lastObserved = reading.ObservedAt
+	} else {
+		// Never gated on lastObserved: a throttled absence must not be able to
+		// suppress the reading that follows it when the engineer's plan changes.
+		if !c.lastAbsence.IsZero() && now.Sub(c.lastAbsence) < windowAbsenceInterval {
+			return
+		}
+		c.lastAbsence = now
 	}
-	c.lastObserved = reading.ObservedAt
 	e := buildWindowUsageEvent(providerClaudeCode, reading, now.Unix(), session.DeviceID, session.DeviceID)
 	queueWindowUsageEvent(e, captureProse)
 	if verboseWatch() {
-		fmt.Fprintf(os.Stderr, "claude-watcher: emitted windowUsage (observedAt=%d)\n", reading.ObservedAt)
+		fmt.Fprintf(os.Stderr, "claude-watcher: emitted windowUsage (observedAt=%d state=%s)\n",
+			reading.ObservedAt, reading.SignalState)
 	}
 }

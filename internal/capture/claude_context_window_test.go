@@ -56,8 +56,11 @@ func TestParseClaudeContextWindowIndependentOfRateLimits(t *testing.T) {
 	if _, s, ok := parseClaudeContextWindow(blob, 100); !ok || s.ContextWindowTokens != 200_000 {
 		t.Fatalf("context window must parse with no rate_limits: ok=%v tokens=%d", ok, s.ContextWindowTokens)
 	}
-	if _, ok := parseClaudeStatuslineBlob(blob, 100); ok {
-		t.Fatal("no rate_limits must not yield a window reading")
+	// No rate_limits is now an OBSERVED ABSENCE rather than nothing — but it must
+	// still carry no window field, so the context parser's blob cannot leak a
+	// fabricated gauge.
+	if r, ok := parseClaudeStatuslineBlob(blob, 100); !ok || r.reported() || !r.empty() {
+		t.Fatalf("no rate_limits must yield an empty observed absence, got ok=%v %+v", ok, r)
 	}
 	rlOnly := []byte(`{"session_id":"abc-123","rate_limits":{"five_hour":{"used_percentage":10,"resets_at":5}}}`)
 	if _, _, ok := parseClaudeContextWindow(rlOnly, 100); ok {

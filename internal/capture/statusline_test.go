@@ -60,10 +60,88 @@ func TestParseClaudeStatuslineBlob_AbsentWeeklyOmitted(t *testing.T) {
 	}
 }
 
+// An API-key blob is an OBSERVED ABSENCE, and that is the whole point of the
+// state: the shim demonstrably ran and Claude reported no window. Returning
+// ok=false here — as this used to — made it byte-identical to a shim that never
+// ran, and the surface printed "pay-as-you-go" for both.
 func TestParseClaudeStatuslineBlob_NoRateLimits(t *testing.T) {
 	blob := []byte(`{"session_id":"abc","model":{"id":"x"}}`)
-	if _, ok := parseClaudeStatuslineBlob(blob, 1700000000); ok {
-		t.Error("an API-key blob with no rate_limits must yield ok=false, not a zeroed reading")
+	r, ok := parseClaudeStatuslineBlob(blob, 1700000000)
+	if !ok {
+		t.Fatal("an API-key blob must yield an OBSERVED absence, not nothing")
+	}
+	if r.SignalState != signalProviderAbsent {
+		t.Errorf("signalState = %q, want %q", r.SignalState, signalProviderAbsent)
+	}
+	if r.ObservedAt != 1700000000 {
+		t.Errorf("observedAt = %d, want the tick time", r.ObservedAt)
+	}
+	// ABSENT != 0. An absence carrying a percentage — even 0 — would render a
+	// gauge for an account that has no window at all.
+	if !r.empty() {
+		t.Errorf("an absence must carry no window field at all, got %+v", r)
+	}
+}
+
+// `rate_limits` present but carrying nothing usable is the same fact as no
+// object: asked, told nothing. Claude reports only the two windows the contract
+// names, so there is no third span hiding in an empty object.
+func TestParseClaudeStatuslineBlob_EmptyRateLimitsIsAnAbsence(t *testing.T) {
+	blob := []byte(`{"rate_limits":{}}`)
+	r, ok := parseClaudeStatuslineBlob(blob, 1700000000)
+	if !ok || r.SignalState != signalProviderAbsent || !r.empty() {
+		t.Errorf("want an empty provider_absent reading, got ok=%v %+v", ok, r)
+	}
+}
+
+// A blob we could not read says NOTHING about the account. We assert an absence
+// only from a payload we actually parsed.
+func TestParseClaudeStatuslineBlob_UnparseableIsNotAnAbsence(t *testing.T) {
+	if _, ok := parseClaudeStatuslineBlob([]byte("not json at all"), 1700000000); ok {
+		t.Error("an unparseable blob must not be reported as an observed absence")
+	}
+}
+
+// A real reading omits signalState entirely, so the normal path is byte-identical
+// to what shipped before the field existed.
+func TestBuildWindowUsageEvent_ReportedOmitsSignalState(t *testing.T) {
+	pct := 42.5
+	e := buildWindowUsageEvent(providerClaudeCode,
+		windowReading{FiveHourPct: &pct, ObservedAt: 1700000000}, 1700000001, "s", "d")
+	data := e.Data.(map[string]interface{})
+	if _, present := data["signalState"]; present {
+		t.Error("a reported event must not carry signalState")
+	}
+	if len(data) != 4 { // provider, observedAt, capturedAt, fiveHourPct
+		t.Errorf("unexpected keys on a reported event: %v", data)
+	}
+}
+
+// An absence event carries the state and NO percentage key — not null, not 0.
+func TestBuildWindowUsageEvent_AbsenceCarriesNoPercentageKeys(t *testing.T) {
+	e := buildWindowUsageEvent(providerClaudeCode,
+		absenceReading(signalProviderAbsent, 1700000000), 1700000001, "s", "d")
+	data := e.Data.(map[string]interface{})
+	if data["signalState"] != signalProviderAbsent {
+		t.Errorf("signalState = %v", data["signalState"])
+	}
+	for _, k := range []string{"fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt"} {
+		if _, present := data[k]; present {
+			t.Errorf("absence event must not carry %q at all (absent != 0)", k)
+		}
+	}
+}
+
+// An absence and a reading at the same observedAt are different facts and must
+// not collapse onto one id.
+func TestBuildWindowUsageEvent_AbsenceAndReadingHaveDistinctIDs(t *testing.T) {
+	pct := 0.0
+	reading := buildWindowUsageEvent(providerClaudeCode,
+		windowReading{FiveHourPct: &pct, ObservedAt: 1700000000}, 1, "s", "d")
+	absence := buildWindowUsageEvent(providerClaudeCode,
+		absenceReading(signalProviderAbsent, 1700000000), 1, "s", "d")
+	if reading.ID == absence.ID {
+		t.Error("a genuine 0%% reading and an observed absence must not share an id")
 	}
 }
 

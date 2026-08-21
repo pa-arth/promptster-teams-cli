@@ -994,7 +994,7 @@ func TestProjectEventDurabilityVerdictLivingRanges(t *testing.T) {
 }
 
 // TestProjectEventWindowUsage pins the windowUsage projection (contract.md §2):
-// the seven allowlisted scalars survive, a smuggled content key is stripped, an
+// the eight allowlisted scalars survive, a smuggled content key is stripped, an
 // ABSENT window field stays absent (never coerced to 0), and a genuine 0 is kept.
 // This is the CLI half of the lockstep with the backend's eventFieldProjection.
 func TestProjectEventWindowUsage(t *testing.T) {
@@ -1038,6 +1038,39 @@ func TestProjectEventWindowUsage(t *testing.T) {
 	for _, k := range []string{"transcriptPath", "promptText"} {
 		if _, present := data[k]; present {
 			t.Errorf("smuggled key %q survived windowUsage projection: %+v", k, data)
+		}
+	}
+}
+
+// The OBSERVED-ABSENCE marker, both directions. Present it survives; and an
+// absence event still carries no percentage key at all after projection.
+//
+// This is the lockstep half that fails loudly: if `signalState` were allowlisted
+// here and not in the backend's captureAllowlist.ts, it would be stripped at
+// ingest, every absence would read as an ordinary empty event, and the surface
+// would go back to guessing — with nothing anywhere reporting a fault.
+func TestProjectEventWindowUsageSignalState(t *testing.T) {
+	e := eventWithData("windowUsage", map[string]interface{}{
+		"provider":    "claude_code",
+		"observedAt":  1700000000,
+		"capturedAt":  1700000000,
+		"signalState": "provider_absent",
+		"promptText":  leakCanary,
+	})
+	ProjectEvent(&e, false)
+
+	b, _ := json.Marshal(e)
+	if strings.Contains(string(b), leakCanary) {
+		t.Fatalf("canary survived windowUsage projection: %s", b)
+	}
+	data := e.Data.(map[string]interface{})
+	if data["signalState"] != "provider_absent" {
+		t.Errorf("signalState stripped — the absence marker is now invisible: %+v", data)
+	}
+	// An absence is not a zero. No percentage key may appear, in any form.
+	for _, k := range []string{"fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt"} {
+		if _, present := data[k]; present {
+			t.Errorf("absence event acquired %q in projection: %+v", k, data)
 		}
 	}
 }
