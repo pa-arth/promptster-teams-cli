@@ -108,6 +108,35 @@ func RunStatuslineShim() int {
 //
 // ok=false is now reserved for "this is not a statusline blob at all" (the JSON
 // did not parse). We assert nothing from a payload we could not read.
+//
+// THE PRE-FIRST-RESPONSE TICK IS NOT SPECIAL-CASED HERE, DELIBERATELY.
+// A flat-fee subscriber's status line renders before their session's first API
+// response, and Claude legitimately reports no `rate_limits` at that moment —
+// there is no window to report until a request has been made. So this function
+// emits `provider_absent` for a subscriber, and one tick of that must never
+// become "this person is billed per token" on their manager's screen (parent
+// spec task 1.1, "confirm the pre-first-response absence").
+//
+// The shim is nonetheless RIGHT to emit it, and suppressing it here would be the
+// wrong fix twice over:
+//
+//   - "we asked and Claude reported nothing" is a true observation whatever the
+//     cause, and making it expressible is the entire point of this change.
+//     Withholding it would put a subscriber's absence and a shim that never ran
+//     back into one indistinguishable silence — the defect we just removed.
+//   - the shim cannot tell the two apart cheaply or honestly. The blob's cost
+//     fields would be an inference about first-response state, and they are
+//     deliberately not lifted into `statuslineStdin` (see the struct's doc).
+//     Guessing here is the same over-reading, moved upstream where it is harder
+//     to see.
+//
+// The CONCLUSION is what gets corroborated, and it is corroborated where the
+// evidence actually lives — the backend's `deriveNoSignalReason`, which grants
+// `usage_billed` only when the absence RECURRED and the engineer was observed
+// doing Claude work at or after it began. A startup tick is one observation with
+// no work behind it and earns nothing. Keep those two facts together: this
+// emission is only safe because that derivation is corroborated, and a reader who
+// changes one should read the other.
 func parseClaudeStatuslineBlob(blob []byte, observedAt int64) (windowReading, bool) {
 	var in statuslineStdin
 	if err := json.Unmarshal(blob, &in); err != nil {

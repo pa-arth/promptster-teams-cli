@@ -94,6 +94,37 @@ func TestParseClaudeStatuslineBlob_EmptyRateLimitsIsAnAbsence(t *testing.T) {
 	}
 }
 
+// A SUBSCRIBER's first tick looks exactly like an API-key account's, and that is
+// not a defect to fix here. Claude Code renders the status line before the
+// session's first API response, when there is no window to report yet, so this
+// blob — indistinguishable on the wire from the one above — comes from someone on
+// a flat-fee plan.
+//
+// The shim reports what it observed and the emission stays identical. What must
+// never happen is one of these becoming a billing claim, and that is settled in
+// the backend's deriveNoSignalReason (an absence earns `usage_billed` only after
+// it RECURS and Claude work is observed at or after it began), not by teaching
+// this function to guess. Asserted here so a later reader who reaches for the
+// obvious local fix finds the reason before the code.
+func TestParseClaudeStatuslineBlob_PreFirstResponseIsStillAnAbsence(t *testing.T) {
+	// A real pre-first-response blob: session and model present, cost zeroed, no
+	// rate_limits yet. Same emission as a genuinely usage-billed account.
+	blob := []byte(`{"session_id":"abc","model":{"id":"claude-opus-5"},"cost":{"total_cost_usd":0}}`)
+	r, ok := parseClaudeStatuslineBlob(blob, 1700000000)
+	if !ok {
+		t.Fatal("a pre-first-response blob is still an OBSERVED absence")
+	}
+	if r.SignalState != signalProviderAbsent {
+		t.Errorf("signalState = %q, want %q", r.SignalState, signalProviderAbsent)
+	}
+	// The point of the test: the shim does NOT special-case this. If someone
+	// suppresses it here, "subscriber before first response" and "shim never ran"
+	// collapse back into one silence with five causes.
+	if r.empty() != true {
+		t.Errorf("an absence must carry no window field at all, got %+v", r)
+	}
+}
+
 // A blob we could not read says NOTHING about the account. We assert an absence
 // only from a payload we actually parsed.
 func TestParseClaudeStatuslineBlob_UnparseableIsNotAnAbsence(t *testing.T) {

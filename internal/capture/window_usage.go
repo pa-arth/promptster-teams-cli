@@ -564,9 +564,25 @@ type claudeWindowEmitter struct {
 // 87% carrying no new information; see
 // changes/usage-window-currency-coverage/findings-write-amplification.md).
 //
-// An hour is chosen against what the fact can DO: the backend's absence read
-// looks back 14 days and only ever asks "is there one", so a slower cadence
-// costs nothing but a longer wait for the first correct copy after enabling.
+// An hour is chosen against what the fact can DO — and what it can do CHANGED on
+// 2026-08-21, so this constant is no longer free to grow.
+//
+// The backend's absence read no longer asks "is there one". `deriveNoSignalReason`
+// grants `usage_billed` only to an absence that RECURRED — two markers at
+// different timestamps — because a single one is indistinguishable from the
+// statusline tick that precedes a subscriber's first API response, and one tick
+// must not assert how a named person is billed.
+//
+// So this interval now sets how long a genuinely API-key engineer reads
+// `never_captured` before reading `usage_billed`: two throttled markers, hence
+// roughly one hour. That is a claim about our tooling giving way to a claim about
+// their billing, which is the right order to be wrong in.
+//
+// RAISING THIS LENGTHENS THAT WRONG WINDOW ONE-FOR-ONE. Cutting write volume is a
+// real goal (windowUsage is 24.4% of every captured row; see
+// changes/usage-window-currency-coverage/findings-write-amplification.md), but cut
+// it on the READING path, where 93.9% of the redundancy actually is. Absences are
+// already the cheap side of that ledger.
 const windowAbsenceInterval = time.Hour
 
 func (c *claudeWindowEmitter) maybe(session Session, now time.Time, captureProse bool) {
