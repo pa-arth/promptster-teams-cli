@@ -130,7 +130,15 @@ var projectFieldAllowlist = map[string][]string{
 	// per-kind for the same reason cacheWriteInputTokens does: projectUsageFields
 	// is byte-for-byte lockstep with the backend's USAGE_FIELDS, which is frozen
 	// in field ORDER by the server's historical-allowlist test.
-	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens"),
+	// generationId is Cursor's opaque per-turn id (`generation_id` on the hook
+	// payload). It rides per-kind for the same reason the two above do:
+	// projectUsageFields is byte-for-byte lockstep with the backend's
+	// USAGE_FIELDS, frozen in field ORDER by the server's historical-allowlist
+	// test. Content-free — a vendor identifier, no prose, no path. It is the only
+	// key that can join a usage row to Cursor's own model-resolution step and to
+	// its server-side usage API; the row id folds it in but a hash cannot be
+	// joined on.
+	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId"),
 	// `sidechain` marks work done by a subagent. Its events roll up to the
 	// PARENT session's id (a subagent transcript records its parent's sessionId),
 	// so without this flag subagent work is indistinguishable from the main

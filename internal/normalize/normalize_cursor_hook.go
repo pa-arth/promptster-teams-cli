@@ -504,6 +504,29 @@ func (p cursorHookPayload) usageEvent(model string) (event.Event, bool) {
 	// PER-REQUEST, ASSERTED AT THE EMITTER. See the file header: absent, this
 	// tag means CUMULATIVE downstream, and these numbers are not.
 	data["usageScope"] = "request"
+	// The generation id, carried as a FIELD as well as folded into the row id.
+	//
+	// AFTER the emptiness check above, never before, and the ordering is
+	// load-bearing: written earlier it would make `len(data)` nonzero for an
+	// aborted turn that reported no tokens and resolved no model, and this
+	// function would start emitting rows that say nothing while inflating the
+	// rail's response count against the rails it is compared with. That guard is
+	// three lines up and easy to walk past.
+	//
+	// WHY CARRY IT AT ALL, given the row id already encodes it: the id is a hash
+	// input, not a join key. `generation_id` is the only thing that joins a usage
+	// row to Cursor's own `afterAgentThought` (which resolves the model behind the
+	// `"default"` routing sentinel) and to Cursor's server-side usage API. Neither
+	// join can be performed against an id nobody can reconstruct.
+	//
+	// It is CONTENT-FREE — an opaque vendor identifier, no prose, no path, no
+	// source — which is why it may ride the allowlist at all. It is spelled
+	// camelCase here and stripped as `generation_id` from the raw payload; the
+	// projection test asserts the raw snake_case key never survives, and that
+	// assertion is about the PAYLOAD, not about this field.
+	if p.GenerationID != "" {
+		data["generationId"] = p.GenerationID
+	}
 	e := p.newAIEvent("ai_response", p.usageDiscriminator())
 	e.Data = data
 	return e, true
