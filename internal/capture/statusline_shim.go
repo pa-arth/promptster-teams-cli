@@ -96,14 +96,54 @@ func RunStatuslineShim() int {
 // parseClaudeStatuslineBlob lifts the 5h/weekly window scalars from a Claude Code
 // status-line blob. observedAt is the tick time (contract.md §3: Claude
 // observedAt ~= tick time). Absent/malformed fields are omitted (absent != zero;
-// NaN/Inf dropped). ok=false when nothing usable was present.
+// NaN/Inf dropped).
+//
+// A blob with NO `rate_limits` is an OBSERVED ABSENCE, not a nothing: the shim
+// demonstrably ran and Claude reported no window, which is the one and only
+// evidence that earns "this account is usage-billed". It used to return
+// ok=false, which made that indistinguishable from a shim that never ran — five
+// causes collapsed into one observation, and the surface printed the least
+// likely of them as fact. The absence carries a state and a time and NO
+// percentage, ever.
+//
+// ok=false is now reserved for "this is not a statusline blob at all" (the JSON
+// did not parse). We assert nothing from a payload we could not read.
+//
+// THE PRE-FIRST-RESPONSE TICK IS NOT SPECIAL-CASED HERE, DELIBERATELY.
+// A flat-fee subscriber's status line renders before their session's first API
+// response, and Claude legitimately reports no `rate_limits` at that moment —
+// there is no window to report until a request has been made. So this function
+// emits `provider_absent` for a subscriber, and one tick of that must never
+// become "this person is billed per token" on their manager's screen (parent
+// spec task 1.1, "confirm the pre-first-response absence").
+//
+// The shim is nonetheless RIGHT to emit it, and suppressing it here would be the
+// wrong fix twice over:
+//
+//   - "we asked and Claude reported nothing" is a true observation whatever the
+//     cause, and making it expressible is the entire point of this change.
+//     Withholding it would put a subscriber's absence and a shim that never ran
+//     back into one indistinguishable silence — the defect we just removed.
+//   - the shim cannot tell the two apart cheaply or honestly. The blob's cost
+//     fields would be an inference about first-response state, and they are
+//     deliberately not lifted into `statuslineStdin` (see the struct's doc).
+//     Guessing here is the same over-reading, moved upstream where it is harder
+//     to see.
+//
+// The CONCLUSION is what gets corroborated, and it is corroborated where the
+// evidence actually lives — the backend's `deriveNoSignalReason`, which grants
+// `usage_billed` only when the absence RECURRED and the engineer was observed
+// doing Claude work at or after it began. A startup tick is one observation with
+// no work behind it and earns nothing. Keep those two facts together: this
+// emission is only safe because that derivation is corroborated, and a reader who
+// changes one should read the other.
 func parseClaudeStatuslineBlob(blob []byte, observedAt int64) (windowReading, bool) {
 	var in statuslineStdin
 	if err := json.Unmarshal(blob, &in); err != nil {
 		return windowReading{}, false
 	}
 	if in.RateLimits == nil {
-		return windowReading{}, false
+		return absenceReading(signalProviderAbsent, observedAt), true
 	}
 	r := windowReading{ObservedAt: observedAt}
 	if fh := in.RateLimits.FiveHour; fh != nil {
@@ -123,7 +163,12 @@ func parseClaudeStatuslineBlob(blob []byte, observedAt int64) (windowReading, bo
 		}
 	}
 	if r.empty() {
-		return windowReading{}, false
+		// `rate_limits` was present but carried nothing usable — no percentage and
+		// no reset on either window. Claude reports only the two windows this
+		// contract already names, so there is no third span hiding here: the
+		// provider was asked and answered with nothing. Same fact as a missing
+		// object, same state.
+		return absenceReading(signalProviderAbsent, observedAt), true
 	}
 	return r, true
 }

@@ -282,11 +282,17 @@ var projectFieldAllowlist = map[string][]string{
 	// surrounding usage/session field. Absent != zero: a window the provider did
 	// not report is OMITTED (projectEvent drops nil/absent keys), a genuine 0 is
 	// 0, and a NaN percentage is dropped at the emitter before it reaches here.
+	// signalState is the OBSERVED-ABSENCE marker: "reported" | "provider_absent" |
+	// "plan_unsupported", a closed enum of three content-free words. It is present
+	// only when the provider was asked and gave us no window, and it is the only
+	// thing that separates that from a shim that never ran — which are the same
+	// bytes without it, and which mean opposite things about how someone is billed.
+	// It never accompanies a percentage.
 	// LOCKSTEP with promptster-backend packages/shared/src/eventFieldProjection.ts
-	// (§2 of usage-window-currency/contract.md): these seven keys must be
+	// (§2 of usage-window-currency/contract.md): these eight keys must be
 	// allowlisted on BOTH sides in the same release — a field allowed here but not
 	// there is silently stripped at ingest and reads as an older CLI.
-	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt"},
+	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
