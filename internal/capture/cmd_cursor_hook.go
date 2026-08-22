@@ -237,7 +237,16 @@ func daemonWatchRoot() string {
 // startup, and the engineer does nothing at all. It is idempotent, so running it
 // on every start costs one stat and one parse when nothing has changed.
 func EnsureCursorHooksBestEffort() {
-	changed, err := EnsureCursorHooks()
+	changed, repairs, err := ensureCursorHooks()
+	for _, r := range repairs {
+		// ALWAYS printed, never gated on verbose: this is us editing a file we do
+		// not own, to undo damage we did. The persistent record is in
+		// cursorHookRepairLogPath() and `status` reports it, because a line on a
+		// daemon's stderr is exactly the kind of signal nobody reads — which is
+		// how this defect survived two days in the first place.
+		fmt.Fprintf(os.Stderr, "promptster-teams: repaired %s in %s — %s (%s)\n",
+			r.Step, cursorUserHooksPath(), r.Action, r.Reason)
+	}
 	if err != nil {
 		// Loud enough to diagnose, never fatal. The most likely cause is an
 		// engineer's own hooks.json that does not parse — which we refuse to
