@@ -220,13 +220,20 @@ var projectFieldAllowlist = map[string][]string{
 	// Both kinds must list them. This rail default-DENIES, so a field the CLI
 	// sends and this map does not name is stripped SILENTLY: the beat would keep
 	// returning 201 and the numbers would simply never arrive.
+	// `cursorHooks` / `cursorHookRepairs` / `cursorHookUnverifiable` are the
+	// device's own Cursor hook rail health — a CLOSED enum word and two integers
+	// ABOUT the file, never anything out of it. hooks.json is shared with other
+	// tools, so this rail must never carry a reason string: a neighbour's command
+	// line would ride out with it. See presenceData.CursorHooks.
 	"heartbeat": {
 		"device", "cliVersion", "os", "arch", "watching",
 		"pendingEvents", "pendingOldestEventAt",
+		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 	},
 	"presence": {
 		"device", "cliVersion", "os", "arch", "watching", "state",
 		"pendingEvents", "pendingOldestEventAt",
+		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 	},
 	// Config census: token-count inventory — counts and names only.
 	// workspaceKey is a git remote slug (owner/name) or an opaque sha256(path)

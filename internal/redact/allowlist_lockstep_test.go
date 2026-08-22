@@ -254,6 +254,21 @@ var deviceOnlyFields = map[string]map[string]string{
 		"pendingOldestEventAt": "Same beat, same pre-projection path; lands in " +
 			"engineer_keys.latest_pending_oldest_event_at. The two move as one — the count alone " +
 			"cannot tell 62k-queued-five-minutes-ago from 62k-queued-three-weeks-ago.",
+		"cursorHooks": "Same pre-projection path as pendingEvents, and denormalized for the same " +
+			"reason. teams-ingest.ts reads event.data.cursorHooks off the raw beat, refuses any word " +
+			"outside the closed enum, and writes engineer_keys.latest_cursor_hook_state / " +
+			"latest_cursor_hook_reported_at (promptster-backend#777). NOT persisted onto the timeline " +
+			"row on purpose: this answers a CURRENT-STATE question — 'is anyone's hooks.json being " +
+			"rejected right now' — and a state word on every beat would be a second, disagreeing " +
+			"source for it. The history that matters is carried by cursorHookRepairs, which is " +
+			"cumulative. Emitted at internal/capture/presence.go via InspectCursorHookRail().",
+		"cursorHookRepairs": "Same beat, same path; lands in engineer_keys.latest_cursor_hook_repairs. " +
+			"Cumulative over the life of the repair log, which is what makes the row-per-beat history " +
+			"unnecessary: 'did the v0.18.1 repair ever run on this machine' is a scalar, not a series.",
+		"cursorHookUnverifiable": "Same beat, same path; lands in " +
+			"engineer_keys.latest_cursor_hook_unverifiable. Rides with the state rather than alone — " +
+			"it is the honesty term on `ok`, which means 'nothing PROVABLY wrong', and where this is " +
+			"non-zero that is a weaker claim than the word sounds.",
 	},
 	// `heartbeat` is NOT a kind this CLI mints. The emitter walk finds zero
 	// construction sites for it; the only beat built here is `presence`
@@ -271,7 +286,10 @@ var deviceOnlyFields = map[string]map[string]string{
 	"heartbeat": {
 		"pendingEvents": "Mirrors presence.pendingEvents for the server's other accepted beat " +
 			"spelling. This CLI constructs no `heartbeat` event, so no bytes leave here for it today.",
-		"pendingOldestEventAt": "Mirrors presence.pendingOldestEventAt, same reason.",
+		"pendingOldestEventAt":   "Mirrors presence.pendingOldestEventAt, same reason.",
+		"cursorHooks":            "Mirrors presence.cursorHooks for the server's other accepted beat spelling.",
+		"cursorHookRepairs":      "Mirrors presence.cursorHookRepairs, same reason.",
+		"cursorHookUnverifiable": "Mirrors presence.cursorHookUnverifiable, same reason.",
 	},
 }
 
