@@ -348,3 +348,48 @@ func TestDoctorReportsARepairAfterTheFact(t *testing.T) {
 		t.Errorf("repair line = %q, want it to name the untouched copy", found)
 	}
 }
+
+// A repair record must not cost the machine its health verdict.
+//
+// The repair note is informational, and the tail of CursorHooksDoctor gates the
+// healthy lines on "did I find a problem?" — asked, at the time, as "is the list
+// non-empty?". Appending the note to that same list silently satisfied the gate,
+// so every machine that had ever been repaired lost BOTH its enrollment verdict
+// and its usage-coverage numbers from then on. Permanently: the repair record is
+// permanent. Two questions, one condition; caught by review on PR #173.
+func TestARepairRecordDoesNotSuppressTheHealthVerdict(t *testing.T) {
+	home := sandboxHome(t)
+	// A neighbour entry we will repair, so the record exists...
+	writeHooks(t, home, `{"version":1,"hooks":{"sessionStart":[{"type":"","command":"/bin/theirs"}]}}`)
+	if _, err := EnsureCursorHooks(); err != nil {
+		t.Fatal(err)
+	}
+	// ...and an otherwise perfectly healthy machine.
+	bin := cursorHookCommandBinary(cursorHookCommand())
+	if err := os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("binary"), 0o700); err != nil { // #nosec G306 -- test fixture.
+		t.Fatal(err)
+	}
+
+	lines := CursorHooksDoctor()
+	var repaired, enrolled bool
+	for _, l := range lines {
+		if l.Err || l.Warn {
+			t.Errorf("healthy machine reported a problem: %+v", l)
+		}
+		if strings.Contains(l.Text, "repaired") {
+			repaired = true
+		}
+		if strings.Contains(l.Text, "enrolled for all") {
+			enrolled = true
+		}
+	}
+	if !repaired {
+		t.Error("the repair note is gone")
+	}
+	if !enrolled {
+		t.Errorf("the enrollment verdict was suppressed by the repair note; got %+v", lines)
+	}
+}
