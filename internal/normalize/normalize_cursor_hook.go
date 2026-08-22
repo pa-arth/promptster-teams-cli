@@ -46,10 +46,13 @@ import (
 //     keys ABSENT, not zero. Deliberately NOT branched on: a `status ==
 //     "completed"` gate would silently drop an unenumerated status that does
 //     bill, where absent-means-absent covers that case for free.
-//   - model / model_id — both the literal "default". The resolved id lives on
-//     afterAgentThought, and the two arrive in different processes, so the join
-//     happens on device; this package takes it as CursorHookOptions.ResolveModel
-//     rather than doing any I/O of its own.
+//   - model / model_id — both the literal "default" whenever the picker is on
+//     Auto. The resolved id lives on afterAgentThought, and the two arrive in
+//     different processes, so the join happens on device; this package takes it
+//     as CursorHookOptions.ResolveModel rather than doing any I/O of its own.
+//     THE TWO HALVES ARE NOT KEYED ALIKE: `stop` carries the bare turn UUID and
+//     the resolved model rides a `-<n>-<slug>` sub-request id built on it. See
+//     cursorGenerationBaseID in internal/capture.
 //
 // STILL NOT HERE: anything resembling source. tool_output,
 // edits[].old_string/new_string and afterShellExecution's `output` all arrive in
@@ -66,8 +69,11 @@ type cursorHookPayload struct {
 
 	// Model identity. `model` is frequently the literal "default" (routing).
 	// `model_id` is usually the resolved model — except Cursor also sends
-	// model_id:"default" as a sentinel (IDE afterAgentThought, measured
-	// 2026-08-03). modelLabel rejects both sentinels.
+	// model_id:"default" as a sentinel on afterAgentThought. Measured 2026-08-22
+	// (IDE 3.17.8, Auto): each thought fires TWICE, once on the bare turn UUID
+	// carrying the sentinel and once on a `-<n>-<slug>` sub-request id carrying
+	// the real model. modelLabel rejects both sentinels, so the sentinel copy
+	// records nothing and only the resolved copy reaches the cache.
 	Model       string                `json:"model"`
 	ModelID     string                `json:"model_id"`
 	ModelParams []cursorHookModelParm `json:"model_params"`
@@ -185,10 +191,14 @@ func NormalizeCursorHook(line []byte, opts CursorHookOptions) (CursorHookResult,
 	if sess == "" || p.HookEventName == "" {
 		return CursorHookResult{}, false
 	}
-	// `stop` reports the routing sentinel on both model spellings, so its model
-	// comes from the cache the thought step filled. Every other step resolves its
-	// own or has none; neither is allowed to reach into the cache, because the
-	// value of a per-generation join is precisely that it cannot inherit.
+	// `stop` reports the routing sentinel on both model spellings when the picker
+	// is on Auto, so its model comes from the cache the thought step filled. The
+	// lookup is keyed on the BASE turn id, because stop's generation id is the
+	// bare UUID while the resolved model arrived on a sub-request id built from
+	// it; cursorGenerationBaseID owns that reduction on both sides. Every other
+	// step resolves its own or has none; neither is allowed to reach into the
+	// cache, because the value of a per-generation join is precisely that it
+	// cannot inherit.
 	model := p.modelLabel()
 	if model == "" && p.HookEventName == "stop" && p.GenerationID != "" && opts.ResolveModel != nil {
 		model = opts.ResolveModel(p.GenerationID)
@@ -298,10 +308,15 @@ func (p cursorHookPayload) newAIEvent(kind, discriminator string) event.Event {
 
 // modelLabel resolves the model to report. model_id is usually the resolved
 // model, but Cursor also sends the literal "default" there as a routing
-// sentinel (IDE afterAgentThought, measured 2026-08-03). Treating that as a
-// real model poisons model-mix metrics and used to mint an ai_response that
-// claimed the transcript away from the watcher with nothing useful on it.
-// `model` is often the same sentinel and is worth nothing on its own.
+// sentinel (IDE afterAgentThought, measured 2026-08-03, re-measured 2026-08-22
+// on 3.17.8). Treating that as a real model poisons model-mix metrics and used
+// to mint an ai_response that claimed the transcript away from the watcher with
+// nothing useful on it. `model` is often the same sentinel and is worth nothing
+// on its own.
+//
+// Returning "" for the sentinel is what makes the generation join safe: the
+// sentinel-bearing thought and the resolved one share a base id, so a permissive
+// modelLabel would let "default" overwrite a real model under the same key.
 func (p cursorHookPayload) modelLabel() string {
 	if id := p.ModelID; id != "" && id != "default" {
 		return id
