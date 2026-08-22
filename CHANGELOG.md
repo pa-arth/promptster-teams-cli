@@ -6,6 +6,42 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+**The Cursor model join was keyed on two different ids and could never fire.**
+Every auto-routed Cursor turn shipped its tokens with no model, so the backend
+declined to price it — the `$0` on the Cursor rail was partly this, not the rate
+table.
+
+Cursor delivers one turn's facts across two hooks: `afterAgentThought` carries
+the resolved model, `stop` carries the tokens and reports `"default"` on both
+model spellings. `cursorGenerationModel` joined them on `generation_id`. They do
+not share one. Measured on IDE 3.17.8 with the picker on Auto, 2026-08-22:
+
+```
+afterAgentThought  gen 3a8b6e45-…-617844887809         model_id "default"
+afterAgentThought  gen 3a8b6e45-…-617844887809-3-1v0i  model_id "composer-2.5"
+stop               gen 3a8b6e45-…-617844887809         model_id "default"   in=823043 out=4914
+```
+
+Each thought fires **twice** — once on the bare turn UUID reporting the sentinel,
+once on a `-<n>-<slug>` sub-request id carrying the real model. `modelLabel`
+correctly rejects the sentinel, so the cache only ever learned suffixed ids,
+while the lookup only ever asked for bare ones. Guaranteed miss.
+
+Both sides now reduce to the base turn UUID (`cursorGenerationBaseID`). The
+36-char prefix is verified to be a canonical UUID before it is used: an id of an
+unrecognised shape is kept whole, because truncating one would mint a key that
+silently joins unrelated turns — quieter and worse than the miss being fixed.
+
+**Why it survived review.** On a *pinned* model `stop` resolves its own model and
+never consults the cache, so the join is dead code on exactly the turns that
+work. It is reached only under Auto, where it missed every time — invisible in
+aggregate, and perfectly correlated with the one case it existed to serve. The
+regression test asserted the bug: it used `"g1"` for both halves, a shape Cursor
+never emits. It now uses the ids Cursor actually sent, and fails without the fix.
+
+
 ## [0.18.1] — 2026-08-22
 
 **We were writing the entry that killed every Cursor hook on the machine.**

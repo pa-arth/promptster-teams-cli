@@ -94,6 +94,10 @@ const (
 	// cursorLastOutputMax bounds the monotonicity inputs the same way. One entry
 	// per live conversation; a handful is the real number.
 	cursorLastOutputMax = 64
+	// cursorGenerationUUIDLen is the length of a canonical 8-4-4-4-12 UUID, which
+	// is the prefix Cursor suffixes with `-<n>-<slug>` to identify a sub-request
+	// within one turn. See cursorGenerationBaseID.
+	cursorGenerationUUIDLen = 36
 )
 
 func loadCursorGenerations() cursorGenerations {
@@ -173,6 +177,70 @@ func pruneCursorGenerations(c *cursorGenerations, now time.Time) {
 	}
 }
 
+// cursorGenerationBaseID reduces a generation id to the TURN it belongs to.
+//
+// MEASURED 2026-08-22, Cursor IDE 3.17.8, model picker on Auto. One turn emits
+// afterAgentThought TWICE per thought, under two different ids:
+//
+//	gen 3a8b6e45-…-617844887809         model_id "default"       <- routing sentinel
+//	gen 3a8b6e45-…-617844887809-3-1v0i  model_id "composer-2.5"  <- the resolved model
+//
+// and `stop` carries the BARE id with the tokens. So the two halves of this join
+// were keyed differently and could never meet. The cache only ever learned
+// SUFFIXED ids — the bare thought reports the sentinel, which modelLabel
+// correctly rejects, so it records nothing — while the lookup only ever asked
+// for BARE ones.
+//
+// WHY NOBODY SAW IT. On a PINNED model `stop` resolves its own model and never
+// consults the cache, so the join is dead code on exactly the turns that work.
+// It is consulted only under Auto, where it missed every time. The failure was
+// therefore invisible in aggregate and perfectly correlated with the one case it
+// existed to serve: Auto turns are precisely the turns that arrived unpriced.
+//
+// The suffix is `-<n>-<slug>` appended to a full UUID, so the base is the first
+// 36 characters and nothing needs parsing. The UUID shape is VERIFIED rather
+// than assumed: an id that is not a UUID keeps its full value, because
+// truncating an unrecognised shape would mint a key that silently joins two
+// unrelated turns — a quieter and worse failure than the one being fixed.
+//
+// Normalising on BOTH sides is what makes the entry findable; doing it on one
+// side only moves the miss rather than closing it. Entries written by an older
+// build under a suffixed key simply go unread and expire on the TTL, so no
+// migration is needed.
+func cursorGenerationBaseID(id string) string {
+	if len(id) <= cursorGenerationUUIDLen || id[cursorGenerationUUIDLen] != '-' {
+		return id
+	}
+	if !isCursorGenerationUUID(id[:cursorGenerationUUIDLen]) {
+		return id
+	}
+	return id[:cursorGenerationUUIDLen]
+}
+
+// isCursorGenerationUUID reports whether s is exactly a canonical 8-4-4-4-12
+// hex UUID. Deliberately hand-rolled and allocation-free: this runs inside the
+// engineer's agent loop on every hook invocation.
+func isCursorGenerationUUID(s string) bool {
+	if len(s) != cursorGenerationUUIDLen {
+		return false
+	}
+	for i := 0; i < cursorGenerationUUIDLen; i++ {
+		c := s[i]
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			isHex := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // recordCursorGenerationModel remembers which model produced a generation.
 //
 // afterAgentThought fires many times per turn and every one resolves the same
@@ -183,6 +251,7 @@ func recordCursorGenerationModel(generationID, model string) {
 	if generationID == "" || model == "" {
 		return
 	}
+	generationID = cursorGenerationBaseID(generationID)
 	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
 		if prev, ok := c.Entries[generationID]; ok && prev.Model == model {
@@ -204,6 +273,7 @@ func cursorGenerationModel(generationID string) string {
 	if generationID == "" {
 		return ""
 	}
+	generationID = cursorGenerationBaseID(generationID)
 	e, ok := loadCursorGenerations().Entries[generationID]
 	if !ok || time.Since(time.UnixMilli(e.TsMs)) > cursorGenerationTTL {
 		return ""
