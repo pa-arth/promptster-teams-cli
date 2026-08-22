@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-08-21
+
+**Two facts the device already had, and never sent.** When the provider reported
+no rate-limit window the capture path emitted *nothing*, so "the provider reported
+no window" and "the shim never ran" were byte-identical on the wire — and the
+console resolved that one observation into the least likely of its five meanings,
+printing **"Usage-billed — no window · Pay-as-you-go account"** about a named
+person. Four of the five causes are flat-fee subscribers whose marginal cost is
+`$0`, which is exactly the population the "% of window" currency exists to serve.
+Separately, Cursor's `generation_id` was parsed on every turn and fed to a hash,
+but never written into the payload — so the only key that can resolve a Cursor
+row's model never left the machine.
+
+Minor, not patch: two new fields leave the machine.
+
+**Upgrading is the only fix for either.** Both are decided on-device and folded
+into the event before it is signed, so a session captured by 0.17.0 has no
+`signalState` and no `generationId`, and no backend re-derivation puts them back.
+
+### Added
+
+- **An absent window is now a positive fact** (#170). `signalState` on
+  `windowUsage` — a closed enum of three content-free words. `provider_absent`
+  (the Claude shim parsed the blob and there was no `rate_limits`) is the **only**
+  evidence that earns "usage-billed"; `plan_unsupported` (Codex reported a span we
+  cannot carry) says "your plan's window isn't one we carry yet", which is not a
+  billing claim; `reported` is the normal case and is omitted from the wire.
+
+  **An absence carries no percentage key at all** — not `null`, not `0` —
+  constructed through `absenceReading()` rather than at each call site so a future
+  caller cannot reintroduce one, and pinned in the emitter tests *and* the
+  projection test. The spool's drain also had to change: it discarded anything
+  `empty()`, which is what an absence is by construction.
+
+  Throttled to one per hour per provider and **never gated on `lastObserved`**. An
+  absence's `observedAt` is the tick time, so it moves every tick and de-dup cannot
+  bound it — unthrottled that is one event per statusline render against a fact
+  that does not change (6,893 `windowUsage` events measured on one machine, 87%
+  carrying no new information). Keeping the throttle off the `lastObserved` path is
+  what lets a plan change produce a reading *immediately* after an absence rather
+  than an hour later, and there is a test for that direction specifically.
+
+  `ok=false` from the shim parser now means only "this is not a statusline blob".
+  We assert nothing from a payload we could not read.
+
+- **Cursor rows carry `generationId`** (#171). The field was parsed and handed to
+  the row-id discriminator, and never written into `data` — settled against prod
+  rather than by reading code: zero rows carried it, all orgs, all time. **A hash
+  input is not a join key.** `afterAgentThought` resolves `model_id` against the
+  *generation*, not the session, so a row that arrives modelless can never be
+  repaired server-side.
+
+  The write sits **after** the empty-payload guard, and is commented as such.
+  Written before it, a fully aborted turn stops being empty and the normalizer
+  begins emitting rows that say nothing — while inflating this rail's response
+  count against the rails it is compared with.
+
+  Both releases re-sync `testdata/capture-allowlist-canonical.json`, which is
+  maintained **by hand**. Between a server-side allowlist landing and its emitter
+  shipping here, the lockstep guard compares against a stale server surface and
+  passes — so the window in which a divergence exists is precisely the window in
+  which the guard cannot see it. It reports on whenever someone last remembered.
+
 ## [0.17.0] — 2026-08-20
 
 **Three rails gained a number they had been generating all along.** Cursor turns
@@ -1671,7 +1734,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.14.0...v0.15.0
