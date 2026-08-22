@@ -45,9 +45,54 @@ so state the scope, not just "hooks".)
 `internal/capture/cursor_hooks.go` writes it, and enrollment happens
 automatically at `watch` startup via `EnsureCursorHooksBestEffort()` — so an
 already-installed fleet gets the hook rail purely by self-updating (~30m) and
-re-execing. Nobody reinstalls anything. `loadCursorHookConfig` preserves
-top-level keys it does not model and **refuses to overwrite a hooks.json that
-does not parse** — an engineer's own config is never clobbered.
+re-execing. Nobody reinstalls anything.
+
+**We clobbered engineers' configs for months, and this paragraph used to say we
+never did.** The claim rested on two real guards — `loadCursorHookConfig`
+preserves top-level keys it does not model, and refuses to overwrite a
+hooks.json that does not parse — neither of which is about the thing that broke:
+
+- **Cursor's validation is all-or-nothing at FILE granularity.** One entry it
+  rejects and it discards the whole config, every step, every tool's hooks. The
+  only trace is
+  `~/Library/Application Support/Cursor/logs/*/window*/output_*/cursor.hooks.*.log`,
+  which nobody reads. Ours going quiet looks identical to Cursor being idle.
+- **A hook entry MAY omit `type`** (it defaults to `command`), so
+  `{"command": "…"}` is legal and common. `cursorHookCmd` modelled `type` as a
+  plain string with no omitempty, so reading a legal type-less neighbour entry
+  and writing the file back produced `"type": ""` — invalid, whole file rejected.
+  Measured on one machine: neighbour entry legal on Aug 18 16:36, our watcher
+  round-tripped it, `Invalid user config: sessionStart[1]` from Aug 20 21:41
+  onward, **17 hooks across four tools dead for two days.**
+- **The same struct silently deleted `timeout`, `matcher`, `loop_limit` and
+  `failClosed`** from neighbours' entries on every write, because it marshalled
+  only the four keys it modelled. `matcher` decides which files their hook fires
+  on; `failClosed` decides whether its failure blocks their agent.
+
+What holds now, all pinned in `cursor_hooks_validate_test.go`:
+
+1. **Entries round-trip verbatim.** `cursorHookCmd` keeps the raw keys and
+   marshals from them; typed fields are decode-side conveniences only.
+2. **`saveCursorHookConfig` refuses to write a config Cursor would reject.** The
+   gate is on the WRITE side because a read-side check could not have caught
+   this — the file we read was fine; our serialisation is what broke it.
+3. **Pre-existing damage is repaired** at `watch` startup, but only by deleting a
+   meaningless `type` key so Cursor's documented default applies. We never delete
+   a neighbour's entry: that would be right only while our validator is right,
+   and down-and-loud beats quietly destructive. Anything else is reported by
+   `doctor`/`status` and left alone.
+4. **The validator is one-directional.** It answers "can I prove Cursor rejects
+   this?", never "do I recognise this?" — an unfamiliar hook type is `unknown`,
+   not invalid, so the vendor shipping a third kind makes us quiet rather than
+   wrong. `CursorHooksDoctor` says how many entries it could not judge instead of
+   implying it checked everything.
+5. **Repairs leave a record** (`~/.promptster-teams/cursor-hook-repairs.json`,
+   plus an untouched pre-repair copy), because a successful repair is otherwise
+   invisible — the same silence the defect was made of.
+
+The general shape, worth carrying to any shared config file: **a validator that
+only reads is blind to a defect its own writer creates**, and **whole-file
+rejection means being a good neighbour is a correctness property, not manners.**
 
 **Registered steps** (`cursorHookSteps`): `sessionStart`, `sessionEnd`,
 `beforeSubmitPrompt`, `afterFileEdit`, `afterShellExecution`,

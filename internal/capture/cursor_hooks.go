@@ -137,11 +137,189 @@ type cursorHookConfig struct {
 	rest map[string]json.RawMessage
 }
 
+// cursorHookCmd is one entry in a step's array.
+//
+// IT ROUND-TRIPS THE ENTRY'S ORIGINAL KEYS VERBATIM, and that is not tidiness —
+// it is the fix for a defect that killed every hook on the machine it ran on.
+//
+// This struct used to model four string fields and marshal exactly those, which
+// destroyed a neighbour's configuration two independent ways:
+//
+//  1. `type` was tagged `json:"type"` with no omitempty. Cursor's schema lets an
+//     entry OMIT `type` (it defaults to "command"), so `{"command": "…"}` is
+//     legal and common. Reading one gave Type == "" and writing it back produced
+//     `"type": ""` — which Cursor rejects, and it rejects the WHOLE FILE for it.
+//     Every hook on that machine, ours and three other tools', went silent for
+//     two days. See the header of cursor_hooks_validate.go for the timeline.
+//  2. `timeout`, `matcher`, `loop_limit` and `failClosed` are real Cursor fields
+//     this struct never modelled, so they were silently deleted on every write.
+//     `matcher` decides which files a neighbour's hook fires on and `failClosed`
+//     decides whether its failure blocks the agent — dropping them changes what
+//     their tool DOES, with nothing in their file to show why.
+//
+// So `raw` is the source of truth for marshalling and the typed fields are
+// decoded conveniences for our own matching. Repairs edit `raw`; nothing mutates
+// a typed field in place, because two representations of one entry drift.
 type cursorHookCmd struct {
-	Type    string `json:"type"`
-	Command string `json:"command,omitempty"`
-	Prompt  string `json:"prompt,omitempty"`
-	Model   string `json:"model,omitempty"`
+	Type    string
+	Command string
+	Prompt  string
+	Model   string
+
+	// raw is the entry exactly as read. nil for entries constructed in code.
+	raw map[string]json.RawMessage
+	// notObject holds an array element that is not a JSON object at all, kept
+	// byte-for-byte. Cursor calls that invalid; we keep it so the validator can
+	// SAY so and so writing the file back does not silently delete it.
+	notObject json.RawMessage
+}
+
+// newCursorCommandHook builds one of our own entries.
+func newCursorCommandHook(command string) cursorHookCmd {
+	return cursorHookCmd{
+		Type:    "command",
+		Command: command,
+		raw: map[string]json.RawMessage{
+			"type":    json.RawMessage(`"command"`),
+			"command": mustJSONString(command),
+		},
+	}
+}
+
+func mustJSONString(v string) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		// A Go string always marshals. Falling back to an empty JSON string keeps
+		// this total rather than panicking inside a best-effort install path.
+		return json.RawMessage(`""`)
+	}
+	return b
+}
+
+func (c *cursorHookCmd) UnmarshalJSON(b []byte) error {
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		// Not an object. Keep the bytes: an entry we cannot model is still an
+		// entry the engineer wrote, and the validator has to be able to see it to
+		// explain why Cursor is refusing the file.
+		c.notObject = append(json.RawMessage(nil), b...)
+		return nil
+	}
+	c.raw = raw
+	// Decoded best-effort: a non-string `command` must NOT fail the load, or we
+	// never reach the validator that can name it. Presence and type are read from
+	// raw, never inferred from these being empty.
+	c.Type = cursorRawString(raw["type"])
+	c.Command = cursorRawString(raw["command"])
+	c.Prompt = cursorRawString(raw["prompt"])
+	c.Model = cursorRawString(raw["model"])
+	return nil
+}
+
+func (c cursorHookCmd) MarshalJSON() ([]byte, error) {
+	if c.notObject != nil {
+		return c.notObject, nil
+	}
+	if c.raw != nil {
+		return json.Marshal(c.raw)
+	}
+	// A struct literal (tests, older call sites). Emit only non-empty keys, so a
+	// literal without a Type does not acquire the `"type": ""` this whole file
+	// exists to stop producing.
+	out := map[string]json.RawMessage{}
+	for k, v := range map[string]string{"type": c.Type, "command": c.Command, "prompt": c.Prompt, "model": c.Model} {
+		if v != "" {
+			out[k] = mustJSONString(v)
+		}
+	}
+	return json.Marshal(out)
+}
+
+// has reports whether the entry carries a key AT ALL — the distinction Cursor
+// draws between an absent `type` (legal, defaults to "command") and an empty one
+// (fatal for the entire file).
+func (c cursorHookCmd) has(key string) bool {
+	if c.raw != nil {
+		_, ok := c.raw[key]
+		return ok
+	}
+	switch key {
+	case "type":
+		return c.Type != ""
+	case "command":
+		return c.Command != ""
+	case "prompt":
+		return c.Prompt != ""
+	case "model":
+		return c.Model != ""
+	}
+	return false
+}
+
+func (c cursorHookCmd) isString(key string) bool {
+	if c.raw == nil {
+		return c.has(key)
+	}
+	v, ok := c.raw[key]
+	t := strings.TrimSpace(string(v))
+	return ok && strings.HasPrefix(t, `"`)
+}
+
+func (c cursorHookCmd) isBool(key string) bool {
+	v, ok := c.raw[key]
+	t := strings.TrimSpace(string(v))
+	return ok && (t == "true" || t == "false")
+}
+
+func (c cursorHookCmd) isNull(key string) bool {
+	v, ok := c.raw[key]
+	return ok && strings.TrimSpace(string(v)) == "null"
+}
+
+func (c cursorHookCmd) number(key string) (float64, bool) {
+	v, ok := c.raw[key]
+	if !ok {
+		return 0, false
+	}
+	var f float64
+	if err := json.Unmarshal(v, &f); err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// withoutKey returns a copy with one key deleted, leaving the original alone.
+func (c cursorHookCmd) withoutKey(key string) cursorHookCmd {
+	out := c
+	out.raw = map[string]json.RawMessage{}
+	for k, v := range c.raw {
+		if k != key {
+			out.raw[k] = v
+		}
+	}
+	switch key {
+	case "type":
+		out.Type = ""
+	case "command":
+		out.Command = ""
+	case "prompt":
+		out.Prompt = ""
+	case "model":
+		out.Model = ""
+	}
+	return out
+}
+
+// cursorRawString decodes a JSON string, or "" for anything that is not one.
+func cursorRawString(v json.RawMessage) string {
+	if len(v) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return ""
+	}
+	return s
 }
 
 // cursorHookCommand is the command Cursor invokes. It MUST be the canonical
@@ -166,7 +344,14 @@ func cursorHookCommand() string {
 // whose path went stale is precisely the one that must be REPLACED, not kept
 // alongside a second copy.
 func isPromptsterCursorHook(c cursorHookCmd) bool {
-	return c.Type == "command" && containsCursorHookSubcommand(c.Command)
+	// A type-less entry IS a command hook — Cursor defaults it. Requiring
+	// type == "command" here would fail to recognise our own binary in a
+	// hand-written entry and append a second copy beside it, double-emitting
+	// every event on that step.
+	if c.has("type") && c.Type != "command" {
+		return false
+	}
+	return containsCursorHookSubcommand(c.Command)
 }
 
 func containsCursorHookSubcommand(cmd string) bool {
@@ -194,17 +379,42 @@ func loadCursorHookConfig(path string) (cursorHookConfig, error) {
 		return cfg, nil
 	}
 
+	parsed, err := parseCursorHookConfig(data)
+	if err != nil {
+		return cfg, fmt.Errorf("%s: %w", path, err)
+	}
+	return parsed, nil
+}
+
+// parseCursorHookConfig decodes hooks.json bytes.
+//
+// SYNTAX ERRORS ARE FATAL, SEMANTIC ONES ARE NOT, and the split is deliberate.
+// Bytes we cannot parse cannot be rewritten without guessing at what they meant,
+// so the caller aborts. An entry that parses but breaks Cursor's rules is
+// something we can name precisely, report, and sometimes repair — so it must
+// reach the validator rather than dying here as "unreadable".
+func parseCursorHookConfig(data []byte) (cursorHookConfig, error) {
+	cfg := cursorHookConfig{Version: 1, Hooks: map[string][]cursorHookCmd{}, rest: map[string]json.RawMessage{}}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return cfg, fmt.Errorf("%s is not valid JSON: %w", path, err)
+		return cfg, fmt.Errorf("is not valid JSON: %w", err)
+	}
+	// Version is read WITHOUT a default when the key is present: Cursor rejects a
+	// config whose version is not a positive integer, so a bad one has to survive
+	// as far as the validator instead of being quietly normalised to 1 here.
+	if _, ok := raw["version"]; !ok {
+		cfg.Version = 0
 	}
 	for k, v := range raw {
 		switch k {
 		case "version":
+			// A non-numeric version leaves this 0, which the validator reports and
+			// the repair sets to 1.
+			cfg.Version = 0
 			_ = json.Unmarshal(v, &cfg.Version)
 		case "hooks":
 			if err := json.Unmarshal(v, &cfg.Hooks); err != nil {
-				return cfg, fmt.Errorf("%s has an unreadable \"hooks\" block: %w", path, err)
+				return cfg, fmt.Errorf("has an unreadable \"hooks\" block: %w", err)
 			}
 		default:
 			cfg.rest[k] = v
@@ -212,9 +422,6 @@ func loadCursorHookConfig(path string) (cursorHookConfig, error) {
 	}
 	if cfg.Hooks == nil {
 		cfg.Hooks = map[string][]cursorHookCmd{}
-	}
-	if cfg.Version == 0 {
-		cfg.Version = 1
 	}
 	return cfg, nil
 }
@@ -242,7 +449,7 @@ func mergeCursorHooks(cfg *cursorHookConfig, command string) bool {
 			kept = append(kept, e)
 		}
 		if !found {
-			kept = append(kept, cursorHookCmd{Type: "command", Command: command})
+			kept = append(kept, newCursorCommandHook(command))
 			changed = true
 		}
 		cfg.Hooks[step] = kept
@@ -299,6 +506,25 @@ func saveCursorHookConfig(path string, cfg cursorHookConfig) error {
 	}
 	data = append(data, '\n')
 
+	// THE GATE: never persist a config Cursor would throw away.
+	//
+	// This is the check whose absence caused the outage. A read-side check would
+	// not have caught it — the file we READ was valid, and our own serialisation
+	// is what made it invalid. So the assertion has to sit on the last thing that
+	// happens before the bytes land, and it has to run over the bytes themselves
+	// rather than over the struct they came from.
+	//
+	// Refusing leaves the file exactly as it was. That is the right outcome even
+	// when the defect is somebody else's: an unenrolled rail costs us data, while
+	// a rejected hooks.json costs the engineer every hook they own.
+	var written cursorHookConfig
+	if written, err = parseCursorHookConfig(data); err != nil {
+		return fmt.Errorf("refusing to write %s: %w", path, err)
+	}
+	if defects, _ := cursorHookConfigDefects(written); len(defects) > 0 {
+		return fmt.Errorf("refusing to write %s: Cursor would reject the whole file (%s)", path, defects[0])
+	}
+
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
@@ -324,24 +550,41 @@ func saveCursorHookConfig(path string, cfg cursorHookConfig) error {
 // re-renders the command unconditionally rather than trusting whatever path is
 // already in the file.
 func EnsureCursorHooks() (changed bool, err error) {
+	changed, _, err = ensureCursorHooks()
+	return changed, err
+}
+
+// ensureCursorHooks is EnsureCursorHooks plus the repairs it made, which the
+// caller reports. Repairs are separated from `changed` on purpose: enrolling our
+// own entries is routine and silent, while editing an entry belonging to another
+// tool is something an engineer is entitled to hear about.
+func ensureCursorHooks() (changed bool, repairs []cursorHookRepair, err error) {
 	if !dirExists(filepath.Dir(cursorUserHooksPath())) {
 		// No ~/.cursor at all — Cursor is not installed on this machine. Creating
 		// the directory would leave a config for a product the engineer does not
 		// use, so do nothing and report no change.
-		return false, nil
+		return false, nil, nil
 	}
 	path := cursorUserHooksPath()
+	original, _ := os.ReadFile(path) // #nosec G304 -- fixed path under the user's home.
 	cfg, err := loadCursorHookConfig(path)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	if !mergeCursorHooks(&cfg, cursorHookCommand()) {
-		return false, nil
+
+	// REPAIR BEFORE MERGE. Our entries are irrelevant while the file as a whole
+	// is being rejected — Cursor runs none of it — so the damage has to be
+	// cleared first or enrolling is theatre.
+	repairs = repairCursorHookConfig(&cfg)
+	merged := mergeCursorHooks(&cfg, cursorHookCommand())
+	if len(repairs) == 0 && !merged {
+		return false, nil, nil
 	}
 	if err := saveCursorHookConfig(path, cfg); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return true, nil
+	recordCursorHookRepairs(path, original, repairs)
+	return true, repairs, nil
 }
 
 // RemoveCursorHooks unenrolls this machine. Exported for a future `cursor-hook

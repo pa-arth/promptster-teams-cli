@@ -65,6 +65,62 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 		}}
 	}
 
+	// THE WHOLE-FILE VERDICT COMES FIRST, because it outranks everything below
+	// it: while Cursor is rejecting the file, our enrollment is irrelevant — none
+	// of it runs, and neither does any other tool's. Reporting "enrolled for all
+	// 8 steps" on a machine whose hooks.json Cursor threw away is precisely the
+	// false green this check exists to end.
+	//
+	// It is reported here as well as repaired at watch startup because THE DAEMON
+	// IS A DIFFERENT BINARY. A fleet machine running a months-old daemon never
+	// executes the repair, and doctor — typed at a fresh binary while something
+	// is already wrong — is the only place that machine hears about it.
+	// TWO ACCUMULATORS, BECAUSE THE TAIL BELOW GATES ON "DID I FIND A PROBLEM?"
+	// AND USED TO ASK IT AS "IS THE LIST NON-EMPTY?".
+	//
+	// Those are different questions the moment any line is informational. The
+	// repair note is: it says something we did, not something wrong. Appended to
+	// the same slice it silently satisfied `len(lines) > 0`, and every machine
+	// that had ever been repaired lost its enrollment verdict AND its usage
+	// coverage numbers from then on — permanently, since the repair record is
+	// permanent. Caught in review on PR #173.
+	var problems []CursorHookDoctorLine // something is wrong; suppresses the healthy tail
+	var notes []CursorHookDoctorLine    // always rendered, gates nothing
+	// finish composes a report: problems, then notes, then whatever the caller
+	// concluded. Every return goes through it so a new line cannot be added to
+	// one exit and forgotten at the other four.
+	finish := func(extra ...CursorHookDoctorLine) []CursorHookDoctorLine {
+		out := make([]CursorHookDoctorLine, 0, len(problems)+len(notes)+len(extra))
+		out = append(out, problems...)
+		out = append(out, notes...)
+		return append(out, extra...)
+	}
+
+	defects, unknown := cursorHookConfigDefects(cfg)
+	if len(defects) > 0 {
+		reasons := make([]string, 0, len(defects))
+		fixable := true
+		for _, d := range defects {
+			reasons = append(reasons, d.String())
+			if !d.Fixable {
+				fixable = false
+			}
+		}
+		remedy := "an entry must be corrected by hand before ANY hook in that file runs again"
+		if fixable {
+			remedy = "restart capture (`promptster-teams stop` then `promptster-teams start`) to repair it"
+		}
+		problems = append(problems, CursorHookDoctorLine{
+			Err: true,
+			Text: fmt.Sprintf(
+				"Cursor is rejecting ALL of ~/.cursor/hooks.json (%s) — every hook in it is off, other tools' included; %s",
+				strings.Join(reasons, "; "), remedy),
+		})
+	}
+	if l, ok := cursorHookRepairLine(); ok {
+		notes = append(notes, l)
+	}
+
 	var missing []string
 	bins := map[string]bool{}
 	for _, step := range cursorHookSteps {
@@ -82,11 +138,12 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 	}
 
 	if len(missing) == len(cursorHookSteps) {
-		// Nothing of ours is registered, so there is no command to validate.
-		return []CursorHookDoctorLine{{
+		// Nothing of ours is registered, so there is no command to validate. Any
+		// whole-file verdict above still stands and is returned with it.
+		return finish(CursorHookDoctorLine{
 			Warn: true,
 			Text: "Cursor hook not enrolled — start capture (`promptster-teams start`) to enroll it; transcript capture still works, without model attribution",
-		}}
+		})
 	}
 
 	// EVERY REMAINING ENTRY IS VALIDATED, INCLUDING UNDER A PARTIAL ENROLLMENT.
@@ -103,10 +160,9 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 		}
 	}
 
-	var lines []CursorHookDoctorLine
 	if len(dangling) > 0 {
 		sort.Strings(dangling)
-		lines = append(lines, CursorHookDoctorLine{
+		problems = append(problems, CursorHookDoctorLine{
 			Err: true,
 			Text: fmt.Sprintf(
 				"Cursor is running a command that does not exist (%s) on every prompt, edit and shell call — run `promptster-teams uninstall` to unenroll this machine, or reinstall to the managed path",
@@ -119,13 +175,13 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 		// watcher repairs it at the next startup, so this is a warning, not an
 		// error — but it is named because the missing steps are silently absent
 		// signals, not a loud failure.
-		lines = append(lines, CursorHookDoctorLine{
+		problems = append(problems, CursorHookDoctorLine{
 			Warn: true,
 			Text: fmt.Sprintf("Cursor hook enrolled for only some steps (missing: %s) — restart capture to repair", strings.Join(missing, ", ")),
 		})
 	}
-	if len(lines) > 0 {
-		return lines
+	if len(problems) > 0 {
+		return finish()
 	}
 
 	// Enrolled everywhere and runnable. The only thing left is whether it points
@@ -135,26 +191,33 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 	canonical := cursorHookCommandBinary(cursorHookCommand())
 	for bin := range bins {
 		if filepath.Clean(bin) != filepath.Clean(canonical) {
-			lines = append(lines, CursorHookDoctorLine{
+			offPath := CursorHookDoctorLine{
 				OK: true,
 				Text: fmt.Sprintf("Cursor hook enrolled, pointed at %s (not the managed path) — capture restart re-points it",
 					state.HomeRelative(bin)),
-			})
-			if l, ok := cursorUsageCoverageLine(); ok {
-				lines = append(lines, l)
 			}
-			return lines
+			if l, ok := cursorUsageCoverageLine(); ok {
+				return finish(offPath, l)
+			}
+			return finish(offPath)
 		}
 	}
 
-	lines = append(lines, CursorHookDoctorLine{
-		OK:   true,
-		Text: fmt.Sprintf("Cursor hook enrolled for all %d steps in ~/.cursor/hooks.json", len(cursorHookSteps)),
-	})
-	if l, ok := cursorUsageCoverageLine(); ok {
-		lines = append(lines, l)
+	healthy := fmt.Sprintf("Cursor hook enrolled for all %d steps in ~/.cursor/hooks.json", len(cursorHookSteps))
+	if unknown > 0 {
+		// We found nothing provably wrong, but we did not check everything: our
+		// validator refuses to judge a hook type it does not recognise, so that it
+		// can never condemn one the vendor added after this binary shipped. Say so
+		// rather than let the OK line imply a completeness it does not have — if
+		// Cursor IS rejecting this file, these entries are where to look.
+		healthy += fmt.Sprintf(" (%d entr%s there use a hook type this build cannot check)",
+			unknown, map[bool]string{true: "y", false: "ies"}[unknown == 1])
 	}
-	return lines
+	healthyLine := CursorHookDoctorLine{OK: true, Text: healthy}
+	if l, ok := cursorUsageCoverageLine(); ok {
+		return finish(healthyLine, l)
+	}
+	return finish(healthyLine)
 }
 
 // cursorUsageCoverageLine reports what a probe measured, after the probe is gone.
@@ -238,4 +301,28 @@ func cursorHookCommandBinary(cmd string) string {
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
+}
+
+// cursorHookRepairLine reports that we edited a file we do not own.
+//
+// A repair is invisible once it succeeds — the file is correct afterwards and
+// nothing on disk admits we changed it. That silence is the same material this
+// defect was made of, so the record outlives the repair and doctor reads it
+// back. It names the untouched original too: an engineer told "we rewrote your
+// hook entry" is owed the copy of what it said before.
+func cursorHookRepairLine() (CursorHookDoctorLine, bool) {
+	l := loadCursorHookRepairLog()
+	if len(l.Repairs) == 0 {
+		return CursorHookDoctorLine{}, false
+	}
+	last := l.Repairs[len(l.Repairs)-1]
+	return CursorHookDoctorLine{
+		OK: true,
+		Text: fmt.Sprintf(
+			"repaired %d entr%s in ~/.cursor/hooks.json that Cursor was rejecting (last: %s — %s); original kept at %s",
+			len(l.Repairs),
+			map[bool]string{true: "y", false: "ies"}[len(l.Repairs) == 1],
+			last.Step, last.Action, state.HomeRelative(l.Backup),
+		),
+	}, true
 }
