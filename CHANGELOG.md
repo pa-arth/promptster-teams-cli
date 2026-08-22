@@ -6,6 +6,78 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.18.1] — 2026-08-22
+
+**We were writing the entry that killed every Cursor hook on the machine.**
+`~/.cursor/hooks.json` is user-scope — every tool an engineer runs writes into
+the same file — and Cursor validates it **all-or-nothing**: one entry it rejects
+and it discards the *whole* config. Not the entry, not the step. The file.
+
+Cursor's schema lets a hook entry omit `type` (it defaults to `"command"`), so
+`{"command": "…"}` is legal and common. Our hook entry struct modelled `type` as
+a plain string with no `omitempty`, so reading a legal type-less neighbour entry
+and writing the file back produced `"type": ""` — invalid, whole file rejected.
+Measured on one machine, from its own backups and Cursor's log:
+
+```
+Aug 18 16:36  neighbour entry reads {"command": "bash …"}   legal
+Aug 18-20     our watcher round-trips the file              we break it
+Aug 20 21:41  Invalid user config: sessionStart[1]          all hooks off
+```
+
+**17 hooks across four tools, dead for two days, silently.** The only trace is a
+per-window Cursor log nobody reads, and our rail going quiet is indistinguishable
+from Cursor being idle.
+
+**Upgrade to repair.** The damage is on disk and outlives the fix that caused it:
+this version repairs it at `watch` startup. Machines with no Cursor install, or
+no type-less neighbour entry, were never affected.
+
+### Fixed
+
+- **Hook entries round-trip verbatim** (#173). The same struct that manufactured
+  `"type": ""` also **silently deleted `timeout`, `matcher`, `loop_limit` and
+  `failClosed`** from neighbours' entries on every write, because it marshalled
+  only the four keys it modelled. `matcher` decides which files their hook fires
+  on; `failClosed` decides whether its failure blocks their agent. Unknown keys
+  are now preserved as raw JSON and written back untouched.
+
+- **`saveCursorHookConfig` refuses to write a config Cursor would reject** (#173).
+  The gate is on the **write** side deliberately: a read-side check could not have
+  caught this, because the file we read was always valid and our own serialisation
+  is what broke it. A validator that only reads is blind to a defect its own
+  writer creates.
+
+- **Damage already on disk is repaired** (#173), but narrowly: by deleting a
+  meaningless `type` key so Cursor's own documented default applies. We never
+  delete a neighbour's entry — that would be correct only while our validator is
+  correct, and down-and-loud beats quietly destructive. Anything else is reported
+  and left alone. Repairs leave a record at
+  `~/.promptster-teams/cursor-hook-repairs.json` plus an untouched pre-repair
+  copy, because a successful repair is otherwise invisible.
+
+- **`doctor` and `status` lead with the whole-file verdict** (#173). "Enrolled for
+  all 8 steps" is a false green when Cursor is running none of them. This is
+  separate from the repair on purpose: *the daemon is a different binary*, so a
+  machine on an old daemon never executes the repair, and `doctor` — typed at a
+  fresh binary while something is already wrong — is the only place it hears.
+
+  A repair record is a **note**, not a problem: it must not suppress the health
+  verdict or the usage-coverage numbers. Caught in review, since the tail gated
+  its healthy output on "is the list non-empty?" while meaning "did I find a
+  problem?".
+
+### Notes
+
+The validator is transcribed from Cursor 3.12.17's own (`workbench.desktop.main.js`,
+module `hooksConfig.ts`) rather than from its docs, which disagree with it. It is
+deliberately **one-directional**: it answers "can I prove Cursor rejects this?",
+never "do I recognise this?". An unfamiliar hook type is `unknown`, not invalid —
+so the day Cursor ships a third hook kind we go quiet rather than "repairing" a
+hook that works. Same reason `matcher` is checked for stringness only: Cursor
+compiles it as a JavaScript RegExp, and Go's RE2 rejects lookahead and
+backreferences that Cursor loads happily.
+
 ## [0.18.0] — 2026-08-21
 
 **Two facts the device already had, and never sent.** When the provider reported
@@ -1734,7 +1806,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.15.0...v0.16.0
