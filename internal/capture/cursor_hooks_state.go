@@ -40,8 +40,9 @@ const (
 	// CursorHookRailRejected — the file parses, and Cursor is provably throwing
 	// ALL of it away. The state this whole change exists to make visible.
 	CursorHookRailRejected CursorHookRailState = "rejected"
-	// CursorHookRailDangling — enrolled, but the registered command is gone, so
-	// Cursor execs a missing binary inside the agent loop on every event.
+	// CursorHookRailDangling — enrolled, but the registered command cannot run:
+	// gone, or present without an executable bit. Either way Cursor execs it
+	// inside the agent loop on every event and gets nothing.
 	CursorHookRailDangling CursorHookRailState = "dangling"
 	// CursorHookRailUnenrolled — Cursor is installed, none of our steps are
 	// registered. Usually a daemon that has not restarted since 0.12.0.
@@ -56,7 +57,9 @@ const (
 // CursorHookRailReport is what the device knows about its own hook rail.
 type CursorHookRailReport struct {
 	State CursorHookRailState
-	// Repairs is how many entries we have ever repaired in this file. Reported
+	// Repairs is how many entries we have ever repaired in this file — the log's
+	// cumulative Total, NOT the length of its trimmed record window, which
+	// saturates at 50. Reported
 	// as a number and NOT omitted at zero, for the same reason pendingEvents is
 	// not: a reported zero is a measurement ("we changed nothing of theirs"),
 	// and a field that vanishes at zero cannot be told apart from a fleet too old
@@ -78,7 +81,7 @@ type CursorHookRailReport struct {
 // TestDoctorAndRailStateAgree pins the two together so they cannot drift into
 // telling an engineer and a dashboard different stories about one machine.
 func InspectCursorHookRail() CursorHookRailReport {
-	rep := CursorHookRailReport{Repairs: len(loadCursorHookRepairLog().Repairs)}
+	rep := CursorHookRailReport{Repairs: loadCursorHookRepairLog().totalRepairs()}
 
 	path := cursorUserHooksPath()
 	if !dirExists(filepath.Dir(path)) {
@@ -122,7 +125,7 @@ func InspectCursorHookRail() CursorHookRailReport {
 	// command inside the engineer's agent loop, which is worse than the three
 	// signals it is not collecting.
 	for bin := range bins {
-		if bin == "" || !fileExists(bin) {
+		if bin == "" || !isRunnable(bin) {
 			rep.State = CursorHookRailDangling
 			return rep
 		}

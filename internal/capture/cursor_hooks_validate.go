@@ -314,10 +314,29 @@ func cursorHookBackupPath() string {
 }
 
 type cursorHookRepairLog struct {
-	V       int                `json:"v"`
-	Path    string             `json:"path"`
-	Backup  string             `json:"backup"`
+	V      int    `json:"v"`
+	Path   string `json:"path"`
+	Backup string `json:"backup"`
+	// Total is how many entries we have repaired EVER, and it exists because
+	// `Repairs` is trimmed to the last cursorHookRepairLogMax. Reporting
+	// len(Repairs) as a cumulative count would saturate at 50 and then silently
+	// undercount forever — a number that stops moving reads as "it stopped
+	// happening", which is the opposite of what a machine being repaired 200
+	// times is telling us. Raised in review on PR #176.
+	//
+	// Absent in logs written before this field existed, so readers take
+	// max(Total, len(Repairs)) rather than trusting a zero.
+	Total   int                `json:"total"`
 	Repairs []cursorHookRepair `json:"repairs"`
+}
+
+// totalRepairs is the cumulative count, tolerant of a log written before Total
+// existed (where it is absent and unmarshals to 0).
+func (l cursorHookRepairLog) totalRepairs() int {
+	if n := len(l.Repairs); n > l.Total {
+		return n
+	}
+	return l.Total
 }
 
 const (
@@ -364,6 +383,9 @@ func recordCursorHookRepairs(hooksPath string, original []byte, repairs []cursor
 	l.V = cursorHookRepairLogVersion
 	l.Path = hooksPath
 	l.Backup = backup
+	// Counted BEFORE the trim, so the total survives the window closing over the
+	// records it counts.
+	l.Total = l.totalRepairs() + len(repairs)
 	l.Repairs = append(l.Repairs, repairs...)
 	if n := len(l.Repairs); n > cursorHookRepairLogMax {
 		l.Repairs = l.Repairs[n-cursorHookRepairLogMax:]

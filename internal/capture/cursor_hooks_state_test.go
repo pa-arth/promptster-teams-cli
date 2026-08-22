@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -281,5 +282,91 @@ func TestRepairsAreCountedAfterTheFileIsHealthyAgain(t *testing.T) {
 	}
 	if rep.Repairs != 1 {
 		t.Fatalf("after repair: Repairs = %d, want 1 — a repair that leaves no trace is invisible to the fleet", rep.Repairs)
+	}
+}
+
+// A binary that is present but not executable is NOT healthy.
+//
+// RAISED IN REVIEW ON PR #176. `fileExists` answered "is there a file here",
+// which the rail read as "can Cursor run this". The gap is a false green with no
+// symptom: a hook binary restored from an archive that dropped its mode bits, or
+// copied by an installer that did not chmod it, sits there perfectly readable
+// while Cursor fails to launch it on every event. The rail said `ok` and the
+// machine produced nothing — the exact failure shape this change exists to end,
+// reintroduced by the check meant to detect it.
+//
+// Skipped on Windows, where there is no executable bit to be missing and the
+// check deliberately does not apply.
+func TestAPresentButUnrunnableBinaryIsDangling(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no executable bit on Windows; isRunnable does not apply there")
+	}
+	home := sandboxHome(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	bin := filepath.Join(home, "bin", "promptster-teams")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// Readable, writable, NOT executable.
+	if err := os.WriteFile(bin, []byte("binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeCursorHooks(t, filepath.Join(home, ".cursor", "hooks.json"),
+		fmt.Sprintf("%q cursor-hook", bin), cursorHookSteps)
+
+	if got := InspectCursorHookRail().State; got != CursorHookRailDangling {
+		t.Fatalf("state = %q, want %q — a file Cursor cannot exec is not a healthy rail", got, CursorHookRailDangling)
+	}
+}
+
+// The repair count does not saturate at the log's window.
+//
+// RAISED IN REVIEW ON PR #176. Repairs is documented as cumulative and was
+// len(log.Repairs), which is trimmed to cursorHookRepairLogMax. Past that the
+// number stops moving — and a counter that stops moving reads as "it stopped
+// happening", which is the opposite of what a machine being repaired over and
+// over is telling us. That is the whole failure mode this beacon exists to
+// prevent, wearing an integer.
+func TestRepairCountSurvivesTheLogWindowClosing(t *testing.T) {
+	sandboxHome(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	total := cursorHookRepairLogMax + 7
+	for i := 0; i < total; i++ {
+		recordCursorHookRepairs("/tmp/hooks.json", []byte("{}"), []cursorHookRepair{{
+			Step: "beforeShellExecution", Action: "dropped an empty type",
+		}})
+	}
+
+	l := loadCursorHookRepairLog()
+	if len(l.Repairs) != cursorHookRepairLogMax {
+		t.Fatalf("record window = %d, want it trimmed to %d", len(l.Repairs), cursorHookRepairLogMax)
+	}
+	if got := l.totalRepairs(); got != total {
+		t.Fatalf("totalRepairs = %d, want %d — the count saturated at the window", got, total)
+	}
+	if got := InspectCursorHookRail().Repairs; got != total {
+		t.Fatalf("reported Repairs = %d, want %d", got, total)
+	}
+}
+
+// A log written before Total existed still reports its records.
+//
+// The field is absent in those files and unmarshals to 0, so trusting it
+// directly would report a machine with 12 recorded repairs as having done none —
+// turning an upgrade into an apparent recovery that never happened.
+func TestARepairLogWithoutATotalStillCounts(t *testing.T) {
+	sandboxHome(t)
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	old := `{"v":1,"path":"/tmp/hooks.json","backup":"/tmp/b.json","repairs":[
+		{"step":"beforeShellExecution","action":"dropped an empty type"},
+		{"step":"stop","action":"dropped an empty type"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "cursor-hook-repairs.json"), []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := loadCursorHookRepairLog().totalRepairs(); got != 2 {
+		t.Fatalf("totalRepairs = %d on a pre-Total log, want 2", got)
 	}
 }

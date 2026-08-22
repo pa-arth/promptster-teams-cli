@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -155,7 +156,7 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 	// review on PR #125.
 	var dangling []string
 	for bin := range bins {
-		if bin == "" || !fileExists(bin) {
+		if bin == "" || !isRunnable(bin) {
 			dangling = append(dangling, bin)
 		}
 	}
@@ -165,7 +166,7 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 		problems = append(problems, CursorHookDoctorLine{
 			Err: true,
 			Text: fmt.Sprintf(
-				"Cursor is running a command that does not exist (%s) on every prompt, edit and shell call — run `promptster-teams uninstall` to unenroll this machine, or reinstall to the managed path",
+				"Cursor is running a command it cannot execute (%s) on every prompt, edit and shell call — run `promptster-teams uninstall` to unenroll this machine, or reinstall to the managed path",
 				state.HomeRelative(strings.Join(dangling, ", ")),
 			),
 		})
@@ -298,9 +299,29 @@ func cursorHookCommandBinary(cmd string) string {
 	return ""
 }
 
-func fileExists(p string) bool {
+// isRunnable reports whether Cursor could actually exec this path.
+//
+// PRESENT IS NOT THE SAME AS RUNNABLE, and the gap is a false green: a hook
+// binary restored from an archive that dropped its mode bits, or copied by an
+// installer that did not chmod it, sits there perfectly readable while Cursor
+// fails to launch it on every event. The rail then reports `ok` and produces
+// nothing, which is precisely the shape of failure this whole change exists to
+// end. Raised in review on PR #176.
+//
+// THE EXECUTABLE BIT IS CHECKED ON UNIX ONLY. Windows has no such bit — Go
+// reports a mode without it — so applying the test there would call every
+// healthy Windows install unrunnable and print the most alarming line this
+// package has, on machines that are fine. Same trap as the escaped-path scan in
+// cursorHookCommandBinary, one field over.
+func isRunnable(p string) bool {
 	fi, err := os.Stat(p)
-	return err == nil && !fi.IsDir()
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	return fi.Mode().Perm()&0o111 != 0
 }
 
 // cursorHookRepairLine reports that we edited a file we do not own.

@@ -67,6 +67,15 @@ every other tool on the machine, so free text here could carry a neighbour's
 command line. A closed enum cannot. The doctor's prose stays on the device,
 where it is safe.
 
+Two review findings from #176 landed with it, both of which were the same
+false-green shape the beacon exists to end: `fileExists` answered "is there a
+file here" where the rail needed "can Cursor run this" (a binary present
+without its executable bit reported `ok` and produced nothing — now
+`dangling`, checked on unix only, since Windows has no such bit); and the
+repair count was the length of a record window trimmed at 50, so a
+"cumulative" number stopped moving on exactly the machines being repaired
+most. The log now carries a `total` that survives the trim.
+
 Reported at zero rather than omitted — a measured "we repaired nothing of
 yours" must not be indistinguishable from a CLI too old to report at all.
 

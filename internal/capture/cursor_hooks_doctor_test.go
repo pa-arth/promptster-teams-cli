@@ -162,7 +162,10 @@ func TestCursorHooksDoctorFlagsADanglingCommandUnderPartialEnrollment(t *testing
 	lines := CursorHooksDoctor()
 	var sawDangling, sawPartial bool
 	for _, l := range lines {
-		if l.Err && strings.Contains(l.Text, "does not exist") {
+		// "cannot execute", not "does not exist": the check widened to cover a
+		// binary that is PRESENT without an executable bit, which Cursor also
+		// fails to launch (PR #176). One sentence now covers both.
+		if l.Err && strings.Contains(l.Text, "cannot execute") {
 			sawDangling = true
 		}
 		if l.Warn && strings.Contains(l.Text, "only some steps") {
