@@ -75,6 +75,35 @@ type presenceData struct {
 	// count alone cannot tell 62k-queued-from-five-minutes-ago from
 	// 62k-queued-from-three-weeks-ago.
 	PendingOldestEventAt string `json:"pendingOldestEventAt,omitempty"`
+
+	// CURSOR HOOK RAIL HEALTH. One closed word, plus two counts.
+	//
+	// Same argument as PendingEvents above, one rail over: the device is the only
+	// party that can see its own ~/.cursor/hooks.json, and an absence of Cursor
+	// hook data has at least five causes that are byte-identical from the server
+	// — Cursor not installed, rail never enrolled, file rejected outright, our
+	// binary missing, engineer idle. v0.18.1 shipped a REPAIR for the third and
+	// could not tell anyone whether it had run.
+	//
+	// NOT omitempty, both of them, for the reason spelled out above: a reported
+	// zero is a measurement, and a field that disappears at zero is
+	// indistinguishable from a fleet too old to send it. `cursorHooks` is
+	// likewise always populated — `not_installed` is a real answer and the most
+	// useful one this field gives.
+	//
+	// THE ENUM IS THE PRIVACY BOUNDARY. hooks.json is a SHARED file: its other
+	// entries belong to tools we did not write, and their commands, paths and
+	// arguments are none of our business and must never ride a heartbeat. A
+	// closed word cannot carry them; a reason string could. The doctor's prose
+	// stays on the machine. See CursorHookRailState.
+	CursorHooks CursorHookRailState `json:"cursorHooks"`
+	// How many of a neighbour's entries we have repaired, ever. Non-zero means we
+	// edited a file we do not own, which an engineer is entitled to see reported
+	// somewhere other than their own terminal.
+	CursorHookRepairs int `json:"cursorHookRepairs"`
+	// Entries whose hook type this build cannot judge. The honesty term on
+	// `cursorHooks: ok` — see CursorHookRailReport.Unverifiable.
+	CursorHookUnverifiable int `json:"cursorHookUnverifiable"`
 }
 
 // watchedTools reports which AI tools this device is set up to capture, keyed
@@ -136,6 +165,11 @@ func buildPresenceEvent(session Session) event.Event {
 	if pending.Count > 0 && !pending.Oldest.IsZero() {
 		oldest = pending.Oldest.UTC().Format(time.RFC3339Nano)
 	}
+	// Cheap: one stat, one small parse, one small read. It runs on the beat
+	// rather than being cached because the file is SHARED — another tool can
+	// break it between beats, and a cached "ok" would outlive the truth.
+	rail := InspectCursorHookRail()
+
 	e := event.NewEvent("presence", session.DeviceID)
 	e.Source = presenceSource
 	e.DeviceID = session.DeviceID
@@ -147,6 +181,12 @@ func buildPresenceEvent(session Session) event.Event {
 		Watching:             watchedTools(),
 		PendingEvents:        pending.Count,
 		PendingOldestEventAt: oldest,
+
+		// Read at BUILD time alongside the backlog, so every number in the beat
+		// describes the same instant its `ts` does.
+		CursorHooks:            rail.State,
+		CursorHookRepairs:      rail.Repairs,
+		CursorHookUnverifiable: rail.Unverifiable,
 	})
 	return e
 }

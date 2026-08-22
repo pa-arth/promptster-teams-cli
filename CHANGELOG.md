@@ -40,6 +40,47 @@ work. It is reached only under Auto, where it missed every time — invisible in
 aggregate, and perfectly correlated with the one case it existed to serve. The
 regression test asserted the bug: it used `"g1"` for both halves, a shape Cursor
 never emits. It now uses the ids Cursor actually sent, and fails without the fix.
+### Added — the Cursor hook rail can say it is broken
+
+The 0.18.1 repair works and was **completely unobservable**. It runs at watch
+startup, fixes the file, and nothing leaves the machine to say so — so "did the
+fleet actually recover" could only be answered by running `doctor` on every
+laptop. That is the same shape as the defect itself: state that exists only on
+the device.
+
+The presence beat now carries three fields, read at build time alongside the
+outbox backlog so every number in the beat describes the instant its `ts` does:
+
+- `cursorHooks` — one word from a **closed** enum, ranked worst-first:
+  `not_installed`, `unreadable`, `rejected`, `dangling`, `unenrolled`,
+  `partial`, `ok`. `rejected` outranks `partial` because a rejected file makes
+  enrollment irrelevant — Cursor runs none of it.
+- `cursorHookRepairs` — cumulative, so "did the repair ever run here" survives
+  the repair succeeding. Afterwards the file is correct and nothing on disk
+  admits we changed it, which is the silence this defect was made of.
+- `cursorHookUnverifiable` — the honesty term on `ok`, which means "nothing
+  *provably* wrong". Our validator refuses to condemn a hook type it does not
+  recognise, and where this is non-zero that claim is weaker than it sounds.
+
+**Never a reason string, and that is the point.** `hooks.json` is shared with
+every other tool on the machine, so free text here could carry a neighbour's
+command line. A closed enum cannot. The doctor's prose stays on the device,
+where it is safe.
+
+Two review findings from #176 landed with it, both of which were the same
+false-green shape the beacon exists to end: `fileExists` answered "is there a
+file here" where the rail needed "can Cursor run this" (a binary present
+without its executable bit reported `ok` and produced nothing — now
+`dangling`, checked on unix only, since Windows has no such bit); and the
+repair count was the length of a record window trimmed at 50, so a
+"cumulative" number stopped moving on exactly the machines being repaired
+most. The log now carries a `total` that survives the trim.
+
+Reported at zero rather than omitted — a measured "we repaired nothing of
+yours" must not be indistinguishable from a CLI too old to report at all.
+
+Requires promptster-backend#777; a device ahead of the server has these fields
+dropped silently at ingest, which is why the server ships first.
 
 
 ## [0.18.1] — 2026-08-22

@@ -46,9 +46,18 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	// `pendingOldestEventAt` is deliberately NOT in this required set: it is
 	// omitted when the queue is empty, which is the state this test's fixture is
 	// in. Its presence-when-non-empty is pinned by presence_pending_test.go.
+	//
+	// `cursorHooks` and its two counters are the device's own Cursor hook rail
+	// health — one CLOSED enum word and two integers ABOUT ~/.cursor/hooks.json,
+	// never anything out of it. That file is shared with every other tool on the
+	// machine, so this rail must never widen to a reason string: a neighbour's
+	// command line would ride out with it. The doctor's prose stays on the
+	// machine, where it is safe. Pinned on the emitted bytes by
+	// presence_cursor_hooks_test.go.
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
+		"cursorHooks": true, "cursorHookRepairs": true, "cursorHookUnverifiable": true,
 	}
 	for k := range data {
 		if !allowed[k] {
