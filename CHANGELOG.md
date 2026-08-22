@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.19.0] — 2026-08-22
+
+**The Cursor rail reported tokens it could not price, and could not say so.**
+Two halves of one silence. 0.18.0 began metering Cursor turns; the model that
+prices them arrives on a different hook, and the join between the two asked for
+a key the cache never held — so every auto-routed turn shipped its tokens with
+no model and the backend correctly declined to price it. Measured against
+production 2026-08-22: **29.1% of the live external org's metered Cursor turns
+carry no model.** That is spend which exists, is captured, and is invisible.
+
+**Minor, not patch — three new fields leave the machine** (`cursorHooks`,
+`cursorHookRepairs`, `cursorHookUnverifiable`, on the presence beat). The server
+half is promptster-backend#777 and **must be deployed first**: the device
+projector default-denies, so a field the server does not allowlist is dropped at
+ingest with a `201` and no error anywhere. It was deployed 2026-08-22 16:55 UTC,
+before this release.
+
 ### Fixed
 
 **The Cursor model join was keyed on two different ids and could never fire.**
@@ -1883,7 +1900,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.16.0...v0.17.0
