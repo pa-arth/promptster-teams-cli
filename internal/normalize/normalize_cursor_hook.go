@@ -42,10 +42,23 @@ import (
 //     absent, the backend's readUsage treats a row as CUMULATIVE, differences it
 //     against a running maximum, and drops the first row as a baseline — the
 //     observed pair would book 92,763 then +3,372, losing turn one entirely.
+//
+//     ⚠ PER TURN IS NOT PER REQUEST, and the tag's spelling invites that read.
+//     A turn is N model calls and this payload sums them: measured 2026-08-22,
+//     a turn reporting input_tokens 823,043 while Cursor's own
+//     contextWindowStatusAtCreation recorded tokensUsed 148,337 for it, over 6
+//     captured sub-request ids — 5.55x, and ~75x on the largest observed turn.
+//     Summing these rows is correct and pricing them is correct; reading one as
+//     a context size is not. The backend suppresses that reading via
+//     TURN_SUM_INTEGRATIONS. Do not "fix" the tag here: dropping it would make
+//     readUsage difference a rail that must not be differenced, which is the
+//     larger error of the two.
+//
 //   - status (completed | aborted | ...). An ABORTED turn arrives with the token
 //     keys ABSENT, not zero. Deliberately NOT branched on: a `status ==
 //     "completed"` gate would silently drop an unenumerated status that does
 //     bill, where absent-means-absent covers that case for free.
+//
 //   - model / model_id — both the literal "default" whenever the picker is on
 //     Auto. The resolved id lives on afterAgentThought, and the two arrive in
 //     different processes, so the join happens on device; this package takes it
@@ -516,8 +529,10 @@ func (p cursorHookPayload) usageEvent(model string) (event.Event, bool) {
 		// count against the rails it is compared with.
 		return event.Event{}, false
 	}
-	// PER-REQUEST, ASSERTED AT THE EMITTER. See the file header: absent, this
-	// tag means CUMULATIVE downstream, and these numbers are not.
+	// NON-CUMULATIVE, ASSERTED AT THE EMITTER. See the file header: absent, this
+	// tag means CUMULATIVE downstream, and these numbers are not. It asserts
+	// only that — the row is a per-TURN sum over several model calls, so it is
+	// summable as emitted but is not one request.
 	data["usageScope"] = "request"
 	// The generation id, carried as a FIELD as well as folded into the row id.
 	//

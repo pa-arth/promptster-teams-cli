@@ -49,19 +49,32 @@ type cursorGenerations struct {
 	// same quantity is counted here forever, cheaply.
 	UsageRows     int64 `json:"usageRows"`
 	ModellessRows int64 `json:"modellessRows"`
-	// PerRequest* are the owning observation for the premise that this rail's
-	// counts are per-turn rather than cumulative (see usageEvent's
-	// `usageScope: "request"`). A cumulative counter cannot decrease, so every
-	// observed decrease is positive evidence for the premise and a run of zero
-	// decreases across many comparisons is the shape that would refute it.
+	// NonCumulative* are the owning observation for the premise that this rail's
+	// counts are NOT cumulative (see usageEvent's `usageScope: "request"`). A
+	// cumulative counter cannot decrease, so every observed decrease is positive
+	// evidence for the premise and a run of zero decreases across many
+	// comparisons is the shape that would refute it.
+	//
+	// ⚠ THIS COUNTER PROVES NON-CUMULATIVE AND NOTHING MORE. It was named
+	// PerRequest* until 2026-08-22 and read as though a decrease established
+	// that a row IS one request. It does not, and the row is not: Cursor emits
+	// a per-TURN sum across the turn's model calls. That reading is a separate
+	// premise living on the backend's TURN_SUM_INTEGRATIONS, and nothing here
+	// can check it — the two are numerically identical on a single-call turn,
+	// which is exactly the shape the calibration below happened to use.
+	//
+	// The JSON keys deliberately KEEP the old spelling. They are the on-disk
+	// names on every enrolled machine, and these counters are worth having only
+	// because they accumulate over a machine's lifetime; renaming the key would
+	// silently reset the fleet's evidence to zero to fix a word.
 	//
 	// Calibrated 2026-08-18 on Cursor 3.12.17: output fell 902 -> 525 across
 	// consecutive generations of one conversation. REFUTED IF this counter
 	// reports many comparisons and zero decreases on a fleet whose Cursor
 	// version has moved — that is the signal to re-probe before trusting any
 	// per-turn figure, not a reason to keep asserting the tag.
-	PerRequestComparisons int64 `json:"perRequestComparisons"`
-	PerRequestDecreases   int64 `json:"perRequestDecreases"`
+	NonCumulativeComparisons int64 `json:"perRequestComparisons"`
+	NonCumulativeDecreases   int64 `json:"perRequestDecreases"`
 	// LastOutput is the previous generation's output count per conversation,
 	// kept only to make the comparison above possible. It is a counter input,
 	// never an event field.
@@ -314,9 +327,9 @@ func recordCursorUsageObservation(conversationID, model string, outputTokens *in
 		}
 		if outputTokens != nil && conversationID != "" {
 			if prev, ok := c.LastOutput[conversationID]; ok {
-				c.PerRequestComparisons++
+				c.NonCumulativeComparisons++
 				if *outputTokens < prev.Tokens {
-					c.PerRequestDecreases++
+					c.NonCumulativeDecreases++
 				}
 			}
 			c.LastOutput[conversationID] = cursorLastOutput{Tokens: *outputTokens, TsMs: now.UnixMilli()}
