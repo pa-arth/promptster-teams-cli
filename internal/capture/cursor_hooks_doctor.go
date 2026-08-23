@@ -232,7 +232,7 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 //     that gets torn down; counting it here means the answer stays available on
 //     any enrolled machine instead of expiring into a sentence in a spec.
 //
-//  2. THE PER-REQUEST PREMISE. usageEvent tags every row `usageScope:
+//  2. THE NON-CUMULATIVE PREMISE. usageEvent tags every row `usageScope:
 //     "request"`, which is a MEASUREMENT (Cursor 3.12.17, 2026-08-18: output
 //     fell 902 -> 525 across consecutive generations) and not an invariant. A
 //     cumulative counter cannot decrease, so each observed decrease is evidence
@@ -240,6 +240,18 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 //     recorded only as prose, and was 18.89% false four days later — with a live
 //     customer's published spend as the cost. Prose has no expiry; a counter
 //     does.
+//
+//     ⚠ IT IS THE ONLY THING THE TAG CLAIMS, and this line said otherwise until
+//     2026-08-22. `usageScope: "request"` means "do not difference me". It does
+//     NOT mean the row is one request, and on this rail it is not: Cursor's
+//     stop hook emits a per-TURN sum across the turn's model calls, measured at
+//     5.55x the vendor's own recorded resident context on one turn and ~75x on
+//     the largest. Nothing here can check that, and the calibration above could
+//     not have either — its probe turns were one to two calls each, where a
+//     turn sum and a request's input are the same number. The per-request
+//     reading is a separate premise, and it is refuted: see the backend's
+//     TURN_SUM_INTEGRATIONS, which is why a Cursor row now publishes no
+//     resident context at all.
 //
 //     REFUTED IF this machine reports many comparisons and zero decreases after
 //     a Cursor upgrade. That is the signal to re-probe before trusting any
@@ -252,9 +264,9 @@ func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
 	}
 	text := fmt.Sprintf("Cursor usage rows captured: %d (%d with no model to price)",
 		c.UsageRows, c.ModellessRows)
-	if c.PerRequestComparisons > 0 {
+	if c.NonCumulativeComparisons > 0 {
 		text += fmt.Sprintf("; per-turn counts confirmed by %d of %d output decreases",
-			c.PerRequestDecreases, c.PerRequestComparisons)
+			c.NonCumulativeDecreases, c.NonCumulativeComparisons)
 	}
 	// Modelless rows are a WARNING past a third of the traffic: at that point the
 	// device join is not carrying the rail and the fix is a different step, not a

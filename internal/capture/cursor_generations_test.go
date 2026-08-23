@@ -93,9 +93,9 @@ func TestUsageObservationsCountModellessRows(t *testing.T) {
 	// THE PER-REQUEST PREMISE, COUNTED RATHER THAN ASSERTED. Output fell 902 ->
 	// 525, which no cumulative counter can do. A measurement recorded only as
 	// prose has no expiry; this one has a number that keeps moving.
-	if c.PerRequestComparisons != 1 || c.PerRequestDecreases != 1 {
+	if c.NonCumulativeComparisons != 1 || c.NonCumulativeDecreases != 1 {
 		t.Fatalf("perRequest comparisons/decreases = %d/%d, want 1/1",
-			c.PerRequestComparisons, c.PerRequestDecreases)
+			c.NonCumulativeComparisons, c.NonCumulativeDecreases)
 	}
 }
 
