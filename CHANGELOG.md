@@ -6,6 +6,72 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+**Within-session parallelism was unmeasurable, and the reason was one field on
+one kind.** Lane identity — `agentId`, the per-INVOCATION handle for a concurrent
+agent process — rode `subagent_usage` and nothing else. That is a SPEND event. It
+answers what the delegates cost and it cannot answer how many ran at once,
+because a lane's interval has to come from the first and last moment it was
+WORKING, and the kinds that carry work carried no lane.
+
+The consequence landed hardest on the rail with the least to lose: **Cursor had
+no lane at all.** It emits no `subagent_usage` on purpose — its transcripts carry
+no token counts, and a spend event with absent counts reads downstream as a
+measured zero — so on the one rail where the id could not ride spend, there was
+nothing else for it to ride. Its delegates' work arrived indistinguishable from
+the main chain's.
+
+- **Cursor** now stamps the lane on every event from a subagent transcript, taken
+  from the child transcript's own uuid. `cursorLaneIDFromPath` is deliberately
+  NOT the inverse of `cursorSessionIDFromPath`: the session is the parent, the
+  lane is the child, and deriving either from the other is what collapsed them.
+- **Codex** now stamps the lane on a delegated thread's work events, not just its
+  usage — a Codex delegate is its own rollout file merged into the parent
+  conversation, so without the stamp its file_diffs read as the parent's own. The
+  thread a human types into stamps NOTHING: its thread id is the session, and
+  stamping it would assert "one lane" where the truth is "the main chain, plus
+  whatever it delegated". `session_start` stays conversation-scoped.
+- **Codex** also now carries the delegate's TYPE name as `attributionAgent`, the
+  key the Claude rail already uses, parsed from `session_meta.source`
+  (`{"subagent":{"other":"guardian"}}`). The id says WHICH invocation, the name
+  says WHAT KIND; deduplicating concurrent delegates on the name instead of the
+  id is a measured 32x undercount.
+- **Claude Code** needed no change: its delegates already emit timestamped
+  `subagent_usage` carrying `agentId`, which is enough to bound a lane.
+
+An empty lane stamps nothing, on purpose. "This rail did not tell us" and "this
+session ran one lane" are opposite readings, and a placeholder would merge every
+unidentifiable lane into a single fake one.
+
+**Minor, not patch — the lane leaves the machine on eight kinds** (`prompt`,
+`tool_use`, `file_diff`, `file_create`, `file_delete`, `command`, `mcp_call`,
+`task_dispatch`). The server half is promptster-backend#TBD and **must be
+deployed first**: the device projector default-denies, so a field the server does
+not allowlist is dropped at ingest with a `201` and no error anywhere. That
+ordering is not a convention here — `allowlist_lockstep_test.go` refuses the
+device-first build by name, and it caught this one.
+
+Eight kinds rather than a convenient subset, because the subset is
+shape-dependent: a delegate that only prompted and called one MCP tool would
+silently not exist.
+
+### Security
+
+**The lane id is clamped to an opaque shape at the projector.** An allowlisted
+key is one an emitter can fill with anything, and the cheapest identity to hand a
+lane is the file it came from — so the leak canary, which proves the projector
+drops what is NOT allowlisted, could no longer see this field. `agentId` is now
+accepted only as `[A-Za-z0-9_-]{1,64}`: `/`, `\`, `~`, `:`, `.` and whitespace
+are what a path is made of, and what remains cannot spell a directory. Anything
+else is dropped to ABSENT and logged. Measured against the real corpus before the
+clamp was written — every `agentId` on the wire is lowercase hex and every Cursor
+child transcript name is a hyphenated uuid — so it rejects nothing we mint.
+
+`meta` stays unallowlisted for every kind and raw `cwd` stays dropped for every
+kind. The lane is not a way around either.
+
+
 ## [0.20.0] — 2026-08-24
 
 **A commit two tools touched was credited wholly to one of them, and a commit no

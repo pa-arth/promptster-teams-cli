@@ -96,6 +96,24 @@ type CursorTranscriptProcessor struct {
 	// processor enforces with UsageOnly, for the same reason.
 	Sidechain bool
 
+	// LaneID is THIS subagent's own identity — the child transcript's filename
+	// uuid — set only when Sidechain is true. It rides every event this
+	// processor emits as `agentId`,
+	// the same key Claude and Codex already use for the same thing.
+	//
+	// It exists because sessionID deliberately does NOT carry it.
+	// cursorSessionIDFromPath rolls a child up to its parent so one conversation
+	// stays one session, which is right and stays; the cost was that the child's
+	// own identity was DISCARDED at capture, so every Cursor subagent's events
+	// landed under the parent with nothing to tell one from another. Cursor was
+	// the only rail of the three where within-session concurrency was not
+	// computable, and this is the whole of that gap: the identity was already on
+	// disk as the filename, we simply threw it away.
+	//
+	// Session identity and lane identity are different questions and now have
+	// different fields. Do not re-derive one from the other.
+	LaneID string
+
 	// Workdir is the session's cwd, home-collapsed by the caller's resolution
 	// pass. Cursor records no cwd anywhere in the transcript (unlike Claude Code
 	// and Codex), so capture resolves it once from the transcript's own observed
@@ -167,7 +185,7 @@ func (p *CursorTranscriptProcessor) Process(line []byte, offset int64) []event.E
 			}
 		}
 	}
-	return out
+	return stampLaneID(out, p.LaneID)
 }
 
 // promptEvent builds the human `prompt` event from a user turn.
@@ -399,6 +417,23 @@ func (p *CursorTranscriptProcessor) newAIEvent(kind string, offset int64, idx in
 	e.Provenance = transcriptAiProvenance()
 	return e
 }
+
+// stampLane marks an event with this subagent's lane identity. No-op on the main
+// chain, which HAS no lane id — the main thread is not a delegated agent, and
+// stamping one would make every session read as though it delegated to itself.
+//
+// Applied at Process's single return, to EVERY event the sidechain emits, rather
+// than to one chosen kind. A first draft picked ai_response as "the one event per
+// turn"; the Cursor transcript never emits ai_response at all (its kinds are
+// command / file_create / file_delete / file_diff / mcp_call / prompt /
+// task_dispatch), so that carrier would have stamped nothing and the lane would
+// have stayed invisible while looking implemented. Stamping every event also
+// makes the span robust to a subagent whose whole life is, say, three commands.
+//
+// Cursor deliberately emits no subagent_usage (see the Task branch: its
+// transcripts carry no token usage, and a spend event with absent counts reads
+// downstream as a measured zero). That decision stands and does not block this
+// one — a LANE needs identity and timestamps, not spend.
 
 // noteTimestamp records the wall clock from a user turn's <timestamp> envelope,
 // if this Cursor build writes one.

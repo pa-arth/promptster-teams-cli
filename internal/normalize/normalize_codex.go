@@ -72,6 +72,13 @@ type CodexRolloutProcessor struct {
 	// session (see CodexConversationID) they must say so, or the fluency judge
 	// grades machine-authored text as the engineer's own prompting.
 	subagentThread bool
+	// agentName is the delegated agent's TYPE name — "guardian", not this
+	// thread's id. The two answer different questions and must not be merged:
+	// deduplicating concurrent delegates on the type instead of the invocation
+	// is a measured 32x undercount (backend fluencySignals.ts:1417). It rides
+	// subagent_usage as attributionAgent, the key the Claude rail already uses,
+	// so one consumer reads both rails.
+	agentName string
 	// threadID is this rollout's OWN thread id (session_meta.payload.id, which is
 	// also the uuid in the filename). It is no longer the session id — see
 	// CodexConversationID — but it is what tells one subagent's spend apart from
@@ -188,7 +195,30 @@ func (p *CodexRolloutProcessor) newCodexEvent(kind, ts, sourceKey string) event.
 }
 
 // process parses one rollout line and returns zero or more canonical events.
+// Process handles one rollout line, stamping the lane on everything it emits.
+//
+// A Codex delegate is its OWN rollout file, merged into the parent conversation
+// by sessionID — so without the stamp its file_diffs and commands arrive
+// indistinguishable from the parent's own work, and the conversation looks like
+// one lane doing everything. Only a delegated thread has a lane to name: on the
+// thread a human is typing into, threadID is the session, and stamping it would
+// assert "one lane" where the truth is "the main chain, plus whatever it
+// delegated".
 func (p *CodexRolloutProcessor) Process(line []byte) []event.Event {
+	lane := ""
+	if p.subagentThread {
+		lane = p.threadID
+	}
+	out := p.process(line)
+	// session_meta is line 1 and is what SETS subagentThread, so the lane read
+	// above is one line stale on exactly that line — and it is the line whose
+	// own events (session_start) belong to the conversation rather than to a
+	// lane. Re-reading after the fact would stamp the session_start of every
+	// delegate, which is the one event that must stay conversation-scoped.
+	return stampLaneID(out, lane)
+}
+
+func (p *CodexRolloutProcessor) process(line []byte) []event.Event {
 	var rec map[string]interface{}
 	if err := json.Unmarshal(line, &rec); err != nil {
 		return nil
@@ -434,6 +464,77 @@ func CodexConversationID(payload map[string]interface{}) string {
 	return stringField(payload, "id")
 }
 
+// codexSubagentName pulls the delegated agent's TYPE name out of session_meta's
+// `source`, which is a tagged union rather than a field:
+//
+//	"source": "cli" | "exec"                  -> a thread a human is typing into
+//	"source": {"subagent": {"other": "guardian"}} -> a delegated thread
+//
+// The inner key is NOT hardcoded to "other". Two rollouts is the entire sample
+// this was written against, both carrying the same variant, and `other` reads
+// like one arm of an enum whose other arms we have not seen — so the name is
+// taken from whichever single string the `subagent` object holds. A shape that
+// does not resolve to exactly one string yields "", and the caller omits the
+// key rather than emitting a guess.
+//
+// The value is clamped to a NAME shape. It is the only place a vendor string
+// reaches an allowlisted field on this path, and `attributionAgent` is
+// definitionally a name — so a future variant carrying a path or a prompt is
+// dropped here rather than discovered on the wire.
+func codexSubagentName(payload map[string]interface{}) string {
+	src, ok := payload["source"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	sub, ok := src["subagent"]
+	if !ok {
+		return ""
+	}
+	switch v := sub.(type) {
+	case string:
+		return codexCleanAgentName(v)
+	case map[string]interface{}:
+		name := ""
+		for _, raw := range v {
+			str, isString := raw.(string)
+			if !isString || strings.TrimSpace(str) == "" {
+				continue
+			}
+			if name != "" {
+				// Two candidates and no rule for choosing: emit nothing rather
+				// than pick. An absent name reads as "not observed"; a wrong one
+				// reads as a fact.
+				return ""
+			}
+			name = str
+		}
+		return codexCleanAgentName(name)
+	}
+	return ""
+}
+
+// codexCleanAgentName accepts an agent TYPE name and rejects anything shaped
+// like a path or free text. Deliberately narrow: `/`, `\`, `:` and `.` are what
+// a path is made of, and a name has no use for them.
+func codexCleanAgentName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 64 {
+		return ""
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			continue
+		case c == '-', c == '_':
+			continue
+		default:
+			return ""
+		}
+	}
+	return s
+}
+
 // codexIsSubagentThread reports whether this rollout is a delegated thread
 // rather than the one the human is typing into. `thread_source` is the vendor's
 // own marker; the id comparison is the structural backstop for builds that carry
@@ -467,6 +568,7 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 	}
 	p.subagentThread = codexIsSubagentThread(payload)
 	p.threadID = stringField(payload, "id")
+	p.agentName = codexSubagentName(payload)
 	// Stash the home-collapsed cwd for prompt events: session_meta is the only
 	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
 	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home
@@ -634,6 +736,9 @@ func (p *CodexRolloutProcessor) subagentUsage(ts, raw string) []event.Event {
 	p.attachTokenUsage(data)
 	if p.threadID != "" {
 		data["agentId"] = p.threadID
+	}
+	if p.agentName != "" {
+		data["attributionAgent"] = p.agentName
 	}
 	e.Data = data
 	e.RawPayload = "codex subagent usage"

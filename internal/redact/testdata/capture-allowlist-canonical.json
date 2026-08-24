@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:71b25e6ec78767e3ffd04c74228ad0ab21914ceec1b69e972673afde7b52fe0b",
+  "checksum": "sha256:41f5895efc04c906070cdd3754e8710f4818fbffb2626da17bba96dcd409c747",
   "counts": {
     "kinds": 45,
-    "fields": 205,
+    "fields": 213,
     "elementFields": 37
   },
   "kinds": {
@@ -64,7 +64,8 @@
       "fields": [
         "command",
         "exitCode",
-        "durationMs"
+        "durationMs",
+        "agentId"
       ]
     },
     "commit_attribution": {
@@ -203,12 +204,14 @@
       "fields": [
         "path",
         "linesAdded",
-        "sizeBytes"
+        "sizeBytes",
+        "agentId"
       ]
     },
     "file_delete": {
       "fields": [
-        "path"
+        "path",
+        "agentId"
       ]
     },
     "file_diff": {
@@ -216,7 +219,8 @@
         "path",
         "linesAdded",
         "linesRemoved",
-        "lineRanges"
+        "lineRanges",
+        "agentId"
       ],
       "arrayElements": {
         "lineRanges": [
@@ -287,7 +291,8 @@
       "fields": [
         "name",
         "tool",
-        "status"
+        "status",
+        "agentId"
       ]
     },
     "plan_decision": {
@@ -332,7 +337,8 @@
         "repoRoot",
         "repoHost",
         "repoTracked",
-        "promptLength"
+        "promptLength",
+        "agentId"
       ]
     },
     "rework_verdict": {
@@ -401,7 +407,8 @@
       "fields": [
         "name",
         "status",
-        "summary"
+        "summary",
+        "agentId"
       ]
     },
     "test_run": {
@@ -449,7 +456,8 @@
         "name",
         "tool",
         "status",
-        "skill"
+        "skill",
+        "agentId"
       ]
     },
     "web_lookup": {

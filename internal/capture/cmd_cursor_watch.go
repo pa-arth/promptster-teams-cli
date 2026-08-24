@@ -403,6 +403,14 @@ func pollCursorTranscripts(
 			proc = normalize.NewCursorTranscriptProcessor(cursorSessionIDFromPath(path))
 			if isCursorSidechainFile(path) {
 				proc.Sidechain = true
+				// The child's OWN id, which cursorSessionIDFromPath deliberately
+				// does not return — it rolls the child up to its parent so one
+				// conversation stays one session. Both are needed and they are
+				// different questions: the session id says WHICH CONVERSATION,
+				// the lane id says WHICH DELEGATED AGENT. Keeping only the first
+				// is why Cursor was the one rail where two subagents running at
+				// once were indistinguishable.
+				proc.LaneID = cursorLaneIDFromPath(path)
 			} else {
 				// Resolve the repo identity ONCE per transcript from the workspace
 				// root this session matched, so every part (slug, host, tracked
@@ -491,6 +499,21 @@ func isCursorSidechainFile(path string) bool {
 func cursorSessionIDFromPath(path string) string {
 	if isCursorSidechainFile(path) {
 		return filepath.Base(filepath.Dir(filepath.Dir(path)))
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
+}
+
+// cursorLaneIDFromPath is the subagent transcript's OWN uuid — its filename.
+// Empty for a main-chain transcript, which has no lane: the main thread is not a
+// delegated agent.
+//
+// Deliberately NOT the inverse of cursorSessionIDFromPath. That function answers
+// "which conversation does this belong to" and must keep returning the parent;
+// this one answers "which delegated agent is this". Deriving either from the
+// other is what collapsed them in the first place.
+func cursorLaneIDFromPath(path string) string {
+	if !isCursorSidechainFile(path) {
+		return ""
 	}
 	return strings.TrimSuffix(filepath.Base(path), ".jsonl")
 }

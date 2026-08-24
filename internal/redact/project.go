@@ -112,7 +112,7 @@ var projectFieldAllowlist = map[string][]string{
 	// the ambiguity this field exists to remove. Never add it here alone.
 	// (model_turn — a backend-proxy kind this CLI never emits — is deliberately
 	// absent: unknown kinds project to nothing.)
-	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot", "repoHost", "repoTracked"},
+	"prompt": {"text", "command", "followsInterrupt", "promptSource", "workdir", "repoRoot", "repoHost", "repoTracked", "agentId"},
 	// Interrupt (ESC/Ctrl+C mid-response): behavioral metadata only. cutTool is
 	// the tool NAME (same class as a slash-command name); subtype/variant are
 	// enums. NO cutToolInput — a command body / file path is source-adjacent, so
@@ -152,8 +152,8 @@ var projectFieldAllowlist = map[string][]string{
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
 	// what structurally guarantees no diff/text bytes ride along.
-	"file_diff":   {"path", "linesAdded", "linesRemoved", "lineRanges"},
-	"file_create": {"path", "linesAdded", "sizeBytes"},
+	"file_diff":   {"path", "linesAdded", "linesRemoved", "lineRanges", "agentId"},
+	"file_create": {"path", "linesAdded", "sizeBytes", "agentId"},
 	// credentialKeys is the KEY NAMES harvested on-device from a dotenv-class
 	// file the agent read — {"STRIPE_SECRET_KEY", "DATABASE_URL"}, never a value.
 	// normalize.HarvestCredentialKeyNames splits each line with strings.Cut and
@@ -164,7 +164,7 @@ var projectFieldAllowlist = map[string][]string{
 	// Lockstep with the backend's TEAMS_FIELD_ALLOWLIST + TEAMS_STRING_ARRAY_CLAMPS.
 	"file_read":    {"path", "credentialKeys"},
 	"file_search":  {"path", "query"},
-	"file_delete":  {"path"},
+	"file_delete":  {"path", "agentId"},
 	"dir_list":     {"path"},
 	"editor_focus": {"path"},
 	"editor_edit":  {"path"},
@@ -172,7 +172,7 @@ var projectFieldAllowlist = map[string][]string{
 	// Command-family: invocation + result metadata — never stdout/stderr.
 	// Kept command strings additionally get inline-exec code bodies masked
 	// (scrubInlineCommand below).
-	"command":    {"command", "exitCode", "durationMs"},
+	"command":    {"command", "exitCode", "durationMs", "agentId"},
 	"test_run":   {"suite", "command", "passed", "failed", "skipped", "durationMs"},
 	"build_run":  {"command", "exitCode", "durationMs"},
 	"lint_run":   {"command", "exitCode", "durationMs"},
@@ -180,11 +180,11 @@ var projectFieldAllowlist = map[string][]string{
 	"web_lookup": {"url", "query"},
 	// Tooling: identity + status only — never args/results (can embed file bodies).
 	"tool_intent":    {"name", "tool", "status"},
-	"tool_use":       {"name", "tool", "status", "skill"},
+	"tool_use":       {"name", "tool", "status", "skill", "agentId"},
 	"tool_result":    {"name", "tool", "status"},
 	"tool_decision":  {"name", "tool", "status"},
-	"mcp_call":       {"name", "tool", "status"},
-	"task_dispatch":  {"name", "status", "summary"},
+	"mcp_call":       {"name", "tool", "status", "agentId"},
+	"task_dispatch":  {"name", "status", "summary", "agentId"},
 	"subagent_start": {"name", "status"},
 	"subagent_stop":  {"name", "status"},
 	// Planning / decisions: engineer-authored prose (prompt-context).
@@ -435,6 +435,53 @@ func isIdentifierName(s string) bool {
 			if i == 0 {
 				return false
 			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// laneField is the per-INVOCATION handle for the concurrent agent process that
+// emitted an event — the id that makes within-session parallelism computable.
+// It is allowlisted on every kind the sidechain path can emit, which is exactly
+// why it needs the clamp below: an allowlisted key is one an emitter can fill
+// with anything, and the whole point of this file is that no key carries a path.
+const laneField = "agentId"
+
+// maxLaneIDLen admits every lane id we have measured with room to spare — a
+// Cursor/Codex transcript uuid is 36 characters and a Claude Code agent id is
+// 17 — while staying far below any plausible path.
+const maxLaneIDLen = 64
+
+// isOpaqueLaneID reports whether s is an opaque tool-minted id rather than
+// something derived from the filesystem.
+//
+// The charset is the guarantee, not the length: `/` and `\` end a POSIX or
+// Windows path, `~` ends a home-relative one, `:` ends a Windows drive or a
+// URI scheme, `.` ends a dotted path segment, and a space ends the rest. What
+// remains cannot spell a directory. Measured against the real corpus before it
+// was written — every agentId on the wire is lowercase hex, and every Cursor
+// child transcript name is a hyphenated uuid — so this rejects nothing we
+// actually emit.
+//
+// WHY A CLAMP AND NOT A CONVENTION. The lane id exists because a lane needs an
+// identity, and the cheapest identity to hand a lane is the file it came from.
+// `cursorLaneIDFromPath` deliberately takes only the basename for that reason,
+// but a clamp at the emitter protects one emitter, and this file is the place
+// the promise is actually kept: `meta` stays unallowlisted and raw `cwd` stays
+// dropped for every kind, and a lane id must not become the way around either.
+func isOpaqueLaneID(s string) bool {
+	if s == "" || len(s) > maxLaneIDLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			continue
+		case c == '-', c == '_':
+			continue
 		default:
 			return false
 		}
@@ -873,6 +920,22 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 			continue
 		}
 		projected[key] = value
+	}
+	if lane, present := projected[laneField]; present {
+		// Drop to ABSENT rather than to a placeholder. A lane id we refuse to
+		// carry is a lane we cannot identify, and the consumer contract already
+		// has a word for that: a session with no lane telemetry reports as NOT
+		// OBSERVED, never as having run one lane. A sanitised stand-in would
+		// instead merge every unidentifiable lane into a single fake one.
+		//
+		// Ungated on stderr for the same reason as the unknown-kind warning
+		// above: a value silently failing this test looks exactly like a rail
+		// that emits no lane id, and those two need to stay tellable apart.
+		laneStr, isString := lane.(string)
+		if !isString || !isOpaqueLaneID(laneStr) {
+			delete(projected, laneField)
+			fmt.Fprintf(os.Stderr, "promptster-teams: redact: kind %q carried a %s that is not an opaque id — dropped\n", e.Kind, laneField)
+		}
 	}
 	if shellCommandKinds[e.Kind] {
 		if cmd, isString := projected["command"].(string); isString {
