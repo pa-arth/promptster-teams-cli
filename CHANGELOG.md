@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.21.0] — 2026-08-24
+
 ### Added
 
 **Within-session parallelism was unmeasurable, and the reason was one field on
@@ -46,11 +48,15 @@ unidentifiable lane into a single fake one.
 
 **Minor, not patch — the lane leaves the machine on eight kinds** (`prompt`,
 `tool_use`, `file_diff`, `file_create`, `file_delete`, `command`, `mcp_call`,
-`task_dispatch`). The server half is promptster-backend#TBD and **must be
+`task_dispatch`). The server half is promptster-backend#803 and **must be
 deployed first**: the device projector default-denies, so a field the server does
-not allowlist is dropped at ingest with a `201` and no error anywhere. That
-ordering is not a convention here — `allowlist_lockstep_test.go` refuses the
-device-first build by name, and it caught this one.
+not allowlist is dropped at ingest with a `201` and no error anywhere. It merged
+2026-08-24 18:13 UTC as `00adbc3`, and that is the exact commit both
+`api.promptster.ai/health` and `worker.promptster.ai/health` report — the server
+allowlist is live, verified against the running services rather than inferred
+from the merge. That ordering is not a convention here —
+`allowlist_lockstep_test.go` refuses the device-first build by name, and it
+caught this one.
 
 Eight kinds rather than a convenient subset, because the subset is
 shape-dependent: a delegate that only prompted and called one MCP tool would
@@ -2012,7 +2018,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...v0.18.1
