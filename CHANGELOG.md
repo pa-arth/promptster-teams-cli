@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-08-24
+
 **A commit two tools touched was credited wholly to one of them, and a commit no
 AI touched was given a session identity.** Both are the same defect at different
 scales: `commit_attribution` published less than the reconciler already knew.
@@ -13,7 +15,9 @@ scales: `commit_attribution` published less than the reconciler already knew.
 **Minor, not patch — a new field leaves the machine** (`files[].sessionId`). The
 server half is promptster-backend#790 and **must be deployed first**: the device
 projector default-denies, so a field the server does not allowlist is dropped at
-ingest with a `201` and no error anywhere.
+ingest with a `201` and no error anywhere. It merged 2026-08-23 20:42 UTC and is
+live — verified as an ancestor of the commit `worker.promptster.ai/health` reports
+(`b1a16b3`), rather than inferred from the merge.
 
 ### Added
 
@@ -1942,7 +1946,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.17.0...v0.18.0
