@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -177,12 +178,26 @@ func TestCommitAttributionUnknownNeverHuman(t *testing.T) {
 	if !ok {
 		t.Fatal("expected an emittable event")
 	}
-	// No AI session touched it → sessionId falls back to the device id.
-	if ev.SessionID != "dev-x" {
-		t.Errorf("sessionId = %q, want device fallback dev-x", ev.SessionID)
+	// No AI session touched it → the explicit UNATTRIBUTED marker, never the bare
+	// device id. Written as the inverse of the assertion it replaces: a device id
+	// here resolves to a REAL session row downstream (the device id used to BE the
+	// session id) and puts a commit no AI touched inside a tool's denominator.
+	if want := unattributedSessionID("dev-x"); ev.SessionID != want {
+		t.Errorf("sessionId = %q, want %q", ev.SessionID, want)
+	}
+	if ev.SessionID == "dev-x" {
+		t.Error("sessionId must not be the bare device id — it joins to a session row")
+	}
+	if !strings.HasPrefix(ev.SessionID, unattributedSessionPrefix) {
+		t.Errorf("a consumer must be able to exclude this BY NAME: %q", ev.SessionID)
 	}
 	files := filesByPath(t, ev)
 	hand := files["hand.go"]
+	// The file itself carries no session either — an unattributed file omits the
+	// key rather than naming an id.
+	if _, ok := hand["sessionId"]; ok {
+		t.Error("an unattributed file must omit sessionId, not carry one")
+	}
 	for _, r := range hand["lineRanges"].([]interface{}) {
 		if r.(map[string]interface{})["attribution"] != attributionUnknown {
 			t.Errorf("not-AI residue must be unknown, got %+v", r)
@@ -480,8 +495,11 @@ func TestBashRecoveryOutsideWindowStaysUnknown(t *testing.T) {
 			t.Errorf("file outside any bash window must stay unknown, got %+v", r)
 		}
 	}
-	if ev.SessionID != "dev-x" {
-		t.Errorf("sessionId = %q, want device fallback dev-x (no AI evidence)", ev.SessionID)
+	if want := unattributedSessionID("dev-x"); ev.SessionID != want {
+		t.Errorf("sessionId = %q, want %q (no AI evidence)", ev.SessionID, want)
+	}
+	if _, ok := files["gen.go"]["sessionId"]; ok {
+		t.Error("a file outside any bash window must omit sessionId")
 	}
 	b, _ := json.Marshal(ev)
 	if strings.Contains(string(b), "human") {
@@ -598,5 +616,148 @@ func TestParseUnifiedDiffNewRanges(t *testing.T) {
 	}
 	if _, present := got["gone.txt"]; present {
 		t.Errorf("a deletion must contribute no new-side range, got %+v", got["gone.txt"])
+	}
+}
+
+// TestCommitAttributionPerFileSession: two AI sessions touch different files in
+// ONE commit, and each file records the session that touched IT.
+//
+// This is the case the modal-session collapse could not express: before the
+// per-file field, `sessionFiles` counted both and the event published only the
+// winner, so a commit two tools touched was credited wholly to the one that
+// touched more files. Measured 2026-08-23, multi-session commits are 1.08% of
+// ops.ai's and 3.61% of My Org's — small, which is exactly why the shape has to
+// be able to express it: a board that cannot express a rare case looks correct
+// and stays correct by luck.
+func TestCommitAttributionPerFileSession(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "a.go", "package main\n\nvar A = 1\n")
+	writeCommitFile(t, ws, "b.go", "package main\n\nvar B = 2\n")
+	writeCommitFile(t, ws, "c.go", "package main\n\nvar C = 3\n")
+	git("add", "-A")
+	git("commit", "-m", "two sessions, one commit")
+	sha := gitOut("rev-parse", "HEAD")
+
+	// sess-many touches two files, sess-one touches one. Under the old rule the
+	// whole commit read as sess-many and sess-one vanished.
+	recordAiTouchedPath("sess-many", gitWatchRootKey(ws), "a.go")
+	recordAiTouchedPath("sess-many", gitWatchRootKey(ws), "b.go")
+	recordAiTouchedPath("sess-one", gitWatchRootKey(ws), "c.go")
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+
+	files := filesByPath(t, ev)
+	for path, want := range map[string]string{"a.go": "sess-many", "b.go": "sess-many", "c.go": "sess-one"} {
+		if got := files[path]["sessionId"]; got != want {
+			t.Errorf("%s sessionId = %v, want %q", path, got, want)
+		}
+	}
+	// The other half of the rule, and the one a "credit everyone" fix gets wrong:
+	// no file may be recorded against a session that did not touch it.
+	if got := files["c.go"]["sessionId"]; got == "sess-many" {
+		t.Error("c.go credited to a session that never touched it")
+	}
+	if got := files["a.go"]["sessionId"]; got == "sess-one" {
+		t.Error("a.go credited to a session that never touched it")
+	}
+
+	// The envelope keeps the modal session for existing consumers — deliberately
+	// unchanged in this release, so a consumer cutover and a producer deletion do
+	// not land in the same merge.
+	if ev.SessionID != "sess-many" {
+		t.Errorf("envelope sessionId = %q, want the modal session sess-many", ev.SessionID)
+	}
+}
+
+// TestCommitAttributionPerFileSessionBashRecovery: a file the primary pass left
+// unknown, recovered inside an AI bash window, records the BASH window's session
+// — not the session that touched the other file.
+func TestCommitAttributionPerFileSessionBashRecovery(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "edited.go", "package main\n\nvar E = 1\n")
+	writeCommitFile(t, ws, "generated.go", "package main\n\nvar G = 2\n")
+	git("add", "-A")
+	git("commit", "-m", "one ledger hit, one bash recovery")
+	sha := gitOut("rev-parse", "HEAD")
+
+	recordAiTouchedPath("ledger-sess", gitWatchRootKey(ws), "edited.go")
+	m := statMtimeMs(t, filepath.Join(ws, "generated.go"))
+	recordBashWindow("bash-sess", gitWatchRootKey(ws), m-500, m+500)
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	files := filesByPath(t, ev)
+	if got := files["edited.go"]["sessionId"]; got != "ledger-sess" {
+		t.Errorf("edited.go sessionId = %v, want ledger-sess", got)
+	}
+	if got := files["generated.go"]["sessionId"]; got != "bash-sess" {
+		t.Errorf("generated.go sessionId = %v, want bash-sess (the recovery window's)", got)
+	}
+}
+
+// TestCommitAttributionPerFileSessionSurvivesRedaction asserts on the BYTES that
+// land, not on the struct.
+//
+// The struct field and the wire are two different questions. `attrFile` goes
+// through eventDataMap's JSON round-trip and then the redaction projector's
+// ELEMENT allowlist, which is default-deny: a field the allowlist does not name
+// is stripped to nothing, with no error and no telemetry, and reads downstream as
+// "the CLI does not send it". A test that reads ev.Data before projection would
+// pass on a build that ships nothing.
+func TestCommitAttributionPerFileSessionSurvivesRedaction(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws, git, gitOut := gitRepo(t)
+
+	writeCommitFile(t, ws, "a.go", "package main\n\nvar A = 1\n")
+	git("add", "-A")
+	git("commit", "-m", "one AI-touched file")
+	sha := gitOut("rev-parse", "HEAD")
+	recordAiTouchedPath("sess-wire", gitWatchRootKey(ws), "a.go")
+
+	ev, ok := buildCommitAttributionEvent(Session{DeviceID: "dev-x", TaskRoot: ws}, ws, sha, siblingLineage{})
+	if !ok {
+		t.Fatal("expected an emittable event")
+	}
+	redact.ProjectEvent(&ev, false)
+
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Re-read the wire bytes rather than ev.Data, and reach into files[] BY
+	// STRUCTURE. A substring search for `"sessionId":"sess-wire"` looks like the
+	// same assertion and is not: the ENVELOPE carries a `sessionId` too, holding
+	// the same value, so that check passes on a build whose element allowlist
+	// drops the field entirely. Falsified by narrowing the allowlist — it stayed
+	// green, which is why it is written this way.
+	var wire struct {
+		Data struct {
+			Files []struct {
+				Path      string `json:"path"`
+				SessionID string `json:"sessionId"`
+			} `json:"files"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.Data.Files) != 1 {
+		t.Fatalf("want 1 projected file, got %d: %s", len(wire.Data.Files), b)
+	}
+	if got := wire.Data.Files[0].SessionID; got != "sess-wire" {
+		t.Fatalf("files[0].sessionId = %q, want sess-wire — the element allowlist does not name it: %s", got, b)
+	}
+	// And the projection is still doing its job on this kind.
+	if strings.Contains(string(b), "var A = 1") {
+		t.Fatalf("source survived projection: %s", b)
 	}
 }

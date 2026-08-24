@@ -352,13 +352,20 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	},
 	// commit_attribution nests TWO array levels: files[] each carrying a
 	// lineRanges[]. projectArrayElements recurses when a kept element field has
-	// its own entry here, so `files` keeps {path, lineRanges} and the nested
-	// `lineRanges` is itself clamped to {start,end,attribution} — a smuggled
-	// non-scalar (a `text`/content key) cannot survive either level. `lineRanges`
-	// is NOT a top-level allowlisted field for this kind (only commitSha/
-	// workspaceKey/files are), so this entry serves purely as the nested spec.
+	// its own entry here, so `files` keeps {path, lineRanges, sessionId} and the
+	// nested `lineRanges` is itself clamped to {start,end,attribution} — a
+	// smuggled non-scalar (a `text`/content key) cannot survive either level.
+	// `lineRanges` is NOT a top-level allowlisted field for this kind (only
+	// commitSha/workspaceKey/files are), so this entry serves purely as the nested
+	// spec.
+	//
+	// `sessionId` is the AI session that touched THAT file — an opaque id, the
+	// same one already on the event envelope, so it widens WHERE an identifier is
+	// stored and not WHAT is stored. It MUST be named here: a field the element
+	// allowlist does not name is stripped to nothing with no error and no
+	// telemetry, and reads downstream as "the CLI does not send it".
 	"commit_attribution": {
-		"files":      {"path", "lineRanges"},
+		"files":      {"path", "lineRanges", "sessionId"},
 		"lineRanges": {"start", "end", "attribution"},
 	},
 	// durability_verdict's two range arrays are content-free by construction

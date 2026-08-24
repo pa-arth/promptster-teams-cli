@@ -50,8 +50,23 @@ type attrLineRange struct {
 }
 
 // attrFile is the attribution for one changed file in a commit.
+//
+// SessionID is the AI session that touched THIS file — the attribution of
+// record. It is resolved per file by reconcileCommitAttribution (the ledger
+// lookup, or the bash-window recovery pass) and, before v0.20.0, was counted
+// into `sessionFiles` and then discarded: the event carried one commit-level
+// session picked by mostFrequentSession, so a commit two tools touched was
+// credited wholly to the one that touched more files. On a tool-dominant org
+// that tie-break is self-reinforcing and biases exactly the comparison a
+// per-tool outcome board is made of. Publishing it costs nothing — the value is
+// already in hand at the point of this struct literal.
+//
+// Empty (key omitted) for a file no AI session touched, which is the same file
+// whose ranges are `unknown`. Never the device id, and never a substitute for
+// one: see assembleCommitAttributionEvent.
 type attrFile struct {
 	Path       string          `json:"path"`
+	SessionID  string          `json:"sessionId,omitempty"`
 	LineRanges []attrLineRange `json:"lineRanges"`
 }
 
@@ -70,6 +85,35 @@ const (
 	attributionLikelyAI = "likely_ai"
 	attributionUnknown  = "unknown"
 )
+
+// unattributedSessionPrefix marks a commit_attribution event that NO AI session
+// touched. It replaces the bare device id that used to be stamped there.
+//
+// The old fallback justified itself by analogy to `config_census` and
+// `presence`, and the analogy does not hold. Those two are device-scoped BY
+// NATURE: nothing downstream joins them to a session, so a device id in their
+// session column is the right identity. `commit_attribution` is joined to a
+// `sessions` row — and the join does not fail loudly. The backend upserts a
+// session row for whatever id arrives, and the device id used to BE the session
+// id, so it collides with a REAL session row rather than dangling. Measured
+// 2026-08-23 on prod: 1,709 of ops.ai's 2,134 attribution events carried a
+// device id and ALL 1,709 reached the join; 22 of 113 resolving merged PRs
+// (19.5%) resolved ONLY through one, with no AI session behind them at all.
+// That is a denominator holding rows that could never be in the numerator.
+//
+// So the marker must be unmistakable BY NAME — a consumer must be able to
+// exclude it without a lookup. The device id is appended rather than dropped so
+// that the local signature chain (grouped by SessionID) stays per-device exactly
+// as it was; a single shared constant would interleave every device's chain into
+// one and read as tamper. The prefix, not the suffix, is what consumers match.
+const unattributedSessionPrefix = "unattributed:"
+
+// unattributedSessionID builds the marker for a commit no AI session touched.
+// Never returns a bare device id, and never returns "" — an empty sessionId is
+// dropped at ingest, and a commit a human authored is evidence we want.
+func unattributedSessionID(deviceID string) string {
+	return unattributedSessionPrefix + deviceID
+}
 
 // diffHunkRe captures the NEW-file-side start (group 1) and optional line count
 // (group 2) of a unified-diff hunk header: `@@ -a,b +c,d @@`. A missing `,d`
@@ -166,6 +210,14 @@ func parseDiffNewPath(s string) string {
 // the AI-touched-paths ledger and returns the per-file attributions (sorted by
 // path for a stable, reviewable payload) plus the representative AI session.
 //
+// The PER-FILE session (attrFile.SessionID) is the attribution of record. The
+// returned commit-level session is the modal one and is kept for the event
+// envelope only — existing consumers join `commit_attribution.sessionId` to a
+// session row and would see nothing if it moved in the same release the new
+// field arrived. A consumer cutover and a producer deletion in one merge leaves
+// no working state to roll back to, so mostFrequentSession stays until every
+// consumer reads the per-file value.
+//
 // PATH-LEVEL v1 (deliberate): a changed file is either AI-touched (→ all its
 // committed ranges are likely_ai) or not (→ unknown). Per-line intersection of
 // transcript ranges vs committed ranges is a later refinement — the transcript
@@ -226,7 +278,7 @@ func reconcileCommitAttribution(root string, scope ledgerScope, fileRanges map[s
 			r.Attribution = attribution
 			tagged = append(tagged, r)
 		}
-		files = append(files, attrFile{Path: path, LineRanges: tagged})
+		files = append(files, attrFile{Path: path, SessionID: session, LineRanges: tagged})
 	}
 	return files, mostFrequentSession(sessionFiles)
 }
@@ -303,6 +355,12 @@ func windowDistanceMs(mtimeMs int64, w bashWindow) (int64, bool) {
 // mostFrequentSession returns the sessionId that touched the most files in the
 // commit, tie-broken by the lexicographically smallest id so the choice is
 // deterministic. "" when no AI session touched the commit.
+//
+// ⚠ COMPATIBILITY ONLY — this is no longer the attribution of record, and it is
+// winner-take-all: a commit touched by two tools is credited wholly to the one
+// that touched more files. attrFile.SessionID carries every toucher. Do not add
+// a new consumer of this value; do not delete it until the existing ones have
+// moved.
 func mostFrequentSession(counts map[string]int) string {
 	best, bestN := "", 0
 	for sid, n := range counts {
@@ -320,8 +378,9 @@ func mostFrequentSession(counts map[string]int) string {
 //
 // The event's sessionId is the most-active AI session touching the commit, so
 // the backend can key attribution to a real AI-tool session; when no AI session
-// touched it (an all-unknown commit) it falls back to the device id, matching
-// how the other DEVICE-scoped watcher events (config_census, presence) pick one.
+// touched it (an all-unknown commit) it carries the explicit unattributed marker
+// instead — see unattributedSessionPrefix for why the old device-id fallback was
+// wrong here and right for config_census / presence.
 //
 // Data goes through eventDataMap (a JSON round-trip) so nested arrays-of-structs
 // land as []interface{} of map[string]interface{} — the only shape the redaction
@@ -338,14 +397,16 @@ func buildCommitAttributionEvent(session Session, root, sha string, lin siblingL
 // assembleCommitAttributionEvent wraps reconciled files into a ready-to-funnel
 // event. The sessionId is the most-active AI session touching the commit (so the
 // backend can key attribution to a real AI-tool session), falling back to the
-// device id for an all-unknown commit. Data goes through eventDataMap (a JSON
+// explicit UNATTRIBUTED marker for an all-unknown commit — never to the device
+// id, which resolves to a real session row downstream and puts a commit no AI
+// touched inside a tool's denominator. Data goes through eventDataMap (a JSON
 // round-trip) so nested arrays-of-structs land as []interface{} of map — the
 // only shape the projector's element allowlist can walk (a straight struct
 // assignment would ship {}).
 func assembleCommitAttributionEvent(session Session, root, sha string, files []attrFile, primarySession string, aiTokens int) event.Event {
 	sessionID := primarySession
 	if sessionID == "" {
-		sessionID = session.DeviceID
+		sessionID = unattributedSessionID(session.DeviceID)
 	}
 	e := event.NewEvent("commit_attribution", sessionID)
 	e.Source = presenceSource

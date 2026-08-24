@@ -6,6 +6,48 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+**A commit two tools touched was credited wholly to one of them, and a commit no
+AI touched was given a session identity.** Both are the same defect at different
+scales: `commit_attribution` published less than the reconciler already knew.
+
+**Minor, not patch — a new field leaves the machine** (`files[].sessionId`). The
+server half is promptster-backend#790 and **must be deployed first**: the device
+projector default-denies, so a field the server does not allowlist is dropped at
+ingest with a `201` and no error anywhere.
+
+### Added
+
+**`files[].sessionId` — the AI session that touched THAT file.**
+`reconcileCommitAttribution` has always resolved it per file, counted it into
+`sessionFiles`, and then discarded it; the event carried one commit-level session
+picked by `mostFrequentSession`. That is winner-take-all: a commit two tools
+touched is credited wholly to the one that touched more files, and on a
+tool-dominant org the tie-break is self-reinforcing. Measured against production
+2026-08-23, multi-session commits are **1.08%** of the live external org's 4,073
+and **3.61%** of the internal org's 1,826 — small, which is exactly why the wire
+has to be able to express it. A file no AI session touched omits the key.
+
+The envelope `sessionId` still carries the modal session, deliberately: a consumer
+cutover and a producer deletion in one release leaves no working state to roll
+back to.
+
+### Changed
+
+**A commit no AI session touched now carries `unattributed:<deviceId>`, not the
+bare device id.** The old fallback defended itself by analogy to `config_census`
+and `presence` — device-scoped events nothing joins to a session. This one IS
+joined to a session, and the join does not fail loudly: the device id used to BE
+the session id, so it collides with a real session row rather than dangling.
+Measured 2026-08-23 — **1,709 of the live external org's 2,134** attribution
+events carried a device id and **all 1,709 reached the join**; **22 of its 113
+resolving merged PRs (19.5%)** resolved only through one, with no AI session
+behind them at all.
+
+The marker is a prefix so a consumer can exclude it by name without a lookup, and
+keeps the device suffix so the local signature chain — grouped by session id —
+stays per-device instead of interleaving every device into one chain and reading
+as tamper. The event is still emitted: a human-authored commit is evidence.
+
 ## [0.19.0] — 2026-08-22
 
 **The Cursor rail reported tokens it could not price, and could not say so.**
