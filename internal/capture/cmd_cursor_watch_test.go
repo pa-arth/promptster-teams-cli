@@ -511,3 +511,44 @@ func TestPollCursorTranscriptsSeedsWhenTheWatcherHasNoStartTime(t *testing.T) {
 		t.Fatalf("an unset StartedAt replayed %d event(s) of history", queued)
 	}
 }
+
+// The session and the lane are two different questions about the same file, and
+// answering one with the other is what made within-session parallelism
+// unmeasurable on this rail. The child's uuid is the LANE; the parent directory
+// is the SESSION. Note the last two rows: for one sidechain file these two
+// functions must disagree, and for a main transcript the lane must be empty
+// rather than the session — a lane id that is really a session id reads
+// downstream as a tool that runs exactly one lane, which is the specific wrong
+// answer, not an obvious bug.
+func TestCursorLaneIDFromPath(t *testing.T) {
+	base := "/home/u/.cursor/projects/Users-u-repo/agent-transcripts"
+	cases := []struct{ path, want string }{
+		{base + "/e74dfa4f-f66b-44fe-b10f-39ecccca2fa6.jsonl", ""},
+		{base + "/e74dfa4f/e74dfa4f.jsonl", ""},
+		{base + "/9a2fe3d8/subagents/6497de01.jsonl", "6497de01"},
+	}
+	for _, c := range cases {
+		if got := cursorLaneIDFromPath(c.path); got != c.want {
+			t.Fatalf("cursorLaneIDFromPath(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+	sidechain := base + "/9a2fe3d8/subagents/6497de01.jsonl"
+	if cursorLaneIDFromPath(sidechain) == cursorSessionIDFromPath(sidechain) {
+		t.Fatal("lane and session resolved to the same value for a sidechain file")
+	}
+}
+
+// The lane is derived from a PATH, and it is emitted into an allowlisted field —
+// so the derivation must yield something the projector will accept as opaque.
+// Taking the basename is what makes that true, and this is the assertion that
+// notices if it ever stops being: a lane id carrying a directory would be a path
+// reaching the wire through the one key that is allowed through.
+func TestCursorLaneIDCarriesNoPath(t *testing.T) {
+	base := "/home/u/.cursor/projects/Users-u-repo/agent-transcripts"
+	lane := cursorLaneIDFromPath(base + "/9a2fe3d8/subagents/6497de01.jsonl")
+	for _, frag := range []string{"/", `\`, ".", "~", "home", "Users", "agent-transcripts", "subagents"} {
+		if strings.Contains(lane, frag) {
+			t.Fatalf("lane id %q carries path fragment %q", lane, frag)
+		}
+	}
+}
