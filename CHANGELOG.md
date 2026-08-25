@@ -6,6 +6,59 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+**A lane could say WHICH invocation and WHAT KIND, and not what it was for.**
+`agentId` names the invocation, `attributionAgent` names the type, and neither
+separates concurrent delegates of the SAME type. Measured over 143 Claude
+sidechains across 53 sessions: **68 of them (48%) sit in a cluster of
+concurrent same-type lanes**, cluster sizes 2-7, and the cost spread inside one
+cluster is p50 2.2x and max **11.3x**. "An Explore lane cost 11x another Explore
+lane" is not actionable; naming which one is the point.
+
+- **Claude Code** stamps the dispatch LABEL on `subagent_usage`, read from the
+  `.meta.json` sidecar Claude writes beside every sidechain
+  (`{"agentType","description","toolUseId","spawnDepth"}`, present on 143/143,
+  20-50 chars, distinct in all 21 clusters). Read from the CHILD side on
+  purpose: the parent knows the description but not which sidechain it produced
+  — its Task call carries a `toolUseId`, not an agent id — so pairing them from
+  the parent is a join with no key. The child's sidecar carries all three
+  together, so there is nothing to join. Only `description` is read.
+- **Codex** now recognises the `thread_spawn` arm. `SubAgentSource` is a
+  five-arm union — review | compact | thread_spawn | memory_consolidation |
+  other — and only `other` carries a bare string. A user-spawned delegate takes
+  `thread_spawn`, whose value is an OBJECT, so the old single-string scan found
+  nothing and **every user-spawned Codex delegate arrived with no attribution at
+  all**. Silent: absent reads exactly like a rail that does not report one.
+  `agent_role` becomes `attributionAgent`; `agent_nickname` ("Aristotle") is a
+  per-invocation IDENTITY, not a type, so it becomes `summary` — putting it in
+  the type field would make every lane its own delegate type and invert the
+  32x-undercount axis. `agent_path` is deliberately unused: it is a path, the
+  clamp exists to reject paths, and its basename would be a guess.
+- **Cursor** gets nothing, and not by oversight: zero sidecars across 11
+  sessions, child rows carry only `role`/`message`, **0 of 582 carry any
+  timestamp**, and a child uuid appears in its parent in **1 of 40** cases.
+  There is no child-side metadata to read and no key to join on.
+
+**Not a widening of what leaves the machine.** `summary` is already allowlisted
+on `task_dispatch`, and the CLI already emits that identical string there for
+every dispatch. Both halves — the label and the money — already shipped and
+could not be paired. This restamps a sanctioned field onto the event that
+carries the spend, capped by the same helper at the same 100 bytes.
+
+It is a dispatch LABEL, not sidechain prose. Claude sidechains stay
+counters-only ("sidechain prose is agent-authored and must not leave the
+machine"); the string is the parent's model-authored tool-call description.
+
+The server half is promptster-backend#808 and **must be deployed first**: the
+device projector default-denies, so a field the server does not allowlist is
+dropped at ingest with a `201` and no error anywhere.
+
+**Two honest limits.** Codex `agent_role` was null on both observed rollouts, so
+the `attributionAgent` half of the Codex change is correct-by-construction and
+UNOBSERVED; the `summary` half has a wire fixture behind it. And the fix is
+forward-only — historical rows that arrived with no attribution stay that way.
+
 ## [0.21.0] — 2026-08-24
 
 ### Added

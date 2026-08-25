@@ -79,6 +79,12 @@ type CodexRolloutProcessor struct {
 	// subagent_usage as attributionAgent, the key the Claude rail already uses,
 	// so one consumer reads both rails.
 	agentName string
+	// agentLabel is the delegate's human NICKNAME ("Aristotle"), from the
+	// thread_spawn arm. It rides `summary` — a label answering "which of these
+	// lanes", never `attributionAgent`, which answers "what kind". Keeping them
+	// in separate fields is the whole reason the 32x-undercount note above
+	// stays true.
+	agentLabel string
 	// threadID is this rollout's OWN thread id (session_meta.payload.id, which is
 	// also the uuid in the filename). It is no longer the session id — see
 	// CodexConversationID — but it is what tells one subagent's spend apart from
@@ -470,12 +476,44 @@ func CodexConversationID(payload map[string]interface{}) string {
 //	"source": "cli" | "exec"                  -> a thread a human is typing into
 //	"source": {"subagent": {"other": "guardian"}} -> a delegated thread
 //
-// The inner key is NOT hardcoded to "other". Two rollouts is the entire sample
-// this was written against, both carrying the same variant, and `other` reads
-// like one arm of an enum whose other arms we have not seen — so the name is
-// taken from whichever single string the `subagent` object holds. A shape that
-// does not resolve to exactly one string yields "", and the caller omits the
-// key rather than emitting a guess.
+// The inner key is NOT hardcoded to "other", and the arm we had not seen has
+// now been observed. `SubAgentSource` is a five-arm union — review | compact |
+// thread_spawn | memory_consolidation | other — and only `other` carries a bare
+// string. A USER-spawned delegate takes the `thread_spawn` arm, whose value is
+// an OBJECT:
+//
+//	"source": {"subagent": {"thread_spawn": {
+//	   "parent_thread_id": "...", "depth": 1,
+//	   "agent_path": "/root/count_a",
+//	   "agent_nickname": "Aristotle", "agent_role": null}}}
+//
+// Observed on the wire, codex 0.146.0, two delegates in one session, under
+// `multi_agent_version: "v2"`. The July/August guardian rollouts this function
+// was written against say `"disabled"` — that flag, not the CLI version, is
+// what decides which arm an org produces.
+//
+// Before this, the single-string loop below found no string in that object and
+// returned "", so every user-spawned Codex delegate arrived with no
+// attributionAgent at all. Silent: absent reads exactly like a rail that does
+// not report one.
+//
+// `agent_role` is the arm's TYPE field and the only one that may become
+// attributionAgent. It is NOT `agent_nickname`: a nickname names WHICH
+// invocation ("Aristotle"), and putting a per-invocation identity in the type
+// field would make every lane its own delegate type and inflate any "what does
+// this team delegate" rollup — the same 32x-undercount axis in reverse. The
+// nickname rides `summary` instead, beside the Claude rail's dispatch label.
+//
+// `agent_path` is deliberately unused. It is a path, the clamp below exists to
+// reject paths, and taking its basename would be a guess about Codex's agent
+// naming that two synthetic agents cannot support.
+//
+// HONEST LIMIT: `agent_role` was null on both observed rollouts, so the
+// attributionAgent half of this is correct-by-construction and UNOBSERVED. The
+// summary half is the one with a wire fixture behind it.
+//
+// Any other shape still yields "", and the caller omits the key rather than
+// emitting a guess.
 //
 // The value is clamped to a NAME shape. It is the only place a vendor string
 // reaches an allowlisted field on this path, and `attributionAgent` is
@@ -494,6 +532,12 @@ func codexSubagentName(payload map[string]interface{}) string {
 	case string:
 		return codexCleanAgentName(v)
 	case map[string]interface{}:
+		// The thread_spawn arm, by name. Handled before the single-string scan
+		// because its object holds SEVERAL strings (agent_path, agent_nickname)
+		// and that scan would bail on the ambiguity — correctly, but silently.
+		if spawn, ok := v["thread_spawn"].(map[string]interface{}); ok {
+			return codexCleanAgentName(stringField(spawn, "agent_role"))
+		}
 		name := ""
 		for _, raw := range v {
 			str, isString := raw.(string)
@@ -511,6 +555,34 @@ func codexSubagentName(payload map[string]interface{}) string {
 		return codexCleanAgentName(name)
 	}
 	return ""
+}
+
+// codexSubagentLabel pulls the delegated lane's human-readable NICKNAME out of
+// the `thread_spawn` arm ("Aristotle", "Pauli" — Codex mints one per delegate).
+//
+// It is a LABEL, not a type: it answers "which of these three lanes" rather
+// than "what kind of agent", which is why it rides `summary` beside the Claude
+// rail's dispatch description and never `attributionAgent`. On Codex the lane
+// already has a stable id (the thread uuid), so the nickname adds legibility,
+// not identity — a cost row that reads "Aristotle" instead of a uuid.
+//
+// Clamped by the same name shape as attributionAgent: it is a vendor string
+// reaching an allowlisted field, and a future build putting a path or a prompt
+// here must be dropped rather than discovered downstream.
+func codexSubagentLabel(payload map[string]interface{}) string {
+	src, ok := payload["source"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	sub, ok := src["subagent"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	spawn, ok := sub["thread_spawn"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	return codexCleanAgentName(stringField(spawn, "agent_nickname"))
 }
 
 // codexCleanAgentName accepts an agent TYPE name and rejects anything shaped
@@ -569,6 +641,7 @@ func (p *CodexRolloutProcessor) sessionMeta(payload map[string]interface{}, ts, 
 	p.subagentThread = codexIsSubagentThread(payload)
 	p.threadID = stringField(payload, "id")
 	p.agentName = codexSubagentName(payload)
+	p.agentLabel = codexSubagentLabel(payload)
 	// Stash the home-collapsed cwd for prompt events: session_meta is the only
 	// rollout line carrying cwd, and it precedes every prompt. HomeRelativeStrict
 	// emits ONLY a provably home-relative ("~"-prefixed) value — an outside-home
@@ -739,6 +812,12 @@ func (p *CodexRolloutProcessor) subagentUsage(ts, raw string) []event.Event {
 	}
 	if p.agentName != "" {
 		data["attributionAgent"] = p.agentName
+	}
+	if p.agentLabel != "" {
+		// WHICH lane, in words. Absent on the guardian/`other` arm, which has a
+		// type name and no nickname — omitted rather than backfilled from the
+		// type, because "guardian" as a label would read as a distinct lane.
+		data["summary"] = p.agentLabel
 	}
 	e.Data = data
 	e.RawPayload = "codex subagent usage"

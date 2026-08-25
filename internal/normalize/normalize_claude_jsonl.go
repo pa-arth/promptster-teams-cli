@@ -259,6 +259,22 @@ type ClaudeTranscriptProcessor struct {
 	AgentID          string
 	attributionSkill string
 	attributionAgent string
+	// Summary is WHAT this lane was dispatched to do — the parent's Task
+	// `description`, read from the sidechain's own `.meta.json` sidecar by the
+	// watcher and threaded in like AgentID.
+	//
+	// It is set from the CHILD side on purpose. The parent knows the
+	// description but not which sidechain it produced (its Task call carries a
+	// toolUseId, not an agent id), so pairing them from the parent is a join
+	// with no key. The child's sidecar carries description, agentType AND
+	// toolUseId together, so there is nothing to join.
+	//
+	// This does NOT reopen the counters-only contract below. The string is a
+	// model-authored dispatch LABEL from the parent's tool call — already
+	// emitted verbatim as `task_dispatch.summary` for every dispatch — not
+	// sidechain prose. Held raw here and capped on emit, so the length rule
+	// lives in exactly one place.
+	Summary string
 	// Interrupt tracking. Claude Code writes a synthetic user line
 	// ([Request interrupted by user] / ...for tool use) when the developer hits
 	// ESC/Ctrl+C mid-response. We classify what was cut POSITIONALLY from the
@@ -534,6 +550,15 @@ func (p *ClaudeTranscriptProcessor) flushSidechain(a *claudeMsgAccum) []event.Ev
 	}
 	if p.attributionAgent != "" {
 		data["attributionAgent"] = p.attributionAgent
+	}
+	// WHAT this lane was for. agentId says WHICH invocation and
+	// attributionAgent says WHAT KIND; neither separates three concurrent
+	// delegates of the same kind, which is 48% of measured lanes with an 11.3x
+	// cost spread inside one cluster.
+	if p.Summary != "" {
+		// Capped HERE, with the same helper task_dispatch uses on the identical
+		// string, so one label cannot ship at two lengths from two producers.
+		data["summary"] = strPreview(p.Summary, 100)
 	}
 	e.Data = data
 	e.RawPayload = strPreview(fmt.Sprintf("subagent usage msg=%s", msgID), 100)

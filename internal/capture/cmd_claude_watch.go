@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -849,25 +850,7 @@ func pollClaudeTranscripts(
 		// assistant message against half the lines.
 		proc := processors[key]
 		if proc == nil {
-			proc = normalize.NewClaudeTranscriptProcessor(claudeSessionIDFromPath(path))
-			if isClaudeSidechainFile(path) {
-				proc.UsageOnly = true
-				// The filename is the floor for sidechain attribution: rows
-				// usually repeat it (plus skill/agent names), but agentId must
-				// survive even if they don't.
-				proc.AgentID = claudeAgentIDFromPath(path)
-			} else {
-				// Resolve the canonical repo identity ONCE per session (this
-				// processor is created once per transcript) from the transcript's
-				// recorded cwd, and thread it in as session state so each prompt
-				// event carries repoRoot + repoHost + repoTracked. Sidechains emit
-				// no prompts, so they skip it. transcriptCwd reads only the cwd
-				// field, never the body. All three parts come from ONE call so the
-				// host and the tracked bit can never be stamped from a different
-				// resolution pass than the slug — they describe one observation of
-				// one directory, and a second pass could see it after a `git init`.
-				proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(transcriptCwd(path))
-			}
+			proc = newClaudeProcessorForPath(path)
 			processors[key] = proc
 		}
 		// Refresh the context window on EVERY poll, not once at construction:
@@ -885,6 +868,19 @@ func pollClaudeTranscripts(
 					ObservedAt: spool.ObservedAt,
 				}
 			}
+		} else if proc.Summary == "" {
+			// The sidecar is a SEPARATE file, so the transcript can exist before
+			// it does: measured on 145 real sidechains, the `.meta.json` was born
+			// after its `.jsonl` on 25 of them (17.2%), the closest by 10ms. A
+			// processor lives for the whole watcher run, so reading once at
+			// construction turns a 10ms head start into a permanently unlabelled
+			// lane — and an absent summary reads downstream as "this lane did not
+			// tell us", not as "we looked too early".
+			//
+			// So retry while it is still missing, and stop the moment it is not.
+			// A lane that never gets a sidecar costs one failed os.Open per poll,
+			// which is the price of not guessing which side of the race we are on.
+			proc.Summary = claudeSidecarDescription(path)
 		}
 		n, res := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget, oversizeProbe)
 		parsed += n
@@ -997,6 +993,84 @@ func isClaudeSidechainFile(path string) bool {
 func claudeAgentIDFromPath(path string) string {
 	base := strings.TrimSuffix(filepath.Base(path), ".jsonl")
 	return strings.TrimPrefix(base, "agent-")
+}
+
+// newClaudeProcessorForPath builds the processor for one transcript and threads
+// in everything that is constant for the life of that file.
+//
+// Extracted from the poll loop so the WIRING is reachable from a test. It was
+// inline, and the seam mattered: `claudeSidecarDescription` had unit tests that
+// passed with the call site deleted, which is a library shipped with no caller
+// — green, and inert on every real transcript.
+func newClaudeProcessorForPath(path string) *normalize.ClaudeTranscriptProcessor {
+	proc := normalize.NewClaudeTranscriptProcessor(claudeSessionIDFromPath(path))
+	if isClaudeSidechainFile(path) {
+		proc.UsageOnly = true
+		// The filename is the floor for sidechain attribution: rows usually
+		// repeat it (plus skill/agent names), but agentId must survive even if
+		// they don't.
+		proc.AgentID = claudeAgentIDFromPath(path)
+		// ...and WHAT it was dispatched to do, from the sidecar beside it. Best
+		// effort here: the sidecar may not exist yet (it is a separate file), and
+		// the poll loop retries an empty one until it resolves.
+		proc.Summary = claudeSidecarDescription(path)
+		return proc
+	}
+	// Resolve the canonical repo identity ONCE per session (this processor is
+	// created once per transcript) from the transcript's recorded cwd, and
+	// thread it in as session state so each prompt event carries repoRoot +
+	// repoHost + repoTracked. Sidechains emit no prompts, so they skip it.
+	// transcriptCwd reads only the cwd field, never the body. All three parts
+	// come from ONE call so the host and the tracked bit can never be stamped
+	// from a different resolution pass than the slug — they describe one
+	// observation of one directory, and a second pass could see it after a
+	// `git init`.
+	proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(transcriptCwd(path))
+	return proc
+}
+
+// claudeSidecarDescription reads the dispatch label for a sidechain from the
+// `.meta.json` Claude Code writes beside it:
+//
+//	<session>/subagents/agent-<id>.jsonl
+//	<session>/subagents/agent-<id>.meta.json
+//	  {"agentType":"Explore","description":"Count files in current directory",
+//	   "toolUseId":"toolu_01Rmf...","spawnDepth":1}
+//
+// Present on 143/143 sidechains across 53 sessions of real capture;
+// descriptions ran 20-50 chars, and in all 21 clusters of concurrent same-type
+// lanes every description was distinct — which is the point, since the type
+// name is identical across such a cluster by definition.
+//
+// ONLY `description` is read. `toolUseId` is not: it is the parent's tool-call
+// id, it would need its own allowlist row on both sides, and it answers a
+// question — which dispatch produced this lane — that the description already
+// answers in words. `agentType` is not read either; the sidechain rows carry it
+// as attributionAgent already, and a second source for one field is a second
+// chance to disagree.
+//
+// The 100-byte cap is applied by the normalizer on emit (the same strPreview
+// task_dispatch already uses for this identical string), not here — one place
+// decides the length so the two producers of one label cannot disagree. A
+// missing, unreadable or malformed sidecar yields "" and the caller omits the key —
+// absent means "this lane did not tell us", which is not the same as a lane
+// with no purpose.
+func claudeSidecarDescription(path string) string {
+	meta := strings.TrimSuffix(path, ".jsonl") + ".meta.json"
+	// Bounded read: this is a four-key sidecar, and a file that is not one is
+	// not worth pulling into memory to find out.
+	f, err := os.Open(meta) // #nosec G304 -- path derived from a watched transcript
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	var sidecar struct {
+		Description string `json:"description"`
+	}
+	if err := json.NewDecoder(io.LimitReader(f, 64<<10)).Decode(&sidecar); err != nil {
+		return ""
+	}
+	return sidecar.Description
 }
 
 // claudeSessionIDFromPath derives the OWNING session uuid from a transcript
