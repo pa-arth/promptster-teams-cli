@@ -1,10 +1,6 @@
 package normalize
 
-import (
-	"testing"
-
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-)
+import "testing"
 
 // Real session_meta headers captured from codex-cli 0.146.0 on 2026-08-24,
 // trimmed of base_instructions. One `codex exec` run that delegated twice, so
@@ -130,4 +126,26 @@ func TestCodexLaneLabelRejectsAPath(t *testing.T) {
 	}
 }
 
-var _ = event.Event{}
+// The thread the human typed into is the control arm, and it is what makes the
+// two lanes above mean anything: it comes off the SAME `codex exec` run, under
+// the same `multi_agent_version:"v2"`, and it must not be read as a delegate.
+// `thread_source:"user"` with no `source.subagent` object — so no
+// subagent_usage, and no lane label to leak from a sibling thread's meta.
+func TestCodexParentThreadIsNotADelegate(t *testing.T) {
+	events := runCodexRollout(t, spawnParentThreadID, []string{spawnParentMeta, spawnUsageLine, spawnAnswerLine})
+	for _, e := range events {
+		if e.Kind == "subagent_usage" {
+			t.Fatalf("the human's own thread emitted subagent_usage: %v", codexData(e))
+		}
+		d := codexData(e)
+		if d == nil {
+			continue
+		}
+		if v, ok := d["summary"]; ok {
+			t.Fatalf("%s carried a lane label: %v", e.Kind, v)
+		}
+		if v, ok := d["attributionAgent"]; ok {
+			t.Fatalf("%s carried a delegate type: %v", e.Kind, v)
+		}
+	}
+}
