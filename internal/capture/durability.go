@@ -681,9 +681,14 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 
 	// Fingerprint lookups (a separate locked file) are resolved BEFORE taking the
 	// ledger lock, so the ledger's read-modify-write never nests another lock.
+	//
+	// ONE load for the whole loop, not one per path: the store is a single file
+	// that can reach tens of MB, and re-reading it per path made a wide commit's
+	// cost quadratic in nothing but its own file size.
+	fpStore := loadDurabilityFingerprints()
 	fpsByPath := map[string]map[string]string{}
 	for path := range hunks {
-		if fps := fingerprintsForPath(rootKey, path, nowMs); fps != nil {
+		if fps := fingerprintsForPathIn(fpStore, rootKey, path, nowMs); fps != nil {
 			fpsByPath[path] = fps
 		}
 	}
