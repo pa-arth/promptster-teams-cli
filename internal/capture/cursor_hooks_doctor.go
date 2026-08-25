@@ -258,12 +258,54 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 //     per-turn figure, not a reason to keep asserting the tag.
 func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
 	c := loadCursorGenerations()
-	if c.UsageRows == 0 {
-		// Nothing captured yet. Saying "0 of 0 rows" would read as a problem.
+	o := loadCursorHookOverruns()
+	// Nothing observed at all — say nothing. "0 of 0 rows" on a machine that has
+	// simply not used Cursor reads as a problem.
+	//
+	// EVERY COUNTER GATES THIS, NOT JUST THE TWO ABOUT SUCCESS. Guarding on
+	// UsageRows/StopSeen alone (as the first draft did, caught in review on #186)
+	// hides the WORST machine there is: one whose every invocation blows the
+	// budget, or whose every payload is unreadable, has zero of both and a large
+	// Overruns or Unparsed — and would print nothing, which is the same silence
+	// this whole instrument exists to end.
+	if c.UsageRows == 0 && c.StopSeen == 0 && c.Unparsed == 0 && o.Overruns == 0 {
 		return CursorHookDoctorLine{}, false
 	}
 	text := fmt.Sprintf("Cursor usage rows captured: %d (%d with no model to price)",
 		c.UsageRows, c.ModellessRows)
+	// The denominator, when this machine has one. A build older than the
+	// counters reports StopSeen 0 with real UsageRows, and printing "0 stops"
+	// beside them would be a false statement rather than a missing one — so the
+	// coverage clause appears only when the machine actually counted stops.
+	warnCoverage := false
+	if c.StopSeen > 0 {
+		text += fmt.Sprintf("; %d of %d stop hooks produced one", c.UsageRows, c.StopSeen)
+		if c.StopEmpty > 0 {
+			text += fmt.Sprintf(" (%d turns reported nothing to price)", c.StopEmpty)
+		}
+		// The residual: parsed, not empty, and still no row. Should be zero, and a
+		// nonzero one is OUR defect rather than an aborted turn — so it is named
+		// separately from StopEmpty and it is what raises the warning.
+		lost := c.StopSeen - c.StopEmpty - c.UsageRows
+		if lost > 0 {
+			text += fmt.Sprintf("; %d lost between the normalizer and the queue", lost)
+			warnCoverage = true
+		}
+	}
+	if c.Unparsed > 0 {
+		// Everything above is conditional on a parse, so this says the numbers are
+		// describing a subset of the traffic.
+		text += fmt.Sprintf("; %d payloads never named a step", c.Unparsed)
+		warnCoverage = true
+	}
+	if o.Overruns > 0 {
+		// Always a warning, at any count. An overrun is not a dropped
+		// measurement, it is us stalling the engineer's agent for two seconds and
+		// then dropping the measurement anyway.
+		text += fmt.Sprintf("; %d hook invocations hit the %s budget and were abandoned",
+			o.Overruns, cursorHookBudget)
+		warnCoverage = true
+	}
 	if c.NonCumulativeComparisons > 0 {
 		text += fmt.Sprintf("; per-turn counts confirmed by %d of %d output decreases",
 			c.NonCumulativeDecreases, c.NonCumulativeComparisons)
@@ -275,6 +317,7 @@ func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
 	if warn {
 		text += " — most rows cannot be priced; the generation model join is not covering this machine"
 	}
+	warn = warn || warnCoverage
 	return CursorHookDoctorLine{OK: !warn, Warn: warn, Text: text}, true
 }
 

@@ -79,6 +79,43 @@ type cursorGenerations struct {
 	// kept only to make the comparison above possible. It is a counter input,
 	// never an event field.
 	LastOutput map[string]cursorLastOutput `json:"lastOutput"`
+
+	// THE DENOMINATOR UsageRows NEVER HAD, and the drops it was hiding.
+	//
+	// UsageRows counts what this rail EMITTED. Nothing counted what it was ASKED
+	// to emit, so a `stop` that produced no row left no trace of any kind: not a
+	// log line, not a counter, not an event. Measured against Cursor's own
+	// session records on one live machine, 38% of turns had no usage row and
+	// there was no evidence on the device for a single one of them — which is not
+	// a hard problem so much as an unobserved one.
+	//
+	// SCOPED TO `stop` DELIBERATELY. It is the only step that carries spend, and
+	// the only step whose absence is expensive. A prompt step that emits nothing
+	// costs a metadata field; a `stop` that emits nothing costs a turn's dollars,
+	// silently, in a number a customer is shown.
+	//
+	// StopSeen  — `stop` payloads this hook parsed. Counted after the payload
+	//             names its step, so it excludes anything that never got that
+	//             far (see Unparsed) and anything abandoned before parsing (see
+	//             cursor_hook_overruns.go).
+	// StopEmpty — of those, the ones usageEvent declined: no token counts at all
+	//             AND no model resolved. This is an HONEST drop — an aborted turn
+	//             we were told nothing about — and separating it from the rest is
+	//             the entire point, because it is the one bucket that needs no
+	//             fix.
+	//
+	// The residual, StopSeen - StopEmpty - UsageRows, is the bucket that should
+	// be zero: a `stop` that parsed, was not empty, and still produced no row.
+	// Nonzero means a defect between the normalizer and the queue, and it is
+	// visible as arithmetic rather than needing its own counter.
+	StopSeen  int64 `json:"stopSeen"`
+	StopEmpty int64 `json:"stopEmpty"`
+	// Unparsed counts payloads that never named a step: unmarshalling failed, or
+	// the payload carried no session id / no hook event name. It should be zero.
+	// Its value is that everything else here is conditional on a parse, so a
+	// nonzero Unparsed says the other counters are describing a subset and not
+	// the traffic.
+	Unparsed int64 `json:"unparsed"`
 }
 
 type cursorGeneration struct {
@@ -294,47 +331,106 @@ func cursorGenerationModel(generationID string) string {
 	return e.Model
 }
 
-// recordCursorUsageObservation counts what §0.1 measured with a probe, so the
-// number survives the probe: how many usage rows this machine emitted and how
-// many of them had no model to price.
+// The `stop`-step counters: what §0.1 measured with a probe, so the numbers
+// survive the probe.
 //
-// It also feeds the per-request premise its evidence, by comparing this
+// How many usage rows this machine emitted and how many of them had no model to
+// price, plus (since the 38% investigation) how many `stop` invocations asked
+// for a row at all. See cursorGenerations.StopSeen for why the denominator
+// matters more than the numerator did.
+//
+// They also feed the non-cumulative premise its evidence, by comparing this
 // generation's output count with the previous generation of the same
 // conversation. A decrease is impossible for a cumulative counter, so the
 // counter of decreases IS the observation, and `doctor` reports it.
-func recordCursorUsageObservations(conversationID, model string, events []event.Event) {
-	for _, ev := range events {
-		if ev.Kind != "ai_response" {
-			continue
-		}
-		var out *int64
-		if d, ok := ev.Data.(map[string]interface{}); ok {
-			if v, ok := d["outputTokens"].(int64); ok {
-				out = &v
-			}
-		}
-		recordCursorUsageObservation(conversationID, model, out)
-	}
-}
-
-func recordCursorUsageObservation(conversationID, model string, outputTokens *int64) {
+// recordCursorStopOutcome books one `stop` invocation: the fact that it happened,
+// and whatever it produced.
+//
+// ONE LOCK FOR THE WHOLE INVOCATION, and that is a requirement rather than a
+// tidy-up. The numerator and the denominator of this rail's coverage now live in
+// the same file, so taking the lock twice would let a concurrent hook interleave
+// between them and leave the file asserting a ratio neither process observed.
+// It also keeps the successful path at exactly the one lock acquisition it cost
+// before, which matters because every one of them is inside the engineer's agent
+// loop.
+//
+// TWO SLICES, AND THE GAP BETWEEN THEM IS THE POINT.
+//
+//	normalized — what the normalizer produced. EMPTY means usageEvent declined
+//	             the turn: Cursor reported no token counts and resolved no model,
+//	             so there was nothing to claim. That is StopEmpty, and it is an
+//	             HONEST drop.
+//	queued     — what emitCursorEvent actually got into the outbox. That is
+//	             UsageRows.
+//
+// They differ when a row normalized fine and the enqueue failed — a full outbox,
+// a read-only state dir, a signing failure, all ordinary conditions rather than
+// crashes. Counting UsageRows off `normalized` (as the first draft of this did,
+// caught in review on #186) would report that turn as captured while its spend
+// sat nowhere, and would hold the residual at zero for exactly the case the
+// residual exists to expose.
+//
+// Booked this way, a queue loss lands in NEITHER named bucket: seen goes up,
+// empty does not, usageRows does not, and `seen - empty - usageRows` becomes 1.
+// That is what `doctor` calls "lost between the normalizer and the queue", which
+// is now literally what it is rather than an aspiration.
+func recordCursorStopOutcome(conversationID, model string, normalized, queued []event.Event) {
 	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
 		now := time.Now()
-		c.UsageRows++
-		if model == "" {
-			c.ModellessRows++
+		c.StopSeen++
+		if len(normalized) == 0 {
+			c.StopEmpty++
 		}
-		if outputTokens != nil && conversationID != "" {
-			if prev, ok := c.LastOutput[conversationID]; ok {
-				c.NonCumulativeComparisons++
-				if *outputTokens < prev.Tokens {
-					c.NonCumulativeDecreases++
+		for _, ev := range queued {
+			if ev.Kind != "ai_response" {
+				continue
+			}
+			var out *int64
+			if d, ok := ev.Data.(map[string]interface{}); ok {
+				if v, ok := d["outputTokens"].(int64); ok {
+					out = &v
 				}
 			}
-			c.LastOutput[conversationID] = cursorLastOutput{Tokens: *outputTokens, TsMs: now.UnixMilli()}
+			recordUsageRow(&c, conversationID, model, out, now)
 		}
 		pruneCursorGenerations(&c, now)
+		saveCursorGenerations(c)
+		return nil
+	})
+}
+
+// recordUsageRow folds one emitted usage row into the counters. Takes the loaded
+// struct rather than the lock, so it composes inside recordCursorStopOutcome's
+// single critical section.
+func recordUsageRow(c *cursorGenerations, conversationID, model string, outputTokens *int64, now time.Time) {
+	c.UsageRows++
+	if model == "" {
+		c.ModellessRows++
+	}
+	if outputTokens != nil && conversationID != "" {
+		if prev, ok := c.LastOutput[conversationID]; ok {
+			c.NonCumulativeComparisons++
+			if *outputTokens < prev.Tokens {
+				c.NonCumulativeDecreases++
+			}
+		}
+		c.LastOutput[conversationID] = cursorLastOutput{Tokens: *outputTokens, TsMs: now.UnixMilli()}
+	}
+}
+
+// recordCursorHookUnparsed counts a payload that never named a step.
+//
+// NOT called for the two returns above the parse — a failed stdin read and a
+// failed loadSession. Neither has established that this machine is enrolled, and
+// an unenrolled machine sends no presence beat, so the count would have no
+// reader and the file would be created for nobody. `doctor` reports both of
+// those conditions directly and from better evidence.
+func recordCursorHookUnparsed() {
+	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
+		c := loadCursorGenerations()
+		c.Unparsed++
+		pruneCursorGenerations(&c, time.Now())
 		saveCursorGenerations(c)
 		return nil
 	})

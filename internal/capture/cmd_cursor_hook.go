@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 )
@@ -77,6 +78,15 @@ func RunCursorHook() error {
 		// Budget blown. Abandon the work and return; the transcript rail still
 		// covers this session. Do NOT wait for the goroutine — waiting is the
 		// thing the budget exists to prevent.
+		//
+		// Counted, because this line goes to a stderr Cursor discards and the
+		// abandoned work leaves no other trace: an overrun and an idle engineer
+		// were indistinguishable from anywhere off the machine. The counter is
+		// deliberately NOT in cursor-generations.json — that file's lock is the
+		// leading candidate for what wedged the goroutine, and blocking on it
+		// here would defeat the budget while reporting it. See
+		// cursor_hook_overruns.go.
+		recordCursorHookOverrun()
 		fmt.Fprintln(os.Stderr, "promptster-teams: cursor hook exceeded its time budget, skipping")
 	}
 	// Both paths answer identically. A constant cannot say followup_message.
@@ -135,6 +145,12 @@ func runCursorHookInner() {
 		recordCursorGenerationModel(res.GenerationID, res.Model)
 	}
 	if !ok {
+		// COUNT THE DROP BEFORE RETURNING. Every counter this rail had was on the
+		// far side of this return, so a `stop` that produced nothing incremented
+		// nothing — the one outcome worth measuring was the one outcome that left
+		// no record. 38% of one live machine's turns went missing this way with
+		// no evidence on the device for a single one of them.
+		recordCursorHookDrop(res)
 		return
 	}
 
@@ -160,18 +176,34 @@ func runCursorHookInner() {
 	// the first — silently, since the surviving row looks perfectly healthy.
 	events := res.Events
 
-	// Count what the coverage probe measured, so the number outlives the probe.
-	if res.Step == "stop" {
-		recordCursorUsageObservations(res.SessionID, res.Model, events)
-	}
-
 	// captureProse=false unconditionally. The resolver does a network fetch, and
 	// invariant 2 forbids network I/O on this path; more to the point, this rail
 	// emits no assistant prose at all — the one prose field it carries is the
 	// engineer's own prompt, which is not gated by that policy.
 	queued := 0
+	var queuedEvents []event.Event
 	for _, ev := range events {
-		queued += emitCursorEvent(ev, session, false)
+		n := emitCursorEvent(ev, session, false)
+		queued += n
+		if n > 0 {
+			queuedEvents = append(queuedEvents, ev)
+		}
+	}
+
+	// Count what the coverage probe measured, so the number outlives the probe.
+	// The SAME call books the drop above, with two nil slices — one function,
+	// both outcomes, so the ratio it reports cannot be booked inconsistently.
+	//
+	// AFTER THE ENQUEUE, AND OFF `queuedEvents` RATHER THAN `events`. This ran
+	// before the loop until review caught it (#186): emitCursorEvent returns 0
+	// when the outbox append fails, so counting the normalized set would report a
+	// turn as captured while its spend sat nowhere — and would keep the residual
+	// at zero for precisely the case the residual exists to expose. Both slices
+	// go in because they answer different questions: an empty `events` is the
+	// vendor telling us nothing (honest), while a full `events` and an empty
+	// `queuedEvents` is us losing it (ours). See recordCursorStopOutcome.
+	if res.Step == "stop" {
+		recordCursorStopOutcome(res.SessionID, res.Model, events, queuedEvents)
 	}
 
 	// CLAIM ONLY AFTER SOMETHING WAS DURABLY QUEUED, AND ONLY THEN.
@@ -191,6 +223,35 @@ func runCursorHookInner() {
 	// data. Given the choice, duplicate beats gone.
 	if queued > 0 && res.TranscriptPath != "" {
 		recordCursorHookClaim(res.TranscriptPath, res.SessionID)
+	}
+}
+
+// recordCursorHookDrop books a normalization failure against the step that
+// caused it.
+//
+// Its own function for the reason cursorHookTaskRoot is: the call site is one
+// line and the interesting behaviour is entirely here, so the DISPATCH is
+// testable without standing up a whole hook run. That matters more than usual
+// here — the defect being fixed was a call in the wrong place, not a wrong
+// calculation, so a test that exercised only the recorders would pass against
+// an implementation that had stopped calling them.
+//
+// TWO NAMED OUTCOMES, AND SILENCE FOR THE REST. A `stop` here is an EMPTY turn:
+// usageEvent declined it because Cursor reported no token counts and no model
+// resolved, which is an honest drop of a turn we were told nothing about. An
+// empty Step is a payload that never parsed at all.
+//
+// Every other `!ok` is deliberately not counted — afterAgentThought, which emits
+// nothing by design and whose only product is the model cache entry; an
+// unregistered step; a prompt step with no prompt. None of those is a drop of
+// spend, and a counter that mixes "nothing to say" with "we lost a turn" is the
+// exact ambiguity this instrument exists to remove.
+func recordCursorHookDrop(res normalize.CursorHookResult) {
+	switch res.Step {
+	case "stop":
+		recordCursorStopOutcome(res.SessionID, res.Model, nil, nil)
+	case "":
+		recordCursorHookUnparsed()
 	}
 }
 

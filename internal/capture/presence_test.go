@@ -54,10 +54,20 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	// command line would ride out with it. The doctor's prose stays on the
 	// machine, where it is safe. Pinned on the emitted bytes by
 	// presence_cursor_hooks_test.go.
+	//
+	// The five `cursorStop*` / `cursorHook*` counters join on the same terms and
+	// for a sharper reason: whether the rail is INSTALLED and whether the rail
+	// WORKS are different questions, and only the first had an answer while 38%
+	// of one machine's Cursor turns went missing. They are integers about OUR
+	// behaviour — how many stop hooks we were handed, how many we answered, how
+	// many we abandoned — and they must never widen to a cause string, which
+	// would be the engineer's payload.
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
 		"cursorHooks": true, "cursorHookRepairs": true, "cursorHookUnverifiable": true,
+		"cursorStopSeen": true, "cursorStopUsageRows": true, "cursorStopEmpty": true,
+		"cursorHookOverruns": true, "cursorHookUnparsed": true,
 	}
 	for k := range data {
 		if !allowed[k] {

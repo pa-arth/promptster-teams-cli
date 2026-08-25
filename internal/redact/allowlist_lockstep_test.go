@@ -269,6 +269,33 @@ var deviceOnlyFields = map[string]map[string]string{
 			"engineer_keys.latest_cursor_hook_unverifiable. Rides with the state rather than alone — " +
 			"it is the honesty term on `ok`, which means 'nothing PROVABLY wrong', and where this is " +
 			"non-zero that is a weaker claim than the word sounds.",
+		"cursorStopSeen": "Same beat, same pre-projection path; lands in " +
+			"engineer_keys.latest_cursor_stop_seen / latest_cursor_stop_reported_at " +
+			"(promptster-backend#816, drizzle/0058 ↔ drizzle-teams/0084). It is the DENOMINATOR " +
+			"`cursorHooks` never had: that word says the rail is INSTALLED, which turned out to be a " +
+			"different question from whether it WORKS. On 2026-08-25 a machine reporting `ok` for " +
+			"weeks was found producing no usage row for 38% of its Cursor turns, and no counter here " +
+			"or on the device had recorded one of them. It gates the other four on the SERVER side " +
+			"too — a CLI reporting hook state and not stops must not be read as five measured zeros.",
+		"cursorStopUsageRows": "Same beat, same path; lands in " +
+			"engineer_keys.latest_cursor_stop_usage_rows. The numerator: `stop` invocations that " +
+			"emitted a priceable row. Equals cursorGenerations.UsageRows, which `doctor` already " +
+			"printed on the machine and nothing carried off it.",
+		"cursorStopEmpty": "Same beat, same path; lands in engineer_keys.latest_cursor_stop_empty. " +
+			"The HONEST drop — an aborted turn the vendor reported no tokens and no model for, so " +
+			"usageEvent declines it. Separated from the rest because it is the one bucket that needs " +
+			"no fix, and it is what turns '38% missing' into an answer rather than an alarm.",
+		"cursorHookOverruns": "Same beat, same path; lands in " +
+			"engineer_keys.latest_cursor_hook_overruns. Invocations abandoned on cursorHookBudget, " +
+			"any step. Ours rather than the vendor's, and the reason it is worth shipping: the hook " +
+			"runs synchronously inside the engineer's agent loop, so an overrun is us stalling their " +
+			"agent for two seconds and THEN losing the measurement. Counted through its own file and " +
+			"its own lock (internal/capture/cursor_hook_overruns.go) because contention on the " +
+			"generations lock is the leading candidate for what it counts.",
+		"cursorHookUnparsed": "Same beat, same path; lands in " +
+			"engineer_keys.latest_cursor_hook_unparsed. Payloads that never named a step. Should be " +
+			"zero; every other counter here is conditional on a parse, so a non-zero one says they " +
+			"describe a subset of the traffic and not the traffic.",
 	},
 	// `heartbeat` is NOT a kind this CLI mints. The emitter walk finds zero
 	// construction sites for it; the only beat built here is `presence`
@@ -290,6 +317,11 @@ var deviceOnlyFields = map[string]map[string]string{
 		"cursorHooks":            "Mirrors presence.cursorHooks for the server's other accepted beat spelling.",
 		"cursorHookRepairs":      "Mirrors presence.cursorHookRepairs, same reason.",
 		"cursorHookUnverifiable": "Mirrors presence.cursorHookUnverifiable, same reason.",
+		"cursorStopSeen":         "Mirrors presence.cursorStopSeen for the server's other accepted beat spelling.",
+		"cursorStopUsageRows":    "Mirrors presence.cursorStopUsageRows, same reason.",
+		"cursorStopEmpty":        "Mirrors presence.cursorStopEmpty, same reason.",
+		"cursorHookOverruns":     "Mirrors presence.cursorHookOverruns, same reason.",
+		"cursorHookUnparsed":     "Mirrors presence.cursorHookUnparsed, same reason.",
 	},
 }
 
