@@ -432,3 +432,169 @@ func TestDurabilitySquashSeedsBeforeRecordingOwnFingerprints(t *testing.T) {
 		t.Errorf("tracked = %+v, human lines 4..5 must NOT transfer (seed ran before recording own fps)", tracked)
 	}
 }
+
+// aiDiff builds a one-file diff whose every added line is likely_ai, for the
+// prune tests below (which care about entry COUNTS, not diff parsing).
+func aiDiff(path string, lines []string) (string, []attrFile) {
+	body := []string{
+		"diff --git a/" + path + " b/" + path,
+		"--- /dev/null",
+		"+++ b/" + path,
+		"@@ -0,0 +1," + itoa(len(lines)) + " @@",
+	}
+	for _, l := range lines {
+		body = append(body, "+"+l)
+	}
+	files := []attrFile{{Path: path, LineRanges: []attrLineRange{{Start: 1, End: len(lines), Attribution: attributionLikelyAI}}}}
+	return strings.Join(body, "\n"), files
+}
+
+// countFingerprints totals the entries actually PERSISTED, not what a read-time
+// filter would show — the leak this pins was invisible to fingerprintsForPath.
+func countFingerprints(store durabilityFingerprints) int {
+	n := 0
+	for _, paths := range store.Roots {
+		for _, entries := range paths {
+			n += len(entries)
+		}
+	}
+	return n
+}
+
+// TestDurabilityFingerprintsPruneSweepsUntouchedPaths: expiry must sweep the
+// WHOLE store on every write, not just the paths the current commit touched.
+// Before the global prune, a repo that stopped receiving commits kept its
+// fingerprints on disk forever — 65% of one measured 65 MB store was expired.
+func TestDurabilityFingerprintsPruneSweepsUntouchedPaths(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const t0 int64 = 1_000_000_000_000
+
+	// An abandoned repo: captured once, never committed to again.
+	staleDiff, staleFiles := aiDiff("stale.go", []string{"stale_one", "stale_two"})
+	recordAiFingerprints("rk-abandoned", "sha-stale", staleDiff, staleFiles, t0)
+	if countFingerprints(loadDurabilityFingerprints()) != 2 {
+		t.Fatalf("setup: want 2 persisted entries, got %d", countFingerprints(loadDurabilityFingerprints()))
+	}
+
+	// 20 days later a DIFFERENT root sees a commit. That write is the only thing
+	// that ever runs again — and it must carry the abandoned root out with it.
+	liveDiff, liveFiles := aiDiff("live.go", []string{"live_one"})
+	recordAiFingerprints("rk-live", "sha-live", liveDiff, liveFiles, t0+20*dayMs)
+
+	store := loadDurabilityFingerprints()
+	if _, ok := store.Roots["rk-abandoned"]; ok {
+		t.Errorf("expired root must be deleted from the FILE, got %+v", store.Roots["rk-abandoned"])
+	}
+	if got := countFingerprints(store); got != 1 {
+		t.Errorf("persisted entries = %d, want 1 (only the live capture)", got)
+	}
+	// The live root is untouched by the sweep.
+	if fingerprintsForPath("rk-live", "live.go", t0+20*dayMs) == nil {
+		t.Error("in-TTL fingerprints must survive the sweep")
+	}
+}
+
+// TestDurabilityFingerprintsEntryCap: the backstop bounds the file even when
+// every entry is inside its TTL, and evicts OLDEST first so the evidence most
+// likely to still be awaiting a squash is the evidence kept.
+func TestDurabilityFingerprintsEntryCap(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	old := durabilityFingerprintsMaxEntries
+	durabilityFingerprintsMaxEntries = 4
+	t.Cleanup(func() { durabilityFingerprintsMaxEntries = old })
+
+	const t0 int64 = 1_000_000_000_000
+	oldDiff, oldFiles := aiDiff("old.go", []string{"old_a", "old_b", "old_c"})
+	recordAiFingerprints("rk-cap", "sha-old", oldDiff, oldFiles, t0)
+
+	// Three more, one hour later and all well inside the TTL: 6 entries against a
+	// cap of 4, so the 2 oldest go.
+	newDiff, newFiles := aiDiff("new.go", []string{"new_a", "new_b", "new_c"})
+	recordAiFingerprints("rk-cap", "sha-new", newDiff, newFiles, t0+3_600_000)
+
+	store := loadDurabilityFingerprints()
+	if got := countFingerprints(store); got != 4 {
+		t.Fatalf("persisted entries = %d, want the cap of 4", got)
+	}
+	// All three newest survive; the older file is down to its single newest line.
+	if got := len(store.Roots["rk-cap"]["new.go"]); got != 3 {
+		t.Errorf("new.go entries = %d, want 3 (newest are never evicted first)", got)
+	}
+	if got := len(store.Roots["rk-cap"]["old.go"]); got != 1 {
+		t.Errorf("old.go entries = %d, want 1 (2 of 3 evicted as oldest)", got)
+	}
+}
+
+// TestDurabilityFingerprintsPruneDropsEmptyContainers: a path emptied by expiry
+// must not linger as an empty map, or the store keeps paying marshal and load
+// cost for roots that hold nothing.
+func TestDurabilityFingerprintsPruneDropsEmptyContainers(t *testing.T) {
+	const t0 int64 = 1_000_000_000_000
+	store := durabilityFingerprints{V: durabilityFingerprintsVersion, Roots: map[string]map[string][]durAiFingerprint{
+		"rk": {
+			"gone.go": {{FP: "a", LineageID: "lin", BornTsMs: t0}},
+			"kept.go": {{FP: "b", LineageID: "lin", BornTsMs: t0 + 19*dayMs}},
+		},
+	}}
+	pruneDurabilityFingerprints(&store, t0+20*dayMs)
+
+	if _, ok := store.Roots["rk"]["gone.go"]; ok {
+		t.Error("expired path must be deleted, not left empty")
+	}
+	if len(store.Roots["rk"]["kept.go"]) != 1 {
+		t.Errorf("in-TTL path must survive, got %+v", store.Roots["rk"]["kept.go"])
+	}
+
+	// Now expire the survivor too: the root itself goes.
+	pruneDurabilityFingerprints(&store, t0+40*dayMs)
+	if _, ok := store.Roots["rk"]; ok {
+		t.Errorf("emptied root must be deleted, got %+v", store.Roots["rk"])
+	}
+}
+
+// TestFingerprintsForPathInMatchesLoadingPerPath: the one-load lookup used by
+// durability seeding must be behaviourally identical to the per-path convenience
+// wrapper — same hits, same misses, same TTL boundary, same lineage. The refactor
+// that stopped re-reading the file per path is only safe if these never diverge.
+func TestFingerprintsForPathInMatchesLoadingPerPath(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const t0 int64 = 1_000_000_000_000
+
+	aDiff, aFiles := aiDiff("a.go", []string{"a_one", "a_two"})
+	recordAiFingerprints("rk-eq", "sha-a", aDiff, aFiles, t0)
+	bDiff, bFiles := aiDiff("b.go", []string{"b_one"})
+	recordAiFingerprints("rk-eq", "sha-b", bDiff, bFiles, t0+dayMs)
+
+	store := loadDurabilityFingerprints()
+	// Include a path with no evidence and a root that does not exist: nil-vs-nil
+	// has to agree too, since nil is what makes the caller fall back to
+	// path-level seeding.
+	for _, tc := range []struct{ rootKey, path string }{
+		{"rk-eq", "a.go"},
+		{"rk-eq", "b.go"},
+		{"rk-eq", "never-touched.go"},
+		{"rk-missing", "a.go"},
+	} {
+		for _, now := range []int64{t0, t0 + 13*dayMs, t0 + 20*dayMs} {
+			want := fingerprintsForPath(tc.rootKey, tc.path, now)
+			got := fingerprintsForPathIn(store, tc.rootKey, tc.path, now)
+			if len(want) != len(got) {
+				t.Fatalf("%s/%s @+%dd: got %d entries, want %d", tc.rootKey, tc.path, (now-t0)/dayMs, len(got), len(want))
+			}
+			for fp, lineage := range want {
+				if got[fp] != lineage {
+					t.Errorf("%s/%s @+%dd: fp %s → %q, want %q", tc.rootKey, tc.path, (now-t0)/dayMs, fp, got[fp], lineage)
+				}
+			}
+		}
+	}
+
+	// The TTL boundary is where a divergence would actually bite: a.go is live at
+	// 13 days and gone at 20, and both variants must agree on that.
+	if fingerprintsForPathIn(store, "rk-eq", "a.go", t0+13*dayMs) == nil {
+		t.Error("a.go must be live inside the TTL")
+	}
+	if fingerprintsForPathIn(store, "rk-eq", "a.go", t0+20*dayMs) != nil {
+		t.Error("a.go must be filtered out past the TTL")
+	}
+}

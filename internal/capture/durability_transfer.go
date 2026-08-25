@@ -47,6 +47,16 @@ var durabilityMinTransferRun = 2
 // short enough that stale fingerprints cannot resurface as false matches.
 var durabilityFingerprintTTLms int64 = 14 * 24 * 60 * 60 * 1000
 
+// durabilityFingerprintsMaxEntries is the hard backstop on store size, enforced
+// after TTL expiry. TTL is the real policy — it is what makes the store bounded
+// by "AI lines captured in the last 14 days" — and on a heavy device that steady
+// state measured ~154k live entries / ~22 MB. This cap sits above that so it
+// does not bind in normal use, and bounds the pathological case (a mass-generated
+// or vendored tree committed as AI) that TTL alone would let through. At the ~146
+// bytes/entry measured on disk, 200k entries is roughly 29 MB. A var so tests can
+// pin it.
+var durabilityFingerprintsMaxEntries = 200_000
+
 const durabilityFingerprintsVersion = 1
 
 // durAiFingerprint is one AI line's content hash, the lineage it belongs to, and
@@ -209,10 +219,12 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 		// re-seeing identical AI content must refresh it to the latest bornTs (and
 		// lineage) rather than keep the older existing entry — otherwise the entry
 		// could TTL-expire and miss a later squash despite fresh re-capture.
+		//
+		// TTL is NOT applied here. pruneDurabilityFingerprints below owns expiry for
+		// the WHOLE store; filtering here as well would leave two owners of one
+		// invariant while still sweeping only the paths this commit happened to
+		// touch — which is exactly the leak the prune exists to close.
 		for _, e := range append(append([]durAiFingerprint{}, entries...), paths[path]...) {
-			if nowMs-e.BornTsMs >= durabilityFingerprintTTLms {
-				continue
-			}
 			if seen[e.FP] {
 				continue
 			}
@@ -222,14 +234,127 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 		paths[path] = kept
 	}
 	store.Roots[rootKey] = paths
+	pruneDurabilityFingerprints(&store, nowMs)
 	saveDurabilityFingerprints(store)
+}
+
+// pruneDurabilityFingerprints bounds the store: TTL first, then a hard entry cap
+// with oldest-first eviction. Called on every write, mirroring
+// pruneCursorGenerations — a machine that stops committing is a machine whose
+// file stops growing, so a timer would buy nothing a write-time sweep does not.
+//
+// It sweeps EVERY root and path, not just the ones the caller touched. That is
+// the whole point: expiry used to run only on a path a new commit re-captured,
+// so a repo you stopped committing to kept its fingerprints forever. Measured on
+// one device before this: 444,618 entries / 65 MB, of which 290,646 (65%) were
+// already past the 14-day TTL, the oldest 35.7 days old.
+//
+// Eviction can only ever LOSE transfer evidence, never invent it: a dropped
+// fingerprint means a squashed line falls back to unknown, which is the
+// undercount this subsystem always resolves toward (see durability.go's header).
+func pruneDurabilityFingerprints(store *durabilityFingerprints, nowMs int64) {
+	if store == nil || store.Roots == nil {
+		return
+	}
+
+	total := 0
+	for rootKey, paths := range store.Roots {
+		for path, entries := range paths {
+			kept := entries[:0]
+			for _, e := range entries {
+				if nowMs-e.BornTsMs < durabilityFingerprintTTLms {
+					kept = append(kept, e)
+				}
+			}
+			if len(kept) == 0 {
+				delete(paths, path)
+				continue
+			}
+			paths[path] = kept
+			total += len(kept)
+		}
+		// An empty root is dead weight in every future load and marshal.
+		if len(paths) == 0 {
+			delete(store.Roots, rootKey)
+		}
+	}
+
+	if total <= durabilityFingerprintsMaxEntries {
+		return
+	}
+
+	// Over the cap. Evict oldest-first across the WHOLE store rather than per
+	// root: the cap exists to bound the FILE, and a per-root share would let one
+	// busy repo stay under its own limit while the file as a whole blew past.
+	type fpRef struct {
+		rootKey, path string
+		idx           int
+		born          int64
+	}
+	refs := make([]fpRef, 0, total)
+	for rootKey, paths := range store.Roots {
+		for path, entries := range paths {
+			for i, e := range entries {
+				refs = append(refs, fpRef{rootKey: rootKey, path: path, idx: i, born: e.BornTsMs})
+			}
+		}
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].born < refs[j].born })
+
+	doomed := map[string]map[string]map[int]bool{}
+	for _, r := range refs[:total-durabilityFingerprintsMaxEntries] {
+		if doomed[r.rootKey] == nil {
+			doomed[r.rootKey] = map[string]map[int]bool{}
+		}
+		if doomed[r.rootKey][r.path] == nil {
+			doomed[r.rootKey][r.path] = map[int]bool{}
+		}
+		doomed[r.rootKey][r.path][r.idx] = true
+	}
+	for rootKey, paths := range doomed {
+		for path, idxs := range paths {
+			entries := store.Roots[rootKey][path]
+			kept := entries[:0]
+			for i, e := range entries {
+				if !idxs[i] {
+					kept = append(kept, e)
+				}
+			}
+			if len(kept) == 0 {
+				delete(store.Roots[rootKey], path)
+				continue
+			}
+			store.Roots[rootKey][path] = kept
+		}
+		if len(store.Roots[rootKey]) == 0 {
+			delete(store.Roots, rootKey)
+		}
+	}
 }
 
 // fingerprintsForPath returns the live (TTL-pruned) fingerprint→lineageId map for
 // a path, or nil when none. nil means "no fingerprint evidence" — the caller then
 // falls back to path-level seeding.
+//
+// This loads the store per call. Use it for a ONE-OFF lookup; a caller resolving
+// several paths must load once and call fingerprintsForPathIn instead — see
+// durability seeding, which walks every path in a commit.
 func fingerprintsForPath(rootKey, path string, nowMs int64) map[string]string {
-	store := loadDurabilityFingerprints()
+	return fingerprintsForPathIn(loadDurabilityFingerprints(), rootKey, path, nowMs)
+}
+
+// fingerprintsForPathIn is the lookup against an ALREADY-LOADED store, so a
+// caller with many paths pays one read and one unmarshal instead of one per path.
+//
+// Durability seeding is that caller: it resolves every changed path in a commit,
+// and each call used to re-read and re-parse the whole file under the lock. On a
+// measured device the store was 68 MB, so a 20-file commit parsed ~1.4 GB of JSON
+// to answer 20 questions about one snapshot.
+//
+// Reading one snapshot for the whole loop is also the more correct semantics: the
+// per-path version could observe a concurrent write partway through and seed one
+// commit against two different generations of evidence.
+func fingerprintsForPathIn(store durabilityFingerprints, rootKey, path string, nowMs int64) map[string]string {
 	entries := store.Roots[rootKey][path]
 	if len(entries) == 0 {
 		return nil
