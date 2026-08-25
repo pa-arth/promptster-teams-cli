@@ -128,3 +128,43 @@ func TestLaneIDDoesNotSurviveOnAKindThatDoesNotCarryIt(t *testing.T) {
 }
 
 var _ = event.Event{}
+
+// The lane's LABEL — what it was dispatched to do — must survive projection on
+// the spend event, not merely be declared in the table. A field the device
+// projector drops arrives nowhere and reads downstream exactly like a CLI that
+// never sent it: no error, no telemetry, a `201`.
+//
+// This is the second half of the pair. `agentId` says WHICH invocation and
+// `attributionAgent` says WHAT KIND, and neither separates concurrent delegates
+// of the same kind — 48% of measured lanes sit in such a cluster, with an 11.3x
+// cost spread inside one.
+func TestLaneLabelSurvivesProjectionOnTheSpendEvent(t *testing.T) {
+	e := eventWithData("subagent_usage", map[string]interface{}{
+		"agentId":          "aaa9a3a70c738c722",
+		"attributionAgent": "Explore",
+		"summary":          "Scout backend ingest contract",
+	})
+	ProjectEvent(&e, false)
+	data, ok := e.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("projected Data is %T, want map", e.Data)
+	}
+	if got, _ := data["summary"].(string); got != "Scout backend ingest contract" {
+		t.Fatalf("summary = %q, want the dispatch label to survive projection", got)
+	}
+	if got, _ := data["agentId"].(string); got == "" {
+		t.Fatal("the lane lost its id while gaining a label")
+	}
+}
+
+// It is a NARROW widening. ai_response is the main chain: it has no dispatch
+// behind it, so a summary arriving there is prose with no label semantics.
+// Pinned so the next person adding a kind copies the narrow row.
+func TestLaneLabelIsNotAllowedOnTheMainChain(t *testing.T) {
+	e := eventWithData("ai_response", map[string]interface{}{"summary": "anything at all"})
+	ProjectEvent(&e, false)
+	data, _ := e.Data.(map[string]interface{})
+	if v, ok := data["summary"]; ok {
+		t.Fatalf("summary reached ai_response: %v", v)
+	}
+}
