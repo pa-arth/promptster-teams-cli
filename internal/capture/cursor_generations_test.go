@@ -83,8 +83,10 @@ func TestUsageObservationsCountModellessRows(t *testing.T) {
 			"usageScope": "request", "outputTokens": out,
 		}}
 	}
-	recordCursorStopOutcome("conv", "grok-4.6", []event.Event{usage(902)})
-	recordCursorStopOutcome("conv", "", []event.Event{usage(525)})
+	// Same slice both times: normalized AND queued. These are the turns that
+	// worked end to end, which is the only shape that may increment UsageRows.
+	recordCursorStopOutcome("conv", "grok-4.6", []event.Event{usage(902)}, []event.Event{usage(902)})
+	recordCursorStopOutcome("conv", "", []event.Event{usage(525)}, []event.Event{usage(525)})
 
 	c := loadCursorGenerations()
 	if c.UsageRows != 2 || c.ModellessRows != 1 {

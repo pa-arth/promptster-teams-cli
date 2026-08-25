@@ -258,8 +258,17 @@ func CursorHooksDoctor() []CursorHookDoctorLine {
 //     per-turn figure, not a reason to keep asserting the tag.
 func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
 	c := loadCursorGenerations()
-	if c.UsageRows == 0 && c.StopSeen == 0 {
-		// Nothing captured yet. Saying "0 of 0 rows" would read as a problem.
+	o := loadCursorHookOverruns()
+	// Nothing observed at all — say nothing. "0 of 0 rows" on a machine that has
+	// simply not used Cursor reads as a problem.
+	//
+	// EVERY COUNTER GATES THIS, NOT JUST THE TWO ABOUT SUCCESS. Guarding on
+	// UsageRows/StopSeen alone (as the first draft did, caught in review on #186)
+	// hides the WORST machine there is: one whose every invocation blows the
+	// budget, or whose every payload is unreadable, has zero of both and a large
+	// Overruns or Unparsed — and would print nothing, which is the same silence
+	// this whole instrument exists to end.
+	if c.UsageRows == 0 && c.StopSeen == 0 && c.Unparsed == 0 && o.Overruns == 0 {
 		return CursorHookDoctorLine{}, false
 	}
 	text := fmt.Sprintf("Cursor usage rows captured: %d (%d with no model to price)",
@@ -289,7 +298,7 @@ func cursorUsageCoverageLine() (CursorHookDoctorLine, bool) {
 		text += fmt.Sprintf("; %d payloads never named a step", c.Unparsed)
 		warnCoverage = true
 	}
-	if o := loadCursorHookOverruns(); o.Overruns > 0 {
+	if o.Overruns > 0 {
 		// Always a warning, at any count. An overrun is not a dropped
 		// measurement, it is us stalling the engineer's agent for two seconds and
 		// then dropping the measurement anyway.

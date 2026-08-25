@@ -354,19 +354,35 @@ func cursorGenerationModel(generationID string) string {
 // before, which matters because every one of them is inside the engineer's agent
 // loop.
 //
-// `events` is the emitted set — empty when usageEvent declined the turn. Passing
-// the empty slice rather than calling a separate "it was empty" function is what
-// makes the two outcomes impossible to book inconsistently: there is one call
-// site, on both paths, and it cannot forget the denominator.
-func recordCursorStopOutcome(conversationID, model string, events []event.Event) {
+// TWO SLICES, AND THE GAP BETWEEN THEM IS THE POINT.
+//
+//	normalized — what the normalizer produced. EMPTY means usageEvent declined
+//	             the turn: Cursor reported no token counts and resolved no model,
+//	             so there was nothing to claim. That is StopEmpty, and it is an
+//	             HONEST drop.
+//	queued     — what emitCursorEvent actually got into the outbox. That is
+//	             UsageRows.
+//
+// They differ when a row normalized fine and the enqueue failed — a full outbox,
+// a read-only state dir, a signing failure, all ordinary conditions rather than
+// crashes. Counting UsageRows off `normalized` (as the first draft of this did,
+// caught in review on #186) would report that turn as captured while its spend
+// sat nowhere, and would hold the residual at zero for exactly the case the
+// residual exists to expose.
+//
+// Booked this way, a queue loss lands in NEITHER named bucket: seen goes up,
+// empty does not, usageRows does not, and `seen - empty - usageRows` becomes 1.
+// That is what `doctor` calls "lost between the normalizer and the queue", which
+// is now literally what it is rather than an aspiration.
+func recordCursorStopOutcome(conversationID, model string, normalized, queued []event.Event) {
 	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
 		now := time.Now()
 		c.StopSeen++
-		if len(events) == 0 {
+		if len(normalized) == 0 {
 			c.StopEmpty++
 		}
-		for _, ev := range events {
+		for _, ev := range queued {
 			if ev.Kind != "ai_response" {
 				continue
 			}

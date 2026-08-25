@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 )
@@ -175,20 +176,34 @@ func runCursorHookInner() {
 	// the first — silently, since the surviving row looks perfectly healthy.
 	events := res.Events
 
-	// Count what the coverage probe measured, so the number outlives the probe.
-	// The SAME call books the drop above, with an empty event set — one function,
-	// both outcomes, so the ratio it reports cannot be booked inconsistently.
-	if res.Step == "stop" {
-		recordCursorStopOutcome(res.SessionID, res.Model, events)
-	}
-
 	// captureProse=false unconditionally. The resolver does a network fetch, and
 	// invariant 2 forbids network I/O on this path; more to the point, this rail
 	// emits no assistant prose at all — the one prose field it carries is the
 	// engineer's own prompt, which is not gated by that policy.
 	queued := 0
+	var queuedEvents []event.Event
 	for _, ev := range events {
-		queued += emitCursorEvent(ev, session, false)
+		n := emitCursorEvent(ev, session, false)
+		queued += n
+		if n > 0 {
+			queuedEvents = append(queuedEvents, ev)
+		}
+	}
+
+	// Count what the coverage probe measured, so the number outlives the probe.
+	// The SAME call books the drop above, with two nil slices — one function,
+	// both outcomes, so the ratio it reports cannot be booked inconsistently.
+	//
+	// AFTER THE ENQUEUE, AND OFF `queuedEvents` RATHER THAN `events`. This ran
+	// before the loop until review caught it (#186): emitCursorEvent returns 0
+	// when the outbox append fails, so counting the normalized set would report a
+	// turn as captured while its spend sat nowhere — and would keep the residual
+	// at zero for precisely the case the residual exists to expose. Both slices
+	// go in because they answer different questions: an empty `events` is the
+	// vendor telling us nothing (honest), while a full `events` and an empty
+	// `queuedEvents` is us losing it (ours). See recordCursorStopOutcome.
+	if res.Step == "stop" {
+		recordCursorStopOutcome(res.SessionID, res.Model, events, queuedEvents)
 	}
 
 	// CLAIM ONLY AFTER SOMETHING WAS DURABLY QUEUED, AND ONLY THEN.
@@ -234,7 +249,7 @@ func runCursorHookInner() {
 func recordCursorHookDrop(res normalize.CursorHookResult) {
 	switch res.Step {
 	case "stop":
-		recordCursorStopOutcome(res.SessionID, res.Model, nil)
+		recordCursorStopOutcome(res.SessionID, res.Model, nil, nil)
 	case "":
 		recordCursorHookUnparsed()
 	}

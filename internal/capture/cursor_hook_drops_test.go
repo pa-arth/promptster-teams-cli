@@ -1,9 +1,11 @@
 package capture
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 )
@@ -144,5 +146,76 @@ func TestOverrunIsRecordedWhileTheGenerationsLockIsHeld(t *testing.T) {
 
 	if o := loadCursorHookOverruns(); o.Overruns != 1 {
 		t.Fatalf("overruns = %d, want 1", o.Overruns)
+	}
+}
+
+// A turn that NORMALIZED and never reached the outbox.
+//
+// Raised in review on #186, and it was the same defect one layer down from the
+// one this change fixes: the counting ran BEFORE the enqueue, so a row lost to a
+// full outbox, a read-only state dir or a signing failure — ordinary conditions,
+// not crashes — was booked as captured. The rail would have reported 100%
+// coverage on a machine storing nothing.
+//
+// It must land in NEITHER named bucket. StopEmpty means the vendor told us
+// nothing, and putting our own loss there would launder a defect into the one
+// bucket documented as needing no fix. The residual is where it belongs, which
+// is what makes `doctor`'s "lost between the normalizer and the queue" literally
+// true rather than aspirational.
+func TestAQueueLossIsNotCountedAsCaptured(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	normalized := []event.Event{{Kind: "ai_response", Data: map[string]interface{}{
+		"usageScope": "request", "outputTokens": int64(4914),
+	}}}
+	// What emitCursorEvent returning 0 leaves behind: nothing queued.
+	recordCursorStopOutcome("c1", "composer-2.5", normalized, nil)
+
+	c := loadCursorGenerations()
+	if c.UsageRows != 0 {
+		t.Fatalf("usageRows = %d, want 0 — a row that never reached the outbox is not captured", c.UsageRows)
+	}
+	if c.StopEmpty != 0 {
+		t.Fatalf("stopEmpty = %d, want 0 — the vendor reported a full turn; the loss was ours", c.StopEmpty)
+	}
+	if c.StopSeen != 1 {
+		t.Fatalf("stopSeen = %d, want 1", c.StopSeen)
+	}
+	if lost := c.StopSeen - c.StopEmpty - c.UsageRows; lost != 1 {
+		t.Fatalf("residual = %d, want 1 — a queue loss must surface as unexplained, not as an aborted turn", lost)
+	}
+}
+
+// The doctor line must not go silent on a machine whose ONLY news is bad.
+//
+// Raised in review on #186. The early return guarded on UsageRows and StopSeen
+// alone, so the worst machine there is — every invocation blowing the budget,
+// nothing ever parsed — printed nothing at all, which is precisely the silence
+// this instrument exists to end.
+func TestDoctorReportsAMachineWhoseOnlyNewsIsFailure(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	recordCursorHookOverrun()
+	recordCursorHookOverrun()
+
+	line, ok := cursorUsageCoverageLine()
+	if !ok {
+		t.Fatal("doctor said nothing about a machine that abandoned every hook it ran")
+	}
+	if line.OK || !line.Warn {
+		t.Fatalf("line OK=%v Warn=%v — an overrun stalls the engineer's agent; it is never fine", line.OK, line.Warn)
+	}
+	if !strings.Contains(line.Text, "2 hook invocations") {
+		t.Fatalf("line = %q, want the overrun count in it", line.Text)
+	}
+}
+
+// The other half of the same guard: a machine that has genuinely never touched
+// Cursor still says nothing. "0 of 0 rows" reads as a problem where there is none.
+func TestDoctorStaysSilentWhenNothingWasObserved(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+
+	if line, ok := cursorUsageCoverageLine(); ok {
+		t.Fatalf("doctor reported %q for a machine that has never run a Cursor hook", line.Text)
 	}
 }
