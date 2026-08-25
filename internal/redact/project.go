@@ -230,15 +230,27 @@ var projectFieldAllowlist = map[string][]string{
 	// ABOUT the file, never anything out of it. hooks.json is shared with other
 	// tools, so this rail must never carry a reason string: a neighbour's command
 	// line would ride out with it. See presenceData.CursorHooks.
+	//
+	// `cursorStopSeen` / `cursorStopUsageRows` / `cursorStopEmpty` /
+	// `cursorHookOverruns` / `cursorHookUnparsed` are that rail's COVERAGE, which
+	// is a different question from its install state and had no answer at all:
+	// every counter sat behind the early return that dropped the turn, so 38% of
+	// one machine's Cursor turns went missing leaving no evidence anywhere. Five
+	// integers about our own behaviour — never a cause string, which would be the
+	// engineer's payload. See presenceData.
 	"heartbeat": {
 		"device", "cliVersion", "os", "arch", "watching",
 		"pendingEvents", "pendingOldestEventAt",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
+		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
+		"cursorHookOverruns", "cursorHookUnparsed",
 	},
 	"presence": {
 		"device", "cliVersion", "os", "arch", "watching", "state",
 		"pendingEvents", "pendingOldestEventAt",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
+		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
+		"cursorHookOverruns", "cursorHookUnparsed",
 	},
 	// Config census: token-count inventory — counts and names only.
 	// workspaceKey is a git remote slug (owner/name) or an opaque sha256(path)

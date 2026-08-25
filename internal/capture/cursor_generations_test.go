@@ -83,12 +83,17 @@ func TestUsageObservationsCountModellessRows(t *testing.T) {
 			"usageScope": "request", "outputTokens": out,
 		}}
 	}
-	recordCursorUsageObservations("conv", "grok-4.6", []event.Event{usage(902)})
-	recordCursorUsageObservations("conv", "", []event.Event{usage(525)})
+	recordCursorStopOutcome("conv", "grok-4.6", []event.Event{usage(902)})
+	recordCursorStopOutcome("conv", "", []event.Event{usage(525)})
 
 	c := loadCursorGenerations()
 	if c.UsageRows != 2 || c.ModellessRows != 1 {
 		t.Fatalf("usageRows/modelless = %d/%d, want 2/1", c.UsageRows, c.ModellessRows)
+	}
+	// The denominator moved with the numerator. Two stops asked, two rows came
+	// back, nothing empty — the shape a healthy machine reports.
+	if c.StopSeen != 2 || c.StopEmpty != 0 {
+		t.Fatalf("stopSeen/stopEmpty = %d/%d, want 2/0", c.StopSeen, c.StopEmpty)
 	}
 	// THE PER-REQUEST PREMISE, COUNTED RATHER THAN ASSERTED. Output fell 902 ->
 	// 525, which no cumulative counter can do. A measurement recorded only as

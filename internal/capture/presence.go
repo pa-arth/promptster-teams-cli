@@ -104,6 +104,46 @@ type presenceData struct {
 	// Entries whose hook type this build cannot judge. The honesty term on
 	// `cursorHooks: ok` — see CursorHookRailReport.Unverifiable.
 	CursorHookUnverifiable int `json:"cursorHookUnverifiable"`
+
+	// CURSOR `stop` COVERAGE. Five cumulative integers, no strings.
+	//
+	// `cursorHooks` above says whether the rail is INSTALLED. It cannot say
+	// whether the rail WORKS, and those turned out to be very different
+	// questions: on a machine reporting `ok` for weeks, 38% of Cursor turns
+	// produced no usage row, and the drop was structurally unobservable — the
+	// only counters this rail had were incremented after the early return that
+	// dropped the turn.
+	//
+	// These are the two halves of that ratio plus its causes, so the fleet
+	// answers it instead of a probe on one machine answering it once:
+	//
+	//	seen        = `stop` invocations parsed
+	//	usageRows   = of those, ones that emitted a priceable row
+	//	empty       = of those, ones the vendor told us nothing about (honest)
+	//	overruns    = invocations abandoned on the 2s budget, any step (ours)
+	//	unparsed    = payloads that never named a step; should be 0
+	//
+	// seen - empty - usageRows is the residual that should also be zero. A
+	// nonzero one is a defect between the normalizer and the queue.
+	//
+	// NOT omitempty, all five, for the reason PendingEvents spells out: a zero is
+	// a measurement, and a field that vanishes at zero is indistinguishable from
+	// a fleet too old to send it — which is precisely the ambiguity being fixed.
+	//
+	// ALL INTEGERS, no cause string, and that is the same privacy boundary
+	// `cursorHooks` draws. A drop's context is the engineer's payload; a count of
+	// drops is a fact about us.
+	//
+	// GRAIN: cumulative for this MACHINE's lifetime, like every counter they are
+	// read from. The server's row is per key, so two machines sharing a key
+	// alternate and the stored value is one machine's total — the same
+	// last-write-wins convention `cursorHookRepairs` already carries, and it must
+	// not be read as an engineer's sum.
+	CursorStopSeen      int `json:"cursorStopSeen"`
+	CursorStopUsageRows int `json:"cursorStopUsageRows"`
+	CursorStopEmpty     int `json:"cursorStopEmpty"`
+	CursorHookOverruns  int `json:"cursorHookOverruns"`
+	CursorHookUnparsed  int `json:"cursorHookUnparsed"`
 }
 
 // watchedTools reports which AI tools this device is set up to capture, keyed
@@ -169,6 +209,12 @@ func buildPresenceEvent(session Session) event.Event {
 	// rather than being cached because the file is SHARED — another tool can
 	// break it between beats, and a cached "ok" would outlive the truth.
 	rail := InspectCursorHookRail()
+	// Two small reads of two small files, on the same beat and for the same
+	// reason: the rail's INSTALL state and the rail's COVERAGE are independent
+	// facts, and an `ok` install with a third of its turns missing is exactly the
+	// combination that went unnoticed for weeks.
+	gen := loadCursorGenerations()
+	overruns := loadCursorHookOverruns()
 
 	e := event.NewEvent("presence", session.DeviceID)
 	e.Source = presenceSource
@@ -187,6 +233,12 @@ func buildPresenceEvent(session Session) event.Event {
 		CursorHooks:            rail.State,
 		CursorHookRepairs:      rail.Repairs,
 		CursorHookUnverifiable: rail.Unverifiable,
+
+		CursorStopSeen:      int(gen.StopSeen),
+		CursorStopUsageRows: int(gen.UsageRows),
+		CursorStopEmpty:     int(gen.StopEmpty),
+		CursorHookOverruns:  int(overruns.Overruns),
+		CursorHookUnparsed:  int(gen.Unparsed),
 	})
 	return e
 }
