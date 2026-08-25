@@ -868,6 +868,19 @@ func pollClaudeTranscripts(
 					ObservedAt: spool.ObservedAt,
 				}
 			}
+		} else if proc.Summary == "" {
+			// The sidecar is a SEPARATE file, so the transcript can exist before
+			// it does: measured on 145 real sidechains, the `.meta.json` was born
+			// after its `.jsonl` on 25 of them (17.2%), the closest by 10ms. A
+			// processor lives for the whole watcher run, so reading once at
+			// construction turns a 10ms head start into a permanently unlabelled
+			// lane — and an absent summary reads downstream as "this lane did not
+			// tell us", not as "we looked too early".
+			//
+			// So retry while it is still missing, and stop the moment it is not.
+			// A lane that never gets a sidecar costs one failed os.Open per poll,
+			// which is the price of not guessing which side of the race we are on.
+			proc.Summary = claudeSidecarDescription(path)
 		}
 		n, res := tailClaudeTranscript(path, progress, proc, session, dryRun, captureProse, budget, oversizeProbe)
 		parsed += n
@@ -997,9 +1010,9 @@ func newClaudeProcessorForPath(path string) *normalize.ClaudeTranscriptProcessor
 		// repeat it (plus skill/agent names), but agentId must survive even if
 		// they don't.
 		proc.AgentID = claudeAgentIDFromPath(path)
-		// ...and WHAT it was dispatched to do, from the sidecar beside it. Same
-		// floor argument: read once per processor, constant for the life of one
-		// sidechain file.
+		// ...and WHAT it was dispatched to do, from the sidecar beside it. Best
+		// effort here: the sidecar may not exist yet (it is a separate file), and
+		// the poll loop retries an empty one until it resolves.
 		proc.Summary = claudeSidecarDescription(path)
 		return proc
 	}

@@ -5,6 +5,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 )
 
 // Claude Code writes a four-key sidecar beside every sidechain transcript. The
@@ -103,5 +106,71 @@ func TestWatcherLeavesTheMainChainUnlabelled(t *testing.T) {
 	}
 	if proc.Summary != "" {
 		t.Fatalf("main chain acquired a dispatch label: %q", proc.Summary)
+	}
+}
+
+// THE RACE. The sidecar is a separate file from the transcript, so the watcher
+// can discover one before the other exists: measured on 145 real sidechains,
+// the `.meta.json` was born AFTER its `.jsonl` on 25 of them (17.2%), the
+// closest by 10ms. A processor is built once and lives for the whole watcher
+// run, so a construction-time read that loses that race caches "" forever and
+// every subsequent subagent_usage on the lane ships unlabelled — which reads
+// downstream as "this lane did not tell us", not as "we looked too early".
+//
+// Poll with no sidecar, write it, poll again: the label must arrive.
+func TestSidecarWrittenAfterTheTranscriptStillLandsOnTheLane(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	dir := filepath.Join(root, "-Users-me-repo", "2677c24e-0000-4000-8000-000000000000", "subagents")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(dir, "agent-aaa9a3a70c738c722.jsonl")
+	if err := os.WriteFile(transcript, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-decide the match so this test exercises the processor path, not the
+	// classifier — a sidechain carries no cwd line of its own.
+	key := claudeProgressKey(transcript)
+	saveClaudeWatchProgress(claudeWatchProgress{
+		Offsets: map[string]int64{},
+		Match:   map[string]string{key: "yes"},
+		// Fingerprint the same root set the poll will compute, or the cache-sync
+		// drops the seeded decision and no processor is ever built.
+		RootsFP: captureRootsFingerprint(workspaceMatchRoots(resolvePath(workspace))),
+		V:       claudeProgressSchemaV,
+	})
+
+	session := Session{DeviceID: "sess-race", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	cutoff := session.StartedAt.Add(-2 * time.Minute)
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+
+	pollClaudeTranscripts(session, resolvePath(workspace), cutoff, processors, true, false)
+	proc := processors[key]
+	if proc == nil {
+		t.Fatal("no processor built for the sidechain")
+	}
+	if proc.Summary != "" {
+		t.Fatalf("label appeared before the sidecar existed: %q", proc.Summary)
+	}
+
+	// The sidecar lands a moment later, as it does on 17% of real lanes.
+	meta := filepath.Join(dir, "agent-aaa9a3a70c738c722.meta.json")
+	if err := os.WriteFile(meta, []byte(realSidecar), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	pollClaudeTranscripts(session, resolvePath(workspace), cutoff, processors, true, false)
+	if processors[key] != proc {
+		t.Fatal("processor was rebuilt; this test no longer exercises the retry")
+	}
+	if proc.Summary != "Scout backend ingest contract" {
+		t.Fatalf("proc.Summary = %q — the lane stayed unlabelled after its sidecar arrived", proc.Summary)
 	}
 }
