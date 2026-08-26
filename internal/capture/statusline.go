@@ -8,7 +8,9 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -287,6 +289,16 @@ type StatuslineEnableResult struct {
 // the User layer we own — a project/managed layer that shadows us is a doctor
 // concern, not something enable silently rewrites.
 func EnableStatusline() (StatuslineEnableResult, error) {
+	var res StatuslineEnableResult
+	err := withStatuslineLock(func() error {
+		var err error
+		res, err = enableStatuslineLocked()
+		return err
+	})
+	return res, err
+}
+
+func enableStatuslineLocked() (StatuslineEnableResult, error) {
 	path := userSettingsPath()
 	m, err := readSettingsMap(path)
 	if err != nil {
@@ -355,6 +367,10 @@ func StatuslineWrapped() bool {
 // if we had installed ours where none existed. A round-trip enable→disable leaves
 // the statusLine key byte-equivalent to its pre-enable state.
 func DisableStatusline() error {
+	return withStatuslineLock(disableStatuslineLocked)
+}
+
+func disableStatuslineLocked() error {
 	path := userSettingsPath()
 	m, err := readSettingsMap(path)
 	if err != nil {
@@ -541,6 +557,16 @@ type StatuslineHealResult struct {
 // a timer: it is a no-op in every case above, and a no-op also RESETS the heal
 // counter, so an occasional eviction never accumulates toward the give-up bound.
 func RehealStatusline() (StatuslineHealResult, error) {
+	var res StatuslineHealResult
+	err := withStatuslineLock(func() error {
+		var err error
+		res, err = rehealStatuslineLocked()
+		return err
+	})
+	return res, err
+}
+
+func rehealStatuslineLocked() (StatuslineHealResult, error) {
 	rec, ok := loadStatuslinePrior()
 	if !ok || !rec.Wrapped {
 		return StatuslineHealResult{}, nil
@@ -558,7 +584,11 @@ func RehealStatusline() (StatuslineHealResult, error) {
 		// is not being contested at all.
 		if rec.Heals != 0 {
 			rec.Heals = 0
-			_ = writeStatuslinePriorFile(rec)
+			if err := writeStatuslinePriorFile(rec); err != nil {
+				// A reset that silently fails keeps a stale count, which retires
+				// the healer early on a machine nothing is contesting.
+				return StatuslineHealResult{}, fmt.Errorf("could not reset the heal counter: %w", err)
+			}
 		}
 		return StatuslineHealResult{}, nil
 	}
@@ -570,14 +600,26 @@ func RehealStatusline() (StatuslineHealResult, error) {
 	// Displaced. Wrap whatever holds the slot now — EnableStatusline stores it as
 	// the new prior, so the displacing tool's line keeps rendering.
 	healed := rec.Heals + 1
-	if _, err := EnableStatusline(); err != nil {
+	if _, err := enableStatuslineLocked(); err != nil {
 		return StatuslineHealResult{}, err
 	}
-	// EnableStatusline writes a fresh record (Heals zeroed, which is right for an
-	// engineer-initiated enable), so the count is restored after it, not before.
-	if next, ok := loadStatuslinePrior(); ok {
-		next.Heals = healed
-		_ = writeStatuslinePriorFile(next)
+	// enableStatuslineLocked writes a fresh record (Heals zeroed, which is right
+	// for an engineer-initiated enable), so the count is restored after it, not
+	// before.
+	//
+	// A failure here is REPORTED, not swallowed. Leaving Heals at zero silently
+	// un-bounds the fight this counter exists to bound: a competing tool would be
+	// re-wrapped every five minutes forever and never reach the give-up limit,
+	// which is the exact failure the limit was added to prevent.
+	next, ok := loadStatuslinePrior()
+	if !ok {
+		return StatuslineHealResult{Rewrapped: true, Command: cur.Command},
+			fmt.Errorf("re-wrapped, but the heal counter could not be read back — the give-up limit is not being counted")
+	}
+	next.Heals = healed
+	if err := writeStatuslinePriorFile(next); err != nil {
+		return StatuslineHealResult{Rewrapped: true, Command: cur.Command},
+			fmt.Errorf("re-wrapped, but the heal counter could not be stored (%w) — the give-up limit is not being counted", err)
 	}
 	return StatuslineHealResult{Rewrapped: true, Command: cur.Command}, nil
 }
@@ -600,16 +642,79 @@ func (s *statuslineHealer) maybe(now time.Time) {
 	case res.GaveUp:
 		fmt.Fprintf(os.Stderr, "claude-watcher: statusline displaced %d times running — leaving it alone; run `promptster-teams statusline enable` once whatever else writes it has settled\n", maxAutoHeals)
 	case res.Rewrapped:
-		fmt.Fprintf(os.Stderr, "claude-watcher: statusline had been replaced — re-wrapped it, and %s still renders\n", truncateForLog(res.Command))
+		fmt.Fprintf(os.Stderr, "claude-watcher: statusline had been replaced — re-wrapped it, and %s still renders\n", sanitizeForLog(res.Command))
 	}
 }
 
-// truncateForLog keeps a wrapped command readable in a log line without dumping
-// a 400-character shell pipeline into the daemon log every time it is healed.
-func truncateForLog(cmd string) string {
+// sanitizeForLog renders a statusline command safe to write to the daemon log.
+//
+// The string is arbitrary content from settings.json, and it reaches stderr — a
+// file people read in a terminal. Three separate problems, and truncation alone
+// solved only the first:
+//
+//   - LENGTH: a real statusline command is a 500-character shell pipeline
+//     (claude-hud's is 526) and it would be logged on every heal.
+//   - CONTROL BYTES: a newline or carriage return lets the command forge extra
+//     log lines, and an ESC sequence repaints or hides text in the terminal of
+//     whoever reads the log. Both are escaped, not stripped, so what was there is
+//     still visible as itself.
+//   - SECRETS: statusline commands do carry inline tokens (`--api-key=…`), and a
+//     daemon log outlives the tick. Truncating to a 60-byte prefix is what keeps
+//     this bounded — enough to recognise WHICH tool took the slot, which is all
+//     the log needs to say, and far too little to be a usable credential dump.
+//     If this ever needs to log more of the command, it needs redaction first.
+func sanitizeForLog(cmd string) string {
 	const max = 60
-	if len(cmd) <= max {
-		return cmd
+	truncated := false
+	if len(cmd) > max {
+		cmd, truncated = cmd[:max], true
 	}
-	return cmd[:max] + "…"
+	var b strings.Builder
+	for _, r := range cmd {
+		switch {
+		case r == '\n':
+			b.WriteString(`\n`)
+		case r == '\r':
+			b.WriteString(`\r`)
+		case r == '\t':
+			b.WriteString(`\t`)
+		case unicode.IsControl(r):
+			fmt.Fprintf(&b, `\x%02x`, r)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	if truncated {
+		b.WriteString("…")
+	}
+	return b.String()
+}
+
+// --- the mutation lock -------------------------------------------------------
+
+// statuslineLockPath guards every mutation of the statusLine slot and its prior
+// record. One path, one lock, all writers.
+func statuslineLockPath() string {
+	return filepath.Join(state.StateDir(), "statusline.lock")
+}
+
+// withStatuslineLock serialises enable / disable / reheal ACROSS PROCESSES.
+//
+// The race it closes is not theoretical and it runs the wrong way: `statusline
+// disable` is a foreground command, the healer runs in the daemon, and between
+// the healer clearing its gates and calling enable, a disable can complete. The
+// healer then writes the shim back over a slot the engineer just turned off —
+// an off switch reversed by a background process, which is the one outcome the
+// heal design says must never happen.
+//
+// It is a BLOCKING lock. Nothing here is on a latency path (the shim's own hot
+// path takes no lock at all), and the alternative — try-lock and skip — would
+// mean a heal silently declining to repair, which is the failure we are fixing.
+//
+// RE-ENTRANCY: flock blocks against a second fd on the same file from the SAME
+// process, so a locked function must never call another locked function. That is
+// why the public entry points are thin wrappers and every body is `...Locked`:
+// rehealStatuslineLocked calls enableStatuslineLocked, never EnableStatusline.
+func withStatuslineLock(fn func() error) error {
+	return sign.WithBufferLock(statuslineLockPath(), fn)
 }

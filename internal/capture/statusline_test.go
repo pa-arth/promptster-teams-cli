@@ -744,6 +744,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		}
 	}
 }
+
 // --- re-healing a displaced shim ---------------------------------------------
 //
 // The failure these pin: another tool's setup writes `statusLine.command`
@@ -941,3 +942,144 @@ func TestRehealCounterResetsWhenWeAreLeftAlone(t *testing.T) {
 // override — which would hand any user a way to redirect managed policy at a
 // file they control. The gate is three lines and reads plainly; that is a better
 // trade than a test-only escape hatch through an admin boundary.
+
+// TestSanitizeForLogNeutralisesCommandBytes: a statusline command is arbitrary
+// settings.json content and it reaches a log a human reads in a terminal.
+func TestSanitizeForLogNeutralisesCommandBytes(t *testing.T) {
+	cases := []struct {
+		name, in string
+		wantNot  []string
+		want     string
+	}{
+		{
+			name:    "forged log line",
+			in:      "hud\n2026-01-01 FATAL everything is fine",
+			wantNot: []string{"\n"},
+			want:    `hud\n2026-01-01 FATAL everything is fine`,
+		},
+		{
+			name:    "carriage return overwrite",
+			in:      "hud\rmalicious",
+			wantNot: []string{"\r"},
+			want:    `hud\rmalicious`,
+		},
+		{
+			name:    "terminal escape",
+			in:      "hud\x1b[2J\x1b[1;31mowned",
+			wantNot: []string{"\x1b"},
+			want:    `hud\x1b[2J\x1b[1;31mowned`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeForLog(tc.in)
+			for _, bad := range tc.wantNot {
+				if strings.Contains(got, bad) {
+					t.Errorf("control byte %q survived: %q", bad, got)
+				}
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeForLogBoundsASecret: statusline commands carry inline tokens, and
+// a daemon log outlives the tick. The 60-byte prefix is what keeps a credential
+// from being dumped whole — it is a bound, not decoration.
+func TestSanitizeForLogBoundsASecret(t *testing.T) {
+	secret := strings.Repeat("s3cr3t", 20) // 120 chars
+	got := sanitizeForLog("node hud.js --api-key=" + secret)
+	if len(got) > 64 { // 60 bytes + the ellipsis rune
+		t.Errorf("log line is %d bytes, want the 60-byte bound: %q", len(got), got)
+	}
+	if strings.Contains(got, secret) {
+		t.Error("the whole secret reached the log line")
+	}
+	if !strings.HasPrefix(got, "node hud.js") {
+		t.Errorf("lost the part that names which tool took the slot: %q", got)
+	}
+}
+
+// TestStatuslineLockSerialisesMutations proves the mutual exclusion the disable
+// race depends on: never two mutations of the statusLine slot at once.
+//
+// This is the test that actually fails when the lock is removed. The
+// interleaving test below does NOT — the window between the healer clearing its
+// gates and writing the shim is microseconds wide, and scheduling alone will not
+// hit it in a test run. Asserting on that would have been a test that passes for
+// the wrong reason, which is worse than no test.
+func TestStatuslineLockSerialisesMutations(t *testing.T) {
+	statuslineTestEnv(t)
+
+	var mu sync.Mutex
+	inside, maxInside := 0, 0
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = withStatuslineLock(func() error {
+				mu.Lock()
+				inside++
+				if inside > maxInside {
+					maxInside = inside
+				}
+				mu.Unlock()
+
+				// Wide enough that any overlap is certain to be observed.
+				time.Sleep(2 * time.Millisecond)
+
+				mu.Lock()
+				inside--
+				mu.Unlock()
+				return nil
+			})
+		}()
+	}
+	wg.Wait()
+
+	if maxInside != 1 {
+		t.Errorf("%d mutations ran concurrently; the slot must have exactly one writer at a time", maxInside)
+	}
+}
+
+// TestDisableAndHealNeverDisagree: whatever the interleaving of a foreground
+// `statusline disable` and a daemon heal, the two pieces of state must agree —
+// the shim installed and a prior record present, or neither. A heal that
+// reversed disable would leave the shim back with the record recreated; a
+// half-applied one would leave a record with no shim.
+//
+// Serialisation itself is proven above; this pins the end state.
+func TestDisableAndHealNeverDisagree(t *testing.T) {
+
+	for i := 0; i < 40; i++ {
+		func() {
+			statuslineTestEnv(t)
+			writeUserStatusLine(t, hudCommand)
+			if _, err := EnableStatusline(); err != nil {
+				t.Fatal(err)
+			}
+			// Displace us, so the healer has real work queued.
+			writeUserStatusLine(t, hudCommand)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); _, _ = RehealStatusline() }()
+			go func() { defer wg.Done(); _ = DisableStatusline() }()
+			wg.Wait()
+
+			// Disable clears the prior record; a heal that landed AFTER it would
+			// have recreated the record and the shim together.
+			rec, hasRec := loadStatuslinePrior()
+			if StatuslineWrapped() && !hasRec {
+				t.Fatalf("run %d: the shim was reinstalled with no prior record — a heal reversed disable", i)
+			}
+			if hasRec && !StatuslineWrapped() {
+				t.Fatalf("run %d: a prior record survived with no shim installed: %+v", i, rec)
+			}
+		}()
+	}
+}
