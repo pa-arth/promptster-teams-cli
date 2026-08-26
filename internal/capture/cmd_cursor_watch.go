@@ -91,7 +91,22 @@ type cursorWatchProgress struct {
 	// the repo identity is recovered after a daemon restart without re-scanning
 	// the file.
 	Roots map[string]string `json:"roots"`
-	V     int               `json:"v"`
+	// Sessions is the session id each transcript's events are emitted under.
+	// USUALLY the transcript's own uuid, but not always: a transcript Cursor
+	// rewrote after a `move_agent_to_*` adopts the id of the one it continues
+	// (see cursor_continuation.go), and this is where that decision is kept.
+	//
+	// Persisting it does two things a re-derivation could not. It survives a
+	// daemon restart, so one file cannot land under two ids across a bounce; and
+	// it is what lets continuations CHAIN — a third transcript matching the
+	// second reads the second's recorded id, which is already the first's,
+	// rather than re-running detection down the chain.
+	//
+	// A missing entry means "never resolved", and the resolver falls back to
+	// cursorSessionIDFromPath — which is exactly the pre-continuation behaviour,
+	// so an older progress file needs no migration and V does not move.
+	Sessions map[string]string `json:"sessions"`
+	V        int               `json:"v"`
 }
 
 // cursorProgressSchemaV is the current progress-file schema version. Bump it
@@ -103,9 +118,10 @@ const cursorProgressSchemaV = 1
 
 func loadCursorWatchProgress() cursorWatchProgress {
 	p := cursorWatchProgress{
-		Offsets: map[string]int64{},
-		Match:   map[string]string{},
-		Roots:   map[string]string{},
+		Offsets:  map[string]int64{},
+		Match:    map[string]string{},
+		Roots:    map[string]string{},
+		Sessions: map[string]string{},
 	}
 	data, err := os.ReadFile(cursorWatchProgressPath())
 	if err != nil {
@@ -120,6 +136,9 @@ func loadCursorWatchProgress() cursorWatchProgress {
 	}
 	if p.Roots == nil {
 		p.Roots = map[string]string{}
+	}
+	if p.Sessions == nil {
+		p.Sessions = map[string]string{}
 	}
 	if p.V < cursorProgressSchemaV {
 		for k, v := range p.Match {
@@ -312,7 +331,8 @@ func pollCursorTranscripts(
 		// events the hook rail structurally cannot produce. See
 		// cursorHookBlindKinds; nil means "emit everything".
 		var only map[string]bool
-		if isCursorHookClaimed(claims, key) {
+		hookClaimed := isCursorHookClaimed(claims, key)
+		if hookClaimed {
 			only = cursorHookBlindKinds
 		}
 		switch progress.Match[key] {
@@ -399,27 +419,72 @@ func pollCursorTranscripts(
 		}
 
 		proc := processors[key]
-		if proc == nil {
-			proc = normalize.NewCursorTranscriptProcessor(cursorSessionIDFromPath(path))
-			if isCursorSidechainFile(path) {
-				proc.Sidechain = true
-				// The child's OWN id, which cursorSessionIDFromPath deliberately
-				// does not return — it rolls the child up to its parent so one
-				// conversation stays one session. Both are needed and they are
-				// different questions: the session id says WHICH CONVERSATION,
-				// the lane id says WHICH DELEGATED AGENT. Keeping only the first
-				// is why Cursor was the one rail where two subagents running at
-				// once were indistinguishable.
-				proc.LaneID = cursorLaneIDFromPath(path)
-			} else {
-				// Resolve the repo identity ONCE per transcript from the workspace
-				// root this session matched, so every part (slug, host, tracked
-				// bit) and the workdir describe ONE observation of ONE directory.
-				root := progress.Roots[key]
-				proc.Workdir = normalize.CursorSessionWorkdir(root)
-				proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(root)
+		// RE-RESOLVE WHENEVER THE ANSWER WAS NEVER FINAL, not only when the
+		// processor is missing.
+		//
+		// cursorResolveSessionID reports un-cacheable for the two answers that
+		// can still change — a subagent seen before its moved parent resolved,
+		// and a transcript the hook rail claimed under a TTL — and refusing to
+		// write progress.Sessions is how it says so. An ABSENT entry is
+		// therefore the record that the question is still open; no second map is
+		// needed to track it, and none can drift out of step with the first.
+		//
+		// KEYING THE RE-ASK ON `proc == nil` ALONE WAS THE BUG. The processor
+		// cache is held for the daemon's life, so a provisional key was asked
+		// exactly once and frozen one level ABOVE the map that was carefully
+		// refusing to freeze it. A subagent whose parent later adopted an earlier
+		// id then kept emitting under the abandoned uuid forever — precisely the
+		// split the sidechain branch exists to prevent.
+		//
+		// Cheap to repeat: both provisional paths return before the candidate
+		// scan, and a main-chain transcript is always cacheable, so the scan that
+		// reads other transcripts runs at most once per key.
+		if proc == nil || progress.Sessions[key] == "" {
+			// NOT cursorSessionIDFromPath DIRECTLY. The filename answers "what
+			// does this path say"; this answers "which conversation is this",
+			// and a `move_agent_to_*` makes those two different — Cursor rewrites
+			// the whole conversation under a new uuid in a new project dir, and
+			// taking the new filename re-ingests every prompt and tool call so
+			// far as a second session. See cursor_continuation.go.
+			//
+			// The per-path offset bookkeeping is untouched: `key` is still the
+			// path, the new file still gets its own cursor, and only the id the
+			// events carry changes.
+			sessionID, cacheable := cursorResolveSessionID(path, key, progress, hookClaimed)
+			if cacheable {
+				progress.Sessions[key] = sessionID
 			}
-			processors[key] = proc
+			if proc == nil {
+				proc = normalize.NewCursorTranscriptProcessor(sessionID)
+				if isCursorSidechainFile(path) {
+					proc.Sidechain = true
+					// The child's OWN id, which cursorSessionIDFromPath
+					// deliberately does not return — it rolls the child up to its
+					// parent so one conversation stays one session. Both are
+					// needed and they are different questions: the session id
+					// says WHICH CONVERSATION, the lane id says WHICH DELEGATED
+					// AGENT. Keeping only the first is why Cursor was the one
+					// rail where two subagents running at once were
+					// indistinguishable.
+					proc.LaneID = cursorLaneIDFromPath(path)
+				} else {
+					// Resolve the repo identity ONCE per transcript from the
+					// workspace root this session matched, so every part (slug,
+					// host, tracked bit) and the workdir describe ONE observation
+					// of ONE directory.
+					root := progress.Roots[key]
+					proc.Workdir = normalize.CursorSessionWorkdir(root)
+					proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(root)
+				}
+				processors[key] = proc
+			} else {
+				// Already tailing under a provisional id. Migrate IN PLACE:
+				// rebuilding would drop the prompt-timestamp anchor and every
+				// later event would fall back to read time. The lane, sidechain
+				// bit and repo identity are properties of the FILE, not of the
+				// session, so they do not move. See normalize.AdoptSessionID.
+				proc.AdoptSessionID(sessionID)
+			}
 		}
 		queued += tailCursorTranscript(path, key, progress, proc, session, captureProse, only)
 	}
