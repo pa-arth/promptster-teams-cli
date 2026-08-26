@@ -262,8 +262,18 @@ func TestCursorResolveSessionIDFallsBackWhenThePredecessorIsGone(t *testing.T) {
 // ONE CONVERSATION MOVED TWICE IS STILL ONE CONVERSATION. The corpus holds a
 // chain of three: A ended on a turn_ended error, B rewrote it under a new uuid
 // in a new directory and was itself moved, C rewrote B. All three must land on
-// A's id, which only works because the resolver reads the CANDIDATE'S RECORDED
-// id rather than its filename.
+// A's id.
+//
+// THE DIRECTORY NAMES ARE NOT DECORATION. Candidates are scanned in sorted key
+// order, and in the corpus the worktree directory sorts BEFORE the repo it was
+// cut from ('-' < '/'), so C meets B first — never A. That is what forces the
+// resolver down the transitive path, reading B's RECORDED id rather than B's
+// filename. Name the directories the other way and the test passes on the
+// direct A-match, proving nothing: a mutation replacing the recorded-id lookup
+// with cursorSessionIDFromPath(candidate) stayed green until this was fixed.
+//
+// The second phase removes A from disk entirely, so there is no direct match
+// left to fall back on and the recorded id is the only route to aID.
 func TestCursorContinuationChainsTransitively(t *testing.T) {
 	const (
 		aID = "3df490ff-1111-4111-8111-111111111111"
@@ -276,9 +286,12 @@ func TestCursorContinuationChainsTransitively(t *testing.T) {
 		cursorMoveLookupLine("move_agent_to_cloned_root"),
 	}
 	rel := map[string]string{
-		aID: "proj-a/agent-transcripts/" + aID + "/" + aID + ".jsonl",
-		bID: "proj-b/agent-transcripts/" + bID + "/" + bID + ".jsonl",
-		cID: "proj-c/agent-transcripts/" + cID + "/" + cID + ".jsonl",
+		aID: "repo-main/agent-transcripts/" + aID + "/" + aID + ".jsonl",
+		bID: "repo-main-worktree-b/agent-transcripts/" + bID + "/" + bID + ".jsonl",
+		cID: "repo-main-worktree-c/agent-transcripts/" + cID + "/" + cID + ".jsonl",
+	}
+	if !(filepath.ToSlash(rel[bID]) < filepath.ToSlash(rel[aID])) {
+		t.Fatalf("fixture no longer forces the transitive path: %q must sort before %q", rel[bID], rel[aID])
 	}
 	writeCursorTranscript(t, root, rel[aID], append(append([]string{}, head...), cursorTurnEndedErrorLine())...)
 	writeCursorTranscript(t, root, rel[bID], append(append([]string{}, head...),
@@ -292,21 +305,37 @@ func TestCursorContinuationChainsTransitively(t *testing.T) {
 		Roots:    map[string]string{},
 		Sessions: map[string]string{},
 	}
-	// Resolve in discovery order, recording each answer exactly as the poll loop
-	// does.
-	for _, id := range []string{aID, bID, cID} {
+	resolve := func(id string) string {
+		t.Helper()
 		p := filepath.Join(root, filepath.FromSlash(rel[id]))
 		k := cursorProgressKey(p)
 		got, cacheable := cursorResolveSessionID(p, k, progress)
 		if !cacheable {
 			t.Fatalf("%s: resolution not cacheable", id)
 		}
-		if got != aID {
-			t.Fatalf("%s resolved to %q, want the head of the chain %q", id, got, aID)
-		}
 		progress.Sessions[k] = got
 		progress.Offsets[k] = 0
 		progress.Match[k] = "yes"
+		return got
+	}
+
+	// Discovery order, exactly as the poll loop records each answer.
+	for _, id := range []string{aID, bID, cID} {
+		if got := resolve(id); got != aID {
+			t.Fatalf("%s resolved to %q, want the head of the chain %q", id, got, aID)
+		}
+	}
+
+	// Second phase: the head is pruned from disk but still remembered. C is
+	// re-resolved from scratch; only B's recorded id can still reach aID.
+	if err := os.Remove(filepath.Join(root, filepath.FromSlash(rel[aID]))); err != nil {
+		t.Fatal(err)
+	}
+	cPath := filepath.Join(root, filepath.FromSlash(rel[cID]))
+	delete(progress.Sessions, cursorProgressKey(cPath))
+	got, _ := cursorResolveSessionID(cPath, cursorProgressKey(cPath), progress)
+	if got != aID {
+		t.Fatalf("with the head pruned, C resolved to %q, want %q via B's recorded id", got, aID)
 	}
 }
 
