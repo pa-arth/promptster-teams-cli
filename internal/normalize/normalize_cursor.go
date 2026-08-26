@@ -338,8 +338,10 @@ func isCursorBuiltinNamespace(ns string) bool {
 // toolEvent maps one assistant tool_use to a canonical event.
 //
 // SCOPE. Only the tools that describe WORK are mapped: edits, file creation,
-// deletion, shell commands, delegation, and MCP calls. Read/Grep/Glob are 782 of
-// the corpus's 1,809 tool calls and say only that the agent looked at something
+// deletion, shell commands, delegation, and MCP calls. Read/Grep/Glob are 3,864
+// of the corpus's 7,314 tool calls (re-counted 2026-08-25 over 142 transcripts;
+// the earlier reading was 782 of 1,809, and the SHARE barely moved — 43.2% then,
+// 52.8% now) and say only that the agent looked at something
 // — they are deliberately unmapped rather than shipped as volume.
 //
 // Task and CallMcpTool were previously in that unmapped set, with the stated
