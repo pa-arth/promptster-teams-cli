@@ -760,6 +760,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		e.RawPayload = raw
 		return []event.Event{e}
 
+	case "context_compacted":
+		return p.contextCompacted(ts, raw)
+
 	case "patch_apply_end":
 		return p.patchApplyEnd(payload, ts, raw)
 
@@ -783,6 +786,49 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 	default:
 		return nil
 	}
+}
+
+// contextCompacted converts the rollout's compaction marker into a canonical
+// context_compact event — the reset signal `SOURCE_CAPABILITIES.codex.resetEvents`
+// records us as blind to. Codex has always had /compact; we simply never read it,
+// which is how a hiring candidate was docked `context_hygiene: developing` for
+// "zero clears or compactions" on a rail that could not have shown one.
+//
+// Keyed off `event_msg`/`context_compacted`, NOT the sibling `type:"compacted"`
+// record. The two arrive 1:1 (8 of each across the 5 local rollouts that compact,
+// never one without the other), so either would count the same resets — but:
+//
+//   - `compacted`'s payload is the whole `replacement_history`: every prior user
+//     turn verbatim, base64 image data included. It is the largest blob in the
+//     file and precisely what the teams projection exists never to carry.
+//   - `context_compacted` is an `EventMsg` VARIANT, so it survives the codex 0.149
+//     stream rename that moved user and agent messages under `item_completed`.
+//     Verified against the installed 0.149.1 binary's variant table, where it
+//     still sits beside `token_count` and `task_started`.
+//
+// NO `trigger`. The Claude path reads auto-vs-manual off `compactMetadata`; the
+// codex rollout records nothing equivalent, and it does not log slash commands at
+// all (0 slash-prefixed user turns across 41 local rollouts), so any value here
+// would be invented — the same failure that produced the false `developing` in the
+// first place. A trigger-less `context_compact` already parses downstream.
+//
+// NO token counts either. `total_token_usage` is a running SESSION total, not the
+// live context size — the same reason the ai_response path leaves usageScope unset
+// — so it cannot answer "how big was the context before this reset".
+//
+// A DELEGATED thread's compaction is the subagent's context wall, not the human's,
+// and is dropped for the same reason its prompts and answers are.
+func (p *CodexRolloutProcessor) contextCompacted(ts, raw string) []event.Event {
+	if p.subagentThread {
+		return nil
+	}
+	// event_msg lines carry no per-item id; the rollout line ts is the record's
+	// stable identity (copied verbatim on resume/fork), as for prompt/ai_response.
+	e := p.newCodexEvent("context_compact", ts, ts)
+	e.Actor = event.SystemActor()
+	e.Data = map[string]interface{}{}
+	e.RawPayload = raw
+	return []event.Event{e}
 }
 
 // subagentUsage emits a delegated thread's completed turn as COUNTERS ONLY.
