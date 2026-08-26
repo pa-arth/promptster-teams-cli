@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.22.0] — 2026-08-26
+
 ### Added
 
 **A lane could say WHICH invocation and WHAT KIND, and not what it was for.**
@@ -58,6 +60,126 @@ dropped at ingest with a `201` and no error anywhere.
 the `attributionAgent` half of the Codex change is correct-by-construction and
 UNOBSERVED; the `summary` half has a wire fixture behind it. And the fix is
 forward-only — historical rows that arrived with no attribution stay that way.
+
+
+**38% of Cursor turns produced no usage row, and nothing counted one.** Measured
+2026-08-25 against Cursor's own session records on one live customer machine.
+Every counter this rail had was incremented *after* the early return that
+dropped the turn, so the one outcome worth measuring was the one outcome that
+left no record — and a rail that drops work invisibly is indistinguishable from
+a rail with nothing to do. It ran that way for weeks on a machine reporting
+`cursorHooks: ok` throughout: the install state was observable, the coverage
+was not.
+
+Five cumulative counters now sit beside the existing model-coverage pair:
+`stopSeen` (the denominator `usageRows` never had), `stopEmpty` (declined for no
+tokens *and* no model), `unparsed`, `overruns`, and `usageRows`. `stopEmpty` is
+an **honest** drop — an aborted turn the vendor told us nothing about — and
+separating it is what turns "38% missing" into an answer rather than an alarm.
+The residual `stopSeen - stopEmpty - usageRows` is left as arithmetic rather
+than given its own counter that could disagree with its parts.
+
+The overrun counter keeps **its own file and its own lock**, deliberately.
+`RunCursorHook` abandons its worker at the budget without waiting, and the
+worker may be running precisely because it is blocked in a `flock` on
+`cursor-generations.json`; recording the overrun through that same lock would
+park the parent on the very wedge it is reporting. The hook runs synchronously
+inside the engineer's agent loop, so that cost is not theoretical.
+`TestOverrunIsRecordedWhileTheGenerationsLockIsHeld` is a design assertion — it
+fails the moment someone moves this counter in "so the counters live together".
+
+### Fixed
+
+**A moved agent rewrites the conversation, and we called it a new session.**
+When a Cursor agent calls `cursor-app-control`'s `move_agent_to_root` or
+`move_agent_to_cloned_root`, Cursor ends the transcript on a `turn_ended` error
+and re-writes the ENTIRE conversation under a NEW uuid in a DIFFERENT project
+directory. `cursorSessionIDFromPath` reads the id off the filename, so the
+rewritten history arrived as a brand-new session at offset 0 and every prompt
+and tool call the engineer had already made was ingested a second time.
+
+Nothing downstream caught it and nothing downstream could: the teams ingest
+index is `UNIQUE (ts, md5(org||session||kind||data))` with
+`onConflictDoNothing`, so content-identical events collapse **only within one
+`session_id`**. Unifying the session id is therefore the whole fix, and it
+needs no backend change.
+
+Measured on 142 real transcripts: 16 first-record-duplicate groups over 19
+redundant files (**13.4% of the corpus**); 6 are true continuations, every one
+crossing a project directory, one a chain of three. Simulated against the
+index's identity fields, **61 of 61 predecessor events are absorbed** under a
+unified id.
+
+Adoption requires all four of: a byte-identical first record, a **different**
+project directory, a move referenced in the predecessor, and a shared prefix of
+K=2 records. Conservative on purpose — a duplicate is absorbed by the server's
+index, whereas a bad merge silently eats real events into a session they did not
+belong to, so every condition fails toward minting today's id. Three findings
+changed the rules from their first draft: rule 3 cannot require the invocation
+(in **4 of 6** continuations the move killed the turn before the call record was
+written, leaving only the schema fetch), it cannot require
+`server == "cursor-app-control"` (the dynamic-tool shape carries no `server`
+field), and K is a **ceiling** rather than a floor — two same-directory
+look-alikes are byte-identical for their entire length, so no prefix separates
+them and rule 2 does the work.
+
+Two interactions closed that were not in the original scope. A **hook-claimed**
+transcript keeps its filename id: the hook rail reads its session id from
+Cursor's payload, which after a move is the new uuid, so adopting on the
+transcript side would strand `task_dispatch`/`mcp_call` on a session with no
+prompts — trading a duplicate for a split. And **subagent** rollup targets route
+through the same map, so delegation does not strand on the abandoned id.
+
+Known limit: candidates come from the watcher's own progress map, so a move
+whose predecessor was never watched still duplicates. Inherent to
+reconstructing identity from what we track.
+
+**The MCP board went quiet on a rename, and two thirds of what was left was not
+MCP.** Cursor renamed its MCP invocation around **2026-08-22T20:29Z** —
+`CallMcpTool` with `{server, toolName, arguments}` became `CallDynamicTool` with
+`{namespace, toolName, arguments}`. `toolEvent` only handled the old name, so
+every post-cut Cursor MCP call was silently dropped, and a dropped `mcp_call` is
+invisible: the board reads it as "this engineer used no MCP", not as a gap.
+Production `mcp_call` per day: 307 on 08-21, 238 on 08-22, then **0** on 08-23,
+08-24, 08-25 and 08-26, while `command` and `task_dispatch` kept flowing across
+the same boundary. **~300 MCP calls a day, lost since 08-23.**
+
+`CallDynamicTool` is also a **superset** of MCP — all five corpus calls are
+Cursor's own chat management — so a one-line name mapping would have put five of
+five non-MCP invocations on the MCP board. One
+`case "CallMcpTool", "CallDynamicTool":` clause now shares one
+`isCursorBuiltinNamespace` predicate, and it is a **denylist on `cursor-`, not
+an allowlist on `user-`**: production has five namespace families (bare 1,595,
+`plugin-*` 1,432, `project-*` 309, `user-*` 75, `cursor-*` 52), so an allowlist
+would have dropped **~97.8%** of live MCP rows — a customer's entire Linear,
+Grafana and Granola history — which is the same invisible-loss defect this patch
+exists to fix. `CallMcpTool` stays mapped: the watcher re-reads back to
+`transcriptHistoryWindow` (28 days), so old-format records are live input for
+four weeks.
+
+**Durability fingerprints grew forever and reloaded per path.**
+`durability-fingerprints.json` was the only unbounded file in the state dir.
+Expiry ran only over the paths the current commit re-captured, so a repo that
+stopped receiving commits kept its fingerprints permanently — and the leak was
+invisible to `fingerprintsForPath`, which filtered on read without writing back,
+so the store looked correct while the file grew. Measured on one device:
+**444,618 entries / 68.4 MB, 65% of them already past the 14-day TTL**, oldest
+35.7 days. `pruneDurabilityFingerprints` now sweeps every root and path on each
+write and deletes emptied paths and roots: **68.4 MB → 23.3 MB, 244 roots → 82**
+over a copy of that real store. Behind the TTL sits a hard cap of 200,000
+entries evicted oldest-first across the whole store — TTL is the policy, the cap
+only bounds what TTL cannot. Eviction can only ever **lose** transfer evidence,
+never invent it.
+
+Second defect, same store: seeding resolved fingerprints one path at a time,
+each call re-reading and re-unmarshalling the whole file under the lock. On that
+68.4 MB store a 20-file commit spent **24.3s** answering 20 questions about one
+snapshot; one load takes **1.0s (23.3x)**. Reading one snapshot is also the more
+correct semantics — the per-path version could observe a concurrent write
+partway through and seed a single commit against two generations of evidence.
+
+Existing on-disk stores shrink on the engineer's next AI-attributed commit. No
+migration, no startup sweep, nothing fleet-wide.
 
 ## [0.21.0] — 2026-08-24
 
@@ -2071,7 +2193,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.18.1...v0.19.0
