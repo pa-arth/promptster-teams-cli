@@ -234,8 +234,13 @@ func cursorContinuationSessionID(path, key string, progress cursorWatchProgress)
 		if id == "" {
 			id = cursorSessionIDFromPath(candidatePath)
 		}
+		// A candidate that already resolves to this file's own id has nothing to
+		// contribute. KEEP LOOKING rather than bailing out: two transcripts can
+		// carry the SAME uuid in two project directories (the corpus has one),
+		// and if that twin is met before the real predecessor, stopping here
+		// would drop the adoption for the ordering alone.
 		if id == "" || id == own {
-			return "", false
+			continue
 		}
 		return id, true
 	}
