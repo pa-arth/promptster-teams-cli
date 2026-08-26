@@ -6,6 +6,39 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+**We wrapped their statusline and then replaced it anyway.** The shim runs the
+engineer's own `statusLine` command and passes its stdout through — that is what
+makes taking the slot defensible. But it bounded that command at **2500ms** and,
+on overrun, drew OUR line (`promptster · 5h x% · wk y%`) in its place. 2.5s is
+below what a real statusline costs: claude-hud (node, a plugin-cache glob, a
+user extra-cmd subprocess) measured **0.6s–4.5s over eight consecutive runs on
+an idle laptop and exceeded the bound on five of them**. The engineer's
+statusline was being replaced by ours on most ticks, and the failure was
+self-concealing — the line that would have said so is the line that got
+replaced.
+
+- **Our line is never the fallback for a command we wrapped.** The ladder is now
+  last-good output → this run's partial stdout → nothing at all. Complete-but-
+  one-tick-stale beats fresh-but-truncated (a killed command's stdout can end
+  mid-escape-sequence and bleed color), and a blank tick is something the
+  engineer can attribute to their own script — ours is a takeover. The compact
+  promptster line survives for the one case it was ever for: an empty slot.
+- **The last-good render is cached** (`statusline-lastgood`, 0600, 64KB cap) so
+  a slow tick redraws THEIR line. It holds rendered third-party content, is read
+  by exactly one function, and never reaches the spools or the wire. It is
+  dropped on re-wrap and on `statusline disable` / `uninstall`.
+- **The timeout now actually bounds the render.** stdout is a buffer, so
+  `os/exec` plumbs it through a pipe and `Wait` blocks until every writer closes
+  it — and a killed `sh` leaves GRANDCHILDREN holding it open. claude-hud is
+  exactly that shape. A 100ms context took **30s** to return; `cmd.WaitDelay`
+  makes it 0.6s.
+- **The bound is now 10s**, a wedge guard rather than a latency budget.
+  Unwrapped, Claude Code runs that same command with no timeout of ours, so any
+  value a real statusline can reach makes us the cause of a regression the
+  engineer would not otherwise have had.
+
 ## [0.22.0] — 2026-08-26
 
 ### Added

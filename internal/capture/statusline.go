@@ -175,6 +175,10 @@ func loadStatuslinePrior() (statuslinePriorRecord, bool) {
 }
 
 func saveStatuslinePrior(rec statuslinePriorRecord) error {
+	// A new prior invalidates the last-good cache: serving the OLD statusline's
+	// output as a fallback for a NEW one is exactly the kind of quiet
+	// substitution the cache exists to prevent.
+	clearStatuslineLastGood()
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -190,7 +194,12 @@ func saveStatuslinePrior(rec statuslinePriorRecord) error {
 	return os.Rename(tmp, statuslinePriorPath())
 }
 
-func clearStatuslinePrior() { _ = os.Remove(statuslinePriorPath()) }
+// clearStatuslinePrior drops the wrap record and the cached render together —
+// once we are no longer wrapping, a remembered line belongs to nobody.
+func clearStatuslinePrior() {
+	_ = os.Remove(statuslinePriorPath())
+	clearStatuslineLastGood()
+}
 
 // --- settings.json mutation (preserving unknown keys) ------------------------
 
