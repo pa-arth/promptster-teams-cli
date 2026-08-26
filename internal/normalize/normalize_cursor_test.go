@@ -554,3 +554,209 @@ func TestCursorRedactionRunsBeforeParse(t *testing.T) {
 		t.Fatalf("secret survived pre-parse redaction: %#v", dataOf(t, e)["text"])
 	}
 }
+
+// --- CallDynamicTool: the 2026-08-22 rename, and the built-in filter ---------
+//
+// Fixtures below use the real key-sets and the real namespace VALUES observed in
+// the 142-transcript corpus. The values matter here in a way they do not
+// elsewhere in this file: the whole point of the filter is which namespace a
+// call carries, so inventing a namespace would test nothing.
+
+// The rename itself. Without this case every post-2026-08-22 Cursor MCP call is
+// dropped, and a dropped mcp_call reads downstream as "used no MCP" rather than
+// as a gap.
+func TestCursorDynamicToolEmitsMcpCall(t *testing.T) {
+	p := procWith("s1")
+	events := p.Process(cursorAssistantLine("CallDynamicTool", `{
+		"namespace":"user-supabase",
+		"toolName":"execute_sql",
+		"arguments":{"query":"SECRET-SQL-BODY"}
+	}`), 0)
+
+	if len(events) != 1 {
+		t.Fatalf("a CallDynamicTool emitted %d events, want 1: %+v", len(events), events)
+	}
+	e := events[0]
+	if e.Kind != "mcp_call" {
+		t.Fatalf("kind = %q, want mcp_call", e.Kind)
+	}
+	d := dataOf(t, e)
+	// Identical composition to the CallMcpTool path: `namespace` is the exact
+	// analogue of `server`, so the two names must produce the SAME tool string.
+	if d["tool"] != "user-supabase__execute_sql" {
+		t.Errorf("tool = %v, want user-supabase__execute_sql", d["tool"])
+	}
+	if _, present := d["status"]; present {
+		t.Errorf("status present; Cursor records no tool results, so any value is invented")
+	}
+	if _, present := d["arguments"]; present {
+		t.Errorf("the call arguments rode along: %#v", d)
+	}
+}
+
+// CallDynamicTool is a SUPERSET of MCP: all 5 such calls in the corpus are
+// Cursor's own chat management under `cursor-app-control`, not MCP at all. A
+// naive one-line rename would have put 5 of 5 non-MCP calls on the MCP board.
+func TestCursorDynamicToolDropsCursorBuiltins(t *testing.T) {
+	for _, input := range []string{
+		`{"namespace":"cursor-app-control","toolName":"rename_chat","arguments":{}}`,
+		`{"namespace":"cursor-app-control","toolName":"move_agent_to_root","arguments":{}}`,
+		`{"namespace":"cursor-app-control","toolName":"move_agent_to_cloned_root","arguments":{}}`,
+	} {
+		p := procWith("s1")
+		if events := p.Process(cursorAssistantLine("CallDynamicTool", input), 0); len(events) != 0 {
+			t.Errorf("input %s emitted %+v; Cursor's own tooling is not MCP", input, events)
+		}
+	}
+}
+
+// THE CORRECTION. The same pollution was already shipping on the OLD name: 42 of
+// 62 corpus CallMcpTool calls are Cursor built-ins (cursor-app-control 40,
+// cursor-ide-browser 2). Filtering them is a deliberate behaviour CHANGE that
+// drops roughly two thirds of historical Cursor mcp_call volume — the board
+// becoming true, not the rail breaking.
+func TestCursorMcpCallDropsCursorBuiltins(t *testing.T) {
+	for _, input := range []string{
+		`{"server":"cursor-app-control","toolName":"move_agent_to_cloned_root","description":"d","arguments":{}}`,
+		`{"server":"cursor-ide-browser","toolName":"browser_tabs","arguments":{}}`,
+	} {
+		p := procWith("s1")
+		if events := p.Process(cursorAssistantLine("CallMcpTool", input), 0); len(events) != 0 {
+			t.Errorf("input %s emitted %+v; Cursor's own tooling is not MCP", input, events)
+		}
+	}
+}
+
+// The filter is a DENYLIST on `cursor-`, not an allowlist on `user-`. A server
+// under some third prefix must stay on the board: failing OPEN costs a visible
+// row somebody can question, where failing closed drops it silently — which is
+// the exact invisible-loss defect this change exists to fix.
+func TestCursorMcpCallKeepsUnknownPrefixedServers(t *testing.T) {
+	for _, tc := range []struct{ toolName, input, want string }{
+		{"CallMcpTool", `{"server":"user-clerk","toolName":"list_clerk_sdk_snippets","arguments":{}}`, "user-clerk__list_clerk_sdk_snippets"},
+		{"CallMcpTool", `{"server":"user-Railway","toolName":"list_projects","arguments":{}}`, "user-Railway__list_projects"},
+		// Neither observed family. An allowlist would silently eat both.
+		{"CallMcpTool", `{"server":"org-internal","toolName":"deploy","arguments":{}}`, "org-internal__deploy"},
+		{"CallDynamicTool", `{"namespace":"project-scoped","toolName":"query","arguments":{}}`, "project-scoped__query"},
+	} {
+		p := procWith("s1")
+		events := p.Process(cursorAssistantLine(tc.toolName, tc.input), 0)
+		if len(events) != 1 {
+			t.Fatalf("%s %s emitted %d events, want 1", tc.toolName, tc.input, len(events))
+		}
+		if d := dataOf(t, events[0]); d["tool"] != tc.want {
+			t.Errorf("tool = %v, want %q", d["tool"], tc.want)
+		}
+	}
+}
+
+// Same "half a name is worse than none" rule as the old name. An empty namespace
+// would compose `__foo` and open a nameless bucket on the MCP board. Note the
+// empty namespace is checked BEFORE the built-in predicate, so an empty string
+// is dropped for being half a name and not for accidentally not matching
+// `cursor-`.
+func TestCursorDynamicToolDroppedWhenHalfNamed(t *testing.T) {
+	for _, input := range []string{
+		`{"toolName":"execute_sql","arguments":{}}`,
+		`{"namespace":"","toolName":"execute_sql"}`,
+		`{"namespace":"user-supabase","arguments":{}}`,
+		`{}`,
+	} {
+		p := procWith("s1")
+		if events := p.Process(cursorAssistantLine("CallDynamicTool", input), 0); len(events) != 0 {
+			t.Errorf("input %s emitted %+v; want it dropped", input, events)
+		}
+	}
+}
+
+// A CallDynamicTool must NOT read `server`, and a CallMcpTool must NOT read
+// `namespace`. The resolve is keyed on the tool name rather than coalescing the
+// two fields, because no corpus record carries both and a coalesce would be a
+// guess about a shape nobody has seen.
+func TestCursorInvocationNamespaceFieldIsNotCoalesced(t *testing.T) {
+	for _, tc := range []struct{ label, toolName, input string }{
+		{"dynamic ignores server", "CallDynamicTool", `{"server":"user-supabase","toolName":"execute_sql"}`},
+		{"mcp ignores namespace", "CallMcpTool", `{"namespace":"user-supabase","toolName":"execute_sql"}`},
+	} {
+		t.Run(tc.label, func(t *testing.T) {
+			p := procWith("s1")
+			if events := p.Process(cursorAssistantLine(tc.toolName, tc.input), 0); len(events) != 0 {
+				t.Errorf("emitted %+v; the wrong field was read", events)
+			}
+		})
+	}
+}
+
+// ID STABILITY ACROSS THE FILTER — the property that makes a re-read idempotent.
+//
+// `idx` is the content-array index, taken in Process's range loop BEFORE any
+// tool is mapped or dropped. So a dropped CallDynamicTool must still consume its
+// index: if the filter renumbered survivors instead, every event after a
+// built-in call would mint a DIFFERENT deterministic id on re-read, and the
+// backend — which dedupes on that id — would store the same work twice.
+//
+// IDs are asserted explicitly rather than merely compared, so a change that
+// alters the derivation for both records at once cannot pass this by moving them
+// together.
+func TestCursorDynamicToolDoesNotShiftLaterEventIDs(t *testing.T) {
+	const withoutDynamic = `{"role":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"Shell","input":{"command":"go test ./..."}},` +
+		`{"type":"tool_use","name":"Delete","input":{"path":"/w/old.go"}}` +
+		`]}}`
+	// The SAME two mapped tools, with a filtered-out built-in spliced in at
+	// index 1 — so the Delete moves from content index 1 to index 2.
+	const withDynamic = `{"role":"assistant","message":{"content":[` +
+		`{"type":"tool_use","name":"Shell","input":{"command":"go test ./..."}},` +
+		`{"type":"tool_use","name":"CallDynamicTool","input":{"namespace":"cursor-app-control","toolName":"rename_chat","arguments":{}}},` +
+		`{"type":"tool_use","name":"Delete","input":{"path":"/w/old.go"}}` +
+		`]}}`
+
+	base := procWith("s1").Process([]byte(withoutDynamic), 512)
+	if len(base) != 2 {
+		t.Fatalf("setup: want 2 events, got %d: %+v", len(base), base)
+	}
+	spliced := procWith("s1").Process([]byte(withDynamic), 512)
+	if len(spliced) != 2 {
+		t.Fatalf("the built-in was not filtered: want 2 events, got %d: %+v", len(spliced), spliced)
+	}
+
+	// The Shell sits at index 0 in both, so its id is unchanged.
+	wantShell := event.DeterministicUUID("s1\x1fcommand\x1f512\x1f0")
+	if base[0].ID != wantShell || spliced[0].ID != wantShell {
+		t.Errorf("command id: base %q, spliced %q, want %q", base[0].ID, spliced[0].ID, wantShell)
+	}
+
+	// The Delete MOVED — index 1 without the built-in, index 2 with it — and its
+	// id must move with it. Equal ids here would mean idx was assigned
+	// post-filter, which is the bug: re-reading the same record after a mapping
+	// change would then re-mint ids for work already stored.
+	wantDeleteBase := event.DeterministicUUID("s1\x1ffile_delete\x1f512\x1f1")
+	wantDeleteSpliced := event.DeterministicUUID("s1\x1ffile_delete\x1f512\x1f2")
+	if base[1].ID != wantDeleteBase {
+		t.Errorf("file_delete id at content index 1 = %q, want %q", base[1].ID, wantDeleteBase)
+	}
+	if spliced[1].ID != wantDeleteSpliced {
+		t.Errorf("file_delete id at content index 2 = %q, want %q — idx must be the PRE-filter content index", spliced[1].ID, wantDeleteSpliced)
+	}
+	if wantDeleteBase == wantDeleteSpliced {
+		t.Fatal("setup is degenerate: the two indices produced the same id")
+	}
+}
+
+// Both invocation names must survive the on-device projector. `mcp_call`
+// allowlists {name, tool, status, agentId}; this change emits no new key, so the
+// dynamic-tool path rides the same already-sanctioned shape.
+func TestCursorDynamicToolSurvivesProjection(t *testing.T) {
+	p := procWith("s1")
+	events := p.Process(cursorAssistantLine("CallDynamicTool",
+		`{"namespace":"user-promptster","toolName":"decision_policy","arguments":{}}`), 0)
+	if len(events) != 1 {
+		t.Fatalf("want 1 event, got %d", len(events))
+	}
+	ev := events[0]
+	redact.ProjectEvent(&ev, false)
+	d := dataOf(t, ev)
+	if d["tool"] != "user-promptster__decision_policy" {
+		t.Errorf("tool = %#v after projection, want user-promptster__decision_policy — a STRIPPED field reads downstream as an older CLI", d["tool"])
+	}
+}
