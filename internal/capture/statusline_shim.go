@@ -9,8 +9,11 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // The statusline SHIM runtime — `promptster-teams statusline run`.
@@ -22,9 +25,14 @@ import (
 // its stdout straight through — so their existing statusline keeps rendering.
 //
 // FAIL-OPEN + FAST is the contract with Claude Code: it calls this synchronously
-// to draw a line, so we must ALWAYS emit something and never hang. Every step is
-// best-effort; a spool failure, a parse failure, or a prior-command failure still
-// results in a rendered line. The prior command runs under a hard timeout.
+// to draw a line, so we must never hang and never error. Every step is
+// best-effort; a spool failure, a parse failure, or a prior-command failure all
+// still exit 0. The prior command runs under a hard timeout.
+//
+// "Fail open" means THEIR line or NO line — never ours over theirs. When we
+// wrapped an existing statusline, a failed tick falls back to that command's
+// last good output, then to nothing; our own compact line is reserved for the
+// case where the slot was empty and we filled it. See runPriorStatusline.
 //
 // PRIVACY: only the window scalars leave the device (via the spool → watcher →
 // projection). The blob may contain a transcript path and model id; those are
@@ -32,8 +40,46 @@ import (
 // logged, or included in any error text.
 
 // priorCommandTimeout bounds how long we wait on the wrapped statusline command
-// so a slow third-party script can never wedge Claude Code's render.
-const priorCommandTimeout = 2500 * time.Millisecond
+// so a genuinely hung script can never wedge Claude Code's render.
+//
+// It is a WEDGE GUARD, not a latency budget, and the difference is the whole
+// point. It was 2500ms, which is BELOW what a real statusline costs: claude-hud
+// (node, plus a plugin-cache glob, plus a user extra-cmd subprocess) measured
+// 0.6s-4.5s over eight consecutive runs on an idle laptop and exceeded 2.5s on
+// five of them. Each of those ticks killed the engineer's statusline and drew
+// ours in its place. Wrapping is only defensible if the wrapped line still
+// renders; a wrapper that replaces its host most of the time is a replacement.
+//
+// Unwrapped, Claude Code runs that same command with no timeout of ours. So any
+// value here that a real statusline can reach makes US the cause of a regression
+// the engineer would not otherwise have had. Ten seconds is far past every
+// statusline we have measured and still bounds a hung process.
+//
+// WHAT CLAUDE CODE ITSELF DOES, read out of the 2.1.246 binary — do not
+// re-derive this from the docs, which do not say it:
+//
+//   - There is NO per-command timeout on the statusLine path. The executor
+//     forwards the CALLER's abort signal to the runner. The sibling
+//     `fileSuggestion` executor in the same module wraps its call in an explicit
+//     `AbortSignal.timeout(5000)`; the statusLine one does not. Where a hard
+//     bound was wanted it was written, and it was not written here.
+//   - The bound that DOES exist is cancellation: a new tick aborts an in-flight
+//     script (docs, "Claude Code cancels the in-flight script"), with a 300ms
+//     debounce between triggers.
+//   - `statusLineHealthLatches` is NOT a circuit breaker. It is literally
+//     `class { okLogged = false; badLogged = false }`, one per host, and its only
+//     job is to emit the `status_line_command` telemetry event once. Nothing
+//     reads it to skip execution: a slow or failing statusline is re-run on the
+//     next tick forever. So a long tick costs us a stale line, never capture.
+//   - Non-zero exit AND empty stdout both render blank, identically. We exit 0
+//     always; the empty-render rung below is therefore a blank line, not an error.
+//
+// Which is why 10s is safe: there is no hidden penalty to stay under, and our
+// spools are already written ~15ms in — before the prior command starts, and so
+// before any abort or overrun can reach us.
+//
+// A var, not a const, only so tests can shrink it and exercise the timeout path.
+var priorCommandTimeout = 10 * time.Second
 
 // statuslineStdin is the MINIMAL projection of Claude Code's status-line blob we
 // parse. Only rate_limits, the context window, and the session id that keys it
@@ -195,11 +241,81 @@ func saneResetPtr(p *int64) (int64, bool) {
 	return *p, true
 }
 
+// --- last-good output cache -------------------------------------------------
+//
+// The wrapped command's most recent SUCCESSFUL stdout, so a tick that fails or
+// times out can redraw the engineer's OWN line instead of ours. One tick stale
+// is invisible on a status line; a brand swap is not.
+//
+// PRIVACY: this file holds a RENDERED statusline, which is third-party content —
+// a branch name, a repo name, whatever the engineer's script chose to draw. It
+// is written 0600 under the state dir, read by exactly ONE function (the shim's
+// own fallback), and is never parsed, spooled, logged, or emitted. The egress
+// path drains the window spools and does not know this file exists. Keep it that
+// way: the moment anything downstream reads it, we are shipping rendered content
+// off the device.
+
+// maxLastGoodBytes caps what we are willing to remember. A status line is one or
+// two rendered lines; anything larger is a misbehaving command, not a line.
+const maxLastGoodBytes = 64 << 10
+
+func statuslineLastGoodPath() string {
+	return filepath.Join(state.StateDir(), "statusline-lastgood")
+}
+
+// saveStatuslineLastGood records a successful render. Best-effort and silent:
+// this runs on the status-line hot path, and a cache we could not write is a
+// worse fallback next tick, never a failed render this tick.
+func saveStatuslineLastGood(out []byte) {
+	if len(out) == 0 || len(out) > maxLastGoodBytes {
+		return
+	}
+	path := statuslineLastGoodPath()
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	// A per-write temp, not a shared `<path>.tmp`. This is the hot path of a
+	// process that runs once per status-line tick, in EVERY open Claude Code
+	// session at once — the single most concurrent writer in the subsystem. Two
+	// shims sharing one temp name interleave their bytes and then rename the
+	// result into place, so the fallback line one session publishes is a torn
+	// splice of another's. Same defect the window spool already fixed.
+	_ = writeFileAtomic(dir, path, out)
+}
+
+func loadStatuslineLastGood() []byte {
+	data, err := os.ReadFile(statuslineLastGoodPath()) // #nosec G304 -- fixed path under the state dir.
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+func clearStatuslineLastGood() { _ = os.Remove(statuslineLastGoodPath()) }
+
 // runPriorStatusline runs the engineer's wrapped statusline command with blob on
 // its stdin and returns its stdout. When no prior command was stored (we
-// installed ours), it renders our OWN compact line from the blob's window
-// scalars. Fail-open: on any error or timeout it returns whatever it has —
-// falling back to our own render — so a line is always drawn.
+// installed ours into an empty slot), it renders our OWN compact line from the
+// blob's window scalars. Fail-open: a line is always drawn, or none is, but the
+// render never errors.
+//
+// OUR OWN LINE IS NEVER THE FALLBACK FOR A COMMAND WE WRAPPED. That is the whole
+// contract of wrapping, and breaking it is not cosmetic: the engineer chose a
+// statusline, we quietly took the slot, and every slow tick handed them
+// promptster branding where their own tool's output had been. It is also
+// self-concealing — the line that says what went wrong is the line that was
+// replaced.
+//
+// The degradation ladder for a wrapped command that fails is therefore:
+//
+//	last good output  ->  this run's partial stdout  ->  nothing at all
+//
+// Complete-but-one-tick-stale beats fresh-but-truncated: a killed command's
+// partial stdout can end mid-escape-sequence and bleed color into the terminal,
+// while the previous tick's line differs only in a token count or a clock. And
+// drawing NOTHING is a blank tick the engineer can attribute to their own
+// script; drawing OURS is a takeover they did not agree to.
 func runPriorStatusline(blob []byte) []byte {
 	rec, ok := loadStatuslinePrior()
 	if !ok || rec.Prior == nil || rec.Prior.Command == "" {
@@ -220,16 +336,28 @@ func runPriorStatusline(blob []byte) []byte {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = io.Discard
+	// WaitDelay is what makes priorCommandTimeout an actual bound. Because stdout
+	// is a buffer rather than a file, os/exec plumbs it through a pipe and Wait
+	// blocks until every writer closes it — and a killed `sh` leaves GRANDCHILDREN
+	// holding that pipe open. claude-hud is exactly that shape (sh -> node -> a
+	// user extra-cmd), so without this the context can expire and the render still
+	// blocks for as long as the deepest child runs. Measured: a 100ms timeout took
+	// 30s to return.
+	cmd.WaitDelay = 500 * time.Millisecond
 	if err := cmd.Run(); err != nil {
-		// Prior command failed or timed out — still draw a line rather than let
-		// Claude Code show nothing. Prefer the prior's partial stdout; fall back
-		// to our own render if it produced nothing.
+		// Prior command failed or timed out. Walk the ladder above — never our
+		// own render, which would put promptster where their statusline was.
+		if cached := loadStatuslineLastGood(); len(cached) > 0 {
+			return cached
+		}
 		if stdout.Len() > 0 {
 			return stdout.Bytes()
 		}
-		return renderOwnStatusline(blob)
+		return nil
 	}
-	return stdout.Bytes()
+	out := stdout.Bytes()
+	saveStatuslineLastGood(out)
+	return out
 }
 
 // renderOwnStatusline draws a compact one-line usage readout from the blob's

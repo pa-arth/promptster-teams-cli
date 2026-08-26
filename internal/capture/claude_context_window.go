@@ -146,6 +146,13 @@ func writeClaudeContextSpool(sessionID string, s claudeContextSpool) error {
 // a read-compare-rename, which is a TOCTOU race dressed up as a fix — worse
 // than the thing it replaces.
 func writeFileAtomic(dir, path string, data []byte) error {
+	return writeFileAtomicMode(dir, path, data, 0o600)
+}
+
+// writeFileAtomicMode is writeFileAtomic with an explicit final mode, for the
+// files that are deliberately not 0600 — ~/.claude/settings.json is user config
+// and world-readable by design.
+func writeFileAtomicMode(dir, path string, data []byte, perm os.FileMode) error {
 	f, err := os.CreateTemp(dir, ".tmp-*")
 	if err != nil {
 		return err
@@ -160,7 +167,7 @@ func writeFileAtomic(dir, path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
+	if err := os.Chmod(tmp, perm); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}

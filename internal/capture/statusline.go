@@ -175,6 +175,10 @@ func loadStatuslinePrior() (statuslinePriorRecord, bool) {
 }
 
 func saveStatuslinePrior(rec statuslinePriorRecord) error {
+	// A new prior invalidates the last-good cache: serving the OLD statusline's
+	// output as a fallback for a NEW one is exactly the kind of quiet
+	// substitution the cache exists to prevent.
+	clearStatuslineLastGood()
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -183,14 +187,20 @@ func saveStatuslinePrior(rec statuslinePriorRecord) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := statuslinePriorPath() + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, statuslinePriorPath())
+	// A per-write temp, not a shared `.tmp` path: several statusline shim
+	// processes run at once on a machine with several Claude Code sessions open,
+	// and a single shared temp name lets two of them interleave into one file
+	// that then gets renamed into place. Exactly the defect already fixed for the
+	// window spool (see writeClaudeWindowSpool) — same shape, same fix.
+	return writeFileAtomic(dir, statuslinePriorPath(), data)
 }
 
-func clearStatuslinePrior() { _ = os.Remove(statuslinePriorPath()) }
+// clearStatuslinePrior drops the wrap record and the cached render together —
+// once we are no longer wrapping, a remembered line belongs to nobody.
+func clearStatuslinePrior() {
+	_ = os.Remove(statuslinePriorPath())
+	clearStatuslineLastGood()
+}
 
 // --- settings.json mutation (preserving unknown keys) ------------------------
 
@@ -227,11 +237,10 @@ func writeSettingsMap(path string, m map[string]interface{}) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { // #nosec G301 -- ~/.claude is a user config dir, not secret material.
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil { // #nosec G306 -- settings.json is user config, world-readable by design.
-		return err
-	}
-	return os.Rename(tmp, path)
+	// Per-write temp for the same reason as the prior record — and this one
+	// matters more now that the file has two writers (a foreground `statusline
+	// enable` and the daemon), not just one.
+	return writeFileAtomicMode(filepath.Dir(path), path, data, 0o644) // #nosec G306 -- settings.json is user config, world-readable by design.
 }
 
 // shimCommand is the statusLine command we install: the running binary invoked

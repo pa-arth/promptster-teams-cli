@@ -8,7 +8,11 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // statuslineTestEnv points CLAUDE_CONFIG_DIR (the User settings layer) and the
@@ -550,5 +554,193 @@ func TestDisableDoesNotResurrectADeletedStatusline(t *testing.T) {
 	// must start fresh rather than re-wrap a command that is no longer there.
 	if rec, ok := loadStatuslinePrior(); ok && rec.Prior != nil {
 		t.Errorf("the stale prior survived: %+v", rec.Prior)
+	}
+}
+
+// --- the wrap must never become a replacement --------------------------------
+//
+// These four pin the one property that makes wrapping an engineer's statusline
+// defensible at all: whatever happens to the command we wrapped, the line the
+// engineer sees is THEIRS or nothing — never ours. The shipped shim failed this
+// on a plain timeout, and the timeout was reachable by a normal statusline
+// (claude-hud, measured at 0.6s-4.5s against a 2.5s bound), so the failure was
+// the common case rather than a corner.
+
+// shimWrapPrior stores a wrapped prior command for the tests below.
+func shimWrapPrior(t *testing.T, command string) {
+	t.Helper()
+	if err := saveStatuslinePrior(statuslinePriorRecord{
+		Wrapped: true,
+		Prior:   &statusLineConfig{Type: "command", Command: command},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWrappedFailureNeverDrawsOurLine: the wrapped command exits non-zero with
+// no output and no cache to fall back on. A blank line is the correct answer;
+// promptster branding is not.
+func TestWrappedFailureNeverDrawsOurLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	statuslineTestEnv(t)
+	shimWrapPrior(t, "exit 1")
+
+	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
+	out := runPriorStatusline(blob)
+	if strings.Contains(string(out), "promptster") {
+		t.Fatalf("our line replaced the wrapped statusline: %q", out)
+	}
+	if len(out) != 0 {
+		t.Errorf("want an empty render, got %q", out)
+	}
+}
+
+// TestWrappedTimeoutServesLastGoodLine: a tick slower than the bound redraws the
+// engineer's previous line, not ours. This is the exact shape of the claude-hud
+// conflict — a working statusline that is merely slow.
+func TestWrappedTimeoutServesLastGoodLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	statuslineTestEnv(t)
+	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
+
+	// ONE command that is fast on its first tick and slow on every tick after —
+	// the same string throughout, because changing it would (correctly) drop the
+	// cache and stop testing what this test is about.
+	mark := filepath.Join(t.TempDir(), "slow")
+	shimWrapPrior(t, "[ -f "+mark+" ] && sleep 30; printf 'THEIR-LINE'")
+
+	// The fast tick seeds the cache.
+	if got := string(runPriorStatusline(blob)); got != "THEIR-LINE" {
+		t.Fatalf("seed tick = %q, want THEIR-LINE", got)
+	}
+
+	// Arm the slowness and shrink the bound so the tick certainly overruns it.
+	if err := os.WriteFile(mark, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := priorCommandTimeout
+	priorCommandTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { priorCommandTimeout = orig })
+
+	start := time.Now()
+	out := string(runPriorStatusline(blob))
+	elapsed := time.Since(start)
+
+	if strings.Contains(out, "promptster") {
+		t.Fatalf("a slow tick drew our line over theirs: %q", out)
+	}
+	if out != "THEIR-LINE" {
+		t.Errorf("timeout render = %q, want the cached THEIR-LINE", out)
+	}
+	// And the bound has to actually bind. `sleep 30` is a GRANDCHILD holding the
+	// stdout pipe open; without cmd.WaitDelay this same call returned in 30s
+	// despite a 100ms context — a timeout that timed out and then waited anyway.
+	if elapsed > 5*time.Second {
+		t.Errorf("timeout did not bound the render: took %s", elapsed)
+	}
+}
+
+// TestRewrapDropsTheCachedLine: when the engineer swaps their statusline, the
+// old one's remembered output must not be served as a fallback for the new one.
+func TestRewrapDropsTheCachedLine(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	statuslineTestEnv(t)
+	blob := []byte(`{"session_id":"s"}`)
+
+	shimWrapPrior(t, "printf 'OLD-LINE'")
+	_ = runPriorStatusline(blob)
+
+	shimWrapPrior(t, "exit 1")
+	if out := string(runPriorStatusline(blob)); out != "" {
+		t.Errorf("re-wrap served the old statusline's output: %q", out)
+	}
+}
+
+// TestOwnLineStillRendersForAnEmptySlot: the one case our line is ours to draw
+// — nothing was wrapped, so nothing is displaced.
+func TestOwnLineStillRendersForAnEmptySlot(t *testing.T) {
+	statuslineTestEnv(t)
+	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000},"seven_day":{"used_percentage":7,"resets_at":1950000000}}}`)
+	out := string(runPriorStatusline(blob))
+	if !strings.Contains(out, "promptster") {
+		t.Errorf("empty slot should render our line, got %q", out)
+	}
+}
+
+// TestConcurrentWritersNeverPublishASplicedFile: the last-good cache is written
+// by the shim, and the shim runs once per status-line tick in EVERY open Claude
+// Code session at once. A shared `<path>.tmp` lets two of them interleave into
+// one file that is then renamed into place, so a session's fallback line becomes
+// a splice of another's. Every read must be one writer's WHOLE value.
+func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
+	statuslineTestEnv(t)
+
+	// Distinct lengths and distinct fill bytes, so a splice cannot masquerade as
+	// a clean write the way same-shaped payloads would.
+	payloads := [][]byte{
+		bytes.Repeat([]byte("A"), 1024),
+		bytes.Repeat([]byte("B"), 4096),
+		bytes.Repeat([]byte("C"), 16384),
+	}
+	valid := map[string]bool{}
+	for _, p := range payloads {
+		valid[string(p)] = true
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Readers run throughout, so a torn file has to survive only until the next
+	// rename to be caught.
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if got := loadStatuslineLastGood(); len(got) > 0 && !valid[string(got)] {
+					t.Errorf("read a spliced cache: %d bytes, starts %q", len(got), got[:1])
+					return
+				}
+			}
+		}()
+	}
+
+	for w := 0; w < 12; w++ {
+		wg.Add(1)
+		go func(p []byte) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				saveStatuslineLastGood(p)
+			}
+		}(payloads[w%len(payloads)])
+	}
+
+	// Writers finish, then readers are told to stop.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(stop)
+	}()
+	wg.Wait()
+
+	// And no temp files may be left lying around in the state dir.
+	entries, err := os.ReadDir(state.StateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") || strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("left a temp file behind: %s", e.Name())
+		}
 	}
 }
