@@ -156,7 +156,7 @@ func resolveEffectiveStatusLine(dir string) EffectiveStatusLine {
 // records "there was no prior statusLine — we installed ours", so disable removes
 // the key rather than restoring a fabricated one.
 func statuslinePriorPath() string {
-	return filepath.Join(state.StateDir(), "statusline-prior.json")
+	return filepath.Join(state.GlobalStateDir(), "statusline-prior.json")
 }
 
 type statuslinePriorRecord struct {
@@ -694,8 +694,17 @@ func sanitizeForLog(cmd string) string {
 
 // statuslineLockPath guards every mutation of the statusLine slot and its prior
 // record. One path, one lock, all writers.
+//
+// GlobalStateDir, NOT StateDir, and this is load-bearing rather than tidiness.
+// The resource being guarded is ~/.claude/settings.json — machine-global, with
+// no workspace concept. A lock keyed to something narrower than what it guards
+// is not a lock: the day the per-workspace branch in StateDir is lit up, two
+// workspaces would take two different locks while writing the one settings.json,
+// and nothing would fail loudly. The prior record and the render cache are
+// global for the same reason — see GlobalStateDir's comment for the split-brain
+// this prevents.
 func statuslineLockPath() string {
-	return filepath.Join(state.StateDir(), "statusline.lock")
+	return filepath.Join(state.GlobalStateDir(), "statusline.lock")
 }
 
 // withStatuslineLock serialises enable / disable / reheal ACROSS PROCESSES.

@@ -261,8 +261,29 @@ func saneResetPtr(p *int64) (int64, bool) {
 // two rendered lines; anything larger is a misbehaving command, not a line.
 const maxLastGoodBytes = 64 << 10
 
-func statuslineLastGoodPath() string {
-	return filepath.Join(state.StateDir(), "statusline-lastgood")
+// The cache is PER SESSION, not per machine, and that is a correctness
+// requirement rather than tidiness.
+//
+// A statusline command renders its own session's CONTEXT — claude-hud draws the
+// repo name and git branch, both derived from the cwd Claude Code invoked it
+// from. Two sessions open in different repos run the SAME command string, so a
+// single global entry keyed only by the command would let a failed tick in one
+// repo render the other repo's branch. That is the same class of defect as
+// drawing our line over theirs: showing someone a line that is not about what
+// they are looking at.
+//
+// Session-keyed also means a machine running many sessions at once keeps a
+// working fallback for each, instead of the last session to tick evicting
+// everyone else's.
+func statuslineLastGoodDir() string {
+	return filepath.Join(state.GlobalStateDir(), "statusline-lastgood")
+}
+
+func statuslineLastGoodPath(sessionID string) (string, bool) {
+	if !claudeContextSessionIDOK(sessionID) {
+		return "", false
+	}
+	return filepath.Join(statuslineLastGoodDir(), sessionID+".json"), true
 }
 
 // statuslineLastGood is the cache record. It carries a FINGERPRINT of the
@@ -299,8 +320,14 @@ func commandFingerprint(command string) string {
 // saveStatuslineLastGood records a successful render. Best-effort and silent:
 // this runs on the status-line hot path, and a cache we could not write is a
 // worse fallback next tick, never a failed render this tick.
-func saveStatuslineLastGood(command string, out []byte) {
+func saveStatuslineLastGood(sessionID, command string, out []byte) {
 	if len(out) == 0 || len(out) > maxLastGoodBytes {
+		return
+	}
+	path, ok := statuslineLastGoodPath(sessionID)
+	if !ok {
+		// No usable session id — no cache. The fallback degrades to a blank tick,
+		// which is the correct direction: better nothing than another session's line.
 		return
 	}
 	data, err := json.Marshal(statuslineLastGood{
@@ -310,8 +337,12 @@ func saveStatuslineLastGood(command string, out []byte) {
 	if err != nil {
 		return
 	}
-	path := statuslineLastGoodPath()
-	dir := filepath.Dir(path)
+	dir := statuslineLastGoodDir()
+	// Earlier builds kept ONE cache file at exactly this path. It has to go, or
+	// MkdirAll fails forever and the cache silently never works again.
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		_ = os.Remove(dir)
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
@@ -327,8 +358,12 @@ func saveStatuslineLastGood(command string, out []byte) {
 // loadStatuslineLastGood returns the cached render ONLY if it belongs to the
 // command being asked about. A mismatch is a superseded entry and yields
 // nothing — better a blank tick than another statusline's line.
-func loadStatuslineLastGood(command string) []byte {
-	data, err := os.ReadFile(statuslineLastGoodPath()) // #nosec G304 -- fixed path under the state dir.
+func loadStatuslineLastGood(sessionID, command string) []byte {
+	path, ok := statuslineLastGoodPath(sessionID)
+	if !ok {
+		return nil
+	}
+	data, err := os.ReadFile(path) // #nosec G304 -- a validated session id under the state dir.
 	if err != nil {
 		return nil
 	}
@@ -342,7 +377,10 @@ func loadStatuslineLastGood(command string) []byte {
 	return rec.Output
 }
 
-func clearStatuslineLastGood() { _ = os.Remove(statuslineLastGoodPath()) }
+// clearStatuslineLastGood drops EVERY session's entry. A re-wrap changes the
+// wrapped command for the whole machine, so no session's cache outlives it.
+// (The fingerprint already makes a survivor inert; this keeps the dir tidy.)
+func clearStatuslineLastGood() { _ = os.RemoveAll(statuslineLastGoodDir()) }
 
 // runPriorStatusline runs the engineer's wrapped statusline command with blob on
 // its stdin and returns its stdout. When no prior command was stored (we
@@ -367,6 +405,12 @@ func clearStatuslineLastGood() { _ = os.Remove(statuslineLastGoodPath()) }
 // drawing NOTHING is a blank tick the engineer can attribute to their own
 // script; drawing OURS is a takeover they did not agree to.
 func runPriorStatusline(blob []byte) []byte {
+	// The cache is session-scoped, so the render needs to know which session it is
+	// drawing for. Absent or malformed id => no cache, never a shared one.
+	var in statuslineStdin
+	_ = json.Unmarshal(blob, &in)
+	sessionID := in.SessionID
+
 	rec, ok := loadStatuslinePrior()
 	if !ok || rec.Prior == nil || rec.Prior.Command == "" {
 		// We installed ours — render the engineer's own usage line.
@@ -397,7 +441,7 @@ func runPriorStatusline(blob []byte) []byte {
 	if err := cmd.Run(); err != nil {
 		// Prior command failed or timed out. Walk the ladder above — never our
 		// own render, which would put promptster where their statusline was.
-		if cached := loadStatuslineLastGood(rec.Prior.Command); len(cached) > 0 {
+		if cached := loadStatuslineLastGood(sessionID, rec.Prior.Command); len(cached) > 0 {
 			return cached
 		}
 		if stdout.Len() > 0 {
@@ -406,7 +450,7 @@ func runPriorStatusline(blob []byte) []byte {
 		return nil
 	}
 	out := stdout.Bytes()
-	saveStatuslineLastGood(rec.Prior.Command, out)
+	saveStatuslineLastGood(sessionID, rec.Prior.Command, out)
 	return out
 }
 

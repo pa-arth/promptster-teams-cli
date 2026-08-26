@@ -440,7 +440,7 @@ func TestShimPassesPriorStdoutThrough(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
 	out := runPriorStatusline(blob)
 	if !strings.Contains(string(out), "PRIOR-LINE-OK") {
 		t.Errorf("prior stdout not passed through: %q", out)
@@ -587,7 +587,7 @@ func TestWrappedFailureNeverDrawsOurLine(t *testing.T) {
 	statuslineTestEnv(t)
 	shimWrapPrior(t, "exit 1")
 
-	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
 	out := runPriorStatusline(blob)
 	if strings.Contains(string(out), "promptster") {
 		t.Fatalf("our line replaced the wrapped statusline: %q", out)
@@ -605,7 +605,7 @@ func TestWrappedTimeoutServesLastGoodLine(t *testing.T) {
 		t.Skip("uses sh -c")
 	}
 	statuslineTestEnv(t)
-	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000}}}`)
 
 	// ONE command that is fast on its first tick and slow on every tick after —
 	// the same string throughout, because changing it would (correctly) drop the
@@ -651,7 +651,7 @@ func TestRewrapDropsTheCachedLine(t *testing.T) {
 		t.Skip("uses sh -c")
 	}
 	statuslineTestEnv(t)
-	blob := []byte(`{"session_id":"s"}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555"}`)
 
 	shimWrapPrior(t, "printf 'OLD-LINE'")
 	_ = runPriorStatusline(blob)
@@ -666,7 +666,7 @@ func TestRewrapDropsTheCachedLine(t *testing.T) {
 // — nothing was wrapped, so nothing is displaced.
 func TestOwnLineStillRendersForAnEmptySlot(t *testing.T) {
 	statuslineTestEnv(t)
-	blob := []byte(`{"session_id":"s","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000},"seven_day":{"used_percentage":7,"resets_at":1950000000}}}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555","rate_limits":{"five_hour":{"used_percentage":50,"resets_at":1900000000},"seven_day":{"used_percentage":7,"resets_at":1950000000}}}`)
 	out := string(runPriorStatusline(blob))
 	if !strings.Contains(out, "promptster") {
 		t.Errorf("empty slot should render our line, got %q", out)
@@ -708,7 +708,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 					return
 				default:
 				}
-				if got := loadStatuslineLastGood(hudCommand); len(got) > 0 && !valid[string(got)] {
+				if got := loadStatuslineLastGood("11111111-2222-3333-4444-555555555555", hudCommand); len(got) > 0 && !valid[string(got)] {
 					t.Errorf("read a spliced cache: %d bytes, starts %q", len(got), got[:1])
 					return
 				}
@@ -721,7 +721,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		go func(p []byte) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				saveStatuslineLastGood(hudCommand, p)
+				saveStatuslineLastGood("11111111-2222-3333-4444-555555555555", hudCommand, p)
 			}
 		}(payloads[w%len(payloads)])
 	}
@@ -1094,15 +1094,16 @@ func TestLastGoodNeverServesASupersededCommandsOutput(t *testing.T) {
 	statuslineTestEnv(t)
 
 	const oldCmd, newCmd = "printf OLD-TOOL", "printf NEW-TOOL"
+	const sid = "11111111-2222-3333-4444-555555555555"
 
 	// A tick of the OLD command lands its output in the cache — this is the write
 	// that races a heal, and it can land at any time.
-	saveStatuslineLastGood(oldCmd, []byte("OLD-TOOL-LINE"))
+	saveStatuslineLastGood(sid, oldCmd, []byte("OLD-TOOL-LINE"))
 
-	if got := loadStatuslineLastGood(newCmd); got != nil {
+	if got := loadStatuslineLastGood(sid, newCmd); got != nil {
 		t.Errorf("the new command was served the old one's line: %q", got)
 	}
-	if got := string(loadStatuslineLastGood(oldCmd)); got != "OLD-TOOL-LINE" {
+	if got := string(loadStatuslineLastGood(sid, oldCmd)); got != "OLD-TOOL-LINE" {
 		t.Errorf("the owning command lost its own cache entry: %q", got)
 	}
 }
@@ -1115,7 +1116,7 @@ func TestWrappedFallbackAfterARewrapDrawsNothing(t *testing.T) {
 		t.Skip("uses sh -c")
 	}
 	statuslineTestEnv(t)
-	blob := []byte(`{"session_id":"s"}`)
+	blob := []byte(`{"session_id":"11111111-2222-3333-4444-555555555555"}`)
 
 	shimWrapPrior(t, "printf 'OLD-TOOL-LINE'")
 	if got := string(runPriorStatusline(blob)); got != "OLD-TOOL-LINE" {
@@ -1125,9 +1126,146 @@ func TestWrappedFallbackAfterARewrapDrawsNothing(t *testing.T) {
 	// The engineer's statusline is swapped, and a tick still holding the old
 	// command republishes its output after the re-wrap cleared the cache.
 	shimWrapPrior(t, "exit 1")
-	saveStatuslineLastGood("printf 'OLD-TOOL-LINE'", []byte("OLD-TOOL-LINE"))
+	saveStatuslineLastGood("11111111-2222-3333-4444-555555555555", "printf 'OLD-TOOL-LINE'", []byte("OLD-TOOL-LINE"))
 
 	if got := string(runPriorStatusline(blob)); got != "" {
 		t.Errorf("a superseded tick's line was drawn for the new statusline: %q", got)
+	}
+}
+
+// TestStatuslineStateIsGlobalNotWorkspaceScoped pins the scope of every file
+// backing the statusLine wrap.
+//
+// ~/.claude/settings.json is machine-global and has no workspace concept, so its
+// wrap record, its render cache, and the lock serialising writes to it must be
+// global too. `StateDir()` is documented to become per-workspace in a future
+// mode; the day that lands, anything keyed to it silently splits in two — one
+// settings.json with two disagreeing records, so `statusline disable` in one
+// workspace leaves the other's daemon still believing it is enabled and
+// re-wrapping. Nothing would fail loudly, which is why this asserts now.
+//
+// It works by lighting up that future mode (writing the active-workspace
+// pointer) and requiring these three paths not to move.
+func TestStatuslineStateIsGlobalNotWorkspaceScoped(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("PROMPTSTER_STATE_DIR", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+
+	before := map[string]string{
+		"prior":    statuslinePriorPath(),
+		"lastgood": statuslineLastGoodDir(),
+		"lock":     statuslineLockPath(),
+	}
+
+	// Light up the per-workspace mode StateDir is waiting for.
+	global := state.GlobalPromptsterDir()
+	if err := os.MkdirAll(global, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(home, "some-repo")
+	if err := os.WriteFile(filepath.Join(global, "active-workspace"), []byte(ws), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state.StateDir() == state.GlobalStateDir() {
+		t.Fatal("setup: the workspace pointer did not take effect, so this test proves nothing")
+	}
+
+	for name, was := range before {
+		if now := map[string]string{
+			"prior":    statuslinePriorPath(),
+			"lastgood": statuslineLastGoodDir(),
+			"lock":     statuslineLockPath(),
+		}[name]; now != was {
+			t.Errorf("%s moved when a workspace became active:\n  was %s\n  now %s\n"+
+				"settings.json is global; state describing it must not be workspace-scoped", name, was, now)
+		}
+	}
+}
+
+// TestLastGoodNeverCrossesSessions: a statusline renders its OWN session's
+// context — claude-hud draws the repo name and branch from the cwd it was
+// invoked in. Two sessions open in different repos run the SAME command string,
+// so a cache keyed only by the command would let a failed tick in one repo
+// render the other repo's branch. Same class of defect as drawing our line over
+// theirs: showing someone a line that is not about what they are looking at.
+func TestLastGoodNeverCrossesSessions(t *testing.T) {
+	statuslineTestEnv(t)
+
+	const (
+		sessionA = "aaaaaaaa-0000-0000-0000-00000000000a"
+		sessionB = "bbbbbbbb-0000-0000-0000-00000000000b"
+		// The SAME command in both — that is the whole point.
+		shared = "node hud.js"
+	)
+
+	saveStatuslineLastGood(sessionA, shared, []byte("repo-a git:(feature-x)"))
+	saveStatuslineLastGood(sessionB, shared, []byte("repo-b git:(main)"))
+
+	if got := string(loadStatuslineLastGood(sessionA, shared)); got != "repo-a git:(feature-x)" {
+		t.Errorf("session A got %q", got)
+	}
+	if got := string(loadStatuslineLastGood(sessionB, shared)); got != "repo-b git:(main)" {
+		t.Errorf("session B got %q", got)
+	}
+
+	// And a session that never rendered gets nothing, not somebody else's line.
+	if got := loadStatuslineLastGood("cccccccc-0000-0000-0000-00000000000c", shared); got != nil {
+		t.Errorf("a fresh session was served another session's line: %q", got)
+	}
+}
+
+// TestLastGoodWithoutASessionIDCachesNothing: no usable id means no cache. The
+// fallback degrades to a blank tick, which is the correct direction — better
+// nothing than a line belonging to some other session.
+func TestLastGoodWithoutASessionIDCachesNothing(t *testing.T) {
+	statuslineTestEnv(t)
+	for _, id := range []string{"", "../escape", "not a uuid"} {
+		saveStatuslineLastGood(id, "node hud.js", []byte("SHOULD-NOT-PERSIST"))
+		if got := loadStatuslineLastGood(id, "node hud.js"); got != nil {
+			t.Errorf("session id %q produced a cache entry: %q", id, got)
+		}
+	}
+}
+
+// TestLastGoodMigratesTheOldSingleFile: earlier builds kept ONE cache file at
+// exactly the path that is now a directory. If it is not removed, MkdirAll fails
+// forever and the cache silently never works again.
+func TestLastGoodMigratesTheOldSingleFile(t *testing.T) {
+	statuslineTestEnv(t)
+	const sid = "dddddddd-0000-0000-0000-00000000000d"
+
+	if err := os.MkdirAll(filepath.Dir(statuslineLastGoodDir()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statuslineLastGoodDir(), []byte("old single-file cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	saveStatuslineLastGood(sid, "node hud.js", []byte("NEW-LINE"))
+	if got := string(loadStatuslineLastGood(sid, "node hud.js")); got != "NEW-LINE" {
+		t.Errorf("the old file blocked the cache forever: got %q", got)
+	}
+}
+
+// TestPrunerSweepsTheLastGoodCache: nothing tells the shim a session ended, so
+// without a sweep the cache accumulates one file per session forever.
+func TestPrunerSweepsTheLastGoodCache(t *testing.T) {
+	statuslineTestEnv(t)
+	const sid = "eeeeeeee-0000-0000-0000-00000000000e"
+	saveStatuslineLastGood(sid, "node hud.js", []byte("LINE"))
+
+	path, ok := statuslineLastGoodPath(sid)
+	if !ok {
+		t.Fatal("setup: bad session id")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("setup: entry not written: %v", err)
+	}
+
+	pruneClaudeContextSpools(time.Now().Add(claudeContextSpoolTTL + time.Hour))
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("stale entry survived the prune: %v", err)
 	}
 }
