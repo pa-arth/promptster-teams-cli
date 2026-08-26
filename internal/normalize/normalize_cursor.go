@@ -43,9 +43,22 @@ import (
 //
 // Content items are `{"type":"text","text":…}` or
 // `{"type":"tool_use","name":…,"input":{…}}`. The tool vocabulary observed
-// across the corpus: Shell, Read, Grep, StrReplace, Glob, UpdateCurrentStep,
-// Write, Task, TodoWrite, Await, WebSearch, CallMcpTool, WebFetch, Delete,
-// ReadLints, CreatePlan.
+// across the corpus, re-counted 2026-08-25 over 142 transcripts (7,314 tool_use
+// items), most frequent first: Read 2114, Shell 1952, Grep 1407, StrReplace 702,
+// Glob 343, UpdateCurrentStep 192, Write 143, GetMcpTools 95, AwaitShell 86,
+// TodoWrite 64, CallMcpTool 62, Task 50, SearchConversations 24,
+// SetActiveBranch 21, WebSearch 16, Await 8, SwitchMode 7, WebFetch 6,
+// GetDynamicTools 6, CallDynamicTool 5, CreatePlan 4, Delete 3, AskQuestion 3,
+// ReadLints 1.
+//
+// THIS LIST GREW BY EIGHT NAMES between the 61-transcript reading above and the
+// 142-transcript one — AwaitShell, GetMcpTools, GetDynamicTools,
+// CallDynamicTool, SearchConversations, SetActiveBranch, SwitchMode and
+// AskQuestion. Cursor's vocabulary is not stable, and one of those additions
+// (CallDynamicTool) was a RENAME of a mapped tool that silently zeroed a board
+// rather than a new capability. A name absent from this list is not
+// evidence Cursor does not send it; it is evidence nobody has re-counted since.
+// Re-run the count before concluding anything from an absence here.
 //
 // WHAT LEAVES THE MACHINE. Cursor's edit tools carry the code itself —
 // StrReplace's old_string/new_string, Write's contents. Those are COUNTED here
@@ -237,11 +250,14 @@ func (p *CursorTranscriptProcessor) promptEvent(text string, offset int64, idx i
 // cursorEditInput is the union of the MAPPED tools' inputs. old_string/
 // new_string/contents are read ONLY to be counted; see the package note.
 //
-// The key names below are verified against 89 real transcripts, not assumed —
+// The key names below are verified against 142 real transcripts, not assumed —
 // the standing rule in this file's header. `Task` carries
 // {description, prompt, subagent_type} with optional {model, run_in_background,
 // resume}; `CallMcpTool` carries {server, toolName, arguments} with optional
-// {description}.
+// {description} (34 of its 62 corpus calls omit `description`, 28 carry it);
+// `CallDynamicTool` carries {namespace, toolName, arguments} and, in all 5
+// corpus calls, exactly those three — no `description` has yet been observed on
+// it, so do not add one on the assumption that it mirrors CallMcpTool.
 //
 // `prompt` and `arguments` are deliberately NOT fields here. They are the full
 // delegated instruction and the full MCP call payload — free text that can
@@ -258,8 +274,42 @@ type cursorEditInput struct {
 	Description  string `json:"description"`
 	SubagentType string `json:"subagent_type"`
 	// CallMcpTool
-	Server   string `json:"server"`
+	Server string `json:"server"`
+	// CallDynamicTool. The exact analogue of Server — same position, same
+	// meaning, renamed by Cursor. Kept as a SEPARATE field rather than a second
+	// json tag on Server (which Go does not support anyway) so the resolve in
+	// toolEvent stays keyed on the tool NAME and never coalesces two fields
+	// whose co-occurrence has never been observed.
+	Namespace string `json:"namespace"`
+	// Both.
 	ToolName string `json:"toolName"`
+}
+
+// cursorBuiltinNamespacePrefix marks Cursor's OWN tool namespaces, which ride
+// the same invocation envelope as real MCP servers but are not MCP.
+//
+// Only two prefix families exist across the 142-transcript corpus: `cursor-*`
+// (Cursor built-ins — `cursor-app-control`'s chat management, `cursor-ide-browser`)
+// and `user-*` (servers the engineer configured — Railway, supabase, clerk,
+// promptster). Nothing else has been observed on either invocation name.
+//
+// DENYLIST, NOT ALLOWLIST — deliberate, and the direction matters more than the
+// list. Excluding `cursor-*` fails OPEN: an MCP server arriving under some third
+// prefix (a future project- or org-scoped namespace) stays on the board, which
+// is correct, and a wrong guess costs a visible row somebody can question. An
+// allowlist on `user-*` would fail CLOSED and drop that server silently — which
+// is the exact invisible-loss defect this whole patch exists to fix, so
+// re-introducing it one line lower would be self-defeating. A NEW Cursor
+// built-in will still be named `cursor-*` and will still be caught; a new MCP
+// namespace shape is the case we cannot predict, so it is the one that must
+// survive.
+const cursorBuiltinNamespacePrefix = "cursor-"
+
+// isCursorBuiltinNamespace is the single site of that decision, shared by both
+// invocation names below. Written once on purpose: the same predicate applied
+// in two places is one edit away from being applied in one and a half.
+func isCursorBuiltinNamespace(ns string) bool {
+	return strings.HasPrefix(ns, cursorBuiltinNamespacePrefix)
 }
 
 // toolEvent maps one assistant tool_use to a canonical event.
@@ -368,14 +418,63 @@ func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int
 		e.Data = data
 		return e, true
 
-	case "CallMcpTool":
+	case "CallMcpTool", "CallDynamicTool":
+		// TWO NAMES, ONE CALL. Cursor renamed this invocation around
+		// 2026-08-22T20:29Z: `CallMcpTool` with {server, toolName, arguments}
+		// became `CallDynamicTool` with {namespace, toolName, arguments}.
+		// `namespace` is the exact analogue of `server` — same position, same
+		// meaning, new spelling. Handling only the old name silently dropped
+		// EVERY post-cut Cursor MCP call, and a dropped mcp_call is invisible:
+		// the board reads it as "this engineer used no MCP", not as a gap.
+		//
+		// On the cut TIME specifically: the local corpus only BRACKETS it. The two
+		// names never co-occur in any transcript; the last file carrying
+		// `CallMcpTool` was last written 2026-08-22T07:12Z and the first carrying
+		// `CallDynamicTool` 2026-08-26T02:48Z, so file mtimes place the cut
+		// somewhere in between and cannot narrow it further. The 20:29Z above
+		// comes from outside this corpus — treat the bracket as what the
+		// transcripts on disk actually prove.
+		//
+		// `CallMcpTool` stays mapped and is not dead code. The watcher re-reads
+		// transcripts back to `transcriptHistoryWindow`
+		// (internal/capture/session.go, 28 days), so old-format records are
+		// live input on every install for four weeks after the rename, and
+		// longer on machines that were offline.
+		//
+		// `CallDynamicTool` IS A SUPERSET OF MCP, and this is the part a
+		// one-line rename would get wrong. It carries Cursor's own tooling on
+		// the same envelope: all 5 CallDynamicTool calls in the corpus are
+		// `namespace: "cursor-app-control"` — rename_chat, move_agent_to_root,
+		// move_agent_to_cloned_root — and NONE is an MCP call. Mapping the name
+		// straight across would have put 5 of 5 non-MCP invocations on the MCP
+		// board.
+		//
+		// APPLYING THE FILTER TO `CallMcpTool` IS A CORRECTION, NOT A
+		// REFACTOR, and it will move a live number. The same pollution was
+		// already shipping on the old name: of 62 corpus CallMcpTool calls, 42
+		// are Cursor built-ins (cursor-app-control 40, cursor-ide-browser 2)
+		// against 20 real MCP calls (user-Railway 8, user-supabase 6,
+		// user-clerk 3, user-promptster 3). So expect Cursor `mcp_call` volume
+		// to fall by roughly two thirds once this deploys. That drop is the
+		// board becoming true, not the rail breaking — do not "fix" it by
+		// loosening the predicate.
+		//
 		// Cursor names the server and the tool in SEPARATE fields, where Claude
 		// and Codex ship one `server__tool` string. Recompose it into the single
 		// name so `mcpServerOf` — which splits on the first `__` — resolves the
 		// server for all three tools with no per-tool branch.
-		if in.Server == "" || in.ToolName == "" {
+		ns := in.Server
+		if item.Name == "CallDynamicTool" {
+			ns = in.Namespace
+		}
+		if ns == "" || in.ToolName == "" {
 			// Half a name is worse than none: `__foo` or `bar__` would split into
 			// an empty server and open a nameless bucket on the MCP board.
+			return event.Event{}, false
+		}
+		if isCursorBuiltinNamespace(ns) {
+			// Cursor's own chat/IDE tooling. Not MCP, and counting it as MCP
+			// overstates every MCP-adoption figure a Cursor engineer appears in.
 			return event.Event{}, false
 		}
 		e := p.newAIEvent("mcp_call", offset, idx)
@@ -385,7 +484,7 @@ func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int
 		// as the missing exitCode on Shell above.
 		//
 		// NO `arguments`. It is the full call payload and is never parsed.
-		e.Data = map[string]interface{}{"tool": in.Server + "__" + in.ToolName}
+		e.Data = map[string]interface{}{"tool": ns + "__" + in.ToolName}
 		return e, true
 	}
 
