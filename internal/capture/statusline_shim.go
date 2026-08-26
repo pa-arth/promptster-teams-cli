@@ -271,14 +271,17 @@ func saveStatuslineLastGood(out []byte) {
 		return
 	}
 	path := statuslineLastGoodPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	// A per-write temp, not a shared `<path>.tmp`. This is the hot path of a
+	// process that runs once per status-line tick, in EVERY open Claude Code
+	// session at once — the single most concurrent writer in the subsystem. Two
+	// shims sharing one temp name interleave their bytes and then rename the
+	// result into place, so the fallback line one session publishes is a torn
+	// splice of another's. Same defect the window spool already fixed.
+	_ = writeFileAtomic(dir, path, out)
 }
 
 func loadStatuslineLastGood() []byte {

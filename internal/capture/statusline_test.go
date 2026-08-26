@@ -8,8 +8,11 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // statuslineTestEnv points CLAUDE_CONFIG_DIR (the User settings layer) and the
@@ -667,5 +670,77 @@ func TestOwnLineStillRendersForAnEmptySlot(t *testing.T) {
 	out := string(runPriorStatusline(blob))
 	if !strings.Contains(out, "promptster") {
 		t.Errorf("empty slot should render our line, got %q", out)
+	}
+}
+
+// TestConcurrentWritersNeverPublishASplicedFile: the last-good cache is written
+// by the shim, and the shim runs once per status-line tick in EVERY open Claude
+// Code session at once. A shared `<path>.tmp` lets two of them interleave into
+// one file that is then renamed into place, so a session's fallback line becomes
+// a splice of another's. Every read must be one writer's WHOLE value.
+func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
+	statuslineTestEnv(t)
+
+	// Distinct lengths and distinct fill bytes, so a splice cannot masquerade as
+	// a clean write the way same-shaped payloads would.
+	payloads := [][]byte{
+		bytes.Repeat([]byte("A"), 1024),
+		bytes.Repeat([]byte("B"), 4096),
+		bytes.Repeat([]byte("C"), 16384),
+	}
+	valid := map[string]bool{}
+	for _, p := range payloads {
+		valid[string(p)] = true
+	}
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Readers run throughout, so a torn file has to survive only until the next
+	// rename to be caught.
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if got := loadStatuslineLastGood(); len(got) > 0 && !valid[string(got)] {
+					t.Errorf("read a spliced cache: %d bytes, starts %q", len(got), got[:1])
+					return
+				}
+			}
+		}()
+	}
+
+	for w := 0; w < 12; w++ {
+		wg.Add(1)
+		go func(p []byte) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				saveStatuslineLastGood(p)
+			}
+		}(payloads[w%len(payloads)])
+	}
+
+	// Writers finish, then readers are told to stop.
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(stop)
+	}()
+	wg.Wait()
+
+	// And no temp files may be left lying around in the state dir.
+	entries, err := os.ReadDir(state.StateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".tmp-") || strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("left a temp file behind: %s", e.Name())
+		}
 	}
 }
