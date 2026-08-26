@@ -262,7 +262,7 @@ func saneResetPtr(p *int64) (int64, bool) {
 const maxLastGoodBytes = 64 << 10
 
 func statuslineLastGoodPath() string {
-	return filepath.Join(state.StateDir(), "statusline-lastgood")
+	return filepath.Join(state.GlobalStateDir(), "statusline-lastgood")
 }
 
 // statuslineLastGood is the cache record. It carries a FINGERPRINT of the

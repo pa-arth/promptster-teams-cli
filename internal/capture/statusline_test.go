@@ -1131,3 +1131,54 @@ func TestWrappedFallbackAfterARewrapDrawsNothing(t *testing.T) {
 		t.Errorf("a superseded tick's line was drawn for the new statusline: %q", got)
 	}
 }
+
+// TestStatuslineStateIsGlobalNotWorkspaceScoped pins the scope of every file
+// backing the statusLine wrap.
+//
+// ~/.claude/settings.json is machine-global and has no workspace concept, so its
+// wrap record, its render cache, and the lock serialising writes to it must be
+// global too. `StateDir()` is documented to become per-workspace in a future
+// mode; the day that lands, anything keyed to it silently splits in two — one
+// settings.json with two disagreeing records, so `statusline disable` in one
+// workspace leaves the other's daemon still believing it is enabled and
+// re-wrapping. Nothing would fail loudly, which is why this asserts now.
+//
+// It works by lighting up that future mode (writing the active-workspace
+// pointer) and requiring these three paths not to move.
+func TestStatuslineStateIsGlobalNotWorkspaceScoped(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // windows
+	t.Setenv("PROMPTSTER_STATE_DIR", "")
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(home, ".claude"))
+
+	before := map[string]string{
+		"prior":    statuslinePriorPath(),
+		"lastgood": statuslineLastGoodPath(),
+		"lock":     statuslineLockPath(),
+	}
+
+	// Light up the per-workspace mode StateDir is waiting for.
+	global := state.GlobalPromptsterDir()
+	if err := os.MkdirAll(global, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ws := filepath.Join(home, "some-repo")
+	if err := os.WriteFile(filepath.Join(global, "active-workspace"), []byte(ws), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if state.StateDir() == state.GlobalStateDir() {
+		t.Fatal("setup: the workspace pointer did not take effect, so this test proves nothing")
+	}
+
+	for name, was := range before {
+		if now := map[string]string{
+			"prior":    statuslinePriorPath(),
+			"lastgood": statuslineLastGoodPath(),
+			"lock":     statuslineLockPath(),
+		}[name]; now != was {
+			t.Errorf("%s moved when a workspace became active:\n  was %s\n  now %s\n"+
+				"settings.json is global; state describing it must not be workspace-scoped", name, was, now)
+		}
+	}
+}

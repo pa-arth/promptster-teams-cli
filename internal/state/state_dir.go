@@ -73,6 +73,35 @@ func readActiveWorkspace() string {
 	return strings.TrimSpace(string(data))
 }
 
+// GlobalStateDir is StateDir WITHOUT the per-workspace branch, for state that
+// describes a MACHINE-GLOBAL resource.
+//
+// The two are identical today, because readActiveWorkspace never returns
+// anything — which is exactly why the distinction has to be made NOW rather than
+// when it starts to matter. The per-workspace branch is documented as a future
+// mode waiting to be lit up, and the moment it is, every caller of StateDir
+// silently becomes workspace-scoped. For state that mirrors a global file that
+// is CORRECT; for state that mirrors a global file it is a split brain, and
+// nothing would fail loudly.
+//
+// The concrete case: the Claude statusLine lives in ~/.claude/settings.json,
+// which is machine-global and has no workspace concept at all. Its wrap record,
+// its render cache, and the lock serialising writes to it must therefore be
+// global too. Workspace-scoping them would give one settings.json two
+// disagreeing records, so `statusline disable` in one workspace would leave the
+// other workspace's daemon still believing it is enabled — and re-wrapping.
+//
+// PROMPTSTER_STATE_DIR still wins, so tests stay isolated.
+//
+// Rule of thumb for new state: scope it to whatever it DESCRIBES. Global file →
+// GlobalStateDir. Per-workspace capture progress → StateDir.
+func GlobalStateDir() string {
+	if p := os.Getenv("PROMPTSTER_STATE_DIR"); p != "" {
+		return p
+	}
+	return GlobalPromptsterDir()
+}
+
 // stateDir returns the directory for per-session state files.
 // Priority: PROMPTSTER_STATE_DIR env > active-workspace pointer > ~/.promptster fallback.
 func StateDir() string {
