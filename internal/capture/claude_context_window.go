@@ -135,7 +135,7 @@ func writeClaudeContextSpool(sessionID string, s claudeContextSpool) error {
 // The uniqueness is the point. A fixed `<path>.tmp` is shared by every process
 // that writes it, and the shim is not a singleton: Claude Code invokes it per
 // tick, and our own step (3) runs the engineer's prior status-line command under
-// a 2.5s timeout, so a slow one leaves tick N still resident when tick N+1
+// priorCommandTimeout, so a slow one leaves tick N still resident when tick N+1
 // fires. Two processes writing one tmp file interleave into a file that is
 // neither reading — the rename then publishes corrupt JSON, not a stale value.
 //
@@ -222,7 +222,15 @@ const claudeContextPruneInterval = time.Hour
 // A stale spool that survives a failed prune is still refused downstream by the
 // freshness bound, so this is disk hygiene rather than a correctness guard.
 func pruneClaudeContextSpools(now time.Time) {
-	entries, err := os.ReadDir(claudeContextSpoolDir())
+	// The statusline last-good cache is session-keyed in the same shape and needs
+	// the same sweep — nothing tells the shim a session ended, so without this it
+	// accumulates one file per session forever.
+	pruneSessionKeyedDir(claudeContextSpoolDir(), now)
+	pruneSessionKeyedDir(statuslineLastGoodDir(), now)
+}
+
+func pruneSessionKeyedDir(dir string, now time.Time) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
@@ -243,7 +251,7 @@ func pruneClaudeContextSpools(now time.Time) {
 			continue
 		}
 		if now.Sub(info.ModTime()) > claudeContextSpoolTTL {
-			_ = os.Remove(filepath.Join(claudeContextSpoolDir(), name))
+			_ = os.Remove(filepath.Join(dir, name))
 		}
 	}
 }
