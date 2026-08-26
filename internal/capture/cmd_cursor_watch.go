@@ -331,7 +331,8 @@ func pollCursorTranscripts(
 		// events the hook rail structurally cannot produce. See
 		// cursorHookBlindKinds; nil means "emit everything".
 		var only map[string]bool
-		if isCursorHookClaimed(claims, key) {
+		hookClaimed := isCursorHookClaimed(claims, key)
+		if hookClaimed {
 			only = cursorHookBlindKinds
 		}
 		switch progress.Match[key] {
@@ -429,7 +430,7 @@ func pollCursorTranscripts(
 			// The per-path offset bookkeeping is untouched: `key` is still the
 			// path, the new file still gets its own cursor, and only the id the
 			// events carry changes.
-			sessionID, cacheable := cursorResolveSessionID(path, key, progress)
+			sessionID, cacheable := cursorResolveSessionID(path, key, progress, hookClaimed)
 			if cacheable {
 				progress.Sessions[key] = sessionID
 			}

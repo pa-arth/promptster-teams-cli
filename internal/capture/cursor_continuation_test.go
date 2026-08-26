@@ -211,7 +211,7 @@ func TestCursorResolveSessionID(t *testing.T) {
 			}
 			target := filepath.Join(root, filepath.FromSlash(c.target))
 			key := cursorProgressKey(target)
-			got, cacheable := cursorResolveSessionID(target, key, progress)
+			got, cacheable := cursorResolveSessionID(target, key, progress, false)
 			if got != c.want {
 				t.Fatalf("session id = %q, want %q", got, c.want)
 			}
@@ -250,7 +250,7 @@ func TestCursorResolveSessionIDFallsBackWhenThePredecessorIsGone(t *testing.T) {
 		Sessions: map[string]string{},
 	}
 	bPath := filepath.Join(root, filepath.FromSlash(bRel))
-	got, cacheable := cursorResolveSessionID(bPath, cursorProgressKey(bPath), progress)
+	got, cacheable := cursorResolveSessionID(bPath, cursorProgressKey(bPath), progress, false)
 	if got != bID {
 		t.Fatalf("session id = %q, want the file's own id %q — an absent predecessor cannot be matched", got, bID)
 	}
@@ -309,7 +309,7 @@ func TestCursorContinuationChainsTransitively(t *testing.T) {
 		t.Helper()
 		p := filepath.Join(root, filepath.FromSlash(rel[id]))
 		k := cursorProgressKey(p)
-		got, cacheable := cursorResolveSessionID(p, k, progress)
+		got, cacheable := cursorResolveSessionID(p, k, progress, false)
 		if !cacheable {
 			t.Fatalf("%s: resolution not cacheable", id)
 		}
@@ -333,7 +333,7 @@ func TestCursorContinuationChainsTransitively(t *testing.T) {
 	}
 	cPath := filepath.Join(root, filepath.FromSlash(rel[cID]))
 	delete(progress.Sessions, cursorProgressKey(cPath))
-	got, _ := cursorResolveSessionID(cPath, cursorProgressKey(cPath), progress)
+	got, _ := cursorResolveSessionID(cPath, cursorProgressKey(cPath), progress, false)
 	if got != aID {
 		t.Fatalf("with the head pruned, C resolved to %q, want %q via B's recorded id", got, aID)
 	}
@@ -372,7 +372,7 @@ func TestCursorSidechainFollowsItsParentsAdoptedID(t *testing.T) {
 		Roots:    map[string]string{},
 		Sessions: map[string]string{bKey: aID},
 	}
-	got, cacheable := cursorResolveSessionID(childPath, cursorProgressKey(childPath), progress)
+	got, cacheable := cursorResolveSessionID(childPath, cursorProgressKey(childPath), progress, false)
 	if got != aID {
 		t.Fatalf("sidechain session id = %q, want its parent's adopted id %q", got, aID)
 	}
@@ -383,7 +383,7 @@ func TestCursorSidechainFollowsItsParentsAdoptedID(t *testing.T) {
 	// Parent not resolved yet: fall back to the rollup, and say the answer is
 	// PROVISIONAL rather than freezing it — the parent may adopt on a later poll.
 	progress.Sessions = map[string]string{}
-	got, cacheable = cursorResolveSessionID(childPath, cursorProgressKey(childPath), progress)
+	got, cacheable = cursorResolveSessionID(childPath, cursorProgressKey(childPath), progress, false)
 	if got != bID {
 		t.Fatalf("sidechain fallback = %q, want the rollup %q", got, bID)
 	}
@@ -507,5 +507,50 @@ func TestPollCursorTranscriptsEmitsAContinuationUnderTheOriginalSessionID(t *tes
 	}
 	if got := processors[bKey]; got == nil {
 		t.Fatal("no processor for the rewritten transcript")
+	}
+}
+
+// THE HOOK RAIL AND THIS ONE MUST NOT DISAGREE ABOUT WHAT SESSION A TRANSCRIPT
+// IS. On a hook-claimed transcript this rail emits only cursorHookBlindKinds,
+// and that is safe precisely because both rails resolve the same id. The hook
+// rail reads Cursor's own payload, which after a move is the NEW uuid — so
+// adopting the earlier one here would strand task_dispatch and mcp_call on a
+// session carrying no prompts. A duplicate on two narrow kinds is the cheaper
+// error than a split.
+func TestCursorResolveSessionIDLeavesAHookClaimedTranscriptAlone(t *testing.T) {
+	const (
+		aID = "3df490ff-1111-4111-8111-111111111111"
+		bID = "44da3651-2222-4222-8222-222222222222"
+	)
+	root := cursorProjectsRoot(t)
+	shared := []string{
+		cursorUserLine("pick up the handoff"),
+		cursorMoveLookupLine("move_agent_to_cloned_root"),
+	}
+	aRel := "proj-a/agent-transcripts/" + aID + "/" + aID + ".jsonl"
+	bRel := "proj-b/agent-transcripts/" + bID + "/" + bID + ".jsonl"
+	writeCursorTranscript(t, root, aRel, append(append([]string{}, shared...), cursorTurnEndedErrorLine())...)
+	bPath := writeCursorTranscript(t, root, bRel, append(append([]string{}, shared...), cursorUserLine("carry on"))...)
+
+	aKey := cursorProgressKey(filepath.Join(root, filepath.FromSlash(aRel)))
+	progress := cursorWatchProgress{
+		Offsets:  map[string]int64{aKey: 0},
+		Match:    map[string]string{aKey: "yes"},
+		Roots:    map[string]string{},
+		Sessions: map[string]string{},
+	}
+
+	// Unclaimed, this is a continuation and adopts.
+	if got, _ := cursorResolveSessionID(bPath, cursorProgressKey(bPath), progress, false); got != aID {
+		t.Fatalf("unclaimed continuation resolved to %q, want %q", got, aID)
+	}
+	// Claimed by the hook rail, it keeps its own id — and the answer is not
+	// frozen, because the claim carries a TTL.
+	got, cacheable := cursorResolveSessionID(bPath, cursorProgressKey(bPath), progress, true)
+	if got != bID {
+		t.Fatalf("hook-claimed transcript resolved to %q, want its own id %q", got, bID)
+	}
+	if cacheable {
+		t.Fatal("a hook-claimed resolution must not be cached — the claim expires")
 	}
 }

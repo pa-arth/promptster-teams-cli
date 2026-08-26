@@ -109,10 +109,31 @@ type cursorMoveInput struct {
 //
 // The order matters: a previously recorded answer wins outright, so a decision
 // made once survives daemon restarts and never re-derives differently.
-func cursorResolveSessionID(path, key string, progress cursorWatchProgress) (string, bool) {
+func cursorResolveSessionID(path, key string, progress cursorWatchProgress, hookClaimed bool) (string, bool) {
 	base := cursorSessionIDFromPath(path)
 	if id := progress.Sessions[key]; id != "" {
 		return id, true
+	}
+
+	// A CLAIMED TRANSCRIPT KEEPS ITS FILENAME ID, and this is not an oversight.
+	//
+	// On a claimed transcript this rail emits only cursorHookBlindKinds —
+	// task_dispatch and mcp_call — and the reason that is safe is stated there:
+	// both rails agree on session identity, so those two kinds land on the SAME
+	// session the hooks are populating instead of forking a second one. The
+	// hook rail reads its session id from Cursor's own payload, which after a
+	// move is the NEW uuid; adopting the earlier one here would put delegation
+	// and MCP identity on a session with no prompts in it, which is the phantom
+	// session the subagent rollup exists to prevent.
+	//
+	// The cost is bounded to those two kinds re-arriving under the new id on a
+	// hook-enrolled machine. That is a duplicate; the alternative is a split.
+	//
+	// Not cached: the claim carries a TTL (see isCursorHookClaimed), so this
+	// answer is only true while the hook rail is alive, and freezing it would
+	// outlive the reason for it.
+	if hookClaimed {
+		return base, false
 	}
 
 	// A SUBAGENT FOLLOWS ITS PARENT, IT DOES NOT DETECT ITS OWN CONTINUATION.
