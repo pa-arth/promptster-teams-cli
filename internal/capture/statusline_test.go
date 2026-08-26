@@ -744,3 +744,200 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		}
 	}
 }
+// --- re-healing a displaced shim ---------------------------------------------
+//
+// The failure these pin: another tool's setup writes `statusLine.command`
+// directly, our shim is gone, and window capture stops on that machine with no
+// visible symptom — the engineer's statusline looks fine, because it is the
+// other tool's, rendering normally.
+
+// hudCommand stands in for the real thing: any third-party statusline that
+// writes the slot for itself.
+const hudCommand = "node /plugins/claude-hud/dist/index.js"
+
+// writeUserStatusLine puts a raw statusLine into the user layer, the way another
+// tool's setup does — settings.json edited directly, our shim not consulted.
+func writeUserStatusLine(t *testing.T, command string) {
+	t.Helper()
+	m, err := readSettingsMap(userSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m["statusLine"] = map[string]interface{}{"type": "command", "command": command}
+	if err := writeSettingsMap(userSettingsPath(), m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// currentUserCommand reads back whatever holds the slot now.
+func currentUserCommand(t *testing.T) string {
+	t.Helper()
+	cfg, ok := readStatusLine(userSettingsPath())
+	if !ok {
+		return ""
+	}
+	return cfg.Command
+}
+
+// TestRehealRewrapsAfterAnotherToolEvictsUs is the claude-hud sequence end to
+// end: we wrap hud, hud's setup overwrites the slot with itself, and the heal
+// puts the shim back around hud rather than on top of it.
+func TestRehealRewrapsAfterAnotherToolEvictsUs(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+	if !StatuslineWrapped() {
+		t.Fatal("setup: expected our shim to be installed")
+	}
+
+	// claude-hud's setup runs again and takes the slot back.
+	writeUserStatusLine(t, hudCommand)
+	if StatuslineWrapped() {
+		t.Fatal("setup: expected to be displaced")
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Rewrapped {
+		t.Fatalf("expected a re-wrap, got %+v", res)
+	}
+	if !StatuslineWrapped() {
+		t.Error("the shim was not put back")
+	}
+	// And hud must still be what renders — a heal that dropped the prior would
+	// silently replace the engineer's statusline with ours.
+	rec, ok := loadStatuslinePrior()
+	if !ok || rec.Prior == nil || rec.Prior.Command != hudCommand {
+		t.Errorf("the displacing statusline was not preserved as the prior: %+v", rec.Prior)
+	}
+}
+
+// TestRehealLeavesADisabledStatuslineAlone: `statusline disable` clears the
+// prior record, and an off switch that something reverses on a timer is not an
+// off switch.
+func TestRehealLeavesADisabledStatuslineAlone(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DisableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rewrapped {
+		t.Error("re-wrapped a statusline the engineer had disabled")
+	}
+	if got := currentUserCommand(t); got != hudCommand {
+		t.Errorf("disable did not leave hud in place: %q", got)
+	}
+}
+
+// TestRehealDoesNotResurrectADeletedStatusline: an absent key means the engineer
+// wants no status line. Filling the hole with ours invents configuration they
+// removed on purpose.
+func TestRehealDoesNotResurrectADeletedStatusline(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := readSettingsMap(userSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "statusLine")
+	if err := writeSettingsMap(userSettingsPath(), m); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rewrapped {
+		t.Error("resurrected a statusline the engineer deleted")
+	}
+	if got := currentUserCommand(t); got != "" {
+		t.Errorf("statusLine came back as %q", got)
+	}
+}
+
+// TestRehealGivesUpAgainstATimer bounds a fight: something else rewrites the
+// slot on every check, so we stop swinging and let doctor say a human must pick.
+func TestRehealGivesUpAgainstATimer(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < maxAutoHeals; i++ {
+		writeUserStatusLine(t, hudCommand) // the adversary, every single check
+		res, err := RehealStatusline()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Rewrapped {
+			t.Fatalf("heal %d: expected a re-wrap, got %+v", i+1, res)
+		}
+	}
+
+	writeUserStatusLine(t, hudCommand)
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.GaveUp {
+		t.Errorf("expected to give up after %d heals, got %+v", maxAutoHeals, res)
+	}
+	if got := currentUserCommand(t); got != hudCommand {
+		t.Errorf("kept fighting after giving up: %q", got)
+	}
+}
+
+// TestRehealCounterResetsWhenWeAreLeftAlone: an occasional eviction — the
+// engineer re-runs another tool's setup now and then — must never accumulate
+// toward the give-up bound. A check that finds us in place clears the count.
+func TestRehealCounterResetsWhenWeAreLeftAlone(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < maxAutoHeals*3; i++ {
+		writeUserStatusLine(t, hudCommand)
+		res, err := RehealStatusline()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Rewrapped {
+			t.Fatalf("eviction %d was not repaired: %+v", i+1, res)
+		}
+		// The quiet checks in between, which are the common case.
+		for j := 0; j < 3; j++ {
+			if _, err := RehealStatusline(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if rec, ok := loadStatuslinePrior(); !ok || rec.Heals != 0 {
+			t.Fatalf("eviction %d: heal count did not reset, got %d", i+1, rec.Heals)
+		}
+	}
+}
+
+// NOT TESTED HERE: the managed-policy gate. managedSettingsPath() is a hardcoded
+// OS-owned path, and the only way to exercise it from a test would be an env
+// override — which would hand any user a way to redirect managed policy at a
+// file they control. The gate is three lines and reads plainly; that is a better
+// trade than a test-only escape hatch through an admin boundary.

@@ -210,6 +210,12 @@ func runUninstall(out io.Writer, d uninstallDeps, purge bool) int {
 		skip("no Cursor hook to unenroll")
 	}
 
+	// Also AFTER the daemon is down, and for the same reason as the Cursor hook
+	// above — which is no longer hypothetical: the watcher now re-wraps a
+	// displaced statusline on a timer (see RehealStatusline). Restoring while it
+	// is alive would race a heal. Two things make this safe rather than lucky:
+	// the daemon is already stopped here, and DisableStatusline clears the prior
+	// record, which is the healer's first gate. Do not reorder these steps.
 	wrapped := d.statuslineWrapped()
 	if err := d.disableStatusline(); err != nil {
 		bad("could not restore your Claude statusline: %v", err)

@@ -594,6 +594,12 @@ func RunClaudeWatcher() error {
 	// shim, read (not drained) each poll by pollClaudeTranscripts, and aged out
 	// here because nothing tells the shim a session ended.
 	var contextPruner claudeContextPruner
+	// Statusline slot repair: another tool's setup writes `statusLine.command`
+	// directly and evicts our shim, killing window capture silently. Checked on a
+	// slow throttle here rather than at startup, because a daemon that never
+	// restarts would never run a startup-only check — and this daemon is exactly
+	// the process that does not restart. See RehealStatusline.
+	var statuslineHeal statuslineHealer
 
 	// Org capture policy (opt-in assistant prose). Fail-closed: false until a
 	// successful fetch says otherwise. Refreshed in the background (immediate +
@@ -637,6 +643,7 @@ func RunClaudeWatcher() error {
 		bytesConsumed += consumed
 		windowEmitter.maybe(session, time.Now(), captureProse)
 		contextPruner.maybe(time.Now())
+		statuslineHeal.maybe(time.Now())
 		wasDegraded := degraded
 		degraded, bytesSinceEvent = claudeDegradationStep(degraded, parsed, consumed, bytesSinceEvent)
 		switch {
