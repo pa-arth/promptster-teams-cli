@@ -97,8 +97,10 @@ type cursorMoveProbe struct {
 	} `json:"message"`
 }
 
+// cursorMoveInput reads only toolName. `server` is deliberately absent rather
+// than read-and-ignored: the dynamic-tool shape carries no server field, so a
+// field here would look like a check that is not being made.
 type cursorMoveInput struct {
-	Server   string `json:"server"`
 	ToolName string `json:"toolName"`
 }
 
