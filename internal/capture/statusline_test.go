@@ -708,7 +708,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 					return
 				default:
 				}
-				if got := loadStatuslineLastGood(); len(got) > 0 && !valid[string(got)] {
+				if got := loadStatuslineLastGood(hudCommand); len(got) > 0 && !valid[string(got)] {
 					t.Errorf("read a spliced cache: %d bytes, starts %q", len(got), got[:1])
 					return
 				}
@@ -721,7 +721,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		go func(p []byte) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				saveStatuslineLastGood(p)
+				saveStatuslineLastGood(hudCommand, p)
 			}
 		}(payloads[w%len(payloads)])
 	}
@@ -742,5 +742,392 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		if strings.HasPrefix(e.Name(), ".tmp-") || strings.HasSuffix(e.Name(), ".tmp") {
 			t.Errorf("left a temp file behind: %s", e.Name())
 		}
+	}
+}
+
+// --- re-healing a displaced shim ---------------------------------------------
+//
+// The failure these pin: another tool's setup writes `statusLine.command`
+// directly, our shim is gone, and window capture stops on that machine with no
+// visible symptom — the engineer's statusline looks fine, because it is the
+// other tool's, rendering normally.
+
+// hudCommand stands in for the real thing: any third-party statusline that
+// writes the slot for itself.
+const hudCommand = "node /plugins/claude-hud/dist/index.js"
+
+// writeUserStatusLine puts a raw statusLine into the user layer, the way another
+// tool's setup does — settings.json edited directly, our shim not consulted.
+func writeUserStatusLine(t *testing.T, command string) {
+	t.Helper()
+	m, err := readSettingsMap(userSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m["statusLine"] = map[string]interface{}{"type": "command", "command": command}
+	if err := writeSettingsMap(userSettingsPath(), m); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// currentUserCommand reads back whatever holds the slot now.
+func currentUserCommand(t *testing.T) string {
+	t.Helper()
+	cfg, ok := readStatusLine(userSettingsPath())
+	if !ok {
+		return ""
+	}
+	return cfg.Command
+}
+
+// TestRehealRewrapsAfterAnotherToolEvictsUs is the claude-hud sequence end to
+// end: we wrap hud, hud's setup overwrites the slot with itself, and the heal
+// puts the shim back around hud rather than on top of it.
+func TestRehealRewrapsAfterAnotherToolEvictsUs(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+	if !StatuslineWrapped() {
+		t.Fatal("setup: expected our shim to be installed")
+	}
+
+	// claude-hud's setup runs again and takes the slot back.
+	writeUserStatusLine(t, hudCommand)
+	if StatuslineWrapped() {
+		t.Fatal("setup: expected to be displaced")
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Rewrapped {
+		t.Fatalf("expected a re-wrap, got %+v", res)
+	}
+	if !StatuslineWrapped() {
+		t.Error("the shim was not put back")
+	}
+	// And hud must still be what renders — a heal that dropped the prior would
+	// silently replace the engineer's statusline with ours.
+	rec, ok := loadStatuslinePrior()
+	if !ok || rec.Prior == nil || rec.Prior.Command != hudCommand {
+		t.Errorf("the displacing statusline was not preserved as the prior: %+v", rec.Prior)
+	}
+}
+
+// TestRehealLeavesADisabledStatuslineAlone: `statusline disable` clears the
+// prior record, and an off switch that something reverses on a timer is not an
+// off switch.
+func TestRehealLeavesADisabledStatuslineAlone(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+	if err := DisableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rewrapped {
+		t.Error("re-wrapped a statusline the engineer had disabled")
+	}
+	if got := currentUserCommand(t); got != hudCommand {
+		t.Errorf("disable did not leave hud in place: %q", got)
+	}
+}
+
+// TestRehealDoesNotResurrectADeletedStatusline: an absent key means the engineer
+// wants no status line. Filling the hole with ours invents configuration they
+// removed on purpose.
+func TestRehealDoesNotResurrectADeletedStatusline(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := readSettingsMap(userSettingsPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "statusLine")
+	if err := writeSettingsMap(userSettingsPath(), m); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rewrapped {
+		t.Error("resurrected a statusline the engineer deleted")
+	}
+	if got := currentUserCommand(t); got != "" {
+		t.Errorf("statusLine came back as %q", got)
+	}
+}
+
+// TestRehealGivesUpAgainstATimer bounds a fight: something else rewrites the
+// slot on every check, so we stop swinging and let doctor say a human must pick.
+func TestRehealGivesUpAgainstATimer(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < maxAutoHeals; i++ {
+		writeUserStatusLine(t, hudCommand) // the adversary, every single check
+		res, err := RehealStatusline()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Rewrapped {
+			t.Fatalf("heal %d: expected a re-wrap, got %+v", i+1, res)
+		}
+	}
+
+	writeUserStatusLine(t, hudCommand)
+	res, err := RehealStatusline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.GaveUp {
+		t.Errorf("expected to give up after %d heals, got %+v", maxAutoHeals, res)
+	}
+	if got := currentUserCommand(t); got != hudCommand {
+		t.Errorf("kept fighting after giving up: %q", got)
+	}
+}
+
+// TestRehealCounterResetsWhenWeAreLeftAlone: an occasional eviction — the
+// engineer re-runs another tool's setup now and then — must never accumulate
+// toward the give-up bound. A check that finds us in place clears the count.
+func TestRehealCounterResetsWhenWeAreLeftAlone(t *testing.T) {
+	statuslineTestEnv(t)
+	writeUserStatusLine(t, hudCommand)
+	if _, err := EnableStatusline(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < maxAutoHeals*3; i++ {
+		writeUserStatusLine(t, hudCommand)
+		res, err := RehealStatusline()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !res.Rewrapped {
+			t.Fatalf("eviction %d was not repaired: %+v", i+1, res)
+		}
+		// The quiet checks in between, which are the common case.
+		for j := 0; j < 3; j++ {
+			if _, err := RehealStatusline(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if rec, ok := loadStatuslinePrior(); !ok || rec.Heals != 0 {
+			t.Fatalf("eviction %d: heal count did not reset, got %d", i+1, rec.Heals)
+		}
+	}
+}
+
+// NOT TESTED HERE: the managed-policy gate. managedSettingsPath() is a hardcoded
+// OS-owned path, and the only way to exercise it from a test would be an env
+// override — which would hand any user a way to redirect managed policy at a
+// file they control. The gate is three lines and reads plainly; that is a better
+// trade than a test-only escape hatch through an admin boundary.
+
+// TestSanitizeForLogNeutralisesCommandBytes: a statusline command is arbitrary
+// settings.json content and it reaches a log a human reads in a terminal.
+func TestSanitizeForLogNeutralisesCommandBytes(t *testing.T) {
+	cases := []struct {
+		name, in string
+		wantNot  []string
+		want     string
+	}{
+		{
+			name:    "forged log line",
+			in:      "hud\n2026-01-01 FATAL everything is fine",
+			wantNot: []string{"\n"},
+			want:    `hud\n2026-01-01 FATAL everything is fine`,
+		},
+		{
+			name:    "carriage return overwrite",
+			in:      "hud\rmalicious",
+			wantNot: []string{"\r"},
+			want:    `hud\rmalicious`,
+		},
+		{
+			name:    "terminal escape",
+			in:      "hud\x1b[2J\x1b[1;31mowned",
+			wantNot: []string{"\x1b"},
+			want:    `hud\x1b[2J\x1b[1;31mowned`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sanitizeForLog(tc.in)
+			for _, bad := range tc.wantNot {
+				if strings.Contains(got, bad) {
+					t.Errorf("control byte %q survived: %q", bad, got)
+				}
+			}
+			if got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSanitizeForLogBoundsASecret: statusline commands carry inline tokens, and
+// a daemon log outlives the tick. The 60-byte prefix is what keeps a credential
+// from being dumped whole — it is a bound, not decoration.
+func TestSanitizeForLogBoundsASecret(t *testing.T) {
+	secret := strings.Repeat("s3cr3t", 20) // 120 chars
+	got := sanitizeForLog("node hud.js --api-key=" + secret)
+	if len(got) > 64 { // 60 bytes + the ellipsis rune
+		t.Errorf("log line is %d bytes, want the 60-byte bound: %q", len(got), got)
+	}
+	if strings.Contains(got, secret) {
+		t.Error("the whole secret reached the log line")
+	}
+	if !strings.HasPrefix(got, "node hud.js") {
+		t.Errorf("lost the part that names which tool took the slot: %q", got)
+	}
+}
+
+// TestStatuslineLockSerialisesMutations proves the mutual exclusion the disable
+// race depends on: never two mutations of the statusLine slot at once.
+//
+// This is the test that actually fails when the lock is removed. The
+// interleaving test below does NOT — the window between the healer clearing its
+// gates and writing the shim is microseconds wide, and scheduling alone will not
+// hit it in a test run. Asserting on that would have been a test that passes for
+// the wrong reason, which is worse than no test.
+func TestStatuslineLockSerialisesMutations(t *testing.T) {
+	statuslineTestEnv(t)
+
+	var mu sync.Mutex
+	inside, maxInside := 0, 0
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = withStatuslineLock(func() error {
+				mu.Lock()
+				inside++
+				if inside > maxInside {
+					maxInside = inside
+				}
+				mu.Unlock()
+
+				// Wide enough that any overlap is certain to be observed.
+				time.Sleep(2 * time.Millisecond)
+
+				mu.Lock()
+				inside--
+				mu.Unlock()
+				return nil
+			})
+		}()
+	}
+	wg.Wait()
+
+	if maxInside != 1 {
+		t.Errorf("%d mutations ran concurrently; the slot must have exactly one writer at a time", maxInside)
+	}
+}
+
+// TestDisableAndHealNeverDisagree: whatever the interleaving of a foreground
+// `statusline disable` and a daemon heal, the two pieces of state must agree —
+// the shim installed and a prior record present, or neither. A heal that
+// reversed disable would leave the shim back with the record recreated; a
+// half-applied one would leave a record with no shim.
+//
+// Serialisation itself is proven above; this pins the end state.
+func TestDisableAndHealNeverDisagree(t *testing.T) {
+
+	for i := 0; i < 40; i++ {
+		func() {
+			statuslineTestEnv(t)
+			writeUserStatusLine(t, hudCommand)
+			if _, err := EnableStatusline(); err != nil {
+				t.Fatal(err)
+			}
+			// Displace us, so the healer has real work queued.
+			writeUserStatusLine(t, hudCommand)
+
+			var wg sync.WaitGroup
+			wg.Add(2)
+			go func() { defer wg.Done(); _, _ = RehealStatusline() }()
+			go func() { defer wg.Done(); _ = DisableStatusline() }()
+			wg.Wait()
+
+			// Disable clears the prior record; a heal that landed AFTER it would
+			// have recreated the record and the shim together.
+			rec, hasRec := loadStatuslinePrior()
+			if StatuslineWrapped() && !hasRec {
+				t.Fatalf("run %d: the shim was reinstalled with no prior record — a heal reversed disable", i)
+			}
+			if hasRec && !StatuslineWrapped() {
+				t.Fatalf("run %d: a prior record survived with no shim installed: %+v", i, rec)
+			}
+		}()
+	}
+}
+
+// TestLastGoodNeverServesASupersededCommandsOutput: the shim takes no lock, so a
+// tick can be mid-run with the OLD wrapped command while a heal swaps the prior
+// underneath it, and then publish that old output into the cache the NEW command
+// reads. Clearing on re-wrap does not help — the clear happens first, the stale
+// write lands after. The cache must therefore refuse to serve an entry to a
+// command that did not produce it.
+func TestLastGoodNeverServesASupersededCommandsOutput(t *testing.T) {
+	statuslineTestEnv(t)
+
+	const oldCmd, newCmd = "printf OLD-TOOL", "printf NEW-TOOL"
+
+	// A tick of the OLD command lands its output in the cache — this is the write
+	// that races a heal, and it can land at any time.
+	saveStatuslineLastGood(oldCmd, []byte("OLD-TOOL-LINE"))
+
+	if got := loadStatuslineLastGood(newCmd); got != nil {
+		t.Errorf("the new command was served the old one's line: %q", got)
+	}
+	if got := string(loadStatuslineLastGood(oldCmd)); got != "OLD-TOOL-LINE" {
+		t.Errorf("the owning command lost its own cache entry: %q", got)
+	}
+}
+
+// TestWrappedFallbackAfterARewrapDrawsNothing is the same hazard end to end: a
+// re-wrap, then a stale tick's cache write, then the NEW command failing. A
+// blank tick is correct; the previous tool's line is not.
+func TestWrappedFallbackAfterARewrapDrawsNothing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	statuslineTestEnv(t)
+	blob := []byte(`{"session_id":"s"}`)
+
+	shimWrapPrior(t, "printf 'OLD-TOOL-LINE'")
+	if got := string(runPriorStatusline(blob)); got != "OLD-TOOL-LINE" {
+		t.Fatalf("seed = %q", got)
+	}
+
+	// The engineer's statusline is swapped, and a tick still holding the old
+	// command republishes its output after the re-wrap cleared the cache.
+	shimWrapPrior(t, "exit 1")
+	saveStatuslineLastGood("printf 'OLD-TOOL-LINE'", []byte("OLD-TOOL-LINE"))
+
+	if got := string(runPriorStatusline(blob)); got != "" {
+		t.Errorf("a superseded tick's line was drawn for the new statusline: %q", got)
 	}
 }
