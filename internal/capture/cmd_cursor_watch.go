@@ -419,7 +419,27 @@ func pollCursorTranscripts(
 		}
 
 		proc := processors[key]
-		if proc == nil {
+		// RE-RESOLVE WHENEVER THE ANSWER WAS NEVER FINAL, not only when the
+		// processor is missing.
+		//
+		// cursorResolveSessionID reports un-cacheable for the two answers that
+		// can still change — a subagent seen before its moved parent resolved,
+		// and a transcript the hook rail claimed under a TTL — and refusing to
+		// write progress.Sessions is how it says so. An ABSENT entry is
+		// therefore the record that the question is still open; no second map is
+		// needed to track it, and none can drift out of step with the first.
+		//
+		// KEYING THE RE-ASK ON `proc == nil` ALONE WAS THE BUG. The processor
+		// cache is held for the daemon's life, so a provisional key was asked
+		// exactly once and frozen one level ABOVE the map that was carefully
+		// refusing to freeze it. A subagent whose parent later adopted an earlier
+		// id then kept emitting under the abandoned uuid forever — precisely the
+		// split the sidechain branch exists to prevent.
+		//
+		// Cheap to repeat: both provisional paths return before the candidate
+		// scan, and a main-chain transcript is always cacheable, so the scan that
+		// reads other transcripts runs at most once per key.
+		if proc == nil || progress.Sessions[key] == "" {
 			// NOT cursorSessionIDFromPath DIRECTLY. The filename answers "what
 			// does this path say"; this answers "which conversation is this",
 			// and a `move_agent_to_*` makes those two different — Cursor rewrites
@@ -434,26 +454,37 @@ func pollCursorTranscripts(
 			if cacheable {
 				progress.Sessions[key] = sessionID
 			}
-			proc = normalize.NewCursorTranscriptProcessor(sessionID)
-			if isCursorSidechainFile(path) {
-				proc.Sidechain = true
-				// The child's OWN id, which cursorSessionIDFromPath deliberately
-				// does not return — it rolls the child up to its parent so one
-				// conversation stays one session. Both are needed and they are
-				// different questions: the session id says WHICH CONVERSATION,
-				// the lane id says WHICH DELEGATED AGENT. Keeping only the first
-				// is why Cursor was the one rail where two subagents running at
-				// once were indistinguishable.
-				proc.LaneID = cursorLaneIDFromPath(path)
+			if proc == nil {
+				proc = normalize.NewCursorTranscriptProcessor(sessionID)
+				if isCursorSidechainFile(path) {
+					proc.Sidechain = true
+					// The child's OWN id, which cursorSessionIDFromPath
+					// deliberately does not return — it rolls the child up to its
+					// parent so one conversation stays one session. Both are
+					// needed and they are different questions: the session id
+					// says WHICH CONVERSATION, the lane id says WHICH DELEGATED
+					// AGENT. Keeping only the first is why Cursor was the one
+					// rail where two subagents running at once were
+					// indistinguishable.
+					proc.LaneID = cursorLaneIDFromPath(path)
+				} else {
+					// Resolve the repo identity ONCE per transcript from the
+					// workspace root this session matched, so every part (slug,
+					// host, tracked bit) and the workdir describe ONE observation
+					// of ONE directory.
+					root := progress.Roots[key]
+					proc.Workdir = normalize.CursorSessionWorkdir(root)
+					proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(root)
+				}
+				processors[key] = proc
 			} else {
-				// Resolve the repo identity ONCE per transcript from the workspace
-				// root this session matched, so every part (slug, host, tracked
-				// bit) and the workdir describe ONE observation of ONE directory.
-				root := progress.Roots[key]
-				proc.Workdir = normalize.CursorSessionWorkdir(root)
-				proc.RepoRoot, proc.RepoHost, proc.RepoTracked = sessionRepoIdentity(root)
+				// Already tailing under a provisional id. Migrate IN PLACE:
+				// rebuilding would drop the prompt-timestamp anchor and every
+				// later event would fall back to read time. The lane, sidechain
+				// bit and repo identity are properties of the FILE, not of the
+				// session, so they do not move. See normalize.AdoptSessionID.
+				proc.AdoptSessionID(sessionID)
 			}
-			processors[key] = proc
 		}
 		queued += tailCursorTranscript(path, key, progress, proc, session, captureProse, only)
 	}

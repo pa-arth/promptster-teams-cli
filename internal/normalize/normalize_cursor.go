@@ -139,6 +139,39 @@ func NewCursorTranscriptProcessor(sessionID string) *CursorTranscriptProcessor {
 	return &CursorTranscriptProcessor{sessionID: sessionID}
 }
 
+// AdoptSessionID moves this processor's remaining events onto a different
+// session. A no-op when the id is empty or unchanged.
+//
+// IT EXISTS FOR ONE CALLER — capture's continuation resolver, which cannot
+// always answer "which conversation is this" on the poll a transcript first
+// appears. Two answers are provisional by construction: a subagent seen before
+// its moved parent has resolved, and a transcript the Cursor hook rail has
+// claimed under a TTL. The resolver reports those as un-cacheable, and the
+// whole point of saying so is that they are re-asked later.
+//
+// MIGRATE IN PLACE, DO NOT REBUILD. tsAnchor is unexported and is the one piece
+// of state that cannot survive a rebuild: it carries the last <timestamp>
+// recovered from a user turn, and every assistant record after it inherits that
+// time (see eventTs). A rebuilt processor starts with a zero anchor, so every
+// later event falls back to read time — a worse bug than the split this fixes,
+// and one that moves `ts`, which is a column in the server's
+// (org_id, session_id, kind, ts, md5(data)) dedupe key.
+//
+// Rebuilding-and-copying would need an exported accessor for tsAnchor plus
+// Sidechain, LaneID, Workdir and the three Repo fields — seven things to keep
+// in sync, with nothing to tell you when an eighth is added. This is one.
+//
+// EVENTS ALREADY EMITTED UNDER THE PREVIOUS ID ARE NOT RECALLED. They stay on
+// the session they were sent to; migration corrects the stream from here
+// forward. Capture keeps that window as small as it can by resolving a parent
+// before its subagents within each poll.
+func (p *CursorTranscriptProcessor) AdoptSessionID(sessionID string) {
+	if sessionID == "" || sessionID == p.sessionID {
+		return
+	}
+	p.sessionID = sessionID
+}
+
 // cursorRecord is the complete on-disk record shape. Deliberately exhaustive:
 // if a future Cursor build adds a field, this struct failing to grow is a
 // visible gap rather than a silent one.

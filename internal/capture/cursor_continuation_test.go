@@ -1,13 +1,35 @@
 package capture
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
+
+// appendCursorLines appends complete records to an existing transcript, the way
+// Cursor grows one between polls.
+func appendCursorLines(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range lines {
+		if _, err := f.WriteString(l + "\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // --- fixture shapes ----------------------------------------------------------
 //
@@ -552,5 +574,218 @@ func TestCursorResolveSessionIDLeavesAHookClaimedTranscriptAlone(t *testing.T) {
 	}
 	if cacheable {
 		t.Fatal("a hook-claimed resolution must not be cached — the claim expires")
+	}
+}
+
+// --- a provisional answer must be re-asked -------------------------------------
+
+// cursorQueuedEvents returns every event on the outbox, in order.
+func cursorQueuedEvents(t *testing.T) []event.Event {
+	t.Helper()
+	data, err := os.ReadFile(state.OutboxPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read outbox: %v", err)
+	}
+	var out []event.Event
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var ev event.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("unmarshal outbox line: %v", err)
+		}
+		out = append(out, ev)
+	}
+	return out
+}
+
+// cursorEventsFromLane returns the queued events carrying a given `agentId` —
+// the subagent transcript's own uuid, which rides every event it emits. It is
+// how a test tells the child's events from its parent's.
+func cursorEventsFromLane(t *testing.T, laneID string) []event.Event {
+	t.Helper()
+	var out []event.Event
+	for _, ev := range cursorQueuedEvents(t) {
+		d, ok := ev.Data.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if id, _ := d["agentId"].(string); id == laneID {
+			out = append(out, ev)
+		}
+	}
+	return out
+}
+
+// A PROVISIONAL ANSWER MUST BE RE-ASKED, AND THE PROCESSOR CACHE IS WHERE THAT
+// STOPPED HAPPENING.
+//
+// cursorResolveSessionID reports cacheable=false for a subagent whose parent has
+// not resolved yet, and pollCursorTranscripts honours that by not writing
+// progress.Sessions. But `processors[key]` used to be populated unconditionally,
+// and a non-nil processor meant the resolver was never consulted again for that
+// key — so the answer was frozen one level ABOVE the map that was refusing to
+// freeze it, and a subagent whose parent later adopted an earlier id kept
+// emitting under the abandoned uuid for the daemon's life.
+//
+// Poll 1: the child reveals a workspace path and is captured, but its parent has
+// revealed none yet and stays undecided — so the child's id is provisional.
+// Poll 2: the parent reveals a path, matches the head across a project
+// directory, and adopts. The child must follow.
+func TestPollCursorTranscriptsReResolvesAProvisionalSidechain(t *testing.T) {
+	const (
+		aID     = "3df490ff-1111-4111-8111-111111111111"
+		bID     = "44da3651-2222-4222-8222-222222222222"
+		childID = "c0ffee00-4444-4444-8444-444444444444"
+	)
+	root := cursorProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	ws := resolvePath(t.TempDir())
+
+	// The shared prefix carries NO path, so a transcript holding only it stays
+	// undecided — which is what makes the child provisional on poll 1.
+	shared := []string{
+		cursorUserLine("pick up the handoff"),
+		cursorUserLine("second record of the shared prefix"),
+	}
+	aRel := "proj-a/agent-transcripts/" + aID + "/" + aID + ".jsonl"
+	bRel := "proj-b/agent-transcripts/" + bID + "/" + bID + ".jsonl"
+	childRel := "proj-b/agent-transcripts/" + bID + "/subagents/" + childID + ".jsonl"
+
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"}
+	cutoff := time.Now().Add(-time.Hour)
+	processors := map[string]*normalize.CursorTranscriptProcessor{}
+
+	// An EMPTY first poll sets the pre-existing/new boundary. The transcripts
+	// have to be written after it: anything already on disk at first poll is
+	// history and is seeded to EOF, which would emit nothing at all.
+	pollCursorTranscripts(session, ws, cutoff, map[string]*normalize.CursorTranscriptProcessor{}, true, false)
+
+	writeCursorTranscript(t, root, aRel, append(append([]string{}, shared...),
+		cursorShellLine(ws), cursorMoveLookupLine("move_agent_to_cloned_root"), cursorTurnEndedErrorLine())...)
+	bPath := writeCursorTranscript(t, root, bRel, shared...)
+	childPath := writeCursorTranscript(t, root, childRel,
+		cursorUserLine("delegated brief"), cursorShellLine(ws))
+
+	// Poll 1.
+	pollCursorTranscripts(session, ws, cutoff, processors, false, false)
+
+	childKey := cursorProgressKey(childPath)
+	progress := loadCursorWatchProgress()
+	if got, present := progress.Sessions[childKey]; present {
+		t.Fatalf("a provisional sidechain was frozen into progress.Sessions as %q", got)
+	}
+	if got := progress.Sessions[cursorProgressKey(bPath)]; got != "" {
+		t.Fatalf("parent resolved on poll 1 as %q — the fixture no longer exercises the provisional path", got)
+	}
+	early := cursorEventsFromLane(t, childID)
+	if len(early) == 0 {
+		t.Fatal("the child queued nothing on poll 1 — the fixture is not exercising capture")
+	}
+	// The documented residual, asserted rather than left implicit: events emitted
+	// while the answer was provisional stay on the id they were sent under.
+	if got := early[len(early)-1].SessionID; got != bID {
+		t.Fatalf("poll-1 child event carried %q, want the on-disk parent uuid %q", got, bID)
+	}
+
+	// Poll 2: the parent finally reveals a path and adopts the head's id.
+	appendCursorLines(t, bPath, cursorShellLine(ws), cursorMoveCallLine("move_agent_to_cloned_root"))
+	appendCursorLines(t, childPath, cursorShellLine(ws))
+	pollCursorTranscripts(session, ws, cutoff, processors, false, false)
+
+	progress = loadCursorWatchProgress()
+	if got := progress.Sessions[cursorProgressKey(bPath)]; got != aID {
+		t.Fatalf("parent resolved to %q, want the adopted id %q", got, aID)
+	}
+	if got := progress.Sessions[childKey]; got != aID {
+		t.Fatalf("sidechain resolved to %q, want its parent's adopted id %q", got, aID)
+	}
+	late := cursorEventsFromLane(t, childID)
+	if len(late) <= len(early) {
+		t.Fatalf("the child queued nothing new on poll 2 (%d then %d)", len(early), len(late))
+	}
+	if got := late[len(late)-1].SessionID; got != aID {
+		t.Fatalf("poll-2 child event carried %q, want the adopted id %q — the provisional answer was never re-asked", got, aID)
+	}
+}
+
+// THE ANCHOR IS THE REGRESSION THIS FIX COULD PLAUSIBLY INTRODUCE. Cursor stamps
+// no per-record time; all that exists is the <timestamp> injected into a user
+// turn, held on the processor as tsAnchor and inherited by every assistant
+// record after it. Rebuilding the processor to change its session id would reset
+// that anchor to zero and every later event would silently fall back to read
+// time — moving `ts`, which is a column in the server's dedupe key.
+//
+// So: an anchored turn on poll 1, an assistant record on poll 2 across a
+// migration, and the second must carry the first's time.
+func TestPollCursorTranscriptsKeepsTheTimestampAnchorAcrossAMigration(t *testing.T) {
+	const (
+		aID     = "3df490ff-1111-4111-8111-111111111111"
+		bID     = "44da3651-2222-4222-8222-222222222222"
+		childID = "c0ffee00-4444-4444-8444-444444444444"
+		// What the fixture's <timestamp> parses to: 1:48 PM at UTC-5.
+		wantTs = "2026-08-06T18:48:00Z"
+	)
+	root := cursorProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	ws := resolvePath(t.TempDir())
+
+	shared := []string{
+		cursorUserLine("pick up the handoff"),
+		cursorUserLine("second record of the shared prefix"),
+	}
+	aRel := "proj-a/agent-transcripts/" + aID + "/" + aID + ".jsonl"
+	bRel := "proj-b/agent-transcripts/" + bID + "/" + bID + ".jsonl"
+	childRel := "proj-b/agent-transcripts/" + bID + "/subagents/" + childID + ".jsonl"
+
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"}
+	cutoff := time.Now().Add(-time.Hour)
+	processors := map[string]*normalize.CursorTranscriptProcessor{}
+
+	// Empty first poll first — see the sidechain test for why.
+	pollCursorTranscripts(session, ws, cutoff, map[string]*normalize.CursorTranscriptProcessor{}, true, false)
+
+	writeCursorTranscript(t, root, aRel, append(append([]string{}, shared...),
+		cursorShellLine(ws), cursorMoveLookupLine("move_agent_to_cloned_root"), cursorTurnEndedErrorLine())...)
+	bPath := writeCursorTranscript(t, root, bRel, shared...)
+	// The child's brief carries the anchor; a sidechain emits no prompt from it
+	// but DOES take the time off it.
+	childPath := writeCursorTranscript(t, root, childRel,
+		cursorUserLine("delegated brief"), cursorShellLine(ws))
+
+	pollCursorTranscripts(session, ws, cutoff, processors, false, false)
+
+	early := cursorEventsFromLane(t, childID)
+	if len(early) == 0 {
+		t.Fatal("the child queued nothing on poll 1")
+	}
+	if got := early[len(early)-1].Ts; got != wantTs {
+		t.Fatalf("poll-1 child event ts = %q, want the anchored %q", got, wantTs)
+	}
+
+	// The migration happens on this poll.
+	appendCursorLines(t, bPath, cursorShellLine(ws), cursorMoveCallLine("move_agent_to_cloned_root"))
+	appendCursorLines(t, childPath, cursorShellLine(ws))
+	pollCursorTranscripts(session, ws, cutoff, processors, false, false)
+
+	late := cursorEventsFromLane(t, childID)
+	if len(late) <= len(early) {
+		t.Fatalf("the child queued nothing new on poll 2 (%d then %d)", len(early), len(late))
+	}
+	last := late[len(late)-1]
+	// Guard: without a migration this test would pass for the wrong reason.
+	if last.SessionID != aID {
+		t.Fatalf("poll-2 child event carried %q, want the adopted id %q — no migration happened, so this proves nothing about the anchor", last.SessionID, aID)
+	}
+	if last.Ts != wantTs {
+		t.Fatalf("poll-2 child event ts = %q, want the anchor %q carried across the migration (a rebuilt processor falls back to read time)", last.Ts, wantTs)
 	}
 }
