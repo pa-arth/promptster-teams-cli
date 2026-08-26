@@ -35,7 +35,12 @@ import (
 // live `cursor-agent` run). There are TWO record shapes, not one:
 //
 //	{"role":"user"|"assistant","message":{"content":[ …items… ]}}   — 4,132
-//	{"type":"turn_ended","status":…,"error":…}                     —   145
+//	{"type":"turn_ended","status":…}                               —   119
+//	{"type":"turn_ended","status":…,"error":…}                     —    26
+//
+// `error` is OPTIONAL and present on only 26 of the 145 turn_ended records —
+// written when the turn did not end cleanly. Stating the shape with `error`
+// always present would be the same over-tight claim this comment is correcting.
 //
 // An earlier revision of this comment said "every record, in every file, is
 // exactly" the first shape "and NOTHING else", and gave the whole-corpus key-set
@@ -48,7 +53,9 @@ import (
 //
 // `turn_ended` is worth knowing rather than merely tolerating: it is where a
 // conversation STOPS in this file. Observed status values are success 119,
-// error 25, aborted 1; the errors are `WritableIterable is closed` (15),
+// error 25, aborted 1 — so `success` and a present `error` are near-complements
+// but not exactly (the one `aborted` carries an error too). The errors are
+// `WritableIterable is closed` (15),
 // `User aborted request` (10) and one manual interrupt. When Cursor moves an
 // agent to another root (`cursor-app-control/move_agent_to_root`,
 // `move_agent_to_cloned_root`) the old transcript ends on one of these and the
