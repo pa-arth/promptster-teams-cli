@@ -708,7 +708,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 					return
 				default:
 				}
-				if got := loadStatuslineLastGood(); len(got) > 0 && !valid[string(got)] {
+				if got := loadStatuslineLastGood(hudCommand); len(got) > 0 && !valid[string(got)] {
 					t.Errorf("read a spliced cache: %d bytes, starts %q", len(got), got[:1])
 					return
 				}
@@ -721,7 +721,7 @@ func TestConcurrentWritersNeverPublishASplicedFile(t *testing.T) {
 		go func(p []byte) {
 			defer wg.Done()
 			for i := 0; i < 50; i++ {
-				saveStatuslineLastGood(p)
+				saveStatuslineLastGood(hudCommand, p)
 			}
 		}(payloads[w%len(payloads)])
 	}
@@ -1081,5 +1081,53 @@ func TestDisableAndHealNeverDisagree(t *testing.T) {
 				t.Fatalf("run %d: a prior record survived with no shim installed: %+v", i, rec)
 			}
 		}()
+	}
+}
+
+// TestLastGoodNeverServesASupersededCommandsOutput: the shim takes no lock, so a
+// tick can be mid-run with the OLD wrapped command while a heal swaps the prior
+// underneath it, and then publish that old output into the cache the NEW command
+// reads. Clearing on re-wrap does not help — the clear happens first, the stale
+// write lands after. The cache must therefore refuse to serve an entry to a
+// command that did not produce it.
+func TestLastGoodNeverServesASupersededCommandsOutput(t *testing.T) {
+	statuslineTestEnv(t)
+
+	const oldCmd, newCmd = "printf OLD-TOOL", "printf NEW-TOOL"
+
+	// A tick of the OLD command lands its output in the cache — this is the write
+	// that races a heal, and it can land at any time.
+	saveStatuslineLastGood(oldCmd, []byte("OLD-TOOL-LINE"))
+
+	if got := loadStatuslineLastGood(newCmd); got != nil {
+		t.Errorf("the new command was served the old one's line: %q", got)
+	}
+	if got := string(loadStatuslineLastGood(oldCmd)); got != "OLD-TOOL-LINE" {
+		t.Errorf("the owning command lost its own cache entry: %q", got)
+	}
+}
+
+// TestWrappedFallbackAfterARewrapDrawsNothing is the same hazard end to end: a
+// re-wrap, then a stale tick's cache write, then the NEW command failing. A
+// blank tick is correct; the previous tool's line is not.
+func TestWrappedFallbackAfterARewrapDrawsNothing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses sh -c")
+	}
+	statuslineTestEnv(t)
+	blob := []byte(`{"session_id":"s"}`)
+
+	shimWrapPrior(t, "printf 'OLD-TOOL-LINE'")
+	if got := string(runPriorStatusline(blob)); got != "OLD-TOOL-LINE" {
+		t.Fatalf("seed = %q", got)
+	}
+
+	// The engineer's statusline is swapped, and a tick still holding the old
+	// command republishes its output after the re-wrap cleared the cache.
+	shimWrapPrior(t, "exit 1")
+	saveStatuslineLastGood("printf 'OLD-TOOL-LINE'", []byte("OLD-TOOL-LINE"))
+
+	if got := string(runPriorStatusline(blob)); got != "" {
+		t.Errorf("a superseded tick's line was drawn for the new statusline: %q", got)
 	}
 }

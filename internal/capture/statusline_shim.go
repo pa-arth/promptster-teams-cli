@@ -3,6 +3,8 @@ package capture
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -263,11 +265,49 @@ func statuslineLastGoodPath() string {
 	return filepath.Join(state.StateDir(), "statusline-lastgood")
 }
 
+// statuslineLastGood is the cache record. It carries a FINGERPRINT of the
+// command whose output it holds, and that is a correctness mechanism, not
+// bookkeeping.
+//
+// The shim takes NO lock — it is a per-tick hot path in every open session, and
+// making it contend would be the wrong trade. So a tick can be mid-run with the
+// OLD wrapped command while a heal swaps the prior underneath it, and then
+// publish that old command's output into a cache the new command will read.
+// Clearing the cache on re-wrap does not help: the clear happens first and the
+// stale write lands after it. The result is precisely the quiet substitution the
+// cache was introduced to prevent — a failed NEW statusline rendering the OLD
+// one's line.
+//
+// Fingerprinting closes it without a lock: a cache entry is only ever served to
+// the command that produced it, so a late write from a superseded tick is inert
+// rather than wrong. The clear-on-rewrap is now hygiene, not the guarantee.
+//
+// The fingerprint is a HASH, not the command: the prior record already holds the
+// command, and statusline commands carry inline credentials, so there is no
+// reason for a second file to hold a copy.
+type statuslineLastGood struct {
+	Fingerprint string `json:"fp"`
+	Output      []byte `json:"out"`
+}
+
+// commandFingerprint identifies a wrapped command without reproducing it.
+func commandFingerprint(command string) string {
+	sum := sha256.Sum256([]byte(command))
+	return hex.EncodeToString(sum[:16])
+}
+
 // saveStatuslineLastGood records a successful render. Best-effort and silent:
 // this runs on the status-line hot path, and a cache we could not write is a
 // worse fallback next tick, never a failed render this tick.
-func saveStatuslineLastGood(out []byte) {
+func saveStatuslineLastGood(command string, out []byte) {
 	if len(out) == 0 || len(out) > maxLastGoodBytes {
+		return
+	}
+	data, err := json.Marshal(statuslineLastGood{
+		Fingerprint: commandFingerprint(command),
+		Output:      out,
+	})
+	if err != nil {
 		return
 	}
 	path := statuslineLastGoodPath()
@@ -281,15 +321,25 @@ func saveStatuslineLastGood(out []byte) {
 	// shims sharing one temp name interleave their bytes and then rename the
 	// result into place, so the fallback line one session publishes is a torn
 	// splice of another's. Same defect the window spool already fixed.
-	_ = writeFileAtomic(dir, path, out)
+	_ = writeFileAtomic(dir, path, data)
 }
 
-func loadStatuslineLastGood() []byte {
+// loadStatuslineLastGood returns the cached render ONLY if it belongs to the
+// command being asked about. A mismatch is a superseded entry and yields
+// nothing — better a blank tick than another statusline's line.
+func loadStatuslineLastGood(command string) []byte {
 	data, err := os.ReadFile(statuslineLastGoodPath()) // #nosec G304 -- fixed path under the state dir.
 	if err != nil {
 		return nil
 	}
-	return data
+	var rec statuslineLastGood
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil
+	}
+	if rec.Fingerprint != commandFingerprint(command) {
+		return nil
+	}
+	return rec.Output
 }
 
 func clearStatuslineLastGood() { _ = os.Remove(statuslineLastGoodPath()) }
@@ -347,7 +397,7 @@ func runPriorStatusline(blob []byte) []byte {
 	if err := cmd.Run(); err != nil {
 		// Prior command failed or timed out. Walk the ladder above — never our
 		// own render, which would put promptster where their statusline was.
-		if cached := loadStatuslineLastGood(); len(cached) > 0 {
+		if cached := loadStatuslineLastGood(rec.Prior.Command); len(cached) > 0 {
 			return cached
 		}
 		if stdout.Len() > 0 {
@@ -356,7 +406,7 @@ func runPriorStatusline(blob []byte) []byte {
 		return nil
 	}
 	out := stdout.Bytes()
-	saveStatuslineLastGood(out)
+	saveStatuslineLastGood(rec.Prior.Command, out)
 	return out
 }
 
