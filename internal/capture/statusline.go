@@ -160,6 +160,12 @@ func statuslinePriorPath() string {
 type statuslinePriorRecord struct {
 	Wrapped bool              `json:"wrapped"`
 	Prior   *statusLineConfig `json:"prior,omitempty"`
+	// Heals counts CONSECUTIVE automatic re-wraps (see RehealStatusline). It
+	// exists only to bound a fight with another tool that also rewrites the slot,
+	// and it resets to zero the moment a check finds our shim still in place —
+	// which is what separates "something evicts us every single check" from "the
+	// engineer re-ran another tool's setup once".
+	Heals int `json:"heals,omitempty"`
 }
 
 func loadStatuslinePrior() (statuslinePriorRecord, bool) {
@@ -174,11 +180,18 @@ func loadStatuslinePrior() (statuslinePriorRecord, bool) {
 	return rec, true
 }
 
+// saveStatuslinePrior records a CHANGED prior. It drops the last-good cache,
+// because serving the OLD statusline's output as a fallback for a NEW one is
+// exactly the kind of quiet substitution that cache exists to prevent.
+//
+// Updating only the heal counter is not a prior change and must not clear the
+// cache — that path calls writeStatuslinePriorFile directly.
 func saveStatuslinePrior(rec statuslinePriorRecord) error {
-	// A new prior invalidates the last-good cache: serving the OLD statusline's
-	// output as a fallback for a NEW one is exactly the kind of quiet
-	// substitution the cache exists to prevent.
 	clearStatuslineLastGood()
+	return writeStatuslinePriorFile(rec)
+}
+
+func writeStatuslinePriorFile(rec statuslinePriorRecord) error {
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -438,10 +451,20 @@ func StatuslineDoctor(dir string) []StatuslineDoctorLine {
 		}
 	case weAreInstalled && eff.Present && !eff.IsShim && eff.Layer == "user":
 		// Our record says we wrapped, but the user-layer statusLine is no longer
-		// our shim — something overwrote it.
+		// our shim — something overwrote it. The watcher repairs this on its own
+		// within statuslineHealInterval, so the honest report is "displaced, being
+		// repaired" rather than a chore for the engineer — UNLESS we have already
+		// given up, in which case there is a genuine fight and only a human can
+		// pick the winner.
+		if rec, ok := loadStatuslinePrior(); ok && rec.Heals >= maxAutoHeals {
+			return []StatuslineDoctorLine{{
+				Warn: true,
+				Text: "Claude window capture displaced repeatedly — another tool rewrites your statusLine on a timer, so we stopped re-wrapping. Pick one, then run `promptster-teams statusline enable`",
+			}}
+		}
 		return []StatuslineDoctorLine{{
 			Warn: true,
-			Text: "Claude window capture displaced — your statusLine was overwritten; re-enable with `promptster-teams statusline enable`",
+			Text: "Claude window capture displaced — something overwrote your statusLine; capture resumes within 5 minutes (or now, with `promptster-teams statusline enable`)",
 		}}
 	case weAreInstalled && eff.Present && !eff.IsShim:
 		// A higher-precedence layer shadows our user-layer shim.
@@ -455,4 +478,138 @@ func StatuslineDoctor(dir string) []StatuslineDoctorLine {
 			Text: "Claude window capture off — run `promptster-teams statusline enable`",
 		}}
 	}
+}
+
+// --- re-healing a displaced shim ---------------------------------------------
+//
+// THE SLOT HAS ONE OWNER AND SEVERAL CLAIMANTS. `statusLine` is a single key in
+// a single file, and every tool that wants a status line writes it directly —
+// claude-hud's `/claude-hud:setup` sets `statusLine.command` to its own command,
+// full stop. So re-running another tool's setup silently evicts our shim, and
+// with it every Claude window and context-window reading on that machine.
+//
+// The eviction is invisible from the engineer's side: their statusline looks
+// FINE (it is the other tool's, rendering normally), and the only symptom is
+// data that stops arriving on someone else's dashboard days later. `doctor`
+// would say so, but nothing makes anyone run `doctor`. Before this, capture
+// stayed dead until the next `login`.
+//
+// Re-wrapping is a low-harm repair ONLY because the wrap is genuinely
+// transparent — the engineer's line still renders, byte for byte. If that ever
+// stops being true, this heal becomes a takeover on a timer and must be removed
+// with it. See runPriorStatusline in statusline_shim.go.
+//
+// WHAT WE WILL NOT DO, and why each one is a real case rather than a corner:
+//
+//   - No prior record => never enabled, or `statusline disable` cleared it.
+//     Disable is the off switch, and an off switch that something reverses on a
+//     timer is not an off switch.
+//   - An ABSENT statusLine => the engineer deleted the key. They want NO status
+//     line, and installing ours into the hole would be inventing configuration
+//     they removed on purpose. Same reasoning as DisableStatusline's.
+//   - A MANAGED-policy statusLine outranks the user layer we own, so re-wrapping
+//     ours would change nothing except churn in their settings file. That stays
+//     a doctor warning.
+//   - Project layers are deliberately NOT consulted: they apply per-cwd, and the
+//     daemon has no single cwd to judge from. Guessing one would make the heal
+//     fire or not fire based on which repo the daemon happened to start in.
+
+// statuslineHealInterval is how often the watcher checks the slot. It bounds how
+// long capture can be dead after an eviction; it is not latency-sensitive, and a
+// settings.json read is far too cheap to be worth doing on the 3s poll.
+const statuslineHealInterval = 5 * time.Minute
+
+// maxAutoHeals bounds a fight. If some other tool ALSO re-writes the slot on a
+// timer, healing forever would churn the engineer's settings.json indefinitely
+// and neither tool would win. Five consecutive displacements is well past any
+// plausible one-off, so we stop and say so rather than keep swinging.
+const maxAutoHeals = 5
+
+// StatuslineHealResult reports what a heal attempt did, for logs and doctor.
+type StatuslineHealResult struct {
+	// Rewrapped: we were displaced and put the shim back, wrapping whatever had
+	// taken the slot so that command still renders.
+	Rewrapped bool
+	// Command is what we re-wrapped — the displacing tool's statusline.
+	Command string
+	// GaveUp: we have been displaced maxAutoHeals times running. Something else
+	// owns this slot on a timer and a human needs to pick a winner.
+	GaveUp bool
+}
+
+// RehealStatusline re-wraps our shim if another tool evicted it. Safe to call on
+// a timer: it is a no-op in every case above, and a no-op also RESETS the heal
+// counter, so an occasional eviction never accumulates toward the give-up bound.
+func RehealStatusline() (StatuslineHealResult, error) {
+	rec, ok := loadStatuslinePrior()
+	if !ok || !rec.Wrapped {
+		return StatuslineHealResult{}, nil
+	}
+	if _, managed := readStatusLine(managedSettingsPath()); managed {
+		return StatuslineHealResult{}, nil
+	}
+	cur, hasCur := readStatusLine(userSettingsPath())
+	if !hasCur {
+		return StatuslineHealResult{}, nil
+	}
+	if isOurShim(cur.Command) {
+		// In place. Whatever fight there may have been is over — a heal counter
+		// that only ever climbs would eventually refuse to repair a machine that
+		// is not being contested at all.
+		if rec.Heals != 0 {
+			rec.Heals = 0
+			_ = writeStatuslinePriorFile(rec)
+		}
+		return StatuslineHealResult{}, nil
+	}
+
+	if rec.Heals >= maxAutoHeals {
+		return StatuslineHealResult{GaveUp: true, Command: cur.Command}, nil
+	}
+
+	// Displaced. Wrap whatever holds the slot now — EnableStatusline stores it as
+	// the new prior, so the displacing tool's line keeps rendering.
+	healed := rec.Heals + 1
+	if _, err := EnableStatusline(); err != nil {
+		return StatuslineHealResult{}, err
+	}
+	// EnableStatusline writes a fresh record (Heals zeroed, which is right for an
+	// engineer-initiated enable), so the count is restored after it, not before.
+	if next, ok := loadStatuslinePrior(); ok {
+		next.Heals = healed
+		_ = writeStatuslinePriorFile(next)
+	}
+	return StatuslineHealResult{Rewrapped: true, Command: cur.Command}, nil
+}
+
+// statuslineHealer holds the heal throttle for one watcher. Zero value is ready
+// to use and checks on its first tick.
+type statuslineHealer struct {
+	lastCheck time.Time
+}
+
+func (s *statuslineHealer) maybe(now time.Time) {
+	if !s.lastCheck.IsZero() && now.Sub(s.lastCheck) < statuslineHealInterval {
+		return
+	}
+	s.lastCheck = now
+	res, err := RehealStatusline()
+	switch {
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "claude-watcher: could not re-wrap the displaced statusline: %v\n", err)
+	case res.GaveUp:
+		fmt.Fprintf(os.Stderr, "claude-watcher: statusline displaced %d times running — leaving it alone; run `promptster-teams statusline enable` once whatever else writes it has settled\n", maxAutoHeals)
+	case res.Rewrapped:
+		fmt.Fprintf(os.Stderr, "claude-watcher: statusline had been replaced — re-wrapped it, and %s still renders\n", truncateForLog(res.Command))
+	}
+}
+
+// truncateForLog keeps a wrapped command readable in a log line without dumping
+// a 400-character shell pipeline into the daemon log every time it is healed.
+func truncateForLog(cmd string) string {
+	const max = 60
+	if len(cmd) <= max {
+		return cmd
+	}
+	return cmd[:max] + "…"
 }

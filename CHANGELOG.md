@@ -39,6 +39,35 @@ replaced.
   value a real statusline can reach makes us the cause of a regression the
   engineer would not otherwise have had.
 
+**A statusline another tool evicts stays evicted.** `statusLine` is one key in
+one file and every tool writes it directly — claude-hud's `/claude-hud:setup`
+sets `statusLine.command` to its own command, full stop. Re-running it removed
+our shim and killed every Claude window and context-window reading on that
+machine until the next `login`. The eviction is invisible from the engineer's
+side: their statusline looks FINE, because it is the other tool's, rendering
+normally. The only symptom is data that stops arriving on someone else's
+dashboard days later.
+
+- **The watcher re-wraps a displaced shim** on a 5-minute check, wrapping
+  whatever took the slot so that tool's line keeps rendering. In the poll loop
+  and not at startup on purpose — a daemon that never restarts would never run a
+  startup-only check, and this daemon is precisely the process that does not
+  restart.
+- **It will not touch four cases**, each a real one: no prior record (never
+  enabled, or `statusline disable` cleared it — an off switch something reverses
+  on a timer is not an off switch); an ABSENT `statusLine` (the engineer deleted
+  the key and filling the hole invents config they removed); a managed-policy
+  statusLine that outranks the user layer; and project layers, which are per-cwd
+  and which the daemon has no cwd to judge from.
+- **A fight is bounded.** If something else also rewrites the slot on a timer,
+  we stop after five consecutive displacements rather than churn settings.json
+  forever, and `doctor` says a human has to pick a winner. The counter resets
+  whenever a check finds the shim in place, so an occasional eviction never
+  accumulates toward that bound.
+- Re-wrapping is only defensible because the wrap is now genuinely transparent.
+  If that stops being true, this heal becomes a takeover on a timer and must be
+  removed with it.
+
 ## [0.22.0] — 2026-08-26
 
 ### Added
