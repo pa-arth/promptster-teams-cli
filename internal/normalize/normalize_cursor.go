@@ -30,16 +30,39 @@ import (
 // those two objections as grounds for rejecting hooks ENTIRELY; they are
 // grounds for rejecting one scope. See CLAUDE.md, "Capture surfaces".
 //
-// THE FORMAT, verified against 61 real transcripts (2026-02 → 2026-07) and one
-// live `cursor-agent` run. Every record, in every file, is exactly:
+// THE FORMAT, re-verified 2026-08-25 against 142 real transcripts (4,277
+// records; the earlier reading was 61 transcripts, 2026-02 → 2026-07, plus one
+// live `cursor-agent` run). There are TWO record shapes, not one:
 //
-//	{"role":"user"|"assistant","message":{"content":[ …items… ]}}
+//	{"role":"user"|"assistant","message":{"content":[ …items… ]}}   — 4,132
+//	{"type":"turn_ended","status":…,"error":…}                     —   145
 //
-// and NOTHING else — no timestamp field, no cwd, no model, no token usage, and
-// no `tool_result` records at all. That is not an omission in this parser; the
-// key-set union across the whole corpus is `{role, message}` and `{content}`.
+// An earlier revision of this comment said "every record, in every file, is
+// exactly" the first shape "and NOTHING else", and gave the whole-corpus key-set
+// union as `{role, message}` and `{content}`. THAT WAS WRONG — it missed the
+// second shape entirely. The union is `{role, message}` ∪ `{type, status,
+// error}`. Nothing downstream broke, because `Process` keys on `role` and a
+// `turn_ended` record therefore emits no event, which is correct; but the claim
+// was load-bearing as EVIDENCE and it was false, and the same staleness one
+// paragraph down had silently zeroed a board (see CallDynamicTool).
+//
+// `turn_ended` is worth knowing rather than merely tolerating: it is where a
+// conversation STOPS in this file. Observed status values are success 119,
+// error 25, aborted 1; the errors are `WritableIterable is closed` (15),
+// `User aborted request` (10) and one manual interrupt. When Cursor moves an
+// agent to another root (`cursor-app-control/move_agent_to_root`,
+// `move_agent_to_cloned_root`) the old transcript ends on one of these and the
+// WHOLE conversation is rewritten under a new uuid in the new project dir — the
+// re-ingestion that duplicates it is a separate defect, but this record is its
+// visible marker.
+//
+// What the original claim got RIGHT and still holds for role-bearing records:
+// no timestamp field, no cwd, no model, no token usage, and no `tool_result`
+// records at all. That is not an omission in this parser.
+//
 // Do not add a field here on the assumption Cursor "must" send it — check a
-// real file first, the way this list was built.
+// real file first, the way this list was built. And do not read an exhaustive-
+// sounding key list as current: re-count it.
 //
 // Content items are `{"type":"text","text":…}` or
 // `{"type":"tool_use","name":…,"input":{…}}`. The tool vocabulary observed
