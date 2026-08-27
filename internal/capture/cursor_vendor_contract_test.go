@@ -59,13 +59,14 @@ func TestCursorVendorAbsenceVocabulary(t *testing.T) {
 		"vendor_unreachable",
 		"vendor_shape_unrecognized",
 	}
-	if len(CursorVendorAbsenceReasons) != len(want) {
+	got := CursorVendorAbsenceReasons()
+	if len(got) != len(want) {
 		t.Fatalf("absence vocabulary has %d values, contract has %d",
-			len(CursorVendorAbsenceReasons), len(want))
+			len(got), len(want))
 	}
 	for i, w := range want {
-		if string(CursorVendorAbsenceReasons[i]) != w {
-			t.Errorf("absence reason %d = %q, want %q", i, CursorVendorAbsenceReasons[i], w)
+		if string(got[i]) != w {
+			t.Errorf("absence reason %d = %q, want %q", i, got[i], w)
 		}
 	}
 	// The three that must stay separable, spelled out because collapsing any two
@@ -73,11 +74,25 @@ func TestCursorVendorAbsenceVocabulary(t *testing.T) {
 	// was denied, a credential that expired, and a vendor that answered with
 	// nothing are three different facts, and only one of them is ours to fix.
 	seen := map[CursorVendorAbsenceReason]bool{}
-	for _, r := range CursorVendorAbsenceReasons {
+	for _, r := range got {
 		if seen[r] {
 			t.Errorf("duplicate absence reason %q", r)
 		}
 		seen[r] = true
+	}
+}
+
+// A returned copy must not be able to corrupt the vocabulary other callers read.
+func TestCursorVendorAbsenceVocabularyIsNotMutableByCallers(t *testing.T) {
+	first := CursorVendorAbsenceReasons()
+	first[0] = "clobbered"
+	if CursorVendorAbsenceReasons()[0] != CursorVendorAbsenceCredentialAbsent {
+		t.Fatal("a caller mutated the shared vocabulary; it must be handed out as a copy")
+	}
+	plats := CursorVendorSupportedPlatforms()
+	plats[0] = "clobbered"
+	if CursorVendorSupportedPlatforms()[0] != "darwin" {
+		t.Fatal("a caller mutated the shared platform list; it must be handed out as a copy")
 	}
 }
 

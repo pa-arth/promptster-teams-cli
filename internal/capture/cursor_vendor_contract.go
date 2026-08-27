@@ -141,9 +141,13 @@ const (
 	CursorVendorAbsenceVendorShapeUnrecognized CursorVendorAbsenceReason = "vendor_shape_unrecognized"
 )
 
-// CursorVendorAbsenceReasons is the full vocabulary, in the contract's order.
-// Pinned against the TypeScript enum by test.
-var CursorVendorAbsenceReasons = []CursorVendorAbsenceReason{
+// cursorVendorAbsenceReasons is the full vocabulary, in the contract's order.
+//
+// UNEXPORTED, and handed out only as a copy by CursorVendorAbsenceReasons().
+// An exported slice var is mutable by any caller in the binary, and this file's
+// entire purpose is that its values do NOT drift from the TypeScript authority.
+// A contract a caller can rewrite at runtime is not a contract.
+var cursorVendorAbsenceReasons = []CursorVendorAbsenceReason{
 	CursorVendorAbsenceCredentialAbsent,
 	CursorVendorAbsenceCredentialExpired,
 	CursorVendorAbsencePlatformUnsupported,
@@ -153,15 +157,33 @@ var CursorVendorAbsenceReasons = []CursorVendorAbsenceReason{
 	CursorVendorAbsenceVendorShapeUnrecognized,
 }
 
-// CursorVendorSupportedPlatforms lists the GOOS values the v1 collector supports.
+// cursorVendorSupportedPlatforms lists the GOOS values the v1 collector supports.
 // Anything else emits CursorVendorAbsencePlatformUnsupported rather than nothing.
-var CursorVendorSupportedPlatforms = []string{"darwin"}
+// Unexported for the same reason as the vocabulary above.
+var cursorVendorSupportedPlatforms = []string{"darwin"}
+
+// CursorVendorAbsenceReasons returns the absence vocabulary in the contract's
+// order. A fresh copy per call, so a caller cannot reorder or truncate the
+// vocabulary other callers read.
+func CursorVendorAbsenceReasons() []CursorVendorAbsenceReason {
+	out := make([]CursorVendorAbsenceReason, len(cursorVendorAbsenceReasons))
+	copy(out, cursorVendorAbsenceReasons)
+	return out
+}
+
+// CursorVendorSupportedPlatforms returns the supported GOOS values. A fresh copy
+// per call, for the same reason.
+func CursorVendorSupportedPlatforms() []string {
+	out := make([]string, len(cursorVendorSupportedPlatforms))
+	copy(out, cursorVendorSupportedPlatforms)
+	return out
+}
 
 // CursorVendorPlatformSupported reports whether the collector runs on goos.
 // Callers pass runtime.GOOS; it is a parameter so the unsupported branch is
 // testable on the machine that ships the supported one.
 func CursorVendorPlatformSupported(goos string) bool {
-	for _, p := range CursorVendorSupportedPlatforms {
+	for _, p := range cursorVendorSupportedPlatforms {
 		if p == goos {
 			return true
 		}
