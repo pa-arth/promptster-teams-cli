@@ -775,7 +775,13 @@ func pollClaudeTranscripts(
 		saveClaudeWatchProgress(progress)
 	}
 
-	for _, path := range candidateClaudeTranscripts(historyCutoff) {
+	candidates := candidateClaudeTranscripts(historyCutoff)
+	liveKeys := make(map[string]bool, len(candidates))
+	for _, path := range candidates {
+		liveKeys[claudeProgressKey(path)] = true
+	}
+
+	for _, path := range candidates {
 		key := claudeProgressKey(path)
 		switch progress.Match[key] {
 		case "no":
@@ -920,6 +926,28 @@ func pollClaudeTranscripts(
 			}
 			queueClaudeWatchEvent(ev, session, captureProse)
 		}
+	}
+
+	// Evict processors for transcripts that have aged out of the rolling
+	// history window. Without this, `processors` only ever grows: a long-lived
+	// daemon accumulates one *ClaudeTranscriptProcessor per distinct transcript
+	// it has EVER seen, across every project, for its entire uptime — the
+	// per-file offset/match caches above are meant to persist (disk-backed,
+	// bounded by transcript count), but this map is pure runtime state with no
+	// such justification. Flush first (like the SIGTERM path does) so an
+	// in-flight assistant message isn't dropped just because its transcript
+	// fell out of the window on this exact poll.
+	for key, proc := range processors {
+		if liveKeys[key] {
+			continue
+		}
+		for _, ev := range proc.FlushStale(0) {
+			parsed++
+			if !dryRun {
+				queueClaudeWatchEvent(ev, session, captureProse)
+			}
+		}
+		delete(processors, key)
 	}
 
 	if deferredWork && verboseWatch() {

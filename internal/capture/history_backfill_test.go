@@ -486,6 +486,48 @@ func TestPollClaudeTranscriptsChunksBackfill(t *testing.T) {
 	}
 }
 
+// TestPollClaudeTranscriptsEvictsProcessorsForTranscriptsNoLongerCandidates
+// pins the fix for an unbounded-growth leak: `processors` used to accumulate
+// one entry per transcript the daemon had EVER seen, with nothing ever
+// removing an entry once its transcript stopped being a candidate (aged out of
+// the rolling history window, or was cleaned up). Over a multi-day daemon
+// uptime across many projects that map only grew. This proves an entry is
+// evicted the moment its transcript drops out of the candidate set.
+func TestPollClaudeTranscriptsEvictsProcessorsForTranscriptsNoLongerCandidates(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+
+	workspace := t.TempDir()
+	ws := resolvePath(workspace)
+	path, _ := writeClaudeHistory(t, root, ws, "aging-out.jsonl", 2)
+	key := claudeProgressKey(path)
+
+	session := Session{DeviceID: "sess-evict", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
+	cutoff := transcriptHistoryCutoff(time.Now().UTC())
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+
+	if _, consumed := pollClaudeTranscripts(session, ws, cutoff, processors, true, false); consumed == 0 {
+		t.Fatal("first poll must capture the in-window transcript")
+	}
+	if _, ok := processors[key]; !ok {
+		t.Fatalf("processor for %q was not created: %v", key, processors)
+	}
+
+	// Simulate the transcript no longer being a candidate (aged out of the
+	// rolling window, or removed) — candidateClaudeTranscripts stops listing it.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	pollClaudeTranscripts(session, ws, cutoff, processors, true, false)
+	if _, ok := processors[key]; ok {
+		t.Fatalf("processor for a transcript no longer a candidate must be evicted; map still holds %d entr(ies): %v", len(processors), processors)
+	}
+}
+
 // TestTailClaudeTranscriptDoesNotCrossBudgetMidRecord proves the byte cap is a
 // hard read boundary, not a check performed after ReadBytes has already pulled
 // an arbitrarily large record into memory. A record that does not fit in the
