@@ -6,6 +6,53 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.23.0] — 2026-08-27
+
+### Added
+
+**Codex compactions read as never happening — and a candidate was docked for
+it.** `SOURCE_CAPABILITIES.codex.resetEvents` was false, on the recorded grounds
+that Codex has "NO /clear or /compact concept". That was never true. codex-cli
+ships `/compact`, `/clear` and `/new`, its hook matrix carries pre-compact and
+post-compact, and the ROLLOUT FILE — the rail this normalizer already reads line
+by line — writes a `type:"compacted"` record plus an `event_msg` of
+`"context_compacted"` on every compaction. We were parsing the file that held
+the answer and skipping the two lines that were it. The cost was not abstract: a
+hiring candidate came back `context_hygiene [developing] — zero clears or
+compactions despite prolonged discovery, implementation, and verification
+phases`, docked for a ritual our capture could not have observed.
+
+- **Keyed off the marker, not the record.** `event_msg`/`context_compacted` and
+  `type:"compacted"` arrive 1:1 — 8 of each across the 5 local rollouts that
+  compact, never one without the other — so either would count the same resets.
+  The marker wins twice over. Its sibling's payload is the entire
+  `replacement_history`: every prior user turn verbatim, base64 image data
+  included, the single largest blob in the file and exactly what the teams
+  projection exists never to carry. And `context_compacted` is an `EventMsg`
+  VARIANT, so it survives the 0.149 stream rename that moved user and agent
+  messages under `item_completed` — checked against the installed 0.149.1
+  binary's variant table.
+- **Nothing is invented on the way out.** No `trigger`: the Claude path reads
+  auto-vs-manual off `compactMetadata`, the codex rollout records nothing
+  equivalent, and it does not log slash commands at all (0 slash-prefixed user
+  turns across 41 local rollouts). No token counts: `total_token_usage` is a
+  running SESSION total, not the live context size — the same reason the
+  ai_response path leaves `usageScope` unset — so it cannot say how big the
+  context was before the reset. Manufacturing either would be the same class of
+  mistake as the false `developing` this undoes.
+- A delegated thread's compaction is the subagent's context wall, not the
+  human's, and is dropped like its prompts and answers.
+- **No wire widening.** `context_compact` was already allowlisted on both sides,
+  projecting `summary` and `trigger`.
+- **`resetEvents` stays false, deliberately.** That map is static per
+  source-family with no capture-version awareness, so flipping it now would
+  claim the capability for every codex session already captured by an older
+  build. It waits until the fleet is on this one.
+
+Verified by replaying all 41 local rollouts through the normalizer: 6
+`context_compact` emitted, and the 2 not emitted are both in one subagent
+thread — 8 total, every compaction accounted for.
+
 ### Fixed
 
 **We wrapped their statusline and then replaced it anyway.** The shim runs the
@@ -67,6 +114,32 @@ dashboard days later.
 - Re-wrapping is only defensible because the wrap is now genuinely transparent.
   If that stops being true, this heal becomes a takeover on a timer and must be
   removed with it.
+
+**Global state was keyed to a directory designed to stop being global.**
+`~/.claude/settings.json` is machine-global and has no workspace concept, but
+its wrap record, render cache and lock were keyed to `StateDir()` — whose
+per-workspace branch is documented as a future mode waiting to be lit up. The
+day it is, one `settings.json` gets two disagreeing records: `statusline
+disable` in one workspace leaves the other workspace's daemon still believing it
+is enabled and re-wrapping. A lock keyed to something narrower than what it
+guards is not a lock. `state.GlobalStateDir()` draws the distinction now, with
+identical behaviour today — which is why it had to be drawn before it was
+reachable.
+
+**One repo's statusline could render another repo's branch.** The last-good
+render cache above arrived as a single machine-wide entry keyed only on the
+command fingerprint, and two sessions in different repos run the same command
+string — so a failed tick in one repo redrew the other repo's line. The cache is
+now per session, in the shape already used for the context spools, swept by the
+same pruner, with the old single file migrated.
+
+**`claude watch` never released a transcript processor.** One
+`*ClaudeTranscriptProcessor` accumulated per transcript ever seen and none was
+ever freed, including after its transcript aged out of the rolling history
+window — unbounded growth on a daemon meant to run for weeks across many
+projects. Entries absent for two consecutive polls are now evicted, flushing any
+pending accumulated message first; two polls rather than one so that a single
+`filepath.Walk` hiccup cannot drop live state.
 
 ## [0.22.0] — 2026-08-26
 
@@ -2255,7 +2328,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.19.0...v0.20.0
