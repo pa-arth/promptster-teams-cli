@@ -492,7 +492,12 @@ func TestPollClaudeTranscriptsChunksBackfill(t *testing.T) {
 // removing an entry once its transcript stopped being a candidate (aged out of
 // the rolling history window, or was cleaned up). Over a multi-day daemon
 // uptime across many projects that map only grew. This proves an entry is
-// evicted the moment its transcript drops out of the candidate set.
+// evicted once its transcript is absent from the candidate set for
+// claudeProcessorMissThreshold consecutive polls — and, per review on #195,
+// that a SINGLE miss (candidateClaudeTranscripts' filepath.Walk silently
+// drops a path on any transient per-entry error) does NOT evict: that used to
+// force-flush and discard in-flight state for a transcript that was still
+// genuinely in-window and simply reappeared next poll.
 func TestPollClaudeTranscriptsEvictsProcessorsForTranscriptsNoLongerCandidates(t *testing.T) {
 	root := claudeProjectsRoot(t)
 	stateDir := t.TempDir()
@@ -504,6 +509,7 @@ func TestPollClaudeTranscriptsEvictsProcessorsForTranscriptsNoLongerCandidates(t
 	ws := resolvePath(workspace)
 	path, _ := writeClaudeHistory(t, root, ws, "aging-out.jsonl", 2)
 	key := claudeProgressKey(path)
+	t.Cleanup(func() { delete(claudeProcessorMisses, key) })
 
 	session := Session{DeviceID: "sess-evict", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: time.Now()}
 	cutoff := transcriptHistoryCutoff(time.Now().UTC())
@@ -522,9 +528,16 @@ func TestPollClaudeTranscriptsEvictsProcessorsForTranscriptsNoLongerCandidates(t
 		t.Fatal(err)
 	}
 
+	// One miss (e.g. a single filepath.Walk hiccup) must NOT evict yet.
+	pollClaudeTranscripts(session, ws, cutoff, processors, true, false)
+	if _, ok := processors[key]; !ok {
+		t.Fatalf("processor for %q was evicted after a single missed poll; want it retained through the grace period", key)
+	}
+
+	// A second consecutive miss confirms genuine absence and evicts.
 	pollClaudeTranscripts(session, ws, cutoff, processors, true, false)
 	if _, ok := processors[key]; ok {
-		t.Fatalf("processor for a transcript no longer a candidate must be evicted; map still holds %d entr(ies): %v", len(processors), processors)
+		t.Fatalf("processor for a transcript absent %d consecutive polls must be evicted; map still holds %d entr(ies): %v", claudeProcessorMissThreshold, len(processors), processors)
 	}
 }
 

@@ -71,6 +71,20 @@ const claudeDegradedByteThreshold = 256 * 1024
 // const, so a test can lower it.
 var claudeWatchMaxBytesPerPoll int64 = 8 << 20
 
+// claudeProcessorMissThreshold is how many CONSECUTIVE polls a transcript may
+// be absent from candidateClaudeTranscripts before pollClaudeTranscripts
+// evicts its processor. See the eviction loop at the end of that function for
+// why one miss is not enough: filepath.Walk drops a path on any transient
+// per-entry error, not just genuine window expiry.
+const claudeProcessorMissThreshold = 2
+
+// claudeProcessorMisses counts consecutive misses per transcript key, keyed
+// like `processors`. It shares that map's daemon-lifetime scope but is kept
+// separate (rather than a field on the map's value) to avoid touching
+// normalize.ClaudeTranscriptProcessor and every call site that constructs a
+// `processors` literal.
+var claudeProcessorMisses = map[string]int{}
+
 // transcriptMaxRecordBytes is the largest JSONL record the transcript readers
 // support. A larger record cannot be parsed safely within one bounded poll, so
 // it is discarded in bounded chunks rather than making every future poll reread
@@ -937,8 +951,24 @@ func pollClaudeTranscripts(
 	// such justification. Flush first (like the SIGTERM path does) so an
 	// in-flight assistant message isn't dropped just because its transcript
 	// fell out of the window on this exact poll.
+	//
+	// Require claudeProcessorMissThreshold CONSECUTIVE absences, not one:
+	// candidateClaudeTranscripts' filepath.Walk silently drops a path on ANY
+	// per-entry error (a transient I/O error, a permission hiccup, a
+	// rename-race stat mismatch), for that one poll only. Evicting on a single
+	// miss force-flushed and discarded in-flight state — a partial assistant
+	// message, tool calls awaiting their results — for a transcript that was
+	// still genuinely in-window and simply reappeared on the very next walk.
+	// At the 3s poll interval two consecutive misses costs ~6s of extra
+	// eviction latency once a transcript is genuinely gone, which is what
+	// actually bounds the leak — while absorbing one-off walk hiccups.
 	for key, proc := range processors {
 		if liveKeys[key] {
+			delete(claudeProcessorMisses, key)
+			continue
+		}
+		claudeProcessorMisses[key]++
+		if claudeProcessorMisses[key] < claudeProcessorMissThreshold {
 			continue
 		}
 		for _, ev := range proc.FlushStale(0) {
@@ -948,6 +978,7 @@ func pollClaudeTranscripts(
 			}
 		}
 		delete(processors, key)
+		delete(claudeProcessorMisses, key)
 	}
 
 	if deferredWork && verboseWatch() {
