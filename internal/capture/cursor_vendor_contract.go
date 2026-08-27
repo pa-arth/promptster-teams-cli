@@ -96,7 +96,7 @@ type CursorVendorAbsenceReason string
 const (
 	// CursorVendorAbsenceCredentialAbsent: no Cursor credential in the local
 	// application state on this device.
-	CursorVendorAbsenceCredentialAbsent CursorVendorAbsenceReason = "credential_absent"
+	CursorVendorAbsenceCredentialAbsent CursorVendorAbsenceReason = "credential_absent" // #nosec G101 -- an absence REASON, not a credential; the value never holds one
 
 	// CursorVendorAbsenceCredentialExpired: a credential was found but is expired
 	// and could not be refreshed.
@@ -104,7 +104,7 @@ const (
 	// Attributed to the CREDENTIAL, never rendered as the provider declining to
 	// report. A collector that discovers expiry by getting a 401 and going quiet
 	// emits a gap indistinguishable from "the engineer stopped using Cursor".
-	CursorVendorAbsenceCredentialExpired CursorVendorAbsenceReason = "credential_expired"
+	CursorVendorAbsenceCredentialExpired CursorVendorAbsenceReason = "credential_expired" // #nosec G101 -- an absence REASON, not a credential; the value never holds one
 
 	// CursorVendorAbsencePlatformUnsupported: the collector does not support this
 	// platform. v1 ships macOS only — the credential store's location and
