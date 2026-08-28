@@ -195,7 +195,7 @@ func BuildSigningMessage(e event.Event, prevSigHex string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	dataHash := sha256.Sum256(dataBytes) // lgtm[go/weak-sensitive-data-hashing] event integrity digest, not password storage.
+	dataHash := sha256.Sum256(dataBytes) // lgtm[go/weak-sensitive-data-hashing]
 	sourceIntegration := ""
 	if e.Source != "" {
 		sourceIntegration = e.Source

@@ -456,7 +456,7 @@ func cursorVendorAbsenceSnapshotID(deviceID string, reason CursorVendorAbsenceRe
 		cycleStart.UTC().Format(cursorVendorCycleTimeFormat),
 		cycleEnd.UTC().Format(cursorVendorCycleTimeFormat),
 	}, cursorVendorRecordSep)
-	sum := sha256.Sum256([]byte(canonical)) // lgtm[go/weak-sensitive-data-hashing] protocol digest/id, not password storage.
+	sum := sha256.Sum256([]byte(canonical)) // lgtm[go/weak-sensitive-data-hashing]
 	return hex.EncodeToString(sum[:])
 }
 
