@@ -35,6 +35,7 @@ var promptsterEventNamespace = [16]byte{
 // exactly-once.
 func DeterministicUUID(name string) string {
 	// #nosec G401 -- SHA-1 is mandated by RFC 4122 for v5 UUIDs; not a security use.
+	// lgtm[go/weak-sensitive-data-hashing] RFC 4122 v5 identity, never password storage.
 	h := sha1.New()
 	_, _ = h.Write(promptsterEventNamespace[:])
 	_, _ = h.Write([]byte(name))

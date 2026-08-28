@@ -448,6 +448,7 @@ func buildCursorVendorAbsenceEvent(deviceID string, reason CursorVendorAbsenceRe
 // ongoing condition rather than as a stream of distinct incidents.
 func cursorVendorAbsenceSnapshotID(deviceID string, reason CursorVendorAbsenceReason,
 	cycleStart, cycleEnd time.Time) string {
+	// lgtm[go/weak-sensitive-data-hashing] SHA-256 is a protocol digest/id, never password storage.
 	sum := sha256.Sum256([]byte(strings.Join([]string{
 		cursorVendorSnapshotDigestVersion,
 		"absent",

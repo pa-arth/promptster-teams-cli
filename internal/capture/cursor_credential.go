@@ -51,8 +51,7 @@ const (
 	// Cursor variable (same status as PROMPTSTER_CURSOR_HOME). It exists so the
 	// unsupported-platform, absent-key and expiry branches are exercised on a
 	// machine that ships the supported one.
-	cursorStateDBEnv     = "PROMPTSTER_CURSOR_STATE_DB"
-	cursorVersionFileEnv = "PROMPTSTER_CURSOR_VERSION_FILE"
+	cursorStateDBEnv = "PROMPTSTER_CURSOR_STATE_DB"
 
 	// cursorCredentialReadTimeout bounds the whole store read. The measured read
 	// is 8ms against a 1GB store; anything approaching this bound means the
@@ -64,14 +63,10 @@ const (
 // cursorApplicationVersion reads installation metadata, never application
 // state. Missing metadata is represented as an omitted version on the wire.
 func cursorApplicationVersion() string {
-	path := os.Getenv(cursorVersionFileEnv)
-	if path == "" {
-		if runtime.GOOS != "darwin" {
-			return ""
-		}
-		path = "/Applications/Cursor.app/Contents/Resources/app/package.json"
+	if runtime.GOOS != "darwin" {
+		return ""
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- fixed application metadata path or test-only override.
+	b, err := os.ReadFile("/Applications/Cursor.app/Contents/Resources/app/package.json")
 	if err != nil {
 		return ""
 	}
