@@ -448,15 +448,15 @@ func buildCursorVendorAbsenceEvent(deviceID string, reason CursorVendorAbsenceRe
 // ongoing condition rather than as a stream of distinct incidents.
 func cursorVendorAbsenceSnapshotID(deviceID string, reason CursorVendorAbsenceReason,
 	cycleStart, cycleEnd time.Time) string {
-	// lgtm[go/weak-sensitive-data-hashing] SHA-256 is a protocol digest/id, never password storage.
-	sum := sha256.Sum256([]byte(strings.Join([]string{
+	canonical := strings.Join([]string{
 		cursorVendorSnapshotDigestVersion,
 		"absent",
 		deviceID,
 		string(reason),
 		cycleStart.UTC().Format(cursorVendorCycleTimeFormat),
 		cycleEnd.UTC().Format(cursorVendorCycleTimeFormat),
-	}, cursorVendorRecordSep)))
+	}, cursorVendorRecordSep)
+	sum := sha256.Sum256([]byte(canonical)) // lgtm[go/weak-sensitive-data-hashing] protocol digest/id, not password storage.
 	return hex.EncodeToString(sum[:])
 }
 
