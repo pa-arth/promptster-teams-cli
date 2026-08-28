@@ -64,6 +64,8 @@ var projectUsageFields = []string{
 // newString, content, stdout/stderr, tool args/results, assistant text) are
 // listed for NO kind, so they can never survive projection.
 var projectFieldAllowlist = map[string][]string{
+	"cursorVendorUsage":    {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId"},
+	"cursorVendorSnapshot": {"snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason"},
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
 	// followsInterrupt is a boolean flag marking a redirect prompt (the one
@@ -157,7 +159,7 @@ var projectFieldAllowlist = map[string][]string{
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
 	// what structurally guarantees no diff/text bytes ride along.
-	"file_diff":   {"path", "linesAdded", "linesRemoved", "lineRanges", "agentId"},
+	"file_diff":   {"path", "linesAdded", "linesRemoved", "lineRanges", "agentId", "changeType"},
 	"file_create": {"path", "linesAdded", "sizeBytes", "agentId"},
 	// credentialKeys is the KEY NAMES harvested on-device from a dotenv-class
 	// file the agent read — {"STRIPE_SECRET_KEY", "DATABASE_URL"}, never a value.
@@ -429,10 +431,29 @@ type stringArrayClamp struct {
 // length. The guarantee that no value is ever a candidate comes from the
 // producer — normalize.HarvestCredentialKeyNames discards every right-hand side.
 var projectStringArrayClamp = map[string]map[string]stringArrayClamp{
+	"cursorVendorSnapshot": {
+		"shapeObservedFields": {maxItems: 64, maxLength: 64, allow: isShapeFieldName},
+		"shapeMissingFields":  {maxItems: 64, maxLength: 64, allow: isShapeFieldName},
+	},
 	"file_read": {
 		"credentialKeys": {maxItems: 40, maxLength: 64, allow: isIdentifierName},
 	},
 }
+
+func isShapeFieldName(s string) bool {
+	if s == "" || len(s) > 64 || !isASCIIAlpha(s[0]) {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		c := s[i]
+		if !isASCIIAlpha(c) && (c < '0' || c > '9') && c != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIAlpha(c byte) bool { return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' }
 
 // isIdentifierName — leading letter/underscore, then word characters. Mirrors
 // normalize.isIdentifierName and the backend's `/^[A-Za-z_][A-Za-z0-9_]*$/`.

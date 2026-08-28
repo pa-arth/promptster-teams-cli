@@ -90,6 +90,7 @@ type Ingest struct {
 
 type apiResponse struct {
 	CaptureAssistantProse bool   `json:"captureAssistantProse"`
+	CursorVendorUsage     bool   `json:"cursorVendorUsage"`
 	AutoUpdate            *bool  `json:"autoUpdate"`
 	PinnedCliVersion      string `json:"pinnedCliVersion"`
 	MinCliVersion         string `json:"minCliVersion"`
@@ -105,6 +106,7 @@ type apiResponse struct {
 // apiResponse.
 type diskCache struct {
 	CaptureAssistantProse bool      `json:"captureAssistantProse"`
+	CursorVendorUsage     bool      `json:"cursorVendorUsage"`
 	AutoUpdate            *bool     `json:"autoUpdate"`
 	PinnedCliVersion      string    `json:"pinnedCliVersion"`
 	MinCliVersion         string    `json:"minCliVersion"`
@@ -118,9 +120,10 @@ type diskCache struct {
 type Resolver struct {
 	apiKey string
 
-	mu        sync.Mutex
-	value     bool
-	fetchedAt time.Time // time of the last SUCCESSFUL fetch (zero = never)
+	mu                sync.Mutex
+	value             bool
+	cursorVendorUsage bool
+	fetchedAt         time.Time // time of the last SUCCESSFUL fetch (zero = never)
 
 	// autoUpdate is the org's self-update switch. It defaults to true and is
 	// only flipped off by an explicit `autoUpdate:false` from the backend, so an
@@ -150,6 +153,7 @@ func NewResolver(apiKey string) *Resolver {
 	if c, ok := readDiskCache(); ok {
 		if time.Since(c.FetchedAt) < cacheTTL {
 			r.value = c.CaptureAssistantProse
+			r.cursorVendorUsage = c.CursorVendorUsage
 			r.fetchedAt = c.FetchedAt
 			// TTL-gated like prose, not TTL-free like the self-update fields. An
 			// aged-out capability resolves to per-event, which every backend
@@ -165,6 +169,15 @@ func NewResolver(apiKey string) *Resolver {
 		r.minCliVersion = c.MinCliVersion
 	}
 	return r
+}
+
+// CursorVendorUsage reports whether the account-credential collector is
+// affirmatively permitted by a fresh policy response. Like assistant prose it
+// fails closed on startup, parse/network failure, and cache expiry.
+func (r *Resolver) CursorVendorUsage() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.cursorVendorUsage && !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
 }
 
 // CaptureAssistantProse returns the current policy WITHOUT any network call:
@@ -243,6 +256,15 @@ func (r *Resolver) BatchIngest() (endpoint string, maxSize int, ok bool) {
 func (r *Resolver) StartBackground(ctx context.Context) {
 	go func() {
 		r.Refresh()
+		r.StartBackgroundAfterRefresh(ctx)
+	}()
+}
+
+// StartBackgroundAfterRefresh starts only the recurring portion of policy
+// refresh. It is for a caller that must await the first policy decision before
+// starting a sensitive collector, avoiding two simultaneous initial requests.
+func (r *Resolver) StartBackgroundAfterRefresh(ctx context.Context) {
+	go func() {
 		ticker := time.NewTicker(RefreshInterval)
 		defer ticker.Stop()
 		for {
@@ -279,6 +301,7 @@ func (r *Resolver) Refresh() {
 	}
 	r.mu.Lock()
 	r.value = parsed.CaptureAssistantProse
+	r.cursorVendorUsage = parsed.CursorVendorUsage
 	r.fetchedAt = now
 	r.autoUpdate = autoUpdate
 	r.pinnedCliVersion = parsed.PinnedCliVersion
@@ -291,6 +314,7 @@ func (r *Resolver) Refresh() {
 	r.mu.Unlock()
 	writeDiskCache(diskCache{
 		CaptureAssistantProse: parsed.CaptureAssistantProse,
+		CursorVendorUsage:     parsed.CursorVendorUsage,
 		AutoUpdate:            parsed.AutoUpdate,
 		PinnedCliVersion:      parsed.PinnedCliVersion,
 		MinCliVersion:         parsed.MinCliVersion,

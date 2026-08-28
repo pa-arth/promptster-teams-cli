@@ -190,3 +190,121 @@ func CursorVendorPlatformSupported(goos string) bool {
 	}
 	return false
 }
+
+// ---------------------------------------------------------------------------
+// The restatement protocol — VENDOR ROWS ARE MUTABLE.
+//
+// Mirrors §7 of the TypeScript contract (backend 559beb3e). Measured
+// 2026-08-27: a conversation carrying one row at `timestamp=1787873137139`
+// (inputTokens 104089, chargedCents 48.5714) carried THREE rows twenty minutes
+// later — different timestamps, different counts, a different total. Cursor
+// re-aggregates after the fact and nothing in the payload marks a row as
+// provisional.
+//
+// SO `(conversationId, timestamp)` IS ROW CONTENT, NOT ROW IDENTITY, and the
+// append-only self-dedup this change was originally drafted with is wrong in
+// both directions: keyed tightly it double-counts a rewritten row (new
+// timestamp reads as a new row), keyed loosely it pins a stale cost forever.
+//
+// What replaces it is a LATEST SNAPSHOT. Every cycle re-reads the whole current
+// billing period, hashes the canonical row set plus the cycle's identity into a
+// `snapshotId`, stages each row under `snapshotId + ordinal`, and closes with a
+// completion record carrying the row count and a content digest. Two identical
+// polls produce the same `snapshotId` and dedup on the backend's ordinary event
+// idempotency; a rewritten, split, or deleted row produces a NEW snapshot that
+// supersedes the last one whole. There is no partial update and no arithmetic
+// against a prior state.
+// ---------------------------------------------------------------------------
+
+const (
+	// CursorVendorUsageEventKind carries one STAGED row. A staged row is not a
+	// measurement until the completion record below validates — that is the
+	// whole reason the two kinds are separate.
+	CursorVendorUsageEventKind = "cursorVendorUsage"
+
+	// CursorVendorSnapshotEventKind is the atomic commit marker for a complete
+	// current-billing-period reread.
+	CursorVendorSnapshotEventKind = "cursorVendorSnapshot"
+
+	// CursorVendorSnapshotStatusComplete: the period was read in full and the
+	// staged rows are the period.
+	CursorVendorSnapshotStatusComplete = "complete"
+
+	// CursorVendorSnapshotStatusAbsent: nothing was measured, and the record
+	// says WHY. It stages no rows and must never activate an empty snapshot over
+	// the last good one — an absence is a fact about the collector, not a
+	// restatement of the account to zero.
+	CursorVendorSnapshotStatusAbsent = "absent"
+
+	// CursorVendorQuotaProvider is the `quotaProvider` literal. It is the TOOL,
+	// not the rail: the quota reading is account-scoped and the same figure
+	// whichever rail reports it.
+	CursorVendorQuotaProvider = "cursor"
+)
+
+// cursorVendorSnapshotRowFields is the emitted key set for a staged row, in the
+// contract's order.
+//
+// FLATTENED, and the flattening is a projection requirement rather than a
+// style. The vendor nests its counts under `tokenUsage`; the device's
+// default-deny projector admits KEYS, and admitting `tokenUsage` would admit
+// whatever arbitrary object the vendor puts there — including fields nobody has
+// seen. Four named scalars carry the same numbers and nothing else.
+var cursorVendorSnapshotRowFields = []string{
+	"snapshotId",
+	"ordinal",
+	"usageScope",
+	"timestamp",
+	"model",
+	"kind",
+	"conversationId",
+	"isHeadless",
+	"chargedCents",
+	"inputTokens",
+	"outputTokens",
+	"cacheReadTokens",
+	"totalCents",
+	"isTokenBasedCall",
+	"isChargeable",
+	"owningUser",
+	"subscriptionProductId",
+}
+
+// cursorVendorSnapshotCompletionFields is the emitted key set for the
+// completion record, in the contract's order. `quota*` and `shape*` are the
+// flattened forms of the contract's nested `quota` and `shape` objects, for the
+// same projection reason as the row above.
+var cursorVendorSnapshotCompletionFields = []string{
+	"snapshotId",
+	"status",
+	"capturedAt",
+	"billingCycleStartsAt",
+	"billingCycleResetsAt",
+	"rowCount",
+	"contentSha256",
+	"quotaProvider",
+	"quotaCycleResetsAt",
+	"quotaSpendCents",
+	"quotaCapCents",
+	"quotaVendorStatedPercentUsed",
+	"quotaAbsenceReason",
+	"shapeObservedFields",
+	"shapeMissingFields",
+	"shapeCursorVersion",
+	"shapeHttpStatus",
+	"absenceReason",
+}
+
+// CursorVendorSnapshotRowFields returns the staged-row key set, as a copy.
+func CursorVendorSnapshotRowFields() []string {
+	out := make([]string, len(cursorVendorSnapshotRowFields))
+	copy(out, cursorVendorSnapshotRowFields)
+	return out
+}
+
+// CursorVendorSnapshotCompletionFields returns the completion key set, as a copy.
+func CursorVendorSnapshotCompletionFields() []string {
+	out := make([]string, len(cursorVendorSnapshotCompletionFields))
+	copy(out, cursorVendorSnapshotCompletionFields)
+	return out
+}

@@ -200,6 +200,30 @@ re-uploads months of unbounded history.
 
 ## Cursor egresses counts, never code
 
+### Cursor vendor-usage credential and egress disclosure
+
+On macOS, the background watcher also measures the engineer's current Cursor
+billing period every 15 minutes when the organization policy explicitly permits
+`cursorVendorUsage`. It creates a private copy-on-write temporary clone of
+`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (falling
+back to a byte copy), reads only `cursorAuth/accessToken` and
+`cursorAuth/refreshToken` from that clone, then deletes it. It never opens the
+live database and never reads neighbouring keys.
+
+The credential is used only as an Authorization header for three operations at
+`api2.cursor.sh`: `GetTeams` (to refuse individual-account collection for Teams
+accounts), `GetCurrentPeriodUsage`, and paginated `GetFilteredUsageEvents`. The
+credential never enters an event, log, error, request body, or Promptster
+request. This is the CLI's first outbound host other than Promptster and GitHub,
+and the endpoint is undocumented; the customer's acceptance of possible Cursor
+agreement consequences is contractual risk that disabling the collector cannot
+undo. Operationally, the policy kill switch stops calls within the 15-minute
+cache TTL.
+
+This disclosure is repeated during enrollment and retained here so it remains
+available after the enrollment output is gone. It describes the operations our
+code performs; it does not claim the credential itself is read-only.
+
 **This is the constraint the whole Cursor port exists under, and the hook rail
 makes it sharper, not looser** — a hook payload hands us *more* code than a
 transcript does, not less. The hiring CLI's `buildDiffFromCursorEdits()`
@@ -388,4 +412,3 @@ being re-read, (b) a rough events-per-device figure from the table above, and (c
 what makes it worth a fleet-wide replay. A bump with no declared cost is
 indistinguishable from an accident, which is exactly how this one was diagnosed —
 after the fact, from a backlog.
-

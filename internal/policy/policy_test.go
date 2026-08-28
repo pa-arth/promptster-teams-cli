@@ -4,7 +4,24 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestCursorVendorUsageFailsClosedAndExpires(t *testing.T) {
+	r := &Resolver{}
+	if r.CursorVendorUsage() {
+		t.Fatal("never-fetched policy permitted collector")
+	}
+	r.cursorVendorUsage = true
+	r.fetchedAt = time.Now()
+	if !r.CursorVendorUsage() {
+		t.Fatal("fresh affirmative policy did not permit collector")
+	}
+	r.fetchedAt = time.Now().Add(-cacheTTL - time.Second)
+	if r.CursorVendorUsage() {
+		t.Fatal("expired policy remained permission")
+	}
+}
 
 // setup points the resolver at a test server + a scratch state dir.
 func setup(t *testing.T, handler http.HandlerFunc) {

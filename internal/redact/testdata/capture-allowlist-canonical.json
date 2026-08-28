@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:169806cfab70c949e52612a6922ad0231ff400831d5d9e8a59983ac019775e57",
+  "checksum": "sha256:061d85b915f5194b70ae466081696eb9ae19ac9f50e6b936aeeaafb286e9a980",
   "counts": {
-    "kinds": 45,
-    "fields": 214,
+    "kinds": 47,
+    "fields": 250,
     "elementFields": 37
   },
   "kinds": {
@@ -133,6 +133,61 @@
         "trigger"
       ]
     },
+    "cursorVendorSnapshot": {
+      "fields": [
+        "snapshotId",
+        "status",
+        "capturedAt",
+        "billingCycleStartsAt",
+        "billingCycleResetsAt",
+        "rowCount",
+        "contentSha256",
+        "quotaProvider",
+        "quotaCycleResetsAt",
+        "quotaSpendCents",
+        "quotaCapCents",
+        "quotaVendorStatedPercentUsed",
+        "quotaAbsenceReason",
+        "shapeObservedFields",
+        "shapeMissingFields",
+        "shapeCursorVersion",
+        "shapeHttpStatus",
+        "absenceReason"
+      ],
+      "stringArrays": {
+        "shapeMissingFields": {
+          "maxItems": 64,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9.]*$"
+        },
+        "shapeObservedFields": {
+          "maxItems": 64,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9.]*$"
+        }
+      }
+    },
+    "cursorVendorUsage": {
+      "fields": [
+        "snapshotId",
+        "ordinal",
+        "usageScope",
+        "timestamp",
+        "model",
+        "kind",
+        "conversationId",
+        "isHeadless",
+        "chargedCents",
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens",
+        "totalCents",
+        "isTokenBasedCall",
+        "isChargeable",
+        "owningUser",
+        "subscriptionProductId"
+      ]
+    },
     "decision_event": {
       "fields": [
         "title",
@@ -220,7 +275,8 @@
         "linesAdded",
         "linesRemoved",
         "lineRanges",
-        "agentId"
+        "agentId",
+        "changeType"
       ],
       "arrayElements": {
         "lineRanges": [
