@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,86 @@ func TestGetTeamsRefusesTeamAndSendsCredentialOnlyInHeader(t *testing.T) {
 	onTeam, err := client.cursorAccountIsOnTeam(cursorCredential{token: secret})
 	if err != nil || !onTeam {
 		t.Fatalf("onTeam=%v err=%v", onTeam, err)
+	}
+}
+
+func TestCursorVendorCallRefusesNonFirstPartyOriginsBeforeTransport(t *testing.T) {
+	secret := "cursor-secret-must-not-egress"
+	malicious := []string{
+		"http://api2.cursor.sh",
+		"https://evil.example",
+		"https://api2.cursor.sh.evil.example",
+		"https://api2.cursor.sh@evil.example",
+		"https://evil.example@api2.cursor.sh",
+		"https://api2.cursor.sh:443",
+		"https://api2.cursor.sh/prefix",
+		"https://api2.cursor.sh?next=https://evil.example",
+		"https://api2.cursor.sh#evil",
+	}
+	for _, base := range malicious {
+		t.Run(base, func(t *testing.T) {
+			called := false
+			client := &cursorVendorClient{base: base, http: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				called = true
+				return response(`{}`), nil
+			})}}
+			_, _, err := client.call(cursorCredential{token: secret}, cursorMethodTeams, map[string]any{})
+			if err == nil {
+				t.Fatal("unsafe origin accepted")
+			}
+			if called {
+				t.Fatal("transport received a credential-bearing request")
+			}
+			if strings.Contains(err.Error(), secret) {
+				t.Fatal("credential leaked through validation error")
+			}
+		})
+	}
+}
+
+func TestCursorVendorCallAllowsFirstPartyOriginWithInjectedTransport(t *testing.T) {
+	called := false
+	client := &cursorVendorClient{base: cursorVendorAPIDefaultBase, http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		called = true
+		if r.URL.Scheme != "https" || r.URL.Host != "api2.cursor.sh" {
+			t.Fatalf("unexpected origin: %s", r.URL)
+		}
+		return response(`{}`), nil
+	})}}
+	if _, _, err := client.call(cursorCredential{token: "test-only"}, cursorMethodTeams, map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("injected transport was not exercised")
+	}
+}
+
+func TestCursorVendorCallNeverFollowsRedirectWithBearer(t *testing.T) {
+	calls := 0
+	client := &cursorVendorClient{base: cursorVendorAPIDefaultBase, http: &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			t.Fatal("call did not replace a caller-supplied redirect policy")
+			return nil
+		},
+		Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if calls > 1 {
+				t.Fatalf("bearer followed redirect to %s", r.URL)
+			}
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://evil.example/steal"}},
+				Body:       io.NopCloser(bytes.NewBufferString("redirect")),
+				Request:    r,
+			}, nil
+		}),
+	}}
+	_, status, err := client.call(cursorCredential{token: "must-stay-first-party"}, cursorMethodTeams, map[string]any{})
+	if err == nil || status != http.StatusFound {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	if calls != 1 {
+		t.Fatalf("transport calls=%d, want 1", calls)
 	}
 }
 

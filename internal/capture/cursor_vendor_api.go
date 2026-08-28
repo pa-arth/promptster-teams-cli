@@ -7,10 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
+	"net/url"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -33,11 +32,9 @@ import (
 // sees this response, so a server-side monitor has no subject without it.
 
 const (
-	// cursorVendorAPIDefaultBase is the vendor host. Overridable ONLY so the
-	// tests can point at an httptest server; there is no production
-	// configuration in which this points anywhere else.
+	// cursorVendorAPIDefaultBase is the ONLY origin that may receive the bearer.
+	// Tests inject an http.RoundTripper instead of changing this origin.
 	cursorVendorAPIDefaultBase = "https://api2.cursor.sh"
-	cursorVendorAPIBaseEnv     = "PROMPTSTER_CURSOR_API_URL"
 
 	// The three methods this collector calls. THIS LIST IS THE BOUNDARY, and it
 	// is one constant away from being wider — which is exactly why the
@@ -69,13 +66,6 @@ const (
 	// cursorVendorMaxBodyBytes bounds one response.
 	cursorVendorMaxBodyBytes = 32 << 20
 )
-
-func cursorVendorAPIBase() string {
-	if v := os.Getenv(cursorVendorAPIBaseEnv); v != "" {
-		return strings.TrimSuffix(v, "/")
-	}
-	return cursorVendorAPIDefaultBase
-}
 
 // cursorVendorHTTPError is a non-200. It carries the STATUS and never the body:
 // an error body from an auth endpoint is exactly the string most likely to
@@ -109,8 +99,22 @@ type cursorVendorClient struct {
 func newCursorVendorClient() *cursorVendorClient {
 	return &cursorVendorClient{
 		http: &http.Client{Timeout: cursorVendorHTTPTimeout},
-		base: cursorVendorAPIBase(),
+		base: cursorVendorAPIDefaultBase,
 	}
+}
+
+// validatedCursorVendorOrigin is the last gate before a Cursor bearer can be
+// attached to a request. The exact-origin check is intentionally repeated per
+// call: even an accidentally mutable/test-constructed client cannot redirect a
+// credential. No environment override exists in production; tests preserve the
+// first-party URL and inject a RoundTripper instead.
+func validatedCursorVendorOrigin(raw string) (*url.URL, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme != "https" || u.Hostname() != "api2.cursor.sh" ||
+		u.Port() != "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("cursor vendor RPC: refused non-first-party origin")
+	}
+	return u, nil
 }
 
 // call issues one RPC and returns the raw body plus the status.
@@ -119,11 +123,15 @@ func newCursorVendorClient() *cursorVendorClient {
 // line below. It is never in the URL, never in the body, never in a returned
 // error, and never in anything this function logs — which is nothing.
 func (c *cursorVendorClient) call(cred cursorCredential, method string, payload any) ([]byte, int, error) {
+	origin, err := validatedCursorVendorOrigin(c.base)
+	if err != nil {
+		return nil, 0, err
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.base+method, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, origin.String()+method, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -133,7 +141,15 @@ func (c *cursorVendorClient) call(cred cursorCredential, method string, payload 
 	// what a first-party client sends and the wire probe used it.
 	req.Header.Set("Connect-Protocol-Version", "1")
 
-	resp, err := c.http.Do(req)
+	// Refuse every redirect. Origin validation above protects the initial
+	// request; this protects the second request net/http would otherwise create
+	// from a vendor-controlled Location header. Clone the client so the security
+	// rule cannot be weakened by a caller/test mutating CheckRedirect.
+	httpClient := *c.http
+	httpClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		// net/http wraps the request URL into transport errors, never the
 		// headers — but the error is replaced anyway rather than reasoned about,
