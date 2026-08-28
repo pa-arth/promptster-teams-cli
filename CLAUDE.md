@@ -1,5 +1,60 @@
 # promptster-teams-cli
 
+## Port initiative — bring git-ai's attribution model here (started 2026-07-17)
+
+**The bet:** this CLI stops being *only* a transcript-tailing reporter and gains
+git-ai's crown jewel — trustworthy, line-level AI-vs-human attribution written
+into git itself. We are translating the *ideas* from `git-ai` (the Rust engine
+at `~/repos/git-ai`), **not** the code: different language, different runtime.
+Its model — checkpoint the working tree, diff pre/post edit, attest which line
+ranges are AI vs human, persist that as a git note — is exactly what we want.
+
+**Why, and not the status quo.** Today capture ships raw transcripts and the
+backend *infers*. git-ai proves you can know *exactly* which characters the AI
+wrote by diffing the file before and after each edit, and anchor that to commits
+via `refs/notes/ai`. That is a verifiable signal, not a guess, and it survives
+history rewrites. The teams FE already mocks a commit-joined attribution ledger;
+this initiative makes it real.
+
+**What we take from git-ai** (source architecture: `~/repos/git-ai/CLAUDE.md`):
+
+- **Attribution model** — character/line-level who-wrote-what via pre/post-edit
+  diffing.
+- **Checkpoint flow** — the three checkpoint kinds (untracked/legacy `human`,
+  `known_human`, `ai_agent`) that isolate exactly what the AI changed by
+  snapshotting before and after each edit.
+- **Latency / ingestion discipline** — git-ai's non-negotiables carry over: no
+  unbounded git spawns, nothing non-constant-time (no git call "per commit / per
+  file / per ref"), capture path stays sub-millisecond. We already tail with a
+  3s poll and no hooks — attribution must not regress that.
+
+**What we deliberately do NOT copy.** git-ai is trace2-driven and rewrites git's
+record from inside a git *proxy*. We are not a git proxy and will not become one.
+Attribution here is computed from the transcript capture we already have plus
+working-tree diffs — never by wrapping git.
+
+### Phase 1 — Write trustworthy notes locally (the whole bet rides here)
+
+- **1a. Attribution engine** — turn Claude Code jsonl capture into line-range →
+  AI/human attestations against the working tree.
+- **1b. Commit detection + note write** — detect the commit, write `refs/notes/ai`
+  in git-ai's `authorship/3.0.0` format.
+- **1c. History migration** — migrate notes correctly through squash / rebase /
+  cherry-pick.
+- **✅ Done when:** a local `git ai blame`-equivalent is correct on a repo *after
+  a squash-merge*. **This is the phase to be paranoid about** — wrong notes make
+  everything downstream confidently wrong.
+
+### Phase 2 — Get notes to the backend
+
+- **2a. Ship attribution** (ranges + agent/model + prompt pointer) over the
+  **existing event channel** — not GitHub.
+- **2b. Backend ingest** → a commit-joined attribution ledger (the thing the FE
+  mock already pretends exists).
+- **2c. Prompt bodies** — redact secrets, store, link prompt → line.
+- **✅ Done when:** the server can answer "which lines of commit X were AI, and
+  what prompt wrote them."
+
 ## Capture surfaces
 
 Capture is **transcript tailing only**. It installs no hooks, writes no
