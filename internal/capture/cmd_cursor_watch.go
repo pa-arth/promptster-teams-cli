@@ -286,7 +286,7 @@ func RunCursorWatcher() error {
 	go func() {
 		policyResolver.Refresh()
 		policyResolver.StartBackgroundAfterRefresh(policyCtx)
-		runCursorVendorUsageCollector(policyCtx, session, policyResolver)
+		runCursorVendorUsageCollector(policyCtx, session.DeviceID, policyResolver)
 	}()
 
 	if verboseWatch() {

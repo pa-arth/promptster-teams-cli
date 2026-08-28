@@ -71,7 +71,7 @@ func cursorApplicationVersion() string {
 		}
 		path = "/Applications/Cursor.app/Contents/Resources/app/package.json"
 	}
-	b, err := os.ReadFile(path)
+	b, err := os.ReadFile(path) // #nosec G304 -- fixed application metadata path or test-only override.
 	if err != nil {
 		return ""
 	}
@@ -303,7 +303,7 @@ func snapshotCursorStateDB(path string) (string, func(), error) {
 		return "", func() {}, err
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- directories require execute; 0700 is private.
 		cleanup()
 		return "", func() {}, err
 	}
@@ -335,7 +335,7 @@ func copyFile(src, dst string) error {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) // #nosec G304 -- destination is inside our private random temp dir.
 	if err != nil {
 		return err
 	}

@@ -19,8 +19,8 @@ const cursorVendorPollInterval = 15 * time.Minute
 // runCursorVendorUsageCollector performs one full current-period restatement
 // immediately and then at the policy-aligned 15 minute cadence. Credentials are
 // intentionally acquired inside pollCursorVendorUsage, once per cycle.
-func runCursorVendorUsageCollector(ctx context.Context, session Session, resolver *policy.Resolver) {
-	pollCursorVendorUsage(session, resolver, newCursorVendorClient(), time.Now().UTC())
+func runCursorVendorUsageCollector(ctx context.Context, deviceID string, resolver *policy.Resolver) {
+	pollCursorVendorUsage(deviceID, resolver, newCursorVendorClient(), time.Now().UTC())
 	ticker := time.NewTicker(cursorVendorPollInterval)
 	defer ticker.Stop()
 	for {
@@ -28,14 +28,14 @@ func runCursorVendorUsageCollector(ctx context.Context, session Session, resolve
 		case <-ctx.Done():
 			return
 		case capturedAt := <-ticker.C:
-			pollCursorVendorUsage(session, resolver, newCursorVendorClient(), capturedAt.UTC())
+			pollCursorVendorUsage(deviceID, resolver, newCursorVendorClient(), capturedAt.UTC())
 		}
 	}
 }
 
-func pollCursorVendorUsage(session Session, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
+func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
 	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(session.DeviceID, reason, capturedAt, start, end, shape))
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, reason, capturedAt, start, end, shape))
 	}
 	if !resolver.CursorVendorUsage() {
 		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
@@ -84,10 +84,10 @@ func pollCursorVendorUsage(session Session, resolver *policy.Resolver, client *c
 	}
 	snapshot := buildCursorVendorSnapshot(rows, start, end, quota, shape)
 	queuedAll := true
-	for _, ev := range snapshot.rowEvents(session.DeviceID) {
+	for _, ev := range snapshot.rowEvents(deviceID) {
 		queuedAll = queueCursorVendorEvent(ev) && queuedAll
 	}
-	queuedAll = queueCursorVendorEvent(snapshot.completionEvent(session.DeviceID, capturedAt, shape.CursorVersion)) && queuedAll
+	queuedAll = queueCursorVendorEvent(snapshot.completionEvent(deviceID, capturedAt, shape.CursorVersion)) && queuedAll
 	if queuedAll {
 		recordCursorVendorCostClaims(rows)
 	}
