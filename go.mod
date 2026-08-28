@@ -10,6 +10,7 @@ require (
 	github.com/pkoukk/tiktoken-go-loader v0.0.2
 	github.com/praetorian-inc/titus v1.2.7
 	golang.org/x/sys v0.47.0
+	modernc.org/sqlite v1.45.0
 )
 
 require (
@@ -48,5 +49,4 @@ require (
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
-	modernc.org/sqlite v1.45.0 // indirect
 )

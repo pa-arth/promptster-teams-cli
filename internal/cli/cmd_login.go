@@ -129,6 +129,7 @@ func cmdLogin(args []string) {
 	}
 
 	if startErr == nil {
+		printlnIndent(dimStyle.Render("Cursor vendor usage: every 15 min Promptster clones Cursor's local state.vscdb, reads only its two auth-token keys, and calls api2.cursor.sh usage, billing-period, and team-membership endpoints. The token is never sent to Promptster."))
 		enableAutostartOnLogin()
 		enableStatuslineOnLogin()
 	}

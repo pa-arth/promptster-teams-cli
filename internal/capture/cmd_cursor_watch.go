@@ -279,7 +279,15 @@ func RunCursorWatcher() error {
 	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
-	policyResolver.StartBackground(policyCtx)
+	// The vendor collector's first decision must follow a completed policy
+	// attempt. Starting it beside StartBackground would race the resolver's
+	// fail-closed zero value and defer an actually-permitted first measurement
+	// for fifteen minutes. Keep both network paths off the transcript hot loop.
+	go func() {
+		policyResolver.Refresh()
+		policyResolver.StartBackgroundAfterRefresh(policyCtx)
+		runCursorVendorUsageCollector(policyCtx, session, policyResolver)
+	}()
 
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "cursor-watcher: started, polling %s every %s (workspace=%s)\n",
@@ -779,6 +787,7 @@ func emitCursorEvent(ev event.Event, session Session, captureProse bool) int {
 	// sourced separately on purpose — collapsing them is what once made every
 	// session on a machine look like one session.
 	ev.DeviceID = session.DeviceID
+	suppressCursorHookCostIfVendorClaimed(&ev)
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 	// Cursor is ALWAYS live — the false below is a fact about this surface, not
 	// a default. Two independent reasons, either one sufficient: it never
