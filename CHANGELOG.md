@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.24.0] — 2026-08-27
+
+### Added
+
+- Added the opt-in Cursor vendor usage collector for individual Pro accounts.
+  It reads the current credential from Cursor's local macOS store each cycle,
+  calls only the three disclosed Cursor dashboard methods, and publishes
+  current-billing-period usage, quota, and shape-health snapshots.
+- Added fail-closed policy enforcement, explicit absence reasons, mutable
+  snapshot replacement, hook-rail cost deduplication, and credential-leak
+  guards for the new collector.
+
 ## [0.23.0] — 2026-08-27
 
 ### Added
@@ -2328,7 +2340,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.23.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.20.0...v0.21.0
