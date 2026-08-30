@@ -125,11 +125,11 @@ func TestAutoUpdateStatusLineDevBuild(t *testing.T) {
 }
 
 // The probe is best-effort and degrades silently; doctor still has to say what
-// auto-update will do rather than say nothing.
+// update checks will do rather than say nothing.
 func TestAutoUpdateStatusLineProbeFailureStillReportsOn(t *testing.T) {
 	got := autoUpdateStatusLine("", "0.12.1", "", false)
 
-	if !strings.Contains(got, "auto-update on") {
+	if !strings.Contains(got, "update checks on") {
 		t.Fatalf("expected an on line when the probe fails, got %q", got)
 	}
 	if strings.Contains(got, "up to date") || strings.Contains(got, "newer release") {

@@ -16,8 +16,16 @@ Only **two** call sites outside the package:
 `StartDaemon` → `exec.Command(state.SelfBin(), "watch")` (`internal/capture/daemon.go:147`),
 so the detached child runs the normal watch startup check within a second. Same for
 `autostart`: launchd/systemd run `watch`, and `RunAtLoad` means a check every login.
+Detached checks never install because there is no terminal on which to obtain consent;
+they safely decline and check again on the next cycle. A foreground `watch` prompts.
 
 Anything that never reaches `watch` never checks.
+
+The local on-disk catch-up is not an update check and does not prompt. It downloads,
+verifies, swaps, and installs nothing: after an explicit npm/install.sh/MDM action has
+already replaced the managed binary, the old in-memory watcher re-execs that installed
+file so it does not keep running deleted or stale code. The installer action is the
+authorization boundary; asking again during re-exec would not protect an install.
 
 ## THE DAEMON IS A DIFFERENT BINARY FROM THE ONE YOU ARE TYPING TO
 
@@ -172,7 +180,7 @@ not the trust boundary: minisign-over-SHA256SUMS still gates every installed byt
 ## Timing
 
 - `updateCheckInterval = 30 * time.Minute`, `updateCheckPoll = 5 * time.Minute`
-  (`selfupdate.go`). Worst case release→installed is **~35m** (was ~24h05m).
+  (`selfupdate.go`). A foreground watcher asks within **~35m** worst case.
 - `runAutoUpdate` checks **once at startup unconditionally** — it ignores the persisted
   cursor. So a restart always forces a check.
 - Steady state: the poll compares now against the cursor and acts once the current
@@ -181,6 +189,9 @@ not the trust boundary: minisign-over-SHA256SUMS still gates every installed byt
   or unparseable → zero time → treated as stale → checks on the next tick.
 - **No backoff.** The cursor advances after every check including failures, so a broken
   release is retried at most once per interval rather than hot-looping.
+- **Consent is per cycle.** A declined release is offered again on the next check; only
+  `--no-auto-update`, `PROMPTSTER_TEAMS_NO_AUTO_UPDATE`, or org policy suppresses checks.
+  The prompt links directly to `github.com/<repo>/releases/tag/<tag>` and defaults to no.
 
 ## Why 30m, and what the 24h was actually buying
 
@@ -224,7 +235,7 @@ The lever only works on CLIs that already understand the field, and the CLI is t
 slow-propagating side — so it cannot help the fleet that is live when you need it. That is
 why it shipped before there was a server to send it.
 
-## npm installs DO auto-update — and the binary does NOT run from node_modules
+## npm installs CAN self-update after consent — and the binary does NOT run from node_modules
 
 **The binary that runs is never the copy npm is tracking.** `npm/scripts/postinstall.js`
 copies the platform binary out of `node_modules` to the MANAGED path
@@ -534,4 +545,3 @@ header-only HEAD against a CDN with no rate limit, the blast radius is down to w
 requests. Still worth honoring the cursor at startup unless it is older than ~1h — but note
 that the unconditional startup check is also **the documented way to force an update now**
 (restart the daemon), so anything here must keep that escape hatch.
-

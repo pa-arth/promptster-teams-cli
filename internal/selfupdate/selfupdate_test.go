@@ -77,8 +77,9 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 			app = append(app, staged)
 			return nil
 		},
-		logf: func(string, ...any) {},
-		now:  time.Now,
+		confirm: func(_, _, _ string) bool { return true },
+		logf:    func(string, ...any) {},
+		now:     time.Now,
 	}
 	addRoute = func(sub, body string, code int) { routes[sub] = resp{body, code} }
 	return u, &app, addRoute
@@ -174,6 +175,51 @@ func TestHappyPathApplies(t *testing.T) {
 	}
 	if string(data) != "darwin-binary-content-v1\n" {
 		t.Fatalf("staged content = %q", string(data))
+	}
+}
+
+func TestUpdateRequiresConsentAndIncludesReleaseNotes(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+
+	var current, target, notes string
+	u.confirm = func(gotCurrent, gotTarget, gotNotes string) bool {
+		current, target, notes = gotCurrent, gotTarget, gotNotes
+		return false
+	}
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("declined update outcome = %v, want declined", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("declined update must not apply")
+	}
+	if current != "0.5.2" || target != "9.9.9" {
+		t.Fatalf("prompt versions = %q -> %q, want 0.5.2 -> 9.9.9", current, target)
+	}
+	if notes != "https://rel.test/pa-arth/promptster-teams-cli/releases/tag/v9.9.9" {
+		t.Fatalf("release notes URL = %q", notes)
+	}
+}
+
+func TestDeclineIsAskedAgainOnNextCycle(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+
+	asks := 0
+	u.confirm = func(_, _, _ string) bool {
+		asks++
+		return false
+	}
+	for cycle := 1; cycle <= 2; cycle++ {
+		if got := u.checkAndApply(); got != outcomeDeclined {
+			t.Fatalf("cycle %d outcome = %v, want declined", cycle, got)
+		}
+	}
+	if asks != 2 {
+		t.Fatalf("prompted %d times, want once per cycle", asks)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("declined updates must not apply")
 	}
 }
 

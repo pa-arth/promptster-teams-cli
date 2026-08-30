@@ -341,15 +341,15 @@ func autoUpdateStatusLine(envOptOut, current, latest string, latestOK bool) stri
 	}
 	if latestOK {
 		if selfupdate.IsNewer(current, latest) {
-			return fmt.Sprintf("%s auto-update on — newer release available (%s); it installs on the next check (every %s) while watching",
+			return fmt.Sprintf("%s update checks on — newer release available (%s); you will be asked on the next interactive check (every %s) while watching",
 				okGlyph, latest, humanInterval(selfupdate.CheckInterval))
 		}
 		// Not newer covers both equal and ahead-of-latest (a local build, a
 		// yanked release). Report the version actually RUNNING: claiming to be
 		// "up to date (0.12.1)" while running 0.13.0 is the same lie in reverse.
-		return fmt.Sprintf("%s auto-update on — up to date (%s)", okGlyph, current)
+		return fmt.Sprintf("%s update checks on — up to date (%s)", okGlyph, current)
 	}
-	return fmt.Sprintf("%s auto-update on — silent self-update while watching (org policy may disable or pin)", okGlyph)
+	return fmt.Sprintf("%s update checks on — asks before installing while watching (org policy may disable or pin)", okGlyph)
 }
 
 // countBufferedEvents reports how many captured events are still waiting to be
