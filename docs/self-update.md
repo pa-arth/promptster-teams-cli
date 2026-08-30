@@ -21,6 +21,12 @@ they safely decline and check again on the next cycle. A foreground `watch` prom
 
 Anything that never reaches `watch` never checks.
 
+The local on-disk catch-up is not an update check and does not prompt. It downloads,
+verifies, swaps, and installs nothing: after an explicit npm/install.sh/MDM action has
+already replaced the managed binary, the old in-memory watcher re-execs that installed
+file so it does not keep running deleted or stale code. The installer action is the
+authorization boundary; asking again during re-exec would not protect an install.
+
 ## THE DAEMON IS A DIFFERENT BINARY FROM THE ONE YOU ARE TYPING TO
 
 Read this before answering any "is X captured / why is feature Y missing" question.

@@ -815,7 +815,10 @@ func runAutoUpdate(u *updater, stop <-chan struct{}) {
 	// network at all, and what it is racing is a human who just ran `npm i -g`
 	// and is about to ask why the daemon still reports the old version. Putting
 	// it behind a 30m interval keyed to GitHub — or behind a check a firewalled
-	// machine never gets past — would answer the wrong question.
+	// machine never gets past — would answer the wrong question. This is not a
+	// self-update and therefore does not ask again: another explicit installer
+	// has already replaced the binary on disk; catch-up only starts that already
+	// installed binary and never fetches, verifies, swaps, or applies anything.
 	// In production the go verdict does not return: the process is replaced.
 	if u.catchUpToDisk() == catchupGo {
 		return
