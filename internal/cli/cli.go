@@ -134,10 +134,10 @@ Getting started:
 Capture runs detached and silent. Set PROMPTSTER_DEBUG=1 before watch/start
 to see per-event watcher logging.
 
-The CLI silently self-updates from GitHub Releases (signed) on a 30m cadence
-while watching, so the fleet doesn't drift onto old versions. Opt out per
-machine with watch/start --no-auto-update or PROMPTSTER_TEAMS_NO_AUTO_UPDATE=1;
-your org can also disable or pin the version centrally.
+The CLI checks GitHub Releases on a 30m cadence while watching and asks before
+installing a newer signed release, with a link to its release notes. Declining
+only skips that cycle. Opt out with watch/start --no-auto-update or
+PROMPTSTER_TEAMS_NO_AUTO_UPDATE=1; your org can also disable or pin the version.
 
 Your developer key is resolved from, in order: --key flag,
 PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by

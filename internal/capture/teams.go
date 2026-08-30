@@ -76,7 +76,7 @@ func resolveWatchEnv(args []string) (token, apiURL, watchDir string, noAutoUpdat
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	keyFlag := fs.String("key", "", "Developer key ("+ingest.KeyFormatHint+"); overrides env/stored")
 	urlFlag := fs.String("api-url", "", "Override ingest base URL")
-	noUpdateFlag := fs.Bool("no-auto-update", false, "Disable silent self-update of the CLI while watching")
+	noUpdateFlag := fs.Bool("no-auto-update", false, "Disable update checks and prompts while watching")
 	if err := fs.Parse(args); err != nil {
 		return "", "", "", false, err
 	}
@@ -207,9 +207,10 @@ func RunTeamsWatch(args []string) error {
 	stopCensus := StartConfigCensus(cfg)
 	defer stopCensus()
 
-	// Silent self-update: on startup and every selfupdate.CheckInterval, check
-	// GitHub Releases for a newer signed CLI and swap in place (re-exec keeps
-	// capture running). It is NOT on the census's 24h clock above. Opt out
+	// On startup and every selfupdate.CheckInterval, check GitHub Releases for a
+	// newer signed CLI and ask before swapping it in place (re-exec keeps capture
+	// running). Detached watchers safely decline until an interactive cycle. It
+	// is NOT on the census's 24h clock above. Opt out
 	// per-machine with --no-auto-update / PROMPTSTER_TEAMS_NO_AUTO_UPDATE, or
 	// org-wide via the capture policy. A dedicated resolver refreshes the org
 	// switch/pin off the hot path; fail-OPEN so a policy blip never strands the

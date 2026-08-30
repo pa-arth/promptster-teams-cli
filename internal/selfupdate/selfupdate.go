@@ -1,4 +1,4 @@
-// Package selfupdate lets the long-running `watch` daemon silently update
+// Package selfupdate lets the long-running `watch` daemon offer to update
 // itself from GitHub Releases on the CheckInterval cadence, so a fleet
 // installed on an old CLI stops missing new capture features (the bug that
 // motivated this: config-census never emitted because engineers ran a
@@ -19,6 +19,7 @@
 package selfupdate
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -29,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	"github.com/pa-arth/promptster-teams-cli/internal/version"
@@ -309,6 +311,7 @@ const (
 	outcomeUpToDate                           // no newer (or pinned-not-newer) release
 	outcomeBlockedNotWritable                 // newer release found, install dir read-only
 	outcomeBlockedProjectLocal                // newer release found, but a lockfile pins this copy
+	outcomeDeclined                           // newer release found, user did not approve this cycle
 	outcomeError                              // best-effort failure (network/verify/io)
 	outcomeApplied                            // swapped + re-exec'd (does not return in prod)
 )
@@ -341,6 +344,10 @@ type updater struct {
 	// apply performs the swap + re-exec. Injected so tests record the call
 	// instead of replacing the process.
 	apply func(self, staged string) error
+	// confirm asks for per-cycle consent after a viable newer release has been
+	// found, but before any release assets are downloaded. A decline is not
+	// persisted: the next update cycle asks again while the release is newer.
+	confirm func(current, target, releaseNotesURL string) bool
 
 	// --- on-disk catch-up edges (see ondisk.go) --------------------------------
 	// canonicalBin names the managed install path, fileExists/fileStamp probe the
@@ -378,6 +385,7 @@ func newDefaultUpdater(currentVersion string, noAutoUpdate bool, pol PolicyView)
 		httpRedirect:   httpRedirectLocation,
 		resolveSelf:    resolveSelfPath,
 		apply:          applySwapAndReexec,
+		confirm:        confirmUpdate,
 		canonicalBin:   state.CanonicalInstallBin,
 		fileExists:     fileExists,
 		fileStamp:      fileStamp,
@@ -456,6 +464,14 @@ func (u *updater) checkAndApply() outcome {
 		return outcomeBlockedNotWritable
 	}
 
+	// Consent is deliberately per check, not a remembered preference. Only the
+	// existing flag/env/org gates above disable future prompts. This also means
+	// a "no" today is revisited on the next normal update cycle.
+	releaseNotesURL := strings.TrimRight(u.releaseBaseURL, "/") + "/" + repoSlug + "/releases/tag/" + tag
+	if u.confirm == nil || !u.confirm(u.currentVersion, target, releaseNotesURL) {
+		return outcomeDeclined
+	}
+
 	// 5. Download + verify (minisign THEN sha256) from the SAME tag.
 	asset, err := assetName(u.goos, u.goarch)
 	if err != nil {
@@ -475,6 +491,26 @@ func (u *updater) checkAndApply() outcome {
 		return outcomeError
 	}
 	return outcomeApplied
+}
+
+// confirmUpdate asks on an attached terminal and defaults to no. A detached
+// watcher must never block on an inherited pipe (or treat EOF as permission),
+// so non-interactive runs simply decline this cycle and try again next cycle.
+func confirmUpdate(current, target, releaseNotesURL string) bool {
+	if !term.IsTerminal(os.Stdin.Fd()) {
+		return false
+	}
+	fmt.Fprintf(os.Stderr, "promptster-teams: update available %s -> %s\nRelease notes: %s\nUpdate now? [y/N] ", current, target, releaseNotesURL)
+	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(answer)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
 }
 
 // downloadAndVerify fetches SHA256SUMS, its .minisig, and the platform asset for
