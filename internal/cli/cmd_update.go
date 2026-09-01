@@ -28,6 +28,7 @@ func cmdUpdate(args []string) int {
 	assumeYes := fs.Bool("yes", false, "Install without asking (for scripts and non-interactive shells)")
 	enableAuto := fs.Bool("enable-auto", false, "Allow this machine to install updates in the background from now on")
 	disableAuto := fs.Bool("disable-auto", false, "Stop this machine installing updates in the background")
+	askEach := fs.Bool("ask-each", false, "Show a notification for each new release and let you decide")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -36,8 +37,8 @@ func cmdUpdate(args []string) int {
 	fmt.Println(brandBar("update"))
 	fmt.Println()
 
-	if *enableAuto && *disableAuto {
-		printlnIndent(fmt.Sprintf("%s --enable-auto and --disable-auto contradict each other.", errGlyph))
+	if countTrue(*enableAuto, *disableAuto, *askEach) > 1 {
+		printlnIndent(fmt.Sprintf("%s --enable-auto, --ask-each and --disable-auto are mutually exclusive.", errGlyph))
 		fmt.Println()
 		return 2
 	}
@@ -54,8 +55,11 @@ func cmdUpdate(args []string) int {
 	case *disableAuto:
 		selfupdate.SaveConsent(selfupdate.ConsentDenied, version.Version)
 		printlnIndent(fmt.Sprintf("%s background updates disabled — run `promptster-teams update` when you want one.", okGlyph))
+	case *askEach:
+		selfupdate.SaveConsent(selfupdate.ConsentAsk, version.Version)
+		printlnIndent(fmt.Sprintf("%s you'll get a notification for each new release.", okGlyph))
 	}
-	if (*enableAuto || *disableAuto) && !*checkOnly && len(fs.Args()) == 0 && !*assumeYes {
+	if (*enableAuto || *disableAuto || *askEach) && !*checkOnly && len(fs.Args()) == 0 && !*assumeYes {
 		// A bare consent change is done. Fall through to the version check only
 		// when the engineer also asked to update.
 		fmt.Println()
@@ -172,11 +176,14 @@ func PromptForUpdateConsent() {
 		return
 	}
 
-	printlnIndent(bodyStyle.Render("Keep promptster-teams up to date automatically?"))
-	printlnIndent(dimStyle.Render("Releases are signed and verified before install. You can change this"))
-	printlnIndent(dimStyle.Render("later with ") + bodyStyle.Render("promptster-teams update --enable-auto") + dimStyle.Render(" / ") + bodyStyle.Render("--disable-auto") + dimStyle.Render("."))
+	printlnIndent(bodyStyle.Render("How should promptster-teams handle updates?"))
+	printlnIndent(dimStyle.Render("Releases are signed and verified before anything is installed."))
 	fmt.Println()
-	fmt.Printf("  %s Update automatically? [Y/n] ", promptGlyph())
+	printlnIndent(bodyStyle.Render("  a") + dimStyle.Render(") ask me about each release   (default)"))
+	printlnIndent(bodyStyle.Render("  y") + dimStyle.Render(") update automatically"))
+	printlnIndent(bodyStyle.Render("  n") + dimStyle.Render(") never update on its own"))
+	fmt.Println()
+	fmt.Printf("  %s Choose [A/y/n] ", promptGlyph())
 	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
 	fmt.Println()
 	if err != nil {
@@ -186,15 +193,19 @@ func PromptForUpdateConsent() {
 	}
 
 	switch strings.ToLower(strings.TrimSpace(answer)) {
-	case "n", "no":
+	case "y", "yes":
+		selfupdate.SaveConsent(selfupdate.ConsentGranted, version.Version)
+		printlnIndent(fmt.Sprintf("%s capture will keep itself up to date.", okGlyph))
+	case "n", "no", "never":
 		selfupdate.SaveConsent(selfupdate.ConsentDenied, version.Version)
 		printlnIndent(fmt.Sprintf("%s staying on %s — run `promptster-teams update` when you want a newer one.", okGlyph, version.Version))
 	default:
-		// Empty input takes the capitalized default, which is yes. This is the
-		// one place a default is legitimate: the engineer saw the question.
-		selfupdate.SaveConsent(selfupdate.ConsentGranted, version.Version)
-		printlnIndent(fmt.Sprintf("%s capture will keep itself up to date.", okGlyph))
+		// Empty input takes the capitalized default. This is the one place a
+		// default is legitimate: the engineer saw the question.
+		selfupdate.SaveConsent(selfupdate.ConsentAsk, version.Version)
+		printlnIndent(fmt.Sprintf("%s you'll get a notification when a new release is available.", okGlyph))
 	}
+	printlnIndent(dimStyle.Render("Change it later with ") + bodyStyle.Render("promptster-teams update --enable-auto") + dimStyle.Render(" / ") + bodyStyle.Render("--ask-each") + dimStyle.Render(" / ") + bodyStyle.Render("--disable-auto") + dimStyle.Render("."))
 	fmt.Println()
 }
 
@@ -218,4 +229,16 @@ func updatePolicyView() selfupdate.PolicyView {
 	// at the daemon's next poll.
 	r.Refresh()
 	return r
+}
+
+// countTrue counts how many of the given flags are set, so mutually exclusive
+// options can be rejected as a group rather than in pairs.
+func countTrue(flags ...bool) int {
+	n := 0
+	for _, f := range flags {
+		if f {
+			n++
+		}
+	}
+	return n
 }

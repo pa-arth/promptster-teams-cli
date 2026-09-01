@@ -698,3 +698,142 @@ func TestChecksNeverHitTheGitHubAPI(t *testing.T) {
 		}
 	}
 }
+
+// --- ConsentAsk: the per-release GUI prompt -------------------------------
+
+// askUpdater wires the ask path with fake GUI + asked-version edges, so the
+// policy is assertable with no desktop and no filesystem.
+func askUpdater(t *testing.T, answer guiPromptResult) (u *updater, applied *[]string, prompts *int, asked *string) {
+	t.Helper()
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentAsk }
+
+	n := 0
+	var recorded string
+	u.guiPrompt = func(_, _, _ string) guiPromptResult { n++; return answer }
+	u.lastAsked = func() string { return recorded }
+	u.recordAsked = func(v string) { recorded = v }
+	return u, applied, &n, &recorded
+}
+
+func TestAskModeInstallsWhenAccepted(t *testing.T) {
+	u, applied, prompts, _ := askUpdater(t, guiAccepted)
+
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("accepted prompt outcome = %v, want applied", got)
+	}
+	if *prompts != 1 {
+		t.Fatalf("prompted %d times, want 1", *prompts)
+	}
+	if len(*applied) != 1 {
+		t.Fatalf("apply called %d times, want 1", len(*applied))
+	}
+}
+
+func TestAskModeDoesNotInstallWhenDeclined(t *testing.T) {
+	u, applied, _, _ := askUpdater(t, guiDeclined)
+
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("declined prompt outcome = %v, want declined", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("a declined prompt must not install")
+	}
+}
+
+// THE test that keeps this feature from becoming malware-shaped.
+//
+// The check runs every 30 minutes. Without the once-per-version guard an
+// engineer who clicked Later would be re-prompted on every cycle — six dialogs a
+// workday from a background process — which trains them to dismiss it on sight
+// and ends in a fleet that never updates: the original bug, rebuilt.
+func TestAskModePromptsOncePerVersionNotOncePerCheck(t *testing.T) {
+	u, applied, prompts, asked := askUpdater(t, guiDeclined)
+
+	for cycle := 1; cycle <= 5; cycle++ {
+		if got := u.checkAndApply(); got != outcomeDeclined {
+			t.Fatalf("cycle %d outcome = %v, want declined", cycle, got)
+		}
+	}
+	if *prompts != 1 {
+		t.Fatalf("showed %d dialogs across 5 checks, want exactly 1", *prompts)
+	}
+	if *asked != "9.9.9" {
+		t.Fatalf("recorded asked version = %q, want 9.9.9", *asked)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("declined release must never install")
+	}
+}
+
+// A NEW version earns a new prompt — otherwise "ask me each release" would ask
+// once and then go silent forever, which is the stuck-fleet failure again.
+func TestAskModePromptsAgainForANewerVersion(t *testing.T) {
+	u, _, prompts, _ := askUpdater(t, guiDeclined)
+
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("first outcome = %v, want declined", got)
+	}
+	// The engineer already said no to 9.9.9; 9.9.10 is a different release.
+	u.lastAsked = func() string { return "9.9.9" }
+	u.currentVersion = "0.5.2"
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("second outcome = %v, want declined", got)
+	}
+	if *prompts != 1 {
+		t.Fatalf("prompts = %d; the same version must not re-prompt", *prompts)
+	}
+}
+
+// The record is written BEFORE the dialog. A prompt whose answer is lost — the
+// daemon is killed, the machine sleeps, the display disappears mid-dialog — must
+// not reappear every 30 minutes. Missing one release is recoverable (doctor
+// reports it, `update` installs it); a dialog loop is not.
+func TestAskModeRecordsTheVersionBeforeShowingTheDialog(t *testing.T) {
+	u, _, _, _ := askUpdater(t, guiDeclined)
+
+	var recordedBeforePrompt bool
+	var recorded string
+	u.recordAsked = func(v string) { recorded = v }
+	u.lastAsked = func() string { return "" }
+	u.guiPrompt = func(_, _, _ string) guiPromptResult {
+		recordedBeforePrompt = recorded == "9.9.9"
+		return guiDeclined
+	}
+	u.checkAndApply()
+
+	if !recordedBeforePrompt {
+		t.Fatal("the asked-version record was written after the dialog; a lost answer would re-prompt every cycle")
+	}
+}
+
+// No desktop is NOT a refusal. A headless box, an SSH session, a missing dialog
+// tool — the engineer was never asked, so the daemon must fall back to the
+// printed surfaces rather than silently sit on the release.
+func TestAskModeUnavailableDialogFallsBackToNeedsConsent(t *testing.T) {
+	u, applied, _, _ := askUpdater(t, guiUnavailable)
+
+	if got := u.checkAndApply(); got != outcomeNeedsConsent {
+		t.Fatalf("unavailable dialog outcome = %v, want needsConsent", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("must not install when nobody could be asked")
+	}
+}
+
+// A managed fleet never sees a dialog, whatever the local record says. An
+// engineer clicking a popup is not a security review, and letting one appear
+// would make the org's pin look advisory.
+func TestAskModeNeverPromptsOnAManagedFleet(t *testing.T) {
+	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentAsk }
+	u.guiPrompt = func(_, _, _ string) guiPromptResult {
+		t.Error("a managed machine showed an update dialog; the org already decided")
+		return guiDeclined
+	}
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("managed outcome = %v, want applied", got)
+	}
+}

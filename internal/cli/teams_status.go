@@ -386,6 +386,11 @@ func autoUpdateStatusLine(envOptOut, current, latest string, latestOK bool, auth
 				okGlyph, latest, humanInterval(selfupdate.CheckInterval))
 		}
 		return fmt.Sprintf("%s update checks on — installs automatically within %s while watching", okGlyph, humanInterval(selfupdate.CheckInterval))
+	case auth.consent == selfupdate.ConsentAsk:
+		if latestOK {
+			return fmt.Sprintf("%s update checks on — %s available; you'll get a notification to approve it", okGlyph, latest)
+		}
+		return fmt.Sprintf("%s update checks on — you'll get a notification for each new release", okGlyph)
 	case auth.consent == selfupdate.ConsentDenied:
 		if latestOK {
 			return fmt.Sprintf("%s %s available, but background updates are off on this machine — run `promptster-teams update` to install it", warnGlyph, latest)

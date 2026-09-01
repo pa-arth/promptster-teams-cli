@@ -52,7 +52,51 @@ Authorization is therefore settled BEFORE the check, and by different parties:
 | | Who decides | Where it is stored | Asked? |
 |---|---|---|---|
 | **Org-managed** (`PolicyView.OrgManaged`) | the org's `autoUpdate` switch and `pinnedCliVersion` | backend policy, mirrored to `update-intent.json` | never — not the engineer's call |
-| **Unmanaged** (solo install) | the engineer's one-time answer | `auto-update-consent.json` | once, at `login`/`start` |
+| **Unmanaged** (solo install) | the engineer's stored answer | `auto-update-consent.json` | once, at `login`/`start` |
+
+The unmanaged answer has three values, not two: `granted` (install silently),
+`ask` (a GUI dialog per release — the default), and `denied` (never).
+
+### The `ask` path, and why a dialog works where a terminal prompt could not
+
+A detached watcher has no stdin to read — but it DOES run inside the engineer's
+graphical session. On macOS `autostart` installs a **LaunchAgent** under
+`~/Library/LaunchAgents` (`service_darwin.go`), and LaunchAgents run in the Aqua
+session, so they can put a window on screen. Verified empirically, not inferred:
+a dialog spawned from a detached, TTY-less process rendered and returned its
+button.
+
+Platform coverage is uneven and the code says so:
+
+| | Mechanism | Reality |
+|---|---|---|
+| macOS | `osascript display dialog` | works from a LaunchAgent |
+| Windows | PowerShell `MessageBox` | Task Scheduler user tasks run in the user session |
+| Linux | `zenity` / `kdialog` | needs `DISPLAY`/`WAYLAND_DISPLAY`; headless boxes get nothing |
+
+A dialog that cannot be shown is `guiUnavailable`, which resolves to
+`outcomeNeedsConsent` — **never** to a refusal. Nobody was asked, so nothing may
+be inferred; the printed surfaces carry it instead.
+
+**The dialog fires at most once per VERSION** (`asked.go`), and the record is
+written BEFORE the dialog rather than after. The check runs every 30 minutes, so
+without that guard an engineer who clicked Later would be re-prompted six times a
+workday by a background process — indistinguishable from malware, and a fast route
+to an engineer who dismisses it on sight, which lands right back at a fleet that
+never updates. Writing the record first means a lost answer (daemon killed,
+machine slept, display went away) costs one skipped release, which `doctor` still
+reports and `promptster-teams update` still fixes. Writing it after means a dialog
+loop.
+
+**No dialog ever appears on a managed fleet.** An engineer clicking a popup is not
+a security review, and showing one would make the org's pin look advisory.
+
+**The tag is sanitized for the dialog specifically.** It arrives from a GitHub
+redirect and is interpolated into an AppleScript string literal.
+`tagFromReleaseLocation` rejects path separators — it was written to protect a URL
+path — but not quotes, which is exactly what ends a script literal.
+`sanitizeForDialog` reduces the version to `[0-9A-Za-z.+_-]` and `isSafeURL`
+drops any notes link that is not a plain https github.com URL.
 
 **Managed means "an org has stated an intent", NOT "the machine has an org."** Every
 enrolled machine has an org, so the second reading makes managed universal — including

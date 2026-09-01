@@ -145,6 +145,12 @@ Type=simple
 ExecStart="` + bin + `" watch
 Restart=on-failure
 RestartSec=10
+# Let the update notification reach the engineer's screen when the desktop has
+# imported these (GNOME/KDE run: systemctl --user import-environment). systemd
+# silently ignores names it does not have, so this is a no-op on a headless box
+# rather than a startup failure — and selfupdate falls back to a display guess
+# and then to its printed surfaces if they never arrive.
+PassEnvironment=DISPLAY WAYLAND_DISPLAY XAUTHORITY
 
 [Install]
 WantedBy=default.target

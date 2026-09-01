@@ -24,15 +24,23 @@
 //     they reach company laptops sets autoUpdate:false and moves pinnedCliVersion
 //     as each release clears review — the pin REPLACES "latest" as the target, so
 //     a pinned fleet only ever lands on the tag the org named.
-//   - Unmanaged solo install: a one-time durable answer collected at `login` or
-//     `start` (consent.go), after which updates apply silently.
+//   - Unmanaged solo install: a durable answer collected at `login` or `start`
+//     (consent.go) — update automatically, ask per release, or never.
 //
-// Consent is collected ONCE, at a moment the engineer is provably at a keyboard,
-// and never on this path. An earlier revision prompted per cycle from inside the
-// check itself, which cannot work: the check runs in the detached watch daemon,
-// so the prompt saw a non-TTY stdin, declined itself, and — because the declined
-// outcome had no banner case — froze fleets at their installed version in total
-// silence. Signature verification, not a prompt, is the security boundary here.
+// The engineer's answer is collected at a moment they are provably at a
+// keyboard, and NO TERMINAL PROMPT ever runs on this path. An earlier revision
+// prompted per cycle from inside the check itself, which cannot work: the check
+// runs in the detached watch daemon, so the prompt saw a non-TTY stdin, declined
+// itself, and — because the declined outcome had no banner case — froze fleets at
+// their installed version in total silence.
+//
+// "Ask per release" is served by a GUI dialog instead (notify.go). That channel
+// works precisely where the terminal one could not: the watcher has no stdin,
+// but it runs inside the engineer's graphical session, so it can put a window on
+// their screen naming both versions and linking the release notes. It fires at
+// most once per VERSION, never once per check.
+//
+// Signature verification, not any prompt, is the security boundary here.
 package selfupdate
 
 import (
@@ -379,6 +387,13 @@ type updater struct {
 	// detached daemon, so the prompt saw a non-TTY stdin and declined itself
 	// forever. Consulted only for UNMANAGED machines — see PolicyView.OrgManaged.
 	loadConsent func() Consent
+	// guiPrompt asks the engineer per release when consent is ConsentAsk, and
+	// lastAsked/recordAsked hold the once-per-version guard. Injected like every
+	// other impure edge so the ask policy is assertable with no desktop, no
+	// dialog binary, and no filesystem.
+	guiPrompt   func(current, target, notesURL string) guiPromptResult
+	lastAsked   func() string
+	recordAsked func(string)
 
 	// --- on-disk catch-up edges (see ondisk.go) --------------------------------
 	// canonicalBin names the managed install path, fileExists/fileStamp probe the
@@ -417,6 +432,9 @@ func newDefaultUpdater(currentVersion string, noAutoUpdate bool, pol PolicyView)
 		resolveSelf:    resolveSelfPath,
 		apply:          applySwapAndReexec,
 		loadConsent:    LoadConsent,
+		guiPrompt:      promptGUI,
+		lastAsked:      loadAskedVersion,
+		recordAsked:    saveAskedVersion,
 		canonicalBin:   state.CanonicalInstallBin,
 		fileExists:     fileExists,
 		fileStamp:      fileStamp,
@@ -516,6 +534,10 @@ func (u *updater) checkAndApply() outcome {
 			// proceed
 		case ConsentDenied:
 			return outcomeDeclined
+		case ConsentAsk:
+			if res := u.askPerRelease(target); res != outcomeApplied {
+				return res
+			}
 		default:
 			return outcomeNeedsConsent
 		}
@@ -540,6 +562,41 @@ func (u *updater) checkAndApply() outcome {
 		return outcomeError
 	}
 	return outcomeApplied
+}
+
+// askPerRelease runs the ConsentAsk path for one target and reports whether the
+// install may proceed (outcomeApplied means "keep going" — the caller has not
+// installed anything yet).
+//
+// The version guard comes FIRST, before any dialog. A release the engineer has
+// already been asked about is not re-offered on the next 30-minute check; only a
+// NEW version earns a new prompt (asked.go).
+//
+// The record is written BEFORE the dialog, not after. A prompt that appears and
+// then loses its answer — the daemon is killed, the machine sleeps, the display
+// goes away mid-dialog — must not become a prompt that reappears every 30
+// minutes. Writing first means the worst case is missing one release on this
+// machine, which `doctor` still reports and `promptster-teams update` still
+// fixes; writing after means a dialog loop, which is the failure that makes
+// people uninstall.
+func (u *updater) askPerRelease(target string) outcome {
+	if u.lastAsked() == target {
+		return outcomeDeclined
+	}
+	u.recordAsked(target)
+
+	switch u.guiPrompt(u.currentVersion, target, ReleaseNotesURL(target)) {
+	case guiAccepted:
+		return outcomeApplied
+	case guiDeclined:
+		return outcomeDeclined
+	default:
+		// Nobody could be shown a dialog — a headless box, no desktop session, no
+		// dialog tool. That is NOT a refusal, and it must not read as one: fall
+		// back to the printed surfaces so the engineer still learns a release
+		// exists, rather than the daemon silently sitting on it.
+		return outcomeNeedsConsent
+	}
 }
 
 // orgManaged reports whether an org has expressed an explicit intent about this

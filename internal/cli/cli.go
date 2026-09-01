@@ -132,7 +132,7 @@ Commands:
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
-  update       Install a newer signed release, or set whether this machine updates itself (--check|--enable-auto|--disable-auto)
+  update       Install a newer signed release, or set how this machine updates (--check|--ask-each|--enable-auto|--disable-auto)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
   discover     Find additional local user homes with Claude, Codex, or Cursor
@@ -157,9 +157,15 @@ Who authorizes the install depends on your setup:
   - If your organization has set an update policy, it decides — it can disable
     self-update entirely, or pin the exact version your fleet runs so a security
     team reviews each release before it reaches any machine. You are not asked.
-  - Otherwise login and start ask you ONCE whether this machine may update
-    itself, and remember the answer. Change it any time with
-    promptster-teams update --enable-auto / --disable-auto.
+  - Otherwise login and start ask you ONCE how you want updates handled, and
+    remember the answer:
+      ask me about each release (default) — a notification names the version
+        and links its release notes; you approve or dismiss it. At most one
+        per release, never one per check.
+      update automatically             — installs silently in the background.
+      never update on its own          — nothing installs unless you ask.
+    Change it any time with promptster-teams update --ask-each /
+    --enable-auto / --disable-auto.
 
 promptster-teams update installs a release on demand regardless, and --check
 reports what one would do without installing it. Opt out per-machine

@@ -49,6 +49,16 @@ const (
 	// `promptster-teams update` still works, because an explicit command is a
 	// fresh, unambiguous instruction that outranks a stored preference.
 	ConsentDenied
+	// ConsentAsk means an engineer wants to decide per release. The daemon shows
+	// a GUI dialog naming both versions and linking the release notes — the one
+	// channel that CAN reach someone who never types a command, since the watcher
+	// runs in their graphical session even though it has no terminal (notify.go).
+	//
+	// It is asked at most ONCE PER VERSION, not once per check. The check runs
+	// every 30 minutes; a dialog on that cadence would be indistinguishable from
+	// malware and would train the engineer to dismiss it on sight, which is the
+	// slowest possible way to arrive back at a fleet that never updates.
+	ConsentAsk
 )
 
 // consentRecord is the on-disk shape. Version and DecidedAt are not read by any
@@ -88,6 +98,8 @@ func LoadConsent() Consent {
 		return ConsentGranted
 	case "denied":
 		return ConsentDenied
+	case "ask":
+		return ConsentAsk
 	default:
 		return ConsentUnknown
 	}
@@ -105,6 +117,8 @@ func SaveConsent(c Consent, version string) {
 		answer = "granted"
 	case ConsentDenied:
 		answer = "denied"
+	case ConsentAsk:
+		answer = "ask"
 	}
 	data, err := json.Marshal(consentRecord{
 		Answer:    answer,
