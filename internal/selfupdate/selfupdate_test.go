@@ -14,11 +14,16 @@ type stubPolicy struct {
 	enabled bool
 	pinned  string
 	min     string
+	// managed mirrors policy.Resolver.OrgManaged: an org has stated an explicit
+	// intent about this fleet's version. It defaults false so existing gate tests
+	// keep exercising the UNMANAGED path, where the local consent record decides.
+	managed bool
 }
 
 func (s stubPolicy) AutoUpdateEnabled() bool  { return s.enabled }
 func (s stubPolicy) PinnedCliVersion() string { return s.pinned }
 func (s stubPolicy) MinCliVersion() string    { return s.min }
+func (s stubPolicy) OrgManaged() bool         { return s.managed }
 
 // buildUpdater is the primary test constructor: it returns the updater plus a
 // pointer to the applied-staged-paths slice and a route registration func.
@@ -77,9 +82,9 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 			app = append(app, staged)
 			return nil
 		},
-		confirm: func(_, _, _ string) bool { return true },
-		logf:    func(string, ...any) {},
-		now:     time.Now,
+		loadConsent: func() Consent { return ConsentGranted },
+		logf:        func(string, ...any) {},
+		now:         time.Now,
 	}
 	addRoute = func(sub, body string, code int) { routes[sub] = resp{body, code} }
 	return u, &app, addRoute
@@ -178,48 +183,102 @@ func TestHappyPathApplies(t *testing.T) {
 	}
 }
 
-func TestUpdateRequiresConsentAndIncludesReleaseNotes(t *testing.T) {
-	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
-	wireHappyRelease(addRoute)
+// A stored "no" blocks the install on an unmanaged machine, and an unanswered
+// machine is NOT treated as a yes. The two are distinct outcomes because they
+// need distinct messages: one engineer has decided, the other has never been
+// asked.
+func TestUnmanagedConsentDecidesTheInstall(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		consent Consent
+		want    outcome
+	}{
+		{"denied", ConsentDenied, outcomeDeclined},
+		{"never asked", ConsentUnknown, outcomeNeedsConsent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+			wireHappyRelease(addRoute)
+			u.loadConsent = func() Consent { return tc.consent }
 
-	var current, target, notes string
-	u.confirm = func(gotCurrent, gotTarget, gotNotes string) bool {
-		current, target, notes = gotCurrent, gotTarget, gotNotes
-		return false
-	}
-	if got := u.checkAndApply(); got != outcomeDeclined {
-		t.Fatalf("declined update outcome = %v, want declined", got)
-	}
-	if len(*applied) != 0 {
-		t.Fatal("declined update must not apply")
-	}
-	if current != "0.5.2" || target != "9.9.9" {
-		t.Fatalf("prompt versions = %q -> %q, want 0.5.2 -> 9.9.9", current, target)
-	}
-	if notes != "https://rel.test/pa-arth/promptster-teams-cli/releases/tag/v9.9.9" {
-		t.Fatalf("release notes URL = %q", notes)
+			if got := u.checkAndApply(); got != tc.want {
+				t.Fatalf("outcome = %v, want %v", got, tc.want)
+			}
+			if len(*applied) != 0 {
+				t.Fatal("must not apply without consent")
+			}
+		})
 	}
 }
 
-func TestDeclineIsAskedAgainOnNextCycle(t *testing.T) {
+// The whole point of moving consent out of the check: a stored answer is read,
+// never re-asked. The previous design prompted per cycle from inside a detached
+// daemon, so it declined itself on every cycle forever — this asserts the answer
+// is a lookup with a stable result, which is what makes it survivable.
+func TestStoredConsentIsReusedEveryCycleNotReAsked(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
 	wireHappyRelease(addRoute)
 
-	asks := 0
-	u.confirm = func(_, _, _ string) bool {
-		asks++
-		return false
+	reads := 0
+	u.loadConsent = func() Consent {
+		reads++
+		return ConsentDenied
 	}
-	for cycle := 1; cycle <= 2; cycle++ {
+	for cycle := 1; cycle <= 3; cycle++ {
 		if got := u.checkAndApply(); got != outcomeDeclined {
 			t.Fatalf("cycle %d outcome = %v, want declined", cycle, got)
 		}
 	}
-	if asks != 2 {
-		t.Fatalf("prompted %d times, want once per cycle", asks)
+	if reads != 3 {
+		t.Fatalf("consent read %d times, want once per cycle (a cached read would go stale after --enable-auto)", reads)
 	}
 	if len(*applied) != 0 {
-		t.Fatal("declined updates must not apply")
+		t.Fatal("a standing decline must never apply")
+	}
+}
+
+// An org-managed machine takes the org's answer and never consults the local
+// record. This is the enterprise contract: which build lands on a company's
+// laptops is the org's decision, and an engineer's stored preference — in either
+// direction — must not be able to move it.
+func TestManagedFleetIgnoresLocalConsent(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent {
+		t.Error("a managed machine asked the local consent record; the org already answered")
+		return ConsentDenied
+	}
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("managed+enabled outcome = %v, want applied", got)
+	}
+	if len(*applied) != 1 {
+		t.Fatalf("apply called %d times, want 1", len(*applied))
+	}
+}
+
+// A granted consent must not override the org's "no". Consent and policy answer
+// different questions, and policy is checked first for exactly this reason.
+func TestManagedDisabledBeatsGrantedConsent(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: false, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentGranted }
+	if got := u.checkAndApply(); got != outcomeSkippedPolicy {
+		t.Fatalf("managed+disabled outcome = %v, want skippedPolicy", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("an org that disabled updates must not be overridden by local consent")
+	}
+}
+
+func TestReleaseNotesURLNamesTheTag(t *testing.T) {
+	const want = "https://github.com/pa-arth/promptster-teams-cli/releases/tag/v9.9.9"
+	// Both forms resolve to the same page: callers hold a bare version, the URL
+	// needs the v-prefixed tag.
+	if got := ReleaseNotesURL("9.9.9"); got != want {
+		t.Fatalf("ReleaseNotesURL(%q) = %q, want %q", "9.9.9", got, want)
+	}
+	if got := ReleaseNotesURL("v9.9.9"); got != want {
+		t.Fatalf("ReleaseNotesURL(%q) = %q, want %q", "v9.9.9", got, want)
 	}
 }
 

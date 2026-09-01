@@ -16,10 +16,26 @@
 // or a rejecting backend must never STRAND the fleet, so anything uncertain is
 // best-effort and simply retried next cycle. Org control is opt-OUT (auto-update
 // on unless the org disables it) rather than opt-in.
+//
+// WHO AUTHORIZES an update depends on whether an org has an opinion:
+//
+//   - Org-managed fleet (PolicyView.OrgManaged): the org's switch and pin decide,
+//     and the engineer is never asked. A security team reviewing releases before
+//     they reach company laptops sets autoUpdate:false and moves pinnedCliVersion
+//     as each release clears review — the pin REPLACES "latest" as the target, so
+//     a pinned fleet only ever lands on the tag the org named.
+//   - Unmanaged solo install: a one-time durable answer collected at `login` or
+//     `start` (consent.go), after which updates apply silently.
+//
+// Consent is collected ONCE, at a moment the engineer is provably at a keyboard,
+// and never on this path. An earlier revision prompted per cycle from inside the
+// check itself, which cannot work: the check runs in the detached watch daemon,
+// so the prompt saw a non-TTY stdin, declined itself, and — because the declined
+// outcome had no banner case — froze fleets at their installed version in total
+// silence. Signature verification, not a prompt, is the security boundary here.
 package selfupdate
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,7 +46,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/x/term"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	"github.com/pa-arth/promptster-teams-cli/internal/version"
@@ -116,6 +131,20 @@ type PolicyView interface {
 	// It is an escalation lever for the CHECK CADENCE only — it never overrides
 	// AutoUpdateEnabled or a pin, and it never changes which tag is installed.
 	MinCliVersion() string
+
+	// OrgManaged reports whether an org has ever expressed an explicit intent
+	// about this fleet's CLI version — an explicit autoUpdate value either way,
+	// or a pin. It decides WHO consents, not WHETHER to update: a managed
+	// machine takes its answer from AutoUpdateEnabled/PinnedCliVersion and never
+	// consults the local consent record, because which build lands on a
+	// company's laptops belongs to the org, and asking the engineer would imply
+	// their answer could override it.
+	//
+	// It is deliberately "has an opinion", NOT "has an org". Every enrolled
+	// machine has an org, so that reading would make managed universal and
+	// silently strand every fleet whose backend predates the autoUpdate field —
+	// the stale-fleet bug this updater exists to fix, reintroduced as a default.
+	OrgManaged() bool
 }
 
 // npmPackage is the published npm package name.
@@ -311,7 +340,8 @@ const (
 	outcomeUpToDate                           // no newer (or pinned-not-newer) release
 	outcomeBlockedNotWritable                 // newer release found, install dir read-only
 	outcomeBlockedProjectLocal                // newer release found, but a lockfile pins this copy
-	outcomeDeclined                           // newer release found, user did not approve this cycle
+	outcomeDeclined                           // newer release found, engineer has stored a standing "no"
+	outcomeNeedsConsent                       // newer release found, nobody has been asked yet
 	outcomeError                              // best-effort failure (network/verify/io)
 	outcomeApplied                            // swapped + re-exec'd (does not return in prod)
 )
@@ -344,10 +374,11 @@ type updater struct {
 	// apply performs the swap + re-exec. Injected so tests record the call
 	// instead of replacing the process.
 	apply func(self, staged string) error
-	// confirm asks for per-cycle consent after a viable newer release has been
-	// found, but before any release assets are downloaded. A decline is not
-	// persisted: the next update cycle asks again while the release is newer.
-	confirm func(current, target, releaseNotesURL string) bool
+	// loadConsent reads the engineer's DURABLE answer (consent.go). It replaced a
+	// per-cycle terminal prompt that could never fire: the check runs in a
+	// detached daemon, so the prompt saw a non-TTY stdin and declined itself
+	// forever. Consulted only for UNMANAGED machines — see PolicyView.OrgManaged.
+	loadConsent func() Consent
 
 	// --- on-disk catch-up edges (see ondisk.go) --------------------------------
 	// canonicalBin names the managed install path, fileExists/fileStamp probe the
@@ -385,7 +416,7 @@ func newDefaultUpdater(currentVersion string, noAutoUpdate bool, pol PolicyView)
 		httpRedirect:   httpRedirectLocation,
 		resolveSelf:    resolveSelfPath,
 		apply:          applySwapAndReexec,
-		confirm:        confirmUpdate,
+		loadConsent:    LoadConsent,
 		canonicalBin:   state.CanonicalInstallBin,
 		fileExists:     fileExists,
 		fileStamp:      fileStamp,
@@ -464,12 +495,30 @@ func (u *updater) checkAndApply() outcome {
 		return outcomeBlockedNotWritable
 	}
 
-	// Consent is deliberately per check, not a remembered preference. Only the
-	// existing flag/env/org gates above disable future prompts. This also means
-	// a "no" today is revisited on the next normal update cycle.
-	releaseNotesURL := strings.TrimRight(u.releaseBaseURL, "/") + "/" + repoSlug + "/releases/tag/" + tag
-	if u.confirm == nil || !u.confirm(u.currentVersion, target, releaseNotesURL) {
-		return outcomeDeclined
+	// Consent gate. WHO answers depends on whether an org has an opinion:
+	//
+	//   - MANAGED: the org already answered, above, via AutoUpdateEnabled and
+	//     PinnedCliVersion. Reaching here means it said yes, so there is nothing
+	//     left to ask and the local record is not consulted at all.
+	//   - UNMANAGED: a solo install, where the engineer's stored one-time answer
+	//     decides. Unknown blocks the install but keeps checking, so the answer
+	//     they give at the next `login`/`start` takes effect immediately.
+	//
+	// The answer is durable, NOT per-cycle. The per-cycle prompt this replaced
+	// ran inside a detached daemon with no terminal: it declined itself on every
+	// cycle, silently, and froze the fleet at its installed version. Anything
+	// that reintroduces an interactive question on this path reintroduces that
+	// bug — the engineer is not at a keyboard when this code runs, and in a CLI
+	// that is installed once and never typed again, they never will be.
+	if !u.orgManaged() {
+		switch u.consent() {
+		case ConsentGranted:
+			// proceed
+		case ConsentDenied:
+			return outcomeDeclined
+		default:
+			return outcomeNeedsConsent
+		}
 	}
 
 	// 5. Download + verify (minisign THEN sha256) from the SAME tag.
@@ -493,24 +542,28 @@ func (u *updater) checkAndApply() outcome {
 	return outcomeApplied
 }
 
-// confirmUpdate asks on an attached terminal and defaults to no. A detached
-// watcher must never block on an inherited pipe (or treat EOF as permission),
-// so non-interactive runs simply decline this cycle and try again next cycle.
-func confirmUpdate(current, target, releaseNotesURL string) bool {
-	if !term.IsTerminal(os.Stdin.Fd()) {
-		return false
+// orgManaged reports whether an org has expressed an explicit intent about this
+// fleet's version. A nil policy is UNMANAGED, which is the correct reading: no
+// resolver means no org answer, so the local consent record decides.
+func (u *updater) orgManaged() bool {
+	return u.policy != nil && u.policy.OrgManaged()
+}
+
+// consent reads the durable local answer, defaulting to unknown when no reader
+// is wired. Unknown blocks the install rather than permitting it — an absent
+// edge must never read as permission.
+func (u *updater) consent() Consent {
+	if u.loadConsent == nil {
+		return ConsentUnknown
 	}
-	fmt.Fprintf(os.Stderr, "promptster-teams: update available %s -> %s\nRelease notes: %s\nUpdate now? [y/N] ", current, target, releaseNotesURL)
-	answer, err := bufio.NewReader(os.Stdin).ReadString('\n')
-	if err != nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(answer)) {
-	case "y", "yes":
-		return true
-	default:
-		return false
-	}
+	return u.loadConsent()
+}
+
+// ReleaseNotesURL names the GitHub release page for a version, so `login`,
+// `start` and `update` can show an engineer what they are agreeing to instead of
+// asking them to trust a version number.
+func ReleaseNotesURL(target string) string {
+	return "https://github.com/" + repoSlug + "/releases/tag/" + ensureVPrefix(target)
 }
 
 // downloadAndVerify fetches SHA256SUMS, its .minisig, and the platform asset for
@@ -848,12 +901,22 @@ func runAutoUpdate(u *updater, stop <-chan struct{}) {
 // startupBanner prints ONE concise line at watch start when an update exists but
 // could not be applied, so an operator sees why the fleet is stuck on an old
 // version. The not-writable nudge is already printed inside checkAndApply.
+// EVERY outcome that means "a newer release exists and we are not installing it"
+// must print something here. The bug this file's consent rework fixes was not
+// that the daemon declined — it was that outcomeDeclined had NO case, so the
+// refusal produced no output anywhere and the only symptom was a fleet frozen at
+// its installed version with `doctor` reporting green. A silent branch on this
+// switch is how that happens again.
 func startupBanner(res outcome) {
 	switch res {
 	case outcomeSkippedPolicy:
 		fmt.Fprintln(os.Stderr, "promptster-teams: auto-update disabled by org policy")
 	case outcomeBlockedNotWritable:
 		// nudge already printed in checkAndApply — no second line.
+	case outcomeDeclined:
+		fmt.Fprintln(os.Stderr, "promptster-teams: update available, but auto-update was declined on this machine — run `promptster-teams update` to install it, or `promptster-teams update --enable-auto` to allow future updates")
+	case outcomeNeedsConsent:
+		fmt.Fprintln(os.Stderr, "promptster-teams: update available — run `promptster-teams update` to install it")
 	}
 }
 

@@ -255,7 +255,14 @@ func printAutoUpdateStatus() {
 	if !selfupdate.EnvDisablesAutoUpdate(env) && version.Version != "dev" && version.Version != "" {
 		latest, latestOK = selfupdate.LatestVersionBestEffort(3 * time.Second)
 	}
-	printlnIndent(autoUpdateStatusLine(env, version.Version, latest, latestOK))
+	// Read the org's stated intent from the local mirror rather than fetching:
+	// doctor must work offline, and this is exactly the situation the durable
+	// mirror exists for.
+	auth := updateAuthority{consent: selfupdate.LoadConsent()}
+	if pol := updatePolicyView(); pol != nil {
+		auth.managed = pol.OrgManaged()
+	}
+	printlnIndent(autoUpdateStatusLine(env, version.Version, latest, latestOK, auth))
 }
 
 // humanInterval renders a cadence the way a person writes one. Go's
@@ -333,24 +340,63 @@ func humanInterval(d time.Duration) string {
 //   - the opt-out is selfupdate.EnvDisablesAutoUpdate, which trims and folds
 //     case. The inline comparison it replaces did neither, so a machine set to
 //     `TRUE` had auto-update off and was told it was on.
-func autoUpdateStatusLine(envOptOut, current, latest string, latestOK bool) string {
+//
+// updateAuthority is who gets to say whether this machine installs an update:
+// the org (managed), or the engineer's stored one-time answer (consent). It is a
+// struct rather than two bare bools so a caller cannot silently transpose them.
+type updateAuthority struct {
+	managed bool
+	consent selfupdate.Consent
+}
+
+func autoUpdateStatusLine(envOptOut, current, latest string, latestOK bool, auth updateAuthority) string {
 	if selfupdate.EnvDisablesAutoUpdate(envOptOut) {
 		return fmt.Sprintf("%s auto-update disabled (%s set)", warnGlyph, selfupdate.EnvNoAutoUpdate)
 	}
 	if current == "dev" || current == "" {
 		return fmt.Sprintf("%s auto-update inactive for dev build", warnGlyph)
 	}
-	if latestOK {
-		if selfupdate.IsNewer(current, latest) {
-			return fmt.Sprintf("%s update checks on — newer release available (%s); you will be asked on the next interactive check (every %s) while watching",
-				okGlyph, latest, humanInterval(selfupdate.CheckInterval))
-		}
+	if latestOK && !selfupdate.IsNewer(current, latest) {
 		// Not newer covers both equal and ahead-of-latest (a local build, a
 		// yanked release). Report the version actually RUNNING: claiming to be
 		// "up to date (0.12.1)" while running 0.13.0 is the same lie in reverse.
 		return fmt.Sprintf("%s update checks on — up to date (%s)", okGlyph, current)
 	}
-	return fmt.Sprintf("%s update checks on — asks before installing while watching (org policy may disable or pin)", okGlyph)
+
+	// A newer release exists (or the probe failed and one might). What happens
+	// next depends entirely on WHO authorizes updates on this machine, and this
+	// line is the one screen an engineer reads while already suspecting
+	// auto-update is broken — so it must name the actual next step, not a
+	// generic reassurance.
+	//
+	// The line it replaced said the engineer "will be asked on the next
+	// interactive check". That was false for every machine that mattered: the
+	// check runs in a detached daemon that has no terminal to ask on, so nobody
+	// was ever asked and the fleet sat still. Do not reintroduce a promise that
+	// something will prompt.
+	switch {
+	case auth.managed:
+		if latestOK {
+			return fmt.Sprintf("%s update checks on — %s available; your organization controls when it installs", okGlyph, latest)
+		}
+		return fmt.Sprintf("%s update checks on — your organization controls which version this machine runs", okGlyph)
+	case auth.consent == selfupdate.ConsentGranted:
+		if latestOK {
+			return fmt.Sprintf("%s update checks on — %s available; installs automatically within %s while watching",
+				okGlyph, latest, humanInterval(selfupdate.CheckInterval))
+		}
+		return fmt.Sprintf("%s update checks on — installs automatically within %s while watching", okGlyph, humanInterval(selfupdate.CheckInterval))
+	case auth.consent == selfupdate.ConsentDenied:
+		if latestOK {
+			return fmt.Sprintf("%s %s available, but background updates are off on this machine — run `promptster-teams update` to install it", warnGlyph, latest)
+		}
+		return fmt.Sprintf("%s background updates are off on this machine — run `promptster-teams update` to install one", warnGlyph)
+	default:
+		if latestOK {
+			return fmt.Sprintf("%s %s available — run `promptster-teams update` to install it, or `--enable-auto` to allow background updates", warnGlyph, latest)
+		}
+		return fmt.Sprintf("%s nobody has chosen whether this machine updates itself — run `promptster-teams update --enable-auto` to allow it", warnGlyph)
+	}
 }
 
 // countBufferedEvents reports how many captured events are still waiting to be
