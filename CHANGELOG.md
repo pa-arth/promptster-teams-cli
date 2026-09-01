@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.25.0] — 2026-09-01
+
 ### Added
 
 - Added metadata-only discovery for additional OS user homes containing Claude,
@@ -2351,7 +2353,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.21.0...v0.22.0
