@@ -701,7 +701,7 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 // WHY THIS EXISTS. The rail handoff was whole-transcript: a claimed session was
 // seeked to EOF unread, on the reasoning that the hook payload is strictly
 // richer. That is true of everything the hooks REPORT — and Cursor exposes no
-// hook for an MCP call or a subagent dispatch. We register sessionStart /
+// hook for an MCP call, a subagent dispatch, or a direct skill-file read. We register sessionStart /
 // sessionEnd / beforeSubmitPrompt / afterFileEdit / afterShellExecution /
 // postToolUseFailure / afterAgentThought, and none of them carries either. So
 // on every hook-enrolled machine — the recommended install — delegation and MCP
@@ -720,6 +720,9 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 var cursorHookBlindKinds = map[string]bool{
 	"task_dispatch": true,
 	"mcp_call":      true,
+	// normalize_cursor emits tool_use only for a direct SKILL.md read. The hook
+	// rail has no read event, so this is disjoint rather than a duplicate.
+	"tool_use": true,
 }
 
 func tailCursorTranscript(

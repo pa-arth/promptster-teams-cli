@@ -37,6 +37,22 @@ func dataOf(t *testing.T, e event.Event) map[string]interface{} {
 	return d
 }
 
+func TestCursorReadSkillEmitsCanonicalUseWithoutPath(t *testing.T) {
+	line := []byte(`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/Users/u/.cursor/skills-cursor/review/SKILL.md"}}]}}`)
+	e, ok := firstOfKind(procWith("sess-skill").Process(line, 0), "tool_use")
+	if !ok {
+		t.Fatal("direct SKILL.md read emitted no tool_use")
+	}
+	d := dataOf(t, e)
+	if d["tool"] != "Skill" || d["skill"] != "review" {
+		t.Fatalf("skill event = %#v", d)
+	}
+	ordinary := []byte(`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/repo/main.go"}}]}}`)
+	if got := procWith("sess-read").Process(ordinary, 0); len(got) != 0 {
+		t.Fatalf("ordinary Read emitted %d events", len(got))
+	}
+}
+
 // --- prompts -----------------------------------------------------------------
 
 func TestCursorPrompt_ExtractsUserQuery(t *testing.T) {

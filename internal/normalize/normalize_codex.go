@@ -1022,7 +1022,22 @@ func (p *CodexRolloutProcessor) emitToolEvent(call codexPendingCall, callID, out
 			"stdout":   stdout,
 		}
 		e.RawPayload = raw
-		return []event.Event{e}
+		events := []event.Event{e}
+		// Codex has no Skill tool. A direct shell read of SKILL.md is the
+		// activation signal. Publish the same canonical event Claude emits while
+		// retaining the command event for the rest of the product.
+		if name := skillNameFromCommand(cmd); name != "" {
+			skill := p.newCodexEvent("tool_use", ts, callID+":skill")
+			skill.Provenance = event.AIProvenance()
+			skill.Data = map[string]interface{}{
+				"tool":   "Skill",
+				"skill":  name,
+				"status": codexToolStatus(output),
+			}
+			skill.RawPayload = raw
+			events = append(events, skill)
+		}
+		return events
 
 	case call.name == "update_plan":
 		e := p.newCodexEvent("planning", ts, callID)

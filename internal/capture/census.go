@@ -705,11 +705,11 @@ func buildConfigCensus(env censusEnv) configCensusData {
 		// invocation joins to. Only its contribution to the aggregate is withheld,
 		// because something else already made that contribution.
 		//
-		// `plugin-cache` entries DO count: no plugin line covers them (Codex has no
-		// registry to enumerate, and a cached Claude plugin absent from
-		// `enabledPlugins` is not in the plugin list either), so excluding them
-		// would zero a real cost rather than avoid a duplicated one.
-		if s.Source == skillSourcePlugin {
+		// `plugin-cache` is presence evidence only. A downloaded plugin can remain
+		// cached after it stops contributing skills to Codex's live catalog. We
+		// retain its identity so an observed invocation can join to it, but never
+		// bill its description merely for existing on disk.
+		if s.Source == skillSourcePlugin || s.Source == skillSourcePluginCache {
 			continue
 		}
 		data.SkillListingTokens += s.DescTokens
