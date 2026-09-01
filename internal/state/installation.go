@@ -29,6 +29,7 @@ func InstallationID() string {
 		value := "ins-" + hex.EncodeToString(raw[:])
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
 			// O_EXCL makes concurrent first starts converge on one persisted value.
+			// #nosec G304 -- path is always StateDir()/installation-id, not user input.
 			if f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err == nil {
 				_, writeErr := f.WriteString(value + "\n")
 				closeErr := f.Close()
@@ -49,6 +50,7 @@ func InstallationID() string {
 }
 
 func readInstallationID(path string) string {
+	// #nosec G304 -- callers pass only StateDir()/installation-id.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""

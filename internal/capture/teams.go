@@ -66,7 +66,7 @@ func DeviceID() string {
 	if machine == "" {
 		machine = ingest.Sha256Hex(fp.HostnameHash + fp.UsernameHash)
 	}
-	return "dev-" + ingest.Sha256Hex(machine+":"+state.InstallationID())[:16]
+	return "dev-" + ingest.Sha256Hex(machine + ":" + state.InstallationID())[:16]
 }
 
 // resolveWatchEnv parses the shared `watch`/`start` flags (--key, --api-url),
