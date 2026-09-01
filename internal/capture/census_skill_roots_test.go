@@ -133,10 +133,13 @@ func TestCensusCountsOnePluginSkillOncePerVersionSet(t *testing.T) {
 			t.Errorf("inventoried %q from a superseded cached version", s.Slug)
 		}
 	}
-	// And the carry follows the count — a duplicate would double-bill silently.
+	// Cache presence is not enablement, so these rows are join candidates but do
+	// not contribute to the always-on listing tax.
 	total := 0
 	for _, s := range data.Skills {
-		total += s.DescTokens
+		if s.Source != skillSourcePluginCache && s.Source != skillSourcePlugin {
+			total += s.DescTokens
+		}
 	}
 	if total != data.SkillListingTokens {
 		t.Errorf("listing tokens %d disagree with the summed rows %d", data.SkillListingTokens, total)

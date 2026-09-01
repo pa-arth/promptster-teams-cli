@@ -125,6 +125,26 @@ func TestCodexExecWrapperNormalization(t *testing.T) {
 	}
 }
 
+func TestCodexExecWrapperSkillReadEmitsCanonicalUse(t *testing.T) {
+	p := NewCodexRolloutProcessor("sess-skill")
+	lines := []string{
+		`{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_skill","input":"const r = await tools.exec_command({cmd:\"sed -n '1,240p' /Users/u/.codex/skills/.system/openai-docs/SKILL.md\"}); text(r.output);"}}`,
+		`{"timestamp":"2026-07-22T17:30:01Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_skill","output":[{"type":"input_text","text":"Script completed\\nOutput:\\n"}]}}`,
+	}
+	var events []event.Event
+	for _, line := range lines {
+		events = append(events, p.Process([]byte(line))...)
+	}
+	e, ok := firstOfKind(events, "tool_use")
+	if !ok {
+		t.Fatal("direct SKILL.md shell read emitted no tool_use")
+	}
+	d := dataOf(t, e)
+	if d["tool"] != "Skill" || d["skill"] != "openai-docs" {
+		t.Fatalf("skill event = %#v", d)
+	}
+}
+
 func TestCodexExecWrapperUnknownToolProjectsIdentityFields(t *testing.T) {
 	p := NewCodexRolloutProcessor("sess-wrapper")
 	call := `{"timestamp":"2026-07-22T17:30:00Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_unknown","input":"const r = await tools.some_future_tool({secret:\"must not survive\"}); text(r);"}}`

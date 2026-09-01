@@ -408,6 +408,22 @@ func (p *CursorTranscriptProcessor) toolEvent(item cursorContentItem, offset int
 	}
 
 	switch item.Name {
+	case "Read":
+		// Cursor has no Claude-style Skill tool. A direct read of a skill's own
+		// SKILL.md is its explicit activation signal. Ordinary reads remain
+		// intentionally unmapped; only the privacy-safe skill slug leaves here.
+		name := skillNameFromPath(in.Path)
+		if name == "" {
+			return event.Event{}, false
+		}
+		e := p.newAIEvent("tool_use", offset, idx)
+		e.Data = map[string]interface{}{
+			"tool":   "Skill",
+			"skill":  name,
+			"status": "completed",
+		}
+		return e, true
+
 	case "StrReplace":
 		if in.Path == "" {
 			return event.Event{}, false
