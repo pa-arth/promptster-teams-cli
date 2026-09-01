@@ -94,6 +94,8 @@ func Main(argv []string) int {
 		cmdTeamsStatus(argv[2:])
 	case "doctor":
 		cmdTeamsDoctor()
+	case "discover":
+		cmdDiscover()
 	case "version", "--version", "-v":
 		fmt.Println(version.Version)
 	case "help", "--help", "-h":
@@ -120,6 +122,7 @@ Commands:
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
+  discover     Find additional local user homes with Claude, Codex, or Cursor
   uninstall    Undo the install — stop capture, remove autostart, unenroll the Cursor hook, restore the statusline (--purge also deletes ~/.promptster-teams)
   version      Print version
   help         Show this help

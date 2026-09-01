@@ -87,8 +87,8 @@ func printStatusStatic() {
 		"watch", root,
 		"daemon", daemon,
 		"autostart", autostart,
-		"device", capture.DeviceID(),
-		"identity", "anonymous — device hash + team key, no email",
+		"installation", capture.DeviceID(),
+		"identity", "anonymous — installation-scoped hash + team key, no email",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", humanInterval(capture.PresenceHeartbeatInterval)),
 		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
 	}
@@ -141,6 +141,7 @@ func cmdTeamsDoctor() {
 	} else {
 		printlnIndent(fmt.Sprintf("%s ingest not reachable: %s", warnGlyph, hostOf(apiURL)))
 	}
+	printlnIndent(fmt.Sprintf("%s installation health id: %s", okGlyph, capture.DeviceID()))
 
 	if _, err := os.Stat(capture.ClaudeProjectsDir()); err == nil {
 		printlnIndent(fmt.Sprintf("%s Claude Code transcripts: %s", okGlyph, capture.ClaudeProjectsDir()))

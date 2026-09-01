@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added metadata-only discovery for additional OS user homes containing Claude,
+  Codex, or Cursor state. `promptster-teams discover` gives user-scoped setup
+  instructions, and login reports additional environments without opening
+  their transcripts, configuration, databases, or credentials.
+- Capture identity is now installation-scoped instead of machine-scoped. Each
+  home keeps an independent anonymous identity, heartbeat, signing chain, queue,
+  and progress state, giving fleet health a stable key with which to distinguish
+  two homes on the same physical machine.
+
 ## [0.24.0] — 2026-08-27
 
 ### Added
