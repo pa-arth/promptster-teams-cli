@@ -6,6 +6,53 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.26.0] — 2026-09-01
+
+### Fixed
+
+- Self-update could never install anything. The consent prompt required an
+  interactive terminal, but the update check only ever runs inside the watch
+  daemon, which `start` detaches and `autostart` runs under launchd/systemd —
+  so it declined itself on every cycle, and the declined outcome printed
+  nothing anywhere. Machines stayed on the version they were installed at
+  while `doctor` reported auto-update healthy.
+- An organization's `autoUpdate: false` could be silently undone. The policy
+  cache is discarded on any read or parse error, after which the switch
+  reverts to its enabled default, so a single corrupt or deleted state file
+  re-enabled self-update on a fleet that had turned it off. The organization's
+  stated intent is now mirrored to its own durable file, which fills gaps in
+  the cache but never overrides it.
+- `login --key ... < /dev/null` in a provisioning script reported an
+  interactive terminal and prompted into end-of-input, because the terminal
+  check treated `/dev/null` as a character device.
+
+### Added
+
+- Added `promptster-teams update`: install a newer signed release on demand,
+  with `--check` to report what one would do, `--yes` for unattended runs, and
+  `--ask-each` / `--enable-auto` / `--disable-auto` to set how this machine
+  handles updates.
+- `login` and `start` now ask once how updates should be handled and remember
+  the answer: ask about each release (default), update automatically, or never.
+  Organizations that set an update policy decide for their own fleet, and
+  individual engineers are not asked.
+- When set to ask, a notification names the new version and links its release
+  notes, so a machine with no terminal attached can still get an answer. It
+  appears at most once per release. Verified on macOS; Windows and Linux
+  support is implemented but not yet verified, and a notification that cannot
+  be shown never counts as a refusal.
+- Every outcome where an update exists but is not installed now says so, on
+  `doctor` and at watch startup.
+
+### Changed
+
+- Skill-use capture is now consistent across tools: direct Codex and Cursor
+  `SKILL.md` reads emit canonical skill-use events, nested Codex system-skill
+  paths are recognized, search commands no longer fabricate activations, and
+  cache-only plugin skills no longer contribute listing tax at capture time.
+  Cursor reads discarded by older clients cannot be reconstructed
+  historically; new captures are accurate from this release onward.
+
 ## [0.25.0] — 2026-09-01
 
 ### Added
