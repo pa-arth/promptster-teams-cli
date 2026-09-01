@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/pa-arth/promptster-teams-cli/internal/discovery"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/service"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -133,7 +134,29 @@ func cmdLogin(args []string) {
 		enableAutostartOnLogin()
 		enableStatuslineOnLogin()
 	}
+	reportAdditionalHomesAfterLogin()
 	fmt.Println()
+}
+
+// reportAdditionalHomesAfterLogin makes discovery part of onboarding without
+// silently crossing an OS-user boundary. Another home may require that user's
+// filesystem permissions, Keychain session, and launch service, so the only
+// honest setup action from here is to tell the engineer exactly where to run
+// the same login flow.
+func reportAdditionalHomesAfterLogin() {
+	homes := discovery.AdditionalHomes()
+	if len(homes) == 0 {
+		return
+	}
+	printlnIndent(fmt.Sprintf("%s found %d additional AI environment(s) on this machine", warnGlyph, len(homes)))
+	for _, home := range homes {
+		status := "needs Promptster setup"
+		if home.PromptsterEnrolled {
+			status = "Promptster state found; verify it as that user with `promptster-teams doctor`"
+		}
+		printlnIndent(dimStyle.Render(fmt.Sprintf("%s — %s (%s)", home.Path, strings.Join(home.Products, ", "), status)))
+	}
+	printlnIndent(dimStyle.Render("Run `promptster-teams discover` for safe setup instructions. Each installation links with the same developer key but reports health independently."))
 }
 
 // enableStatuslineOnLogin turns on Claude rate-limit window capture as part of

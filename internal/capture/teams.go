@@ -11,6 +11,7 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // loadSession builds the teams capture context. The ingest credential is a
@@ -54,16 +55,18 @@ func verboseWatch() bool {
 	return os.Getenv("PROMPTSTER_DEBUG") == "1"
 }
 
-// deviceID returns a stable, anonymous per-device identifier (a hash of the
-// machine id, falling back to hostname+user). It is the only identity stamped
-// on events in this phase; org -> team -> developer enrollment lands with the
-// backend.
+// DeviceID returns a stable, anonymous per-INSTALLATION identifier. The
+// installation id separates independent home-scoped daemons on one physical
+// machine; the machine fingerprint keeps continuity tied to this machine
+// without exposing either input. Presence and every captured event carry this
+// field, giving the backend the key it needs for per-installation health rows.
 func DeviceID() string {
 	fp := ingest.CollectDeviceFingerprint()
-	if fp.MachineIDHash != "" {
-		return "dev-" + fp.MachineIDHash[:16]
+	machine := fp.MachineIDHash
+	if machine == "" {
+		machine = ingest.Sha256Hex(fp.HostnameHash + fp.UsernameHash)
 	}
-	return "dev-" + ingest.Sha256Hex(fp.HostnameHash + fp.UsernameHash)[:16]
+	return "dev-" + ingest.Sha256Hex(machine+":"+state.InstallationID())[:16]
 }
 
 // resolveWatchEnv parses the shared `watch`/`start` flags (--key, --api-url),

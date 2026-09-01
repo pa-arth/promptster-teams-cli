@@ -70,7 +70,7 @@ Read straight from the AI tool's own transcript `.jsonl`:
 - Behavioral signals: no typing-cadence, no paste detection, no authorship
   scoring. Capture is *content*, not surveillance of the developer.
 - Your email or any personal identity. Events are stamped only with an
-  **anonymous per-device hash** and your team key; the CLI never collects or
+  **anonymous per-installation hash** and your team key; the CLI never collects or
   sends your email. Mapping a device to a person is done on the backend, from
   the key — so nothing in this on-device path needs to know who you are.
 
@@ -78,14 +78,20 @@ Read straight from the AI tool's own transcript `.jsonl`:
 
 While `watch` is running it emits a small **presence** event on start and every
 few minutes — *even when you are idle and nothing is being captured*. It carries
-only device + environment metadata (the anonymous device hash, the CLI version,
+only device + environment metadata (the anonymous installation hash, the CLI version,
 OS/arch, and which tools are being watched) and **zero transcript content**.
 
 Its only purpose is to let your team tell an *installed-but-idle* seat apart
 from one where the CLI was *never installed* — e.g. for seat-utilization
-reporting. It is not a tracker: it identifies a machine, never a person, and a
+reporting. It is not a tracker: it identifies an installation, never a person, and a
 CI test (`presence_test.go`) fails the build if a presence event ever grows a
 field that could carry captured content.
+
+Each OS-user installation has its own identity, signing chain, delivery queue,
+and heartbeat. Two homes on one physical machine therefore remain independently
+identifiable on the wire. A backend must retain heartbeat health by installation
+(rather than only the latest heartbeat per developer key) to alert on one home
+whose uploads have stopped while a sibling remains healthy.
 
 ## Redaction (on-device, before transmission)
 
@@ -108,7 +114,7 @@ event stream.
 
 ## Tamper-evident signing
 
-On first run the CLI generates a per-device Ed25519 keypair, storing only the
+On first run the CLI generates a per-installation Ed25519 keypair, storing only the
 private seed at `~/.promptster-teams/session.key` (mode 0600) — it never leaves
 the machine. Every event is signed and chained to the previous event's
 signature (`prevSig`). The **public** verifying key is sent with each ingest
@@ -126,7 +132,7 @@ network or the backend.
 
 - **A malicious or compromised backend** can see the metadata this CLI chooses
   to send (redacted prompts, tool-call metadata, token counts, the anonymous
-  device hash, the team key). It **cannot** obtain source code, diffs, file
+  installation hash, the team key). It **cannot** obtain source code, diffs, file
   contents, command output, or assistant response text, because those are
   dropped locally before transmission — there is nothing on the wire to steal.
   It cannot deanonymize a device to a person from the CLI's payload alone (the
@@ -197,6 +203,27 @@ disable` removes it and `autostart status` shows whether it's armed.
 Other commands: `watch` runs capture in the foreground (Ctrl-C to stop) for
 debugging, `stop` halts background capture, and `doctor` checks your key, ingest
 reachability, and transcript dirs.
+
+### Multiple user homes
+
+Run `promptster-teams discover` to look for additional local user homes that
+contain Claude, Codex, or Cursor state. Discovery checks known directory markers
+only; it does not open transcripts, configuration, product databases, or
+credentials. Because another OS user has independent filesystem permissions,
+Keychain access, hooks, and login services, enroll that environment while signed
+in as that user and use the same Promptster developer key:
+
+```sh
+promptster-teams discover
+# switch/sign in to the additional OS user
+promptster-teams login
+promptster-teams doctor
+```
+
+Login also reports additional environments it discovers. The shared developer
+key links their events to the same Promptster account, while the distinct
+installation health IDs give the backend the key needed to monitor their
+heartbeats separately.
 
 ### Uninstall
 
