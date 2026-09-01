@@ -149,31 +149,79 @@ func TestExplicitReEnableOverwritesTheMirror(t *testing.T) {
 	}
 }
 
-// The mirror must not out-rank a FRESH successful fetch — it is a fallback for
-// when the cache cannot answer, not a second source of truth that pins the
-// machine to whatever it saw first.
-func TestFreshCacheWinsOverAnOlderMirror(t *testing.T) {
+// THE P1 regression (Greptile, PR #206). The mirror must never OVERRIDE the
+// cache — it fills gaps only.
+//
+// Both files are written by the same Refresh but independently, so the mirror is
+// stale whenever its write failed and the cache's succeeded. The dangerous
+// ordering is precisely the one the mirror exists to protect: an org disables
+// self-update, writeUpdateIntent(false) fails, writeDiskCache(false) succeeds,
+// and on the next start a mirror still saying `true` would turn self-update back
+// ON for the fleet that just disabled it.
+func TestStaleMirrorNeverOverridesTheCache(t *testing.T) {
 	dir := intentStateDir(t)
-	writeUpdateIntent(boolPtr(false), "")
 
-	// A newer successful fetch said yes, and wrote both files.
-	fresh, err := json.Marshal(diskCache{
-		AutoUpdate: boolPtr(false),
-		FetchedAt:  time.Now(),
-	})
+	// The mirror is stale: it still holds the org's OLD "yes".
+	writeUpdateIntent(boolPtr(true), "")
+
+	// The cache holds the org's CURRENT answer — no.
+	fresh, err := json.Marshal(diskCache{AutoUpdate: boolPtr(false), FetchedAt: time.Now()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, cacheFileName), fresh, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeUpdateIntent(boolPtr(true), "")
 
-	if !NewResolver("PSE-TEST-KEY").AutoUpdateEnabled() {
-		t.Fatal("the mirror did not reflect the most recent stated intent")
+	if NewResolver("PSE-TEST-KEY").AutoUpdateEnabled() {
+		t.Fatal("a stale mirror re-enabled auto-update over a cache that said the org disabled it")
+	}
+}
+
+// The mirror still fills a gap the cache leaves. A valid cache from a backend
+// that sends no autoUpdate field says nothing about the org's intent, so a
+// previously stated one must survive — silence is not withdrawal.
+func TestMirrorFillsAGapTheCacheLeaves(t *testing.T) {
+	dir := intentStateDir(t)
+	writeUpdateIntent(boolPtr(false), "v0.25.0")
+
+	// A valid, fresh cache that simply carries no autoUpdate (older backend).
+	fresh, err := json.Marshal(diskCache{FetchedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, cacheFileName), fresh, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewResolver("PSE-TEST-KEY")
+	if r.AutoUpdateEnabled() {
+		t.Fatal("the org's stated 'no' was lost to a cache that never mentioned autoUpdate")
+	}
+	if got := r.PinnedCliVersion(); got != "v0.25.0" {
+		t.Fatalf("pin = %q, want the mirrored v0.25.0 to fill the cache's gap", got)
 	}
 	// Sanity: the mirror really is under the state dir the test redirected.
 	if _, err := os.Stat(filepath.Join(state.StateDir(), updateIntentFileName)); err != nil {
 		t.Fatalf("intent mirror not written to the state dir: %v", err)
+	}
+}
+
+// A cache that explicitly re-enables updates IS authoritative — withdrawal is
+// possible, it just has to be explicit and come from a successful fetch.
+func TestExplicitCacheReEnableBeatsAnOlderMirroredNo(t *testing.T) {
+	dir := intentStateDir(t)
+	writeUpdateIntent(boolPtr(false), "")
+
+	fresh, err := json.Marshal(diskCache{AutoUpdate: boolPtr(true), FetchedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, cacheFileName), fresh, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if !NewResolver("PSE-TEST-KEY").AutoUpdateEnabled() {
+		t.Fatal("an explicit re-enable in the cache was overridden by an older mirrored no")
 	}
 }

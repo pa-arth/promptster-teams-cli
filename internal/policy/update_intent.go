@@ -27,6 +27,13 @@ import (
 // never aged out, and is never discarded for being stale. It is a mirror, not a
 // second source of truth: a successful fetch always overwrites it, and it only
 // decides anything when the cache cannot.
+//
+// That last clause is ENFORCED at the read (NewResolver), not merely intended.
+// The two files are written independently by the same Refresh, so the mirror is
+// stale whenever its own write failed and the cache's succeeded — and a mirror
+// that could override the cache would then re-enable self-update on a fleet that
+// had just disabled it, which is this file's own failure mode wearing its own
+// hat. It fills gaps; it never wins a disagreement.
 const updateIntentFileName = "update-intent.json"
 
 // updateIntent is the durable copy of the org's stated update intent. AutoUpdate

@@ -189,8 +189,20 @@ func NewResolver(apiKey string) *Resolver {
 	// prevent. The mirror is written only when the org states an intent and is
 	// never invalidated by a TTL, so recovering it does not depend on the cache
 	// being intact.
+	//
+	// It fills GAPS ONLY — it never overrides a value the cache supplied. The two
+	// files are written by the same Refresh but independently, so the mirror can
+	// be older than the cache whenever its write failed and the cache's
+	// succeeded. Letting it win then inverts the guarantee: an org that set
+	// autoUpdate:false lands a cache saying false and a stale mirror saying true,
+	// and the mirror would turn self-update back ON for a fleet that had just
+	// disabled it — the precise failure this file was added to prevent, arriving
+	// through the file added to prevent it.
+	//
+	// So the mirror speaks only where the cache is silent: unreadable, corrupt,
+	// deleted, or carrying no autoUpdate at all.
 	if m, ok := readUpdateIntent(); ok {
-		if m.AutoUpdate != nil {
+		if !r.autoUpdateKnown && m.AutoUpdate != nil {
 			r.autoUpdate = *m.AutoUpdate
 			r.autoUpdateKnown = true
 		}
