@@ -348,9 +348,9 @@ func TestAutoUpdateLoopCatchesUpBeforeItAsksTheNetwork(t *testing.T) {
 		t.Error("the update loop reached the network before catching up to the binary already on disk")
 		return "", 0, nil
 	}
-	u.confirm = func(_, _, _ string) bool {
-		t.Error("catch-up asked for self-update consent after another installer already replaced the binary")
-		return false
+	u.loadConsent = func() Consent {
+		t.Error("catch-up consulted the self-update consent record after another installer already replaced the binary")
+		return ConsentDenied
 	}
 	u.apply = func(_, _ string) error {
 		t.Error("catch-up called the self-update apply path")

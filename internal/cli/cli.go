@@ -33,6 +33,11 @@ func Main(argv []string) int {
 	case "start":
 		// Background capture: spawn a detached `watch` supervisor and return
 		// the shell. `stop` tears it down; `status` shows whether it's alive.
+		//
+		// Ask the one-time update question first: this and `login` are the only
+		// commands where an engineer is reliably at a keyboard, and the daemon
+		// about to be spawned has no terminal of its own to ask on.
+		PromptForUpdateConsent()
 		if err := capture.StartTeamsDaemon(argv[2:]); err != nil {
 			fmt.Fprintf(os.Stderr, "start error: %v\n", err)
 			return 1
@@ -90,6 +95,13 @@ func Main(argv []string) int {
 		// `npm rm -g` runs no uninstall script and leaves the managed binary in
 		// place, so removing the package alone stops nothing.
 		return cmdUninstall(argv[2:])
+	case "update":
+		// Manual update: check GitHub releases, show what changed, install on a
+		// yes. Also carries the --enable-auto/--disable-auto switch for whether
+		// this machine may update itself in the background. It exists because
+		// the background updater runs detached with no terminal and therefore
+		// cannot ask anything — every path where it declines points here.
+		return cmdUpdate(argv[2:])
 	case "status":
 		cmdTeamsStatus(argv[2:])
 	case "doctor":
@@ -120,6 +132,7 @@ Commands:
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
+  update       Install a newer signed release, or set how this machine updates (--check|--ask-each|--enable-auto|--disable-auto)
   status       Show capture status, whether the daemon is running, and event count
   doctor       Diagnose configuration (key, ingest URL, watched dirs)
   discover     Find additional local user homes with Claude, Codex, or Cursor
@@ -137,10 +150,26 @@ Getting started:
 Capture runs detached and silent. Set PROMPTSTER_DEBUG=1 before watch/start
 to see per-event watcher logging.
 
-The CLI checks GitHub Releases on a 30m cadence while watching and asks before
-installing a newer signed release, with a link to its release notes. Declining
-only skips that cycle. Opt out with watch/start --no-auto-update or
-PROMPTSTER_TEAMS_NO_AUTO_UPDATE=1; your org can also disable or pin the version.
+Updates: the CLI checks GitHub Releases on a 30m cadence while watching. Every
+release is verified against an embedded minisign key before a byte is installed.
+Who authorizes the install depends on your setup:
+
+  - If your organization has set an update policy, it decides — it can disable
+    self-update entirely, or pin the exact version your fleet runs so a security
+    team reviews each release before it reaches any machine. You are not asked.
+  - Otherwise login and start ask you ONCE how you want updates handled, and
+    remember the answer:
+      ask me about each release (default) — a notification names the version
+        and links its release notes; you approve or dismiss it. At most one
+        per release, never one per check.
+      update automatically             — installs silently in the background.
+      never update on its own          — nothing installs unless you ask.
+    Change it any time with promptster-teams update --ask-each /
+    --enable-auto / --disable-auto.
+
+promptster-teams update installs a release on demand regardless, and --check
+reports what one would do without installing it. Opt out per-machine
+with watch/start --no-auto-update or PROMPTSTER_TEAMS_NO_AUTO_UPDATE=1.
 
 Your developer key is resolved from, in order: --key flag,
 PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by

@@ -28,6 +28,23 @@ import (
 // the autostart supervisor relaunches straight into it — the update still takes,
 // just on the next start instead of in place.
 func applySwapAndReexec(self, staged string) error {
+	if err := swapInPlace(self, staged); err != nil {
+		return err
+	}
+	// Re-exec the freshly-swapped binary. Never returns on success.
+	return reexecInto(self)
+}
+
+// swapInPlace is applySwapAndReexec without the re-exec: it puts the verified
+// binary on disk and RETURNS.
+//
+// It exists for the foreground `update` command, which must not re-exec. That
+// path replaces a binary the engineer invoked by hand, and reexecInto carries
+// os.Args[1:] into the new image — so re-execing there would relaunch
+// `promptster-teams update` as the new version, turning a one-shot command into
+// a second update run. The daemon is a different process and is restarted
+// explicitly by that command instead.
+func swapInPlace(self, staged string) error {
 	// #nosec G302 -- an executable MUST be 0755; the staged file was sha256 + minisign verified before this call.
 	if err := os.Chmod(staged, 0o755); err != nil {
 		return fmt.Errorf("selfupdate: chmod staged binary: %w", err)
@@ -35,8 +52,7 @@ func applySwapAndReexec(self, staged string) error {
 	if err := os.Rename(staged, self); err != nil {
 		return fmt.Errorf("selfupdate: swap in new binary: %w", err)
 	}
-	// Re-exec the freshly-swapped binary. Never returns on success.
-	return reexecInto(self)
+	return nil
 }
 
 // reexecInto replaces the running process image with the binary at target,

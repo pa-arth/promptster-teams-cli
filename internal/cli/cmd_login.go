@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/pa-arth/promptster-teams-cli/internal/capture"
 	"github.com/pa-arth/promptster-teams-cli/internal/discovery"
 	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
@@ -83,6 +84,12 @@ func cmdLogin(args []string) {
 		"stored", prettyHome(ingest.CredentialsPath()),
 	)))
 	fmt.Println()
+
+	// Ask the one-time update question BEFORE starting capture, so the daemon we
+	// are about to launch already has the answer and its very first check can
+	// act on it. Asking afterwards would leave the first check — the one that
+	// runs within a second of start — reading an unknown consent and declining.
+	PromptForUpdateConsent()
 
 	// Auto-start background capture so login is the only command a new engineer
 	// has to run — capture "just works" afterward instead of waiting for a manual
@@ -212,11 +219,20 @@ func enableAutostartOnLogin() {
 	printlnIndent(dimStyle.Render("Turn it off with ") + bodyStyle.Render("promptster-teams autostart disable") + dimStyle.Render("."))
 }
 
-// stdinIsTTY reports whether stdin is an interactive terminal (vs a pipe/CI),
-// so login only prompts when a human can actually type.
+// stdinIsTTY reports whether stdin is an interactive terminal (vs a pipe, a
+// redirect, or CI), so we only prompt when a human can actually type.
+//
+// It asks term.IsTerminal rather than testing os.ModeCharDevice, which was the
+// previous implementation and got the common non-interactive case backwards:
+// /dev/null IS a character device, so `promptster-teams login --key ... </dev/null`
+// — the exact shape a provisioning script uses — reported an interactive
+// terminal and prompted into a stream that answers EOF immediately. Every such
+// prompt then took its default from an answer nobody gave.
+//
+// A pipe was detected correctly, which is why this survived: the failing case
+// looks identical to the working one at a glance.
 func stdinIsTTY() bool {
-	fi, err := os.Stdin.Stat()
-	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+	return term.IsTerminal(os.Stdin.Fd())
 }
 
 // pingIngestHost does a quick GET to the API base to confirm reachability. Any

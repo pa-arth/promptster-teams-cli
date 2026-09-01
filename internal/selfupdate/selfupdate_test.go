@@ -14,11 +14,16 @@ type stubPolicy struct {
 	enabled bool
 	pinned  string
 	min     string
+	// managed mirrors policy.Resolver.OrgManaged: an org has stated an explicit
+	// intent about this fleet's version. It defaults false so existing gate tests
+	// keep exercising the UNMANAGED path, where the local consent record decides.
+	managed bool
 }
 
 func (s stubPolicy) AutoUpdateEnabled() bool  { return s.enabled }
 func (s stubPolicy) PinnedCliVersion() string { return s.pinned }
 func (s stubPolicy) MinCliVersion() string    { return s.min }
+func (s stubPolicy) OrgManaged() bool         { return s.managed }
 
 // buildUpdater is the primary test constructor: it returns the updater plus a
 // pointer to the applied-staged-paths slice and a route registration func.
@@ -77,9 +82,9 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 			app = append(app, staged)
 			return nil
 		},
-		confirm: func(_, _, _ string) bool { return true },
-		logf:    func(string, ...any) {},
-		now:     time.Now,
+		loadConsent: func() Consent { return ConsentGranted },
+		logf:        func(string, ...any) {},
+		now:         time.Now,
 	}
 	addRoute = func(sub, body string, code int) { routes[sub] = resp{body, code} }
 	return u, &app, addRoute
@@ -178,48 +183,102 @@ func TestHappyPathApplies(t *testing.T) {
 	}
 }
 
-func TestUpdateRequiresConsentAndIncludesReleaseNotes(t *testing.T) {
-	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
-	wireHappyRelease(addRoute)
+// A stored "no" blocks the install on an unmanaged machine, and an unanswered
+// machine is NOT treated as a yes. The two are distinct outcomes because they
+// need distinct messages: one engineer has decided, the other has never been
+// asked.
+func TestUnmanagedConsentDecidesTheInstall(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		consent Consent
+		want    outcome
+	}{
+		{"denied", ConsentDenied, outcomeDeclined},
+		{"never asked", ConsentUnknown, outcomeNeedsConsent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+			wireHappyRelease(addRoute)
+			u.loadConsent = func() Consent { return tc.consent }
 
-	var current, target, notes string
-	u.confirm = func(gotCurrent, gotTarget, gotNotes string) bool {
-		current, target, notes = gotCurrent, gotTarget, gotNotes
-		return false
-	}
-	if got := u.checkAndApply(); got != outcomeDeclined {
-		t.Fatalf("declined update outcome = %v, want declined", got)
-	}
-	if len(*applied) != 0 {
-		t.Fatal("declined update must not apply")
-	}
-	if current != "0.5.2" || target != "9.9.9" {
-		t.Fatalf("prompt versions = %q -> %q, want 0.5.2 -> 9.9.9", current, target)
-	}
-	if notes != "https://rel.test/pa-arth/promptster-teams-cli/releases/tag/v9.9.9" {
-		t.Fatalf("release notes URL = %q", notes)
+			if got := u.checkAndApply(); got != tc.want {
+				t.Fatalf("outcome = %v, want %v", got, tc.want)
+			}
+			if len(*applied) != 0 {
+				t.Fatal("must not apply without consent")
+			}
+		})
 	}
 }
 
-func TestDeclineIsAskedAgainOnNextCycle(t *testing.T) {
+// The whole point of moving consent out of the check: a stored answer is read,
+// never re-asked. The previous design prompted per cycle from inside a detached
+// daemon, so it declined itself on every cycle forever — this asserts the answer
+// is a lookup with a stable result, which is what makes it survivable.
+func TestStoredConsentIsReusedEveryCycleNotReAsked(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
 	wireHappyRelease(addRoute)
 
-	asks := 0
-	u.confirm = func(_, _, _ string) bool {
-		asks++
-		return false
+	reads := 0
+	u.loadConsent = func() Consent {
+		reads++
+		return ConsentDenied
 	}
-	for cycle := 1; cycle <= 2; cycle++ {
+	for cycle := 1; cycle <= 3; cycle++ {
 		if got := u.checkAndApply(); got != outcomeDeclined {
 			t.Fatalf("cycle %d outcome = %v, want declined", cycle, got)
 		}
 	}
-	if asks != 2 {
-		t.Fatalf("prompted %d times, want once per cycle", asks)
+	if reads != 3 {
+		t.Fatalf("consent read %d times, want once per cycle (a cached read would go stale after --enable-auto)", reads)
 	}
 	if len(*applied) != 0 {
-		t.Fatal("declined updates must not apply")
+		t.Fatal("a standing decline must never apply")
+	}
+}
+
+// An org-managed machine takes the org's answer and never consults the local
+// record. This is the enterprise contract: which build lands on a company's
+// laptops is the org's decision, and an engineer's stored preference — in either
+// direction — must not be able to move it.
+func TestManagedFleetIgnoresLocalConsent(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent {
+		t.Error("a managed machine asked the local consent record; the org already answered")
+		return ConsentDenied
+	}
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("managed+enabled outcome = %v, want applied", got)
+	}
+	if len(*applied) != 1 {
+		t.Fatalf("apply called %d times, want 1", len(*applied))
+	}
+}
+
+// A granted consent must not override the org's "no". Consent and policy answer
+// different questions, and policy is checked first for exactly this reason.
+func TestManagedDisabledBeatsGrantedConsent(t *testing.T) {
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: false, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentGranted }
+	if got := u.checkAndApply(); got != outcomeSkippedPolicy {
+		t.Fatalf("managed+disabled outcome = %v, want skippedPolicy", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("an org that disabled updates must not be overridden by local consent")
+	}
+}
+
+func TestReleaseNotesURLNamesTheTag(t *testing.T) {
+	const want = "https://github.com/pa-arth/promptster-teams-cli/releases/tag/v9.9.9"
+	// Both forms resolve to the same page: callers hold a bare version, the URL
+	// needs the v-prefixed tag.
+	if got := ReleaseNotesURL("9.9.9"); got != want {
+		t.Fatalf("ReleaseNotesURL(%q) = %q, want %q", "9.9.9", got, want)
+	}
+	if got := ReleaseNotesURL("v9.9.9"); got != want {
+		t.Fatalf("ReleaseNotesURL(%q) = %q, want %q", "v9.9.9", got, want)
 	}
 }
 
@@ -637,5 +696,144 @@ func TestChecksNeverHitTheGitHubAPI(t *testing.T) {
 		if strings.Contains(url, "api.github.com") || strings.Contains(url, "/repos/") {
 			t.Fatalf("check hit the rate-limited JSON API: %q", url)
 		}
+	}
+}
+
+// --- ConsentAsk: the per-release GUI prompt -------------------------------
+
+// askUpdater wires the ask path with fake GUI + asked-version edges, so the
+// policy is assertable with no desktop and no filesystem.
+func askUpdater(t *testing.T, answer guiPromptResult) (u *updater, applied *[]string, prompts *int, asked *string) {
+	t.Helper()
+	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentAsk }
+
+	n := 0
+	var recorded string
+	u.guiPrompt = func(_, _, _ string) guiPromptResult { n++; return answer }
+	u.lastAsked = func() string { return recorded }
+	u.recordAsked = func(v string) { recorded = v }
+	return u, applied, &n, &recorded
+}
+
+func TestAskModeInstallsWhenAccepted(t *testing.T) {
+	u, applied, prompts, _ := askUpdater(t, guiAccepted)
+
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("accepted prompt outcome = %v, want applied", got)
+	}
+	if *prompts != 1 {
+		t.Fatalf("prompted %d times, want 1", *prompts)
+	}
+	if len(*applied) != 1 {
+		t.Fatalf("apply called %d times, want 1", len(*applied))
+	}
+}
+
+func TestAskModeDoesNotInstallWhenDeclined(t *testing.T) {
+	u, applied, _, _ := askUpdater(t, guiDeclined)
+
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("declined prompt outcome = %v, want declined", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("a declined prompt must not install")
+	}
+}
+
+// THE test that keeps this feature from becoming malware-shaped.
+//
+// The check runs every 30 minutes. Without the once-per-version guard an
+// engineer who clicked Later would be re-prompted on every cycle — six dialogs a
+// workday from a background process — which trains them to dismiss it on sight
+// and ends in a fleet that never updates: the original bug, rebuilt.
+func TestAskModePromptsOncePerVersionNotOncePerCheck(t *testing.T) {
+	u, applied, prompts, asked := askUpdater(t, guiDeclined)
+
+	for cycle := 1; cycle <= 5; cycle++ {
+		if got := u.checkAndApply(); got != outcomeDeclined {
+			t.Fatalf("cycle %d outcome = %v, want declined", cycle, got)
+		}
+	}
+	if *prompts != 1 {
+		t.Fatalf("showed %d dialogs across 5 checks, want exactly 1", *prompts)
+	}
+	if *asked != "9.9.9" {
+		t.Fatalf("recorded asked version = %q, want 9.9.9", *asked)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("declined release must never install")
+	}
+}
+
+// A NEW version earns a new prompt — otherwise "ask me each release" would ask
+// once and then go silent forever, which is the stuck-fleet failure again.
+func TestAskModePromptsAgainForANewerVersion(t *testing.T) {
+	u, _, prompts, _ := askUpdater(t, guiDeclined)
+
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("first outcome = %v, want declined", got)
+	}
+	// The engineer already said no to 9.9.9; 9.9.10 is a different release.
+	u.lastAsked = func() string { return "9.9.9" }
+	u.currentVersion = "0.5.2"
+	if got := u.checkAndApply(); got != outcomeDeclined {
+		t.Fatalf("second outcome = %v, want declined", got)
+	}
+	if *prompts != 1 {
+		t.Fatalf("prompts = %d; the same version must not re-prompt", *prompts)
+	}
+}
+
+// The record is written BEFORE the dialog. A prompt whose answer is lost — the
+// daemon is killed, the machine sleeps, the display disappears mid-dialog — must
+// not reappear every 30 minutes. Missing one release is recoverable (doctor
+// reports it, `update` installs it); a dialog loop is not.
+func TestAskModeRecordsTheVersionBeforeShowingTheDialog(t *testing.T) {
+	u, _, _, _ := askUpdater(t, guiDeclined)
+
+	var recordedBeforePrompt bool
+	var recorded string
+	u.recordAsked = func(v string) { recorded = v }
+	u.lastAsked = func() string { return "" }
+	u.guiPrompt = func(_, _, _ string) guiPromptResult {
+		recordedBeforePrompt = recorded == "9.9.9"
+		return guiDeclined
+	}
+	u.checkAndApply()
+
+	if !recordedBeforePrompt {
+		t.Fatal("the asked-version record was written after the dialog; a lost answer would re-prompt every cycle")
+	}
+}
+
+// No desktop is NOT a refusal. A headless box, an SSH session, a missing dialog
+// tool — the engineer was never asked, so the daemon must fall back to the
+// printed surfaces rather than silently sit on the release.
+func TestAskModeUnavailableDialogFallsBackToNeedsConsent(t *testing.T) {
+	u, applied, _, _ := askUpdater(t, guiUnavailable)
+
+	if got := u.checkAndApply(); got != outcomeNeedsConsent {
+		t.Fatalf("unavailable dialog outcome = %v, want needsConsent", got)
+	}
+	if len(*applied) != 0 {
+		t.Fatal("must not install when nobody could be asked")
+	}
+}
+
+// A managed fleet never sees a dialog, whatever the local record says. An
+// engineer clicking a popup is not a security review, and letting one appear
+// would make the org's pin look advisory.
+func TestAskModeNeverPromptsOnAManagedFleet(t *testing.T) {
+	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
+	wireHappyRelease(addRoute)
+	u.loadConsent = func() Consent { return ConsentAsk }
+	u.guiPrompt = func(_, _, _ string) guiPromptResult {
+		t.Error("a managed machine showed an update dialog; the org already decided")
+		return guiDeclined
+	}
+	if got := u.checkAndApply(); got != outcomeApplied {
+		t.Fatalf("managed outcome = %v, want applied", got)
 	}
 }

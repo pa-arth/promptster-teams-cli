@@ -129,6 +129,15 @@ type Resolver struct {
 	// only flipped off by an explicit `autoUpdate:false` from the backend, so an
 	// unknown/never-fetched policy leaves auto-update ON (fail-OPEN).
 	autoUpdate bool
+	// autoUpdateKnown records whether the backend has ever EXPLICITLY sent an
+	// autoUpdate value, either way. It is what separates "the org said yes" from
+	// "nobody has said anything", which `autoUpdate` alone cannot express because
+	// both resolve to true.
+	//
+	// That distinction is the whole basis of OrgManaged, and therefore of who is
+	// allowed to authorize an update. Without it a solo engineer's machine and a
+	// managed fleet look identical, and the CLI has to guess which one it is on.
+	autoUpdateKnown bool
 	// pinnedCliVersion, when non-empty, pins the fleet to an exact CLI tag.
 	pinnedCliVersion string
 	// minCliVersion, when non-empty, is the floor the org wants the fleet on.
@@ -164,9 +173,42 @@ func NewResolver(apiKey string) *Resolver {
 		}
 		if c.AutoUpdate != nil {
 			r.autoUpdate = *c.AutoUpdate
+			r.autoUpdateKnown = true
 		}
 		r.pinnedCliVersion = c.PinnedCliVersion
 		r.minCliVersion = c.MinCliVersion
+	}
+	// The org's update intent is ALSO mirrored to its own small file, and that
+	// file wins when the policy cache is missing or unreadable.
+	//
+	// readDiskCache returns not-ok on any read error, any JSON error, and a zero
+	// FetchedAt — after which autoUpdate reverts to its true default. So on a
+	// fleet an org had deliberately set to autoUpdate:false, deleting or
+	// corrupting one cache file silently re-enabled self-update, which is exactly
+	// the "an unreviewed build reached our laptops" failure the switch exists to
+	// prevent. The mirror is written only when the org states an intent and is
+	// never invalidated by a TTL, so recovering it does not depend on the cache
+	// being intact.
+	//
+	// It fills GAPS ONLY — it never overrides a value the cache supplied. The two
+	// files are written by the same Refresh but independently, so the mirror can
+	// be older than the cache whenever its write failed and the cache's
+	// succeeded. Letting it win then inverts the guarantee: an org that set
+	// autoUpdate:false lands a cache saying false and a stale mirror saying true,
+	// and the mirror would turn self-update back ON for a fleet that had just
+	// disabled it — the precise failure this file was added to prevent, arriving
+	// through the file added to prevent it.
+	//
+	// So the mirror speaks only where the cache is silent: unreadable, corrupt,
+	// deleted, or carrying no autoUpdate at all.
+	if m, ok := readUpdateIntent(); ok {
+		if !r.autoUpdateKnown && m.AutoUpdate != nil {
+			r.autoUpdate = *m.AutoUpdate
+			r.autoUpdateKnown = true
+		}
+		if r.pinnedCliVersion == "" {
+			r.pinnedCliVersion = m.PinnedCliVersion
+		}
 	}
 	return r
 }
@@ -213,6 +255,27 @@ func (r *Resolver) PinnedCliVersion() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.pinnedCliVersion
+}
+
+// OrgManaged reports whether an org has ever expressed an explicit intent about
+// this fleet's CLI version — an explicit autoUpdate value either way, or a pin.
+// It decides WHO authorizes an update: a managed machine obeys the org and never
+// consults the engineer's local consent record.
+//
+// "Has an opinion", NOT "has an org", and the difference is load-bearing. Every
+// enrolled machine has an org, so treating enrollment as managed would make
+// managed universal — including every fleet whose backend predates the
+// autoUpdate field, all of which would fall to the managed default and freeze.
+// Requiring a stated intent means the CLI regresses nobody: silence keeps
+// today's behavior, and an org gets authority the moment it asks for it.
+//
+// Like the other self-update fields it has no TTL decay, and it is restored from
+// the durable intent mirror as well as the policy cache — an org that turned
+// self-update off must not become "unmanaged" because a cache file went missing.
+func (r *Resolver) OrgManaged() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.autoUpdateKnown || r.pinnedCliVersion != ""
 }
 
 // MinCliVersion returns the version floor the org wants the fleet on, or "".
@@ -304,6 +367,7 @@ func (r *Resolver) Refresh() {
 	r.cursorVendorUsage = parsed.CursorVendorUsage
 	r.fetchedAt = now
 	r.autoUpdate = autoUpdate
+	r.autoUpdateKnown = parsed.AutoUpdate != nil
 	r.pinnedCliVersion = parsed.PinnedCliVersion
 	r.minCliVersion = parsed.MinCliVersion
 	// Assigned unconditionally, INCLUDING to nil. A backend that stops
@@ -312,6 +376,9 @@ func (r *Resolver) Refresh() {
 	// fields' retain-on-anything rule, because the safe direction is reversed.
 	r.ingest = parsed.Ingest
 	r.mu.Unlock()
+	// Mirror the org's update intent before the general cache, so the durable
+	// copy exists even if the larger cache write fails.
+	writeUpdateIntent(parsed.AutoUpdate, parsed.PinnedCliVersion)
 	writeDiskCache(diskCache{
 		CaptureAssistantProse: parsed.CaptureAssistantProse,
 		CursorVendorUsage:     parsed.CursorVendorUsage,

@@ -16,8 +16,9 @@ Only **two** call sites outside the package:
 `StartDaemon` → `exec.Command(state.SelfBin(), "watch")` (`internal/capture/daemon.go:147`),
 so the detached child runs the normal watch startup check within a second. Same for
 `autostart`: launchd/systemd run `watch`, and `RunAtLoad` means a check every login.
-Detached checks never install because there is no terminal on which to obtain consent;
-they safely decline and check again on the next cycle. A foreground `watch` prompts.
+Detached checks DO install. That is the point, and it is the opposite of what this
+document said before: the check has no terminal, so making it ask was the same as
+making it never install.
 
 Anything that never reaches `watch` never checks.
 
@@ -26,6 +27,107 @@ verifies, swaps, and installs nothing: after an explicit npm/install.sh/MDM acti
 already replaced the managed binary, the old in-memory watcher re-execs that installed
 file so it does not keep running deleted or stale code. The installer action is the
 authorization boundary; asking again during re-exec would not protect an install.
+
+## Who authorizes an install
+
+The check path NEVER PROMPTS. An earlier revision did, and it is worth understanding
+exactly how that failed, because the shape of the mistake is easy to repeat.
+
+`confirmUpdate` gated on `term.IsTerminal(os.Stdin.Fd())` and returned false otherwise.
+Every real capture process is detached — `start` spawns it, autostart runs it under
+launchd/systemd — so stdin was never a terminal, the prompt declined itself, and
+`startupBanner` had **no case for `outcomeDeclined`**, so the refusal printed nothing.
+Daemons found every release, refused all of them, and repeated that every 30 minutes
+indefinitely. The only symptom was a fleet frozen at whatever version it was installed
+at, with `doctor` printing green and its auto-update line promising the engineer they
+"will be asked on the next interactive check".
+
+The deeper reason a prompt cannot live here is the product shape: this CLI is installed
+once and then never typed again. Any design that waits for the engineer to run a command
+waits forever, so consent has to be collected at a moment they are provably at a
+keyboard and then remembered.
+
+Authorization is therefore settled BEFORE the check, and by different parties:
+
+| | Who decides | Where it is stored | Asked? |
+|---|---|---|---|
+| **Org-managed** (`PolicyView.OrgManaged`) | the org's `autoUpdate` switch and `pinnedCliVersion` | backend policy, mirrored to `update-intent.json` | never — not the engineer's call |
+| **Unmanaged** (solo install) | the engineer's stored answer | `auto-update-consent.json` | once, at `login`/`start` |
+
+The unmanaged answer has three values, not two: `granted` (install silently),
+`ask` (a GUI dialog per release — the default), and `denied` (never).
+
+### The `ask` path, and why a dialog works where a terminal prompt could not
+
+A detached watcher has no stdin to read — but it DOES run inside the engineer's
+graphical session. On macOS `autostart` installs a **LaunchAgent** under
+`~/Library/LaunchAgents` (`service_darwin.go`), and LaunchAgents run in the Aqua
+session, so they can put a window on screen. Verified empirically, not inferred:
+a dialog spawned from a detached, TTY-less process rendered and returned its
+button.
+
+Platform coverage is uneven and the code says so:
+
+| | Mechanism | Reality |
+|---|---|---|
+| macOS | `osascript display dialog` | works from a LaunchAgent |
+| Windows | PowerShell `MessageBox` | Task Scheduler user tasks run in the user session |
+| Linux | `zenity` / `kdialog` | needs `DISPLAY`/`WAYLAND_DISPLAY`; headless boxes get nothing |
+
+A dialog that cannot be shown is `guiUnavailable`, which resolves to
+`outcomeNeedsConsent` — **never** to a refusal. Nobody was asked, so nothing may
+be inferred; the printed surfaces carry it instead.
+
+**The dialog fires at most once per VERSION** (`asked.go`), and the record is
+written BEFORE the dialog rather than after. The check runs every 30 minutes, so
+without that guard an engineer who clicked Later would be re-prompted six times a
+workday by a background process — indistinguishable from malware, and a fast route
+to an engineer who dismisses it on sight, which lands right back at a fleet that
+never updates. Writing the record first means a lost answer (daemon killed,
+machine slept, display went away) costs one skipped release, which `doctor` still
+reports and `promptster-teams update` still fixes. Writing it after means a dialog
+loop.
+
+**No dialog ever appears on a managed fleet.** An engineer clicking a popup is not
+a security review, and showing one would make the org's pin look advisory.
+
+**The tag is sanitized for the dialog specifically.** It arrives from a GitHub
+redirect and is interpolated into an AppleScript string literal.
+`tagFromReleaseLocation` rejects path separators — it was written to protect a URL
+path — but not quotes, which is exactly what ends a script literal.
+`sanitizeForDialog` reduces the version to `[0-9A-Za-z.+_-]` and `isSafeURL`
+drops any notes link that is not a plain https github.com URL.
+
+**Managed means "an org has stated an intent", NOT "the machine has an org."** Every
+enrolled machine has an org, so the second reading makes managed universal — including
+every fleet whose backend predates the `autoUpdate` field, all of which would fall to the
+managed default and freeze. Requiring a stated intent (an explicit `autoUpdate` either
+way, or a pin) means silence keeps today's behavior and an org gains authority the moment
+it asks for it.
+
+**The pin is the enterprise review gate**, and it is what to point a security team at.
+`pinnedCliVersion` REPLACES "latest" as the target tag, so a pinned fleet only ever lands
+on the build the org named: pin the current version, review the next release, move the
+pin. Signature verification is not a substitute for this — minisign proves the bytes came
+from our key, which says nothing about whether the release is safe, and does not defend
+against the two cases that actually matter (a compromised signing key, or us shipping a
+bad build).
+
+**`update-intent.json` exists because `teams-policy.json` is a cache.** `readDiskCache`
+discards the whole cache on any read error, any JSON error, and a zero `FetchedAt`, after
+which `autoUpdate` reverts to its `true` default. For capture flags that is fine — they
+fail closed. For this switch the safe direction is reversed, so one corrupt or deleted
+file silently re-enabled self-update on a fleet an org had deliberately turned it off
+for. The mirror is written only when an org states an intent, is never aged out, and is
+never erased by a response that omits the fields (a rollback or partial outage has not
+withdrawn the org's decision — withdrawal must be explicit).
+
+**Every non-installing outcome must print something.** `startupBanner` covers
+`outcomeDeclined` and `outcomeNeedsConsent` for exactly the reason above: a silent branch
+on that switch is how a stuck fleet looks healthy. `promptster-teams update` is the escape
+hatch every one of those messages names — it installs on demand regardless of the stored
+answer (an explicit command outranks a stored preference), and `--enable-auto` /
+`--disable-auto` change the answer without needing the network.
 
 ## THE DAEMON IS A DIFFERENT BINARY FROM THE ONE YOU ARE TYPING TO
 
@@ -189,9 +291,9 @@ not the trust boundary: minisign-over-SHA256SUMS still gates every installed byt
   or unparseable → zero time → treated as stale → checks on the next tick.
 - **No backoff.** The cursor advances after every check including failures, so a broken
   release is retried at most once per interval rather than hot-looping.
-- **Consent is per cycle.** A declined release is offered again on the next check; only
-  `--no-auto-update`, `PROMPTSTER_TEAMS_NO_AUTO_UPDATE`, or org policy suppresses checks.
-  The prompt links directly to `github.com/<repo>/releases/tag/<tag>` and defaults to no.
+- **Consent is durable and collected elsewhere.** Nothing on the check path prompts.
+  `--no-auto-update`, `PROMPTSTER_TEAMS_NO_AUTO_UPDATE`, and org policy suppress checks;
+  see "Who authorizes an install" below for who decides.
 
 ## Why 30m, and what the 24h was actually buying
 

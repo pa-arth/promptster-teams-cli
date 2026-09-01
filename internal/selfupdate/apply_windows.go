@@ -21,6 +21,19 @@ import (
 // On success it does not return — it calls os.Exit(0) after spawning the child
 // so only the new image keeps capturing.
 func applySwapAndReexec(self, staged string) error {
+	if err := swapInPlace(self, staged); err != nil {
+		return err
+	}
+	return reexecInto(self)
+}
+
+// swapInPlace performs the move-old-aside swap and RETURNS, for the foreground
+// `update` command. See the unix twin for why that path must not re-exec.
+//
+// The ".old" file is left behind deliberately: on Windows it is still the image
+// of any process currently running from it, so it cannot be deleted yet. The
+// next successful swap clears it.
+func swapInPlace(self, staged string) error {
 	old := self + ".old"
 	_ = os.Remove(old) // clear any leftover from a prior update
 	if err := os.Rename(self, old); err != nil {
@@ -31,8 +44,7 @@ func applySwapAndReexec(self, staged string) error {
 		_ = os.Rename(old, self)
 		return fmt.Errorf("selfupdate: move staged binary into place: %w", err)
 	}
-
-	return reexecInto(self)
+	return nil
 }
 
 // reexecInto is the Windows stand-in for execve: spawn a detached process from

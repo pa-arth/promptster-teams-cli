@@ -211,11 +211,20 @@ func RunTeamsWatch(args []string) error {
 	defer stopCensus()
 
 	// On startup and every selfupdate.CheckInterval, check GitHub Releases for a
-	// newer signed CLI and ask before swapping it in place (re-exec keeps capture
-	// running). Detached watchers safely decline until an interactive cycle. It
-	// is NOT on the census's 24h clock above. Opt out
-	// per-machine with --no-auto-update / PROMPTSTER_TEAMS_NO_AUTO_UPDATE, or
-	// org-wide via the capture policy. A dedicated resolver refreshes the org
+	// newer signed CLI and swap it in place (re-exec keeps capture running). It
+	// is NOT on the census's 24h clock above.
+	//
+	// This code path NEVER PROMPTS, and must not be made to. It runs in a
+	// detached daemon with no controlling terminal — `start` detaches it and
+	// autostart runs it under launchd/systemd — so an earlier revision that asked
+	// here saw a non-TTY stdin, declined itself on every cycle, and silently
+	// froze fleets at their installed version. Authorization is settled BEFORE
+	// this point: by the org's switch/pin for a managed fleet, or by the
+	// engineer's durable one-time answer collected at login/start for a solo
+	// install (selfupdate.Consent).
+	//
+	// Opt out per-machine with --no-auto-update / PROMPTSTER_TEAMS_NO_AUTO_UPDATE,
+	// or org-wide via the capture policy. A dedicated resolver refreshes the org
 	// switch/pin off the hot path; fail-OPEN so a policy blip never strands the
 	// fleet on an old binary (see selfupdate + policy.AutoUpdateEnabled).
 	updatePolicy := policy.NewResolver(cfg.SessionToken)

@@ -36,9 +36,9 @@ func TestHumanInterval(t *testing.T) {
 // wrong by restating a fact selfupdate owns.
 
 func TestAutoUpdateStatusLineReportsNewerRelease(t *testing.T) {
-	got := autoUpdateStatusLine("", "0.11.0", "0.12.1", true)
+	got := autoUpdateStatusLine("", "0.11.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 
-	if !strings.Contains(got, "newer release available (0.12.1)") {
+	if !strings.Contains(got, "0.12.1") {
 		t.Fatalf("expected the newer release to be named, got %q", got)
 	}
 	// The cadence must be derived from the constant, not restated. This is the
@@ -57,7 +57,7 @@ func TestAutoUpdateStatusLineReportsNewerRelease(t *testing.T) {
 // itself would never act on that — IsNewer is strict — so doctor was
 // contradicting the daemon it reports on.
 func TestAutoUpdateStatusLineAheadOfLatestIsUpToDate(t *testing.T) {
-	got := autoUpdateStatusLine("", "0.13.0", "0.12.1", true)
+	got := autoUpdateStatusLine("", "0.13.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 
 	if strings.Contains(got, "newer release available") {
 		t.Fatalf("running ahead of latest must not claim an update: %q", got)
@@ -72,7 +72,7 @@ func TestAutoUpdateStatusLineAheadOfLatestIsUpToDate(t *testing.T) {
 // A tag differing from the running version only by a "v" prefix is the SAME
 // version. String inequality called it an update.
 func TestAutoUpdateStatusLineIgnoresVPrefix(t *testing.T) {
-	got := autoUpdateStatusLine("", "1.0.0", "v1.0.0", true)
+	got := autoUpdateStatusLine("", "1.0.0", "v1.0.0", true, updateAuthority{consent: selfupdate.ConsentGranted})
 
 	if strings.Contains(got, "newer release available") {
 		t.Fatalf("v-prefixed same version must not read as an update: %q", got)
@@ -80,7 +80,7 @@ func TestAutoUpdateStatusLineIgnoresVPrefix(t *testing.T) {
 }
 
 func TestAutoUpdateStatusLineEqualVersionIsUpToDate(t *testing.T) {
-	got := autoUpdateStatusLine("", "0.12.1", "0.12.1", true)
+	got := autoUpdateStatusLine("", "0.12.1", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 
 	if !strings.Contains(got, "up to date (0.12.1)") {
 		t.Fatalf("expected up-to-date line, got %q", got)
@@ -91,7 +91,7 @@ func TestAutoUpdateStatusLineEqualVersionIsUpToDate(t *testing.T) {
 // case-folded). "TRUE" silenced the daemon while doctor reported auto-update on.
 func TestAutoUpdateStatusLineHonorsEnvOptOutAsUpdaterDoes(t *testing.T) {
 	for _, v := range []string{"1", "true", "TRUE", "yes", "on", " 1 "} {
-		got := autoUpdateStatusLine(v, "0.11.0", "0.12.1", true)
+		got := autoUpdateStatusLine(v, "0.11.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 		if !strings.Contains(got, "auto-update disabled") {
 			t.Fatalf("%q should read as disabled, got %q", v, got)
 		}
@@ -105,7 +105,7 @@ func TestAutoUpdateStatusLineHonorsEnvOptOutAsUpdaterDoes(t *testing.T) {
 // than fall through to a vaguer line.
 func TestAutoUpdateStatusLineFalsyEnvIsNotAnOptOut(t *testing.T) {
 	for _, v := range []string{"0", "false", "off", ""} {
-		got := autoUpdateStatusLine(v, "0.11.0", "0.12.1", true)
+		got := autoUpdateStatusLine(v, "0.11.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 		if strings.Contains(got, "auto-update disabled") {
 			t.Fatalf("%q must not read as an opt-out, got %q", v, got)
 		}
@@ -117,7 +117,7 @@ func TestAutoUpdateStatusLineFalsyEnvIsNotAnOptOut(t *testing.T) {
 
 func TestAutoUpdateStatusLineDevBuild(t *testing.T) {
 	for _, v := range []string{"dev", ""} {
-		got := autoUpdateStatusLine("", v, "0.12.1", true)
+		got := autoUpdateStatusLine("", v, "0.12.1", true, updateAuthority{consent: selfupdate.ConsentGranted})
 		if !strings.Contains(got, "inactive for dev build") {
 			t.Fatalf("version %q should report dev build, got %q", v, got)
 		}
@@ -127,12 +127,76 @@ func TestAutoUpdateStatusLineDevBuild(t *testing.T) {
 // The probe is best-effort and degrades silently; doctor still has to say what
 // update checks will do rather than say nothing.
 func TestAutoUpdateStatusLineProbeFailureStillReportsOn(t *testing.T) {
-	got := autoUpdateStatusLine("", "0.12.1", "", false)
+	got := autoUpdateStatusLine("", "0.12.1", "", false, updateAuthority{consent: selfupdate.ConsentGranted})
 
 	if !strings.Contains(got, "update checks on") {
 		t.Fatalf("expected an on line when the probe fails, got %q", got)
 	}
 	if strings.Contains(got, "up to date") || strings.Contains(got, "newer release") {
 		t.Fatalf("a failed probe must not assert a version verdict: %q", got)
+	}
+}
+
+// Doctor must name the actual next step, and the next step depends on who
+// authorizes updates. These cases exist because the line they replaced promised
+// every engineer they "will be asked on the next interactive check" — a prompt
+// that could never fire, on a screen people read precisely when updates have
+// already silently stopped.
+
+func TestAutoUpdateStatusLineManagedFleetPointsAtTheOrg(t *testing.T) {
+	got := autoUpdateStatusLine("", "0.11.0", "0.12.1", true, updateAuthority{managed: true})
+
+	if !strings.Contains(got, "organization") {
+		t.Fatalf("a managed machine must say the org decides, got %q", got)
+	}
+	// Telling a managed engineer to run `update` sends them to a command their
+	// org policy will refuse — and implies their answer outranks their security
+	// team's, which is the confusion this whole split exists to prevent.
+	if strings.Contains(got, "--enable-auto") {
+		t.Fatalf("a managed machine must not offer the engineer a local override: %q", got)
+	}
+}
+
+func TestAutoUpdateStatusLineDeniedConsentNamesTheCommand(t *testing.T) {
+	got := autoUpdateStatusLine("", "0.11.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentDenied})
+
+	if !strings.Contains(got, "promptster-teams update") {
+		t.Fatalf("a machine with background updates off must name the manual command, got %q", got)
+	}
+	if !strings.Contains(got, "0.12.1") {
+		t.Fatalf("expected the available version to be named, got %q", got)
+	}
+	// It must not claim updates are on — that reading is what let a stuck fleet
+	// look healthy.
+	if strings.Contains(got, "installs automatically") {
+		t.Fatalf("declined machine claimed automatic installs: %q", got)
+	}
+}
+
+func TestAutoUpdateStatusLineUnansweredOffersBothWays(t *testing.T) {
+	got := autoUpdateStatusLine("", "0.11.0", "0.12.1", true, updateAuthority{consent: selfupdate.ConsentUnknown})
+
+	if !strings.Contains(got, "promptster-teams update") {
+		t.Fatalf("an unanswered machine must name the manual command, got %q", got)
+	}
+	if !strings.Contains(got, "--enable-auto") {
+		t.Fatalf("an unanswered machine must offer the durable opt-in, got %q", got)
+	}
+}
+
+// The retired promise, pinned so it cannot come back by copy-paste.
+func TestAutoUpdateStatusLineNeverPromisesAPrompt(t *testing.T) {
+	for _, auth := range []updateAuthority{
+		{consent: selfupdate.ConsentGranted},
+		{consent: selfupdate.ConsentDenied},
+		{consent: selfupdate.ConsentUnknown},
+		{managed: true},
+	} {
+		for _, probeOK := range []bool{true, false} {
+			got := autoUpdateStatusLine("", "0.11.0", "0.12.1", probeOK, auth)
+			if strings.Contains(got, "you will be asked") || strings.Contains(got, "asks before installing") {
+				t.Fatalf("line promises a prompt that no detached daemon can deliver: %q", got)
+			}
+		}
 	}
 }
