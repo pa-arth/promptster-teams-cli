@@ -186,7 +186,7 @@ func (m statusModel) capturePanel() string {
 		"autostart", m.autostart,
 		"ingest", hostOf(m.apiURL),
 		"key", keyDisplay(m.token, m.source),
-		"device", m.device,
+		"installation", m.device,
 	)
 }
 

@@ -27,19 +27,8 @@ func InstallationID() string {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err == nil {
 		value := "ins-" + hex.EncodeToString(raw[:])
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err == nil {
-			// O_EXCL makes concurrent first starts converge on one persisted value.
-			// #nosec G304 -- path is always StateDir()/installation-id, not user input.
-			if f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600); err == nil {
-				_, writeErr := f.WriteString(value + "\n")
-				closeErr := f.Close()
-				if writeErr == nil && closeErr == nil {
-					return value
-				}
-				_ = os.Remove(path)
-			} else if existing := readInstallationID(path); existing != "" {
-				return existing
-			}
+		if published := publishInstallationID(path, value); published != "" {
+			return published
 		}
 	}
 
@@ -49,6 +38,39 @@ func InstallationID() string {
 	return "ins-path-" + filepath.Clean(StateDir())
 }
 
+// publishInstallationID writes a complete temp file, closes it, and only then
+// hard-links it into the canonical name. Link is an atomic create-if-absent:
+// concurrent first starts either publish their complete value or read the
+// complete winner. No process can observe the empty/partial canonical file that
+// O_CREATE|O_EXCL followed by Write exposed.
+func publishInstallationID(path, value string) string {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return ""
+	}
+	// #nosec G304 -- dir is always StateDir(), not user input.
+	tmp, err := os.CreateTemp(dir, "installation-id-*.tmp")
+	if err != nil {
+		return ""
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return ""
+	}
+	_, writeErr := tmp.WriteString(value + "\n")
+	syncErr := tmp.Sync()
+	closeErr := tmp.Close()
+	if writeErr != nil || syncErr != nil || closeErr != nil {
+		return ""
+	}
+	if err := os.Link(tmpPath, path); err == nil {
+		return value
+	}
+	return readInstallationID(path)
+}
+
 func readInstallationID(path string) string {
 	// #nosec G304 -- callers pass only StateDir()/installation-id.
 	data, err := os.ReadFile(path)
@@ -56,7 +78,10 @@ func readInstallationID(path string) string {
 		return ""
 	}
 	value := strings.TrimSpace(string(data))
-	if strings.HasPrefix(value, "ins-") && len(value) <= 80 {
+	if strings.HasPrefix(value, "ins-") && len(value) == 36 {
+		if _, err := hex.DecodeString(strings.TrimPrefix(value, "ins-")); err != nil {
+			return ""
+		}
 		return value
 	}
 	return ""
