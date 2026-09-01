@@ -363,7 +363,8 @@ func TestClaimCarriesNoModelSoNothingCanSuppressOnIt(t *testing.T) {
 }
 
 // The handoff used to be whole-transcript: a claimed session was seeked to EOF
-// unread. But Cursor exposes no hook for an MCP call or a subagent dispatch —
+// unread. But Cursor exposes no hook for an MCP call, a subagent dispatch, or a
+// direct skill-file read —
 // the eight steps we register carry neither — so on every hook-enrolled machine,
 // which is the recommended install, those two identities were captured by
 // NOTHING and the asset boards read a zero that was never a measurement.
@@ -376,19 +377,20 @@ func TestClaimedTranscriptStillYieldsTheKindsHooksCannotSee(t *testing.T) {
 	processors := map[string]*normalize.CursorTranscriptProcessor{}
 	pollCursorTranscripts(session, ws, cutoff, processors, true, false)
 
-	// One of each: a kind only this rail can see, and a prompt the hook rail
-	// already sent. Exactly one of them may be emitted.
+	// Two kinds only this rail can see, and a prompt the hook rail already sent.
+	// Exactly the two blind events may be emitted.
 	path := writeCursorTranscript(t, root, "p/agent-transcripts/b/b.jsonl",
 		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>the hook rail already sent this</user_query>"}]}}`,
 		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"CallMcpTool","input":{"server":"user-clerk","toolName":"list_apps"}}]}}`,
+		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"path":"/Users/u/.cursor/skills-cursor/review/SKILL.md"}}]}}`,
 		// Also a `command`, which the hook rail sends: it both anchors the
 		// transcript to this workspace and proves the filter drops it.
 		cursorShellLine(ws),
 	)
 	recordCursorHookClaim(path, "b")
 
-	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 1 {
-		t.Fatalf("claimed transcript queued %d event(s), want exactly 1 (the mcp_call, not the prompt)", queued)
+	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 2 {
+		t.Fatalf("claimed transcript queued %d event(s), want the mcp_call + skill use, not the prompt", queued)
 	}
 }
 
