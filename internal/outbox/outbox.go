@@ -275,7 +275,9 @@ func AppendTo(lane Lane, ev event.Event) error {
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)
 	}
-	return sign.WithBufferLock(lane.lockPath(), func() error {
+	// FLAGGED under the lane lock, RECORDED after it is released — see below.
+	dropped := false
+	err = sign.WithBufferLock(lane.lockPath(), func() error {
 		p := lane.path()
 		// PER LANE, deliberately. Each lane gets the full OutboxMaxBytes rather
 		// than sharing one, so a replay that fills its own queue cannot consume
@@ -303,6 +305,22 @@ func AppendTo(lane Lane, ev event.Event) error {
 			// the text below claims possibility, not loss.
 			warnf("%s outbox is full (%d bytes) — DROPPING event (%s). Delivery has been failing long enough to fill the queue; check connectivity and the ingest endpoint. The signed ledger is bounded too (~64 MiB across 4 segments, oldest dropped first), so a stall this long may already have rotated this event out of it.",
 				lane.Name, fi.Size(), ev.Kind)
+			// NO CURSOR WRITE HERE, and none in the counter this flag drives. The
+			// drop path deliberately advances nothing: the cursor is a byte offset
+			// into bytes that were WRITTEN, and an event that was never appended
+			// contributed none. Any arithmetic added to this branch would skip
+			// real undelivered bytes on the next drain.
+			//
+			// Both halves of the drop happen here and they answer different
+			// readers. `dropped` is the LAGGING count this device keeps for itself
+			// and reports on the beat; ErrQueueFull is what the CALLER acts on in
+			// the next few microseconds — the transcript watchers read it as "these
+			// bytes were not consumed" and decline to advance their offset. Neither
+			// substitutes for the other: a count with no error let the watchers
+			// mark a transcript read while its events were being discarded, and an
+			// error with no count leaves the loss invisible to anyone but the
+			// stderr of a daemon.
+			dropped = true
 			return fmt.Errorf("%s lane at %d bytes: %w", lane.Name, fi.Size(), ErrQueueFull)
 		}
 		// #nosec G304 -- p is lane.path(), derived from state.StateDir(), not user input.
@@ -314,6 +332,23 @@ func AppendTo(lane Lane, ev event.Event) error {
 		_, err = f.Write(append(b, '\n'))
 		return err
 	})
+	// RECORDED OUTSIDE THE LANE LOCK, deliberately, and not as a style choice.
+	//
+	// sign.WithBufferLock is a BLOCKING flock with no timeout. Bumping the counter
+	// through its own lock while still holding the lane's would hold the lane —
+	// the thing every producer on this machine queues behind — across an
+	// unrelated file write, and would establish a lock ordering nothing else is
+	// checked against. cursor_hook_overruns.go makes the same argument one level
+	// down about the same primitive.
+	//
+	// The stderr warning above is KEPT rather than replaced. It is what an
+	// engineer reads on their own machine; the counter is what reaches us. The
+	// device having said so locally is exactly what did not help in the incident
+	// this counter exists for — see drops.go.
+	if dropped {
+		recordDrop(lane)
+	}
+	return err
 }
 
 // warnOut is where warnf writes. A var so tests can capture it; nothing else

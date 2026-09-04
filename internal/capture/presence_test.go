@@ -62,9 +62,20 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	// behaviour — how many stop hooks we were handed, how many we answered, how
 	// many we abandoned — and they must never widen to a cause string, which
 	// would be the engineer's payload.
+	// `droppedEvents` / `outboxBytes` / `outboxCapacityBytes` join on exactly the
+	// same terms as `pendingEvents`, one question further on. That field says how
+	// far BEHIND delivery is; it cannot say whether the queue has begun
+	// DISCARDING, and on 2026-08-31..09-02 a customer lost ~15.6k events while
+	// every surface we had showed `pendingEvents: 63,965` — which at ~1KB/event is
+	// exactly the 64 MiB per-lane cap. Three integers ABOUT the queue: how many
+	// events it threw away, how full its fullest lane is, and the cap it is being
+	// measured against. Nothing about what was in them, and no reason string —
+	// a drop's context is the engineer's payload, a count of drops is a fact about
+	// us. Pinned on the emitted bytes by presence_drops_test.go.
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
+		"droppedEvents": true, "outboxBytes": true, "outboxCapacityBytes": true,
 		"cursorHooks": true, "cursorHookRepairs": true, "cursorHookUnverifiable": true,
 		"cursorStopSeen": true, "cursorStopUsageRows": true, "cursorStopEmpty": true,
 		"cursorHookOverruns": true, "cursorHookUnparsed": true,

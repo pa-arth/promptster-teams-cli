@@ -662,3 +662,69 @@ func TestTheReconstructionLineReportsHowFarBackItHasReached(t *testing.T) {
 		t.Errorf("line must name the date the replay has reached: %s", lines[0].text)
 	}
 }
+
+// TestDoctorReportsPastDropsOnAHealthyQueue is the doctor half of the change.
+//
+// Everything else in this file is a CURRENT-STATE reading and goes back down
+// when the queue drains. The drop counter does not: it is history, it only ever
+// rises, and it stays true after the queue has recovered. A machine that threw
+// telemetry away last Tuesday and is fine today otherwise prints an unqualified
+// all-clear — which is exactly the silence that let ops.ai lose ~15.6k events
+// over 2026-08-31..09-02 and tell us before our own telemetry did.
+func TestDoctorReportsPastDropsOnAHealthyQueue(t *testing.T) {
+	in := queueInputs{
+		haveOutbox:    true,
+		pending:       0,
+		dropsLive:     7,
+		dropsBackfill: 2,
+		now:           time.Now(),
+	}
+	lines := checkQueueHealth(in)
+	if got := worstLevel(lines); got != queueErr {
+		t.Errorf("a queue that has dropped events reported %s, want err\nlines:\n%s",
+			levelName(got), allText(lines))
+	}
+	text := allText(lines)
+	for _, want := range []string{"DROPPED", "9 events", "live 7", "backfill 2"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("drop line does not carry %q:\n%s", want, text)
+		}
+	}
+	// The all-clear still prints beside it. The queue really is empty; what is
+	// wrong is what already happened, and collapsing the two would trade one
+	// missing fact for another.
+	if !strings.Contains(text, "delivery queue empty") {
+		t.Errorf("the current-state line was swallowed by the drop line:\n%s", text)
+	}
+}
+
+// A clean machine says nothing about drops. The counter is loud when non-zero
+// precisely so that it can be silent when zero — a doctor that mentions drops on
+// every run is a doctor whose drop line nobody reads.
+func TestDoctorIsSilentWhenNothingHasBeenDropped(t *testing.T) {
+	in := queueInputs{haveOutbox: true, pending: 0, now: time.Now()}
+	if text := allText(checkQueueHealth(in)); strings.Contains(text, "DROPPED") {
+		t.Errorf("a machine that has never dropped mentions drops:\n%s", text)
+	}
+}
+
+// A FULL queue returns early — it is the one verdict that suppresses the depth
+// line, because "FULL" and "empty" are both true at once and read as a
+// contradiction. The drop history must survive that early return: a queue that
+// is full right now is the single most likely place for a non-zero count, and
+// dropping the line there would hide it exactly when it matters most.
+func TestDoctorKeepsTheDropLineOnAFullQueue(t *testing.T) {
+	in := queueInputs{
+		haveOutbox: true,
+		size:       outbox.OutboxMaxBytes,
+		dropsLive:  3,
+		now:        time.Now(),
+	}
+	text := allText(checkQueueHealth(in))
+	if !strings.Contains(text, "DROPPED 3 events since install") {
+		t.Errorf("the drop history was swallowed by the FULL verdict:\n%s", text)
+	}
+	if !strings.Contains(text, "FULL") {
+		t.Errorf("the FULL verdict was lost:\n%s", text)
+	}
+}

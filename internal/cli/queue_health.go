@@ -100,6 +100,23 @@ type queueInputs struct {
 	// one being alive means the queue is being worked.
 	draining bool
 
+	// dropsLive / dropsBackfill are the DURABLE discard counts, cumulative for
+	// this machine's lifetime (outbox.DropCounts).
+	//
+	// Reported per lane and not summed, because the two mean different things to
+	// the engineer reading this: a LIVE drop is work that was happening at that
+	// moment with no second copy anywhere, while a BACKFILL drop is replayed
+	// history whose source transcript is probably still on disk. The first is
+	// gone; the second may be recoverable.
+	//
+	// Separate from `size` on purpose. Size is the LEADING indicator — how close
+	// this queue is to discarding — and it goes back down when the queue drains.
+	// These only ever rise, and a non-zero one is a statement about the past that
+	// stays true after the queue empties, which is exactly why it is reported
+	// even on a healthy-looking machine.
+	dropsLive     int64
+	dropsBackfill int64
+
 	now time.Time
 }
 
@@ -110,6 +127,20 @@ type queueInputs struct {
 func checkQueueHealth(in queueInputs) []queueLine {
 	var lines []queueLine
 
+	// EVENTS ALREADY LOST, first and unconditionally. This is history, not a
+	// current-state reading: it survives the queue draining, it never goes back
+	// down, and there is no interpretation of a non-zero value under which
+	// nothing is wrong. It leads because a machine that has thrown telemetry away
+	// and since recovered otherwise prints an all-clear, which is precisely the
+	// silence that let a customer lose ~15.6k events over 2026-08-31..09-02 and
+	// tell us about it before our own telemetry did.
+	if in.dropsLive > 0 || in.dropsBackfill > 0 {
+		lines = append(lines, queueLine{queueErr, fmt.Sprintf(
+			"delivery queue has DROPPED %s since install (live %d, backfill %d) — those events were never uploaded and cannot be recovered from here; they remain in the signed local ledger. See %s",
+			eventCount64(in.dropsLive+in.dropsBackfill), in.dropsLive, in.dropsBackfill,
+			capture.DaemonLogPath())})
+	}
+
 	// A full outbox dominates and is reported alone. Append drops on FILE SIZE,
 	// not on backlog depth, so a queue that has drained but not yet compacted is
 	// still at the cap and still dropping every new event — meaning "FULL" and a
@@ -117,9 +148,9 @@ func checkQueueHealth(in queueInputs) []queueLine {
 	// contradiction ("queue FULL" / "queue empty"), so the depth line is dropped
 	// here: when events are being lost right now, that is the only message.
 	if in.haveOutbox && in.size >= outbox.OutboxMaxBytes {
-		return []queueLine{{queueErr, fmt.Sprintf(
+		return append(lines, queueLine{queueErr, fmt.Sprintf(
 			"delivery queue%s FULL (%s) — new events are being DROPPED. Delivery has failed long enough to fill the queue; see %s",
-			laneSuffix(in.lane), humanizeBytes(in.size), capture.DaemonLogPath())}}
+			laneSuffix(in.lane), humanizeBytes(in.size), capture.DaemonLogPath())})
 	}
 
 	// An outbox we cannot read cannot be counted. PendingCount returns 0 on any
@@ -129,9 +160,9 @@ func checkQueueHealth(in queueInputs) []queueLine {
 	// write too. Reported alone, because the depth is genuinely unknown and any
 	// number next to it would be a guess.
 	if in.haveOutbox && in.unreadable {
-		return []queueLine{{queueWarn, fmt.Sprintf(
+		return append(lines, queueLine{queueWarn, fmt.Sprintf(
 			"delivery queue%s unreadable (%s at %s) — cannot tell whether events are pending, and capture is likely failing to write; check permissions on the state dir, then see %s",
-			laneSuffix(in.lane), humanizeBytes(in.size), in.queuePath(), capture.DaemonLogPath())}}
+			laneSuffix(in.lane), humanizeBytes(in.size), in.queuePath(), capture.DaemonLogPath())})
 	}
 
 	// Approaching the cap: warn while there is still lead time to act. Nothing is
@@ -225,6 +256,7 @@ func gatherQueueInputs(now time.Time, snap capture.CaptureSnapshot) queueInputs 
 		draining: watcherDraining(snap),
 		now:      now,
 	}
+	in.dropsLive, in.dropsBackfill = outbox.DropCounts()
 
 	probes := []queueLaneProbe{
 		{
@@ -369,6 +401,16 @@ func latestWatcherStart(snap capture.CaptureSnapshot) time.Time {
 		}
 	}
 	return t
+}
+
+// eventCount64 is eventCount for the durable drop counters, which are int64
+// because they accumulate over a machine's whole life rather than describing a
+// queue that has to fit on disk.
+func eventCount64(n int64) string {
+	if n == 1 {
+		return "1 event"
+	}
+	return fmt.Sprintf("%d events", n)
 }
 
 func eventCount(n int) string {
