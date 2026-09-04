@@ -1,9 +1,11 @@
 package capture
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,5 +180,176 @@ func TestCodexTailDoesNotAdvancePastAnEventTheOutboxDropped(t *testing.T) {
 	}
 	if n := queuedLines(t, outboxPath); n < 3 {
 		t.Errorf("live lane holds %d event(s) after recovery, want the session start and both user messages", n)
+	}
+}
+
+// queuedKinds lists the event kinds sitting in the live lane, in order. The
+// sparse filler fillLiveOutbox wrote holds no newline-terminated records, so it
+// contributes nothing.
+func queuedKinds(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var kinds []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Kind string `json:"kind"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Kind != "" {
+			kinds = append(kinds, ev.Kind)
+		}
+	}
+	return kinds
+}
+
+// TestClaudeTailRewindsPastTheRecordsThatBuiltAFlushedEvent covers the half a
+// per-record rewind alone does NOT close, and it is the half that carries
+// ai_response.
+//
+// Not every event belongs to the record that produced it. The processor
+// accumulates an assistant message across many lines and mints it when a LATER
+// line closes the turn — and that flush releases the accumulator and memoizes
+// the message id as emitted before the event ever reaches the queue. So a rewind
+// that stops at the refusing record puts none of the bytes that BUILT the event
+// back in play: the next poll re-reads the closing line, the flush finds nothing
+// buffered, and the ai_response is gone exactly as permanently as if the offset
+// had advanced. Rewinding to the last record the processor was clean at, and
+// dropping what it holds, is what makes the replay reproduce it.
+//
+// The fixture is the minimum that shows it: an assistant line that only
+// accumulates, then a user line whose flush is what the full queue refuses.
+func TestClaudeTailRewindsPastTheRecordsThatBuiltAFlushedEvent(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	outboxPath := fillLiveOutbox(t)
+
+	workspace := t.TempDir()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	// Accumulates only — no event leaves the processor on this record.
+	assistant := fmt.Sprintf(`{"type":"assistant","uuid":"asst-1","cwd":%q,"timestamp":%q,"message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"the answer"}],"usage":{"input_tokens":10,"output_tokens":5}}}`+"\n", workspace, ts)
+	// Closes the turn: flushes msg_1 as ai_response, THEN mints its own prompt.
+	user := fmt.Sprintf(`{"type":"user","uuid":"rec-2","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"and next"}}`+"\n", workspace, ts)
+	path := filepath.Join(t.TempDir(), "flush-wedged.jsonl")
+	if err := os.WriteFile(path, []byte(assistant+user), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	total := int64(len(assistant) + len(user))
+
+	key := claudeProgressKey(path)
+	progress := claudeWatchProgress{Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{key: "yes"}, V: claudeProgressSchemaV}
+	proc := normalize.NewClaudeTranscriptProcessor("wedged-flush")
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
+
+	if _, res := tailClaudeTranscript(path, progress, proc, session, false, false, total*4, true); !res.truncated {
+		t.Fatal("outcome must report readable bytes left behind after the queue refused the flushed event")
+	}
+	// The assistant record queued nothing, but it is not passable: it is the only
+	// copy of the response the refused event was built from.
+	if got := progress.Offsets[key]; got != 0 {
+		t.Fatalf("offset = %d after the queue refused a flush-derived event; want 0 — the accumulator was built from byte 0 and has just been discarded", got)
+	}
+	if n := queuedLines(t, outboxPath); n != 0 {
+		t.Fatalf("%d event(s) reached a full queue", n)
+	}
+
+	// The drain catches up: the replay must reproduce the ai_response, not just
+	// the prompt. Getting the prompt alone back is the exact silent loss.
+	if err := os.Truncate(outboxPath, 0); err != nil {
+		t.Fatalf("empty the live outbox: %v", err)
+	}
+	if _, res := tailClaudeTranscript(path, progress, proc, session, false, false, total*4, true); res.consumed != total {
+		t.Fatalf("recovery poll consumed %d bytes, want the whole file (%d)", res.consumed, total)
+	}
+	kinds := queuedKinds(t, outboxPath)
+	var sawResponse bool
+	for _, k := range kinds {
+		if k == "ai_response" {
+			sawResponse = true
+		}
+	}
+	if !sawResponse {
+		t.Fatalf("live lane holds %v after recovery — the flushed ai_response was never rebuilt, which is the permanent loss this rewind exists to stop", kinds)
+	}
+}
+
+// TestCodexTailRewindsPastTheRecordsThatBuiltAFlushedEvent is the Codex half of
+// the same rule, on its own buffered shape: a function_call sits in the
+// processor until the record carrying its output arrives, and pairing them
+// DELETES the pending call before the event reaches the queue. A rewind that
+// stopped at the output record would replay it against a processor that no
+// longer holds the call, and the tool event would never be rebuilt.
+//
+// The two records are split across polls deliberately — a budget-capped first
+// poll commits the call as read while the queue is healthy — so the refusal
+// lands on the output record alone. That is the shape a real wedge takes: the
+// bytes that built the event were consumed long before the queue filled.
+func TestCodexTailRewindsPastTheRecordsThatBuiltAFlushedEvent(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	outboxPath := filepath.Join(stateDir, "outbox.jsonl")
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", outboxPath)
+
+	workspace := t.TempDir()
+	ts := time.Now().UTC().Format(time.RFC3339)
+	meta := codexSessionMetaLine(workspace, ts)
+	// Buffers the call; emits nothing.
+	call := fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo done\"}","call_id":"call_B"}}`+"\n", ts)
+	// Pairs with it, emits the tool event, and deletes the pending call.
+	output := fmt.Sprintf(`{"timestamp":%q,"type":"response_item","payload":{"type":"function_call_output","call_id":"call_B","output":"Process exited with code 0\nOutput:\ndone\n"}}`+"\n", ts)
+	path := filepath.Join(t.TempDir(), "rollout-flush-wedged.jsonl")
+	if err := os.WriteFile(path, []byte(meta+call+output), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	head := int64(len(meta) + len(call))
+	total := head + int64(len(output))
+
+	progress := codexWatchProgress{Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{path: "yes"}, V: codexProgressSchemaV}
+	proc := normalize.NewCodexRolloutProcessor("wedged-codex-flush")
+	session := Session{DeviceID: "device", SessionToken: "PSE-TEST", TaskRoot: workspace}
+
+	// Poll 1, healthy queue, budget stops exactly after the call record.
+	if _, res := tailCodexRollout(path, progress, proc, session, false, head, true); res.consumed != head {
+		t.Fatalf("setup poll consumed %d bytes, want %d (session_meta + the call record)", res.consumed, head)
+	}
+	if progress.Offsets[path] != head {
+		t.Fatalf("setup poll left the offset at %d, want %d", progress.Offsets[path], head)
+	}
+
+	// Poll 2, wedged queue: the only record read is the output, and the call it
+	// pairs with is already behind the committed offset.
+	fillLiveOutbox(t)
+	if _, res := tailCodexRollout(path, progress, proc, session, false, total*4, true); !res.truncated {
+		t.Fatal("outcome must report readable bytes left behind after the queue refused the paired tool event")
+	}
+	if got := progress.Offsets[path]; got != int64(len(meta)) {
+		t.Fatalf("offset = %d after the queue refused a pair-derived event; want %d — the call record is the only copy of what built it, and the processor has just been emptied", got, len(meta))
+	}
+
+	// Poll 3, drained: the replay must rebuild the tool event, not just re-read
+	// the output line into a processor with nothing to pair it against.
+	if err := os.Truncate(outboxPath, 0); err != nil {
+		t.Fatalf("empty the live outbox: %v", err)
+	}
+	if _, res := tailCodexRollout(path, progress, proc, session, false, total*4, true); progress.Offsets[path] != total {
+		t.Fatalf("recovery poll left the offset at %d, want the whole file (%d); consumed=%d", progress.Offsets[path], total, res.consumed)
+	}
+	kinds := queuedKinds(t, outboxPath)
+	var sawTool bool
+	for _, k := range kinds {
+		if k == "command" {
+			sawTool = true
+		}
+	}
+	if !sawTool {
+		t.Fatalf("live lane holds %v after recovery — the tool event whose call record was already consumed was never rebuilt", kinds)
 	}
 }

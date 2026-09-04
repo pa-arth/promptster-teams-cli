@@ -898,6 +898,12 @@ func tailCodexRollout(
 	queueFullAt := int64(-1)
 	wasDiscarding := progress.Discarding[path]
 	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte, recordStart int64) bool {
+		// A record the processor enters holding NOTHING buffered is a point the
+		// offset can be rewound to: from here on everything is rebuildable from
+		// bytes alone. Recorded before Process, which is what does the buffering.
+		if !proc.HasBufferedState() {
+			proc.RewindOffset = offset + recordStart
+		}
 		// Scrub secrets before parsing/ingest — same redaction the hook path
 		// applies. Rollout lines carry prompt text, command output, and file
 		// patches that may contain keys/tokens the candidate pasted or printed.
@@ -959,6 +965,23 @@ func tailCodexRollout(
 		if queued > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
+	}
+
+	// The record rewind is necessary but not sufficient, for the same reason it
+	// is not on the Claude rail (see tailClaudeTranscript, which carries the long
+	// version). Process buffers: a human turn deferred until the following line
+	// decides it, a tool call held until the record carrying its output. An event
+	// flushed out of that buffer was built from records BEFORE the one being
+	// rewound to, and the flush already released them, so a replay from the
+	// refusing record reproduces nothing. Rewind instead to the last offset the
+	// processor was clean at, and drop what it holds so the replay rebuilds it
+	// rather than stacking on top of it. Runs after the commit above and
+	// overrides it, because the target can sit behind where this poll started.
+	if queueFullAt >= 0 {
+		if proc.RewindOffset < progress.Offsets[path] {
+			progress.Offsets[path] = proc.RewindOffset
+		}
+		proc.DiscardBufferedState()
 	}
 	if res.discardingOversize {
 		progress.Discarding[path] = true

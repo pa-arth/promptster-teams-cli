@@ -1465,6 +1465,14 @@ func tailClaudeTranscript(
 	queueFullAt := int64(-1)
 	wasDiscarding := progress.Discarding[key]
 	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte, recordStart int64) bool {
+		// A record the processor enters holding NOTHING buffered is a point the
+		// offset can be rewound to, because from here on everything is rebuildable
+		// from bytes alone. Recorded before Process, which is what does the
+		// buffering — and kept on the processor, so it survives the poll exactly as
+		// long as the state it describes does.
+		if !proc.HasBufferedState() {
+			proc.RewindOffset = offset + recordStart
+		}
 		// Scrub secrets BEFORE parsing and before anything is persisted or
 		// queued — transcript lines carry prompt text, command output, and file
 		// content. This ordering is load-bearing; do not move it.
@@ -1516,6 +1524,36 @@ func tailClaudeTranscript(
 		if parsed > 0 && verboseWatch() {
 			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
+	}
+
+	// The record rewind above is necessary but NOT sufficient, and only for one
+	// reason: not every event comes from the record that produced it. Process
+	// accumulates an assistant message across many lines and mints it when a
+	// later line closes the turn, and it holds a tool call until the record
+	// carrying its result. An event flushed out of that buffer was built from
+	// records BEFORE the one being rewound to, and the flush has already released
+	// them — accum cleared, msgID memoized as emitted, pending call deleted — so
+	// re-reading from the refusing record reproduces nothing and the event is
+	// gone for good. That is the same permanent loss by a different door, and on
+	// the worst possible event: ai_response is the flush-derived one.
+	//
+	// So rewind to the last offset the processor was CLEAN at, whichever is
+	// earlier, and drop what it is holding so the replay rebuilds it rather than
+	// stacking on top of it. Those bytes are still on disk — that is the whole
+	// premise of AppendFromDurableSource — and the replay is idempotent, because
+	// every id in it is derived from the record's own uuid/message id.
+	//
+	// A processor stuck holding state (a tool call whose result never lands)
+	// pins this offset, so a long stall re-reads a long prefix each poll. That
+	// is deliberate: a wasted read costs a poll, and the alternative costs the
+	// events. Note the ordering — it runs AFTER the commit above, and overrides
+	// it, because a rewind target can legitimately sit behind where this poll
+	// even started reading.
+	if queueFullAt >= 0 {
+		if proc.RewindOffset < progress.Offsets[key] {
+			progress.Offsets[key] = proc.RewindOffset
+		}
+		proc.DiscardBufferedState()
 	}
 	if res.discardingOversize {
 		progress.Discarding[key] = true
