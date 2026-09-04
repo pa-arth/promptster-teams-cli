@@ -254,6 +254,28 @@ var deviceOnlyFields = map[string]map[string]string{
 		"pendingOldestEventAt": "Same beat, same pre-projection path; lands in " +
 			"engineer_keys.latest_pending_oldest_event_at. The two move as one — the count alone " +
 			"cannot tell 62k-queued-five-minutes-ago from 62k-queued-three-weeks-ago.",
+		"droppedEvents": "Same beat, same pre-projection path; lands in " +
+			"engineer_keys.latest_dropped_events / latest_outbox_reported_at. `pendingEvents` says " +
+			"how far BEHIND delivery is; it cannot say whether the queue has started DISCARDING, " +
+			"and only the first had an answer. Between 2026-08-31 and 2026-09-02 ops.ai lost ~15.6k " +
+			"events (~5,900/day baseline against 19 and 36 on the worst two days) and told US: a " +
+			"403 wedged the lane, it filled to OutboxMaxBytes, and outbox.AppendTo discarded every " +
+			"event after that with only a warnf to a stderr nobody reads. The device kept reporting " +
+			"`pendingEvents: 63,965`, which at ~1KB/event is exactly the 64 MiB cap — a queue PINNED " +
+			"at its cap is indistinguishable from a busy one. Cumulative for this machine's " +
+			"lifetime, both lanes summed; the per-lane split stays on device for `doctor`. Emitted " +
+			"from outbox.DropCount() (internal/outbox/drops.go).",
+		"outboxBytes": "Same beat, same path; lands in engineer_keys.latest_outbox_bytes. The " +
+			"LEADING indicator to droppedEvents' lagging one — how close the fullest lane is to the " +
+			"cap, which is knowable BEFORE anything is lost. A MAX across lanes and deliberately not " +
+			"a sum: OutboxMaxBytes is enforced per lane, so 32MiB+32MiB and 64MiB+0 are the same " +
+			"total and opposite situations. See outbox.OutboxBytes.",
+		"outboxCapacityBytes": "Same beat, same path; lands in " +
+			"engineer_keys.latest_outbox_capacity_bytes. The DIVISOR, sent rather than assumed: " +
+			"OutboxMaxBytes is a constant in a repo that ships independently of the backend, so a " +
+			"server dividing by a hard-coded 64 MiB would silently mis-judge any client whose cap " +
+			"changed. Sending it makes the fill ratio a fact about the client instead of a " +
+			"calculation the server hopes still applies.",
 		"cursorHooks": "Same pre-projection path as pendingEvents, and denormalized for the same " +
 			"reason. teams-ingest.ts reads event.data.cursorHooks off the raw beat, refuses any word " +
 			"outside the closed enum, and writes engineer_keys.latest_cursor_hook_state / " +
@@ -314,6 +336,9 @@ var deviceOnlyFields = map[string]map[string]string{
 		"pendingEvents": "Mirrors presence.pendingEvents for the server's other accepted beat " +
 			"spelling. This CLI constructs no `heartbeat` event, so no bytes leave here for it today.",
 		"pendingOldestEventAt":   "Mirrors presence.pendingOldestEventAt, same reason.",
+		"droppedEvents":          "Mirrors presence.droppedEvents for the server's other accepted beat spelling.",
+		"outboxBytes":            "Mirrors presence.outboxBytes, same reason.",
+		"outboxCapacityBytes":    "Mirrors presence.outboxCapacityBytes, same reason.",
 		"cursorHooks":            "Mirrors presence.cursorHooks for the server's other accepted beat spelling.",
 		"cursorHookRepairs":      "Mirrors presence.cursorHookRepairs, same reason.",
 		"cursorHookUnverifiable": "Mirrors presence.cursorHookUnverifiable, same reason.",

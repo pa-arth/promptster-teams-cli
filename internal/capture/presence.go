@@ -76,6 +76,50 @@ type presenceData struct {
 	// 62k-queued-from-three-weeks-ago.
 	PendingOldestEventAt string `json:"pendingOldestEventAt,omitempty"`
 
+	// DELIVERY LOSS. Three integers about the queue, never about its contents.
+	//
+	// PendingEvents above says how far behind delivery is. It cannot say whether
+	// delivery has started THROWING WORK AWAY, and those turned out to be very
+	// different questions with only one of them answered. Between 2026-08-31 and
+	// 2026-09-02 a customer lost roughly 15.6k events — ~5,900/day baseline
+	// against 19 and 36 on the two worst days — and told US, because every
+	// surface we had said the same thing throughout: `pendingEvents: 63,965`,
+	// which at ~1KB/event is exactly the 64 MiB per-lane cap. A queue PINNED at
+	// its cap is indistinguishable from a queue that is merely busy.
+	//
+	//	DroppedEvents        the LAGGING indicator. Cumulative for this machine's
+	//	                     lifetime, both lanes summed, persisted across
+	//	                     restarts. Non-zero means telemetry was lost; there is
+	//	                     no reading under which that is benign.
+	//	OutboxBytes          the LEADING indicator: bytes in the FULLEST lane. A
+	//	                     max and NOT a sum — the cap is per lane, so two
+	//	                     half-full lanes and one full lane produce the same
+	//	                     total and describe opposite situations. See
+	//	                     outbox.OutboxBytes.
+	//	OutboxCapacityBytes  the per-lane cap THIS BUILD enforces. Sent rather
+	//	                     than assumed by the reader: OutboxMaxBytes is a
+	//	                     constant in a repo that ships independently, so a
+	//	                     server dividing by a hard-coded 64 MiB would silently
+	//	                     mis-judge any client whose cap ever changed. The
+	//	                     divisor rides with the dividend.
+	//
+	// NOT omitempty, all three, for the reason PendingEvents spells out at
+	// length: a reported zero is a MEASUREMENT — here, the fleet saying "we are
+	// losing nothing", which is the most common and most valuable value this
+	// field will ever carry — and a field that vanishes at zero cannot be told
+	// apart from a fleet too old to send it.
+	//
+	// INTEGERS ONLY, no reason string, the same privacy boundary the cursor
+	// counters draw: a drop's context is the engineer's payload, a count of drops
+	// is a fact about us.
+	//
+	// GRAIN: cumulative for this MACHINE, like every counter beside it. The
+	// server's row is per key, so two machines sharing a key alternate and the
+	// stored value is one machine's total — never an engineer's sum.
+	DroppedEvents       int64 `json:"droppedEvents"`
+	OutboxBytes         int64 `json:"outboxBytes"`
+	OutboxCapacityBytes int64 `json:"outboxCapacityBytes"`
+
 	// CURSOR HOOK RAIL HEALTH. One closed word, plus two counts.
 	//
 	// Same argument as PendingEvents above, one rail over: the device is the only
@@ -227,6 +271,14 @@ func buildPresenceEvent(session Session) event.Event {
 		Watching:             watchedTools(),
 		PendingEvents:        pending.Count,
 		PendingOldestEventAt: oldest,
+
+		// Read on the SAME beat and at the same instant as the backlog above, so
+		// the count, the age, the fill and the loss all describe one observation
+		// rather than four sampled at different points in the funnel. Three cheap
+		// reads: one small file, two Stats.
+		DroppedEvents:       outbox.DropCount(),
+		OutboxBytes:         outbox.OutboxBytes(),
+		OutboxCapacityBytes: outbox.OutboxMaxBytes,
 
 		// Read at BUILD time alongside the backlog, so every number in the beat
 		// describes the same instant its `ts` does.

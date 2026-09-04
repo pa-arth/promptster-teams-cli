@@ -233,6 +233,14 @@ var projectFieldAllowlist = map[string][]string{
 	// tools, so this rail must never carry a reason string: a neighbour's command
 	// line would ride out with it. See presenceData.CursorHooks.
 	//
+	// `droppedEvents` / `outboxBytes` / `outboxCapacityBytes` are that same queue's
+	// LOSS and PRESSURE — three integers about the queue, never about what is in
+	// it. `pendingEvents` says how far behind delivery is; it cannot say whether
+	// delivery has started DISCARDING, and the difference cost a customer ~15.6k
+	// events over 2026-08-31..09-02 that we heard about from them rather than from
+	// our own telemetry. Their reported zeros are measurements and must survive
+	// projection like the pair above.
+	//
 	// `cursorStopSeen` / `cursorStopUsageRows` / `cursorStopEmpty` /
 	// `cursorHookOverruns` / `cursorHookUnparsed` are that rail's COVERAGE, which
 	// is a different question from its install state and had no answer at all:
@@ -243,6 +251,7 @@ var projectFieldAllowlist = map[string][]string{
 	"heartbeat": {
 		"device", "cliVersion", "os", "arch", "watching",
 		"pendingEvents", "pendingOldestEventAt",
+		"droppedEvents", "outboxBytes", "outboxCapacityBytes",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
 		"cursorHookOverruns", "cursorHookUnparsed",
@@ -250,6 +259,7 @@ var projectFieldAllowlist = map[string][]string{
 	"presence": {
 		"device", "cliVersion", "os", "arch", "watching", "state",
 		"pendingEvents", "pendingOldestEventAt",
+		"droppedEvents", "outboxBytes", "outboxCapacityBytes",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
 		"cursorHookOverruns", "cursorHookUnparsed",
