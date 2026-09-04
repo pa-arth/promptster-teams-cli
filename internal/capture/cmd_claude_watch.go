@@ -698,7 +698,10 @@ func RunClaudeWatcher() error {
 						continue // hooks owned this window and already emitted
 					}
 					eventsCaptured++
-					queueClaudeWatchEvent(ev, session, captureProse)
+					// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+					// event came out of in-memory state the flush has already released, so
+					// there is no byte range to rewind to.
+					_ = queueClaudeWatchEvent(ev, session, captureProse)
 				}
 			}
 			// Now return and let the drain die with the process. There is
@@ -951,7 +954,10 @@ func pollClaudeTranscripts(
 				if dryRun {
 					continue
 				}
-				queueClaudeWatchEvent(ev, session, captureProse)
+				// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+				// event came out of in-memory state the flush has already released, so
+				// there is no byte range to rewind to.
+				_ = queueClaudeWatchEvent(ev, session, captureProse)
 			}
 		}
 	}
@@ -998,7 +1004,10 @@ func pollClaudeTranscripts(
 		for _, ev := range proc.FlushStale(0) {
 			parsed++
 			if !dryRun {
-				queueClaudeWatchEvent(ev, session, captureProse)
+				// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+				// event came out of in-memory state the flush has already released, so
+				// there is no byte range to rewind to.
+				_ = queueClaudeWatchEvent(ev, session, captureProse)
 			}
 		}
 		delete(processors, key)
