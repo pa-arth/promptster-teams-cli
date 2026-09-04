@@ -78,9 +78,11 @@ func loadOutboxDrops() outboxDrops {
 // recordDrop bumps the named lane's counter, best-effort.
 //
 // MUST be called with the lane's append lock RELEASED — see the package comment
-// above. Errors are swallowed: the caller has already lost an event, and failing
-// its Append because we could not also count the loss trades one dropped event
-// for another.
+// above. Errors never propagate: the caller has already lost an event, and
+// failing its Append because we could not also count the loss trades one dropped
+// event for another. A failed RENAME is warned about rather than swallowed
+// silently, because an under-reporting drop counter is the same class of bug as
+// the drop it is counting.
 func recordDrop(lane Lane) {
 	_ = sign.WithBufferLock(dropsPath()+".lock", func() error {
 		c := loadOutboxDrops()
@@ -94,14 +96,43 @@ func recordDrop(lane Lane) {
 		if err != nil {
 			return nil
 		}
-		if err := os.MkdirAll(filepath.Dir(dropsPath()), 0o700); err != nil {
+		dir := filepath.Dir(dropsPath())
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil
 		}
-		tmp := dropsPath() + ".tmp"
-		if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		// A UNIQUE temp in the same dir, then a CHECKED rename — the pattern
+		// policy.writeDiskCache already uses, and for a reason that bites here
+		// specifically. This lock serialises WRITERS, but DropCount/DropCounts
+		// read outbox-drops.json without taking it, and on Windows a rename onto
+		// a path another process currently has open fails with a sharing
+		// violation. presence beats call DropCount on a timer while AppendTo can
+		// be recording a drop, so those two do overlap.
+		//
+		// The old `_ = os.Rename(tmp, ...)` swallowed that: the increment was
+		// lost, the temp file was left behind, and the counter under-reported the
+		// very loss it exists to make visible. Best-effort still means the append
+		// never fails for it — but a lost count is now SAID, not hidden, which is
+		// the whole thesis of this file.
+		tmp, err := os.CreateTemp(dir, "outbox-drops-*.json.tmp")
+		if err != nil {
 			return nil
 		}
-		_ = os.Rename(tmp, dropsPath())
+		name := tmp.Name()
+		if _, err := tmp.Write(data); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(name)
+			return nil
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(name)
+			return nil
+		}
+		// os.CreateTemp already creates at 0600, so no chmod is needed.
+		if err := os.Rename(name, dropsPath()); err != nil {
+			_ = os.Remove(name)
+			warnf("dropped an event from the %s lane but could not persist the drop count: %v. The counter under-reports; the loss itself is real.",
+				lane.Name, err)
+		}
 		return nil
 	})
 }

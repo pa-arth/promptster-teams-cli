@@ -1,11 +1,15 @@
 package outbox
 
 import (
+	"bytes"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // fillLane grows a lane's queue file past its cap so the next append to it is
@@ -194,4 +198,62 @@ func fileSize(t *testing.T, path string) int64 {
 		return 0
 	}
 	return fi.Size()
+}
+
+// TestAFailedCounterWriteIsNotSilent covers the one branch that decides whether
+// this counter can under-report without saying so.
+//
+// The write is a temp-then-rename, and the rename can fail for reasons that have
+// nothing to do with this process: DropCount/DropCounts read the file WITHOUT
+// taking this lock (presence beats call them on a timer), and on Windows a
+// rename onto a path another process holds open fails with a sharing violation.
+// The original `_ = os.Rename(tmp, ...)` turned that into a lost increment and a
+// leftover temp file, in the one component whose entire job is making a silent
+// loss visible.
+//
+// The failure is forced portably by parking a non-empty DIRECTORY on the
+// counter's path — rename onto it fails on every platform we ship.
+func TestAFailedCounterWriteIsNotSilent(t *testing.T) {
+	laneTest(t)
+
+	if err := os.MkdirAll(filepath.Join(dropsPath(), "occupied"), 0o700); err != nil {
+		t.Fatalf("stage an unwritable counter path: %v", err)
+	}
+
+	var buf bytes.Buffer
+	warnMu.Lock()
+	warnOut = &buf
+	warnMu.Unlock()
+	t.Cleanup(func() {
+		warnMu.Lock()
+		warnOut = os.Stderr
+		warnMu.Unlock()
+	})
+
+	fillLane(t, LaneLive())
+	Append(event.NewEvent("prompt", "sess-test")) //nolint:errcheck // the drop, not its report, is under test here.
+
+	warnMu.Lock()
+	got := buf.String()
+	warnMu.Unlock()
+	if !strings.Contains(got, "could not persist the drop count") {
+		t.Errorf("a lost drop count went unreported; warnings were: %q", got)
+	}
+	if !strings.Contains(got, "live") {
+		t.Errorf("warning %q does not name the lane whose count was lost", got)
+	}
+
+	// And nothing is left behind. A shared literal temp path also RACED between
+	// concurrent watchers; os.CreateTemp gives each write its own name, so the
+	// only correctness requirement left is that a failed write cleans up after
+	// itself rather than seeding the state dir with orphans on every drop.
+	entries, err := os.ReadDir(state.StateDir())
+	if err != nil {
+		t.Fatalf("read state dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Errorf("a failed counter write left %s behind", e.Name())
+		}
+	}
 }
