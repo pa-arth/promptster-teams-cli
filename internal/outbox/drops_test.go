@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,8 +42,14 @@ func TestDropIsCounted(t *testing.T) {
 
 	fillLane(t, LaneLive())
 	for i := 0; i < 3; i++ {
-		if err := Append(event.NewEvent("prompt", "sess-test")); err != nil {
-			t.Fatalf("Append: %v", err)
+		// A drop REPORTS itself now (#208): the count is what reaches us on the
+		// beat, ErrQueueFull is what the caller acts on in the same breath. Both
+		// come out of the one branch, so asserting the error here is also what
+		// pins them together — a refactor that kept the count and lost the error
+		// would put the transcript watchers back to marking a file read while its
+		// events were being discarded.
+		if err := Append(event.NewEvent("prompt", "sess-test")); !errors.Is(err, ErrQueueFull) {
+			t.Fatalf("Append onto a full lane = %v, want ErrQueueFull", err)
 		}
 	}
 
@@ -65,8 +72,8 @@ func TestDropsAreCountedPerLane(t *testing.T) {
 	fillLane(t, LaneBackfill())
 	old := event.NewEvent("prompt", "sess-test")
 	old.Ts = time.Now().Add(-2 * LiveHorizon).UTC().Format(time.RFC3339Nano)
-	if err := AppendFromDurableSource(old); err != nil {
-		t.Fatalf("AppendFromDurableSource: %v", err)
+	if err := AppendFromDurableSource(old); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("AppendFromDurableSource onto a full backfill lane = %v, want ErrQueueFull", err)
 	}
 
 	live, backfill := DropCounts()
@@ -92,8 +99,8 @@ func TestDropCountSurvivesRestart(t *testing.T) {
 	laneTest(t)
 
 	fillLane(t, LaneLive())
-	if err := Append(event.NewEvent("prompt", "sess-test")); err != nil {
-		t.Fatalf("Append: %v", err)
+	if err := Append(event.NewEvent("prompt", "sess-test")); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("Append onto a full lane = %v, want ErrQueueFull", err)
 	}
 
 	// Every read goes back to the file — there is no process-local cache to
@@ -131,8 +138,8 @@ func TestDropDoesNotDisturbTheCursor(t *testing.T) {
 	// Now force the lane over the cap and drop several events against it.
 	fillLane(t, LaneLive())
 	for i := 0; i < 5; i++ {
-		if err := Append(event.NewEvent("prompt", "sess-test")); err != nil {
-			t.Fatalf("Append: %v", err)
+		if err := Append(event.NewEvent("prompt", "sess-test")); !errors.Is(err, ErrQueueFull) {
+			t.Fatalf("Append onto a full lane = %v, want ErrQueueFull", err)
 		}
 	}
 

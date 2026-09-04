@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"errors"
 	"os"
 	"testing"
 
@@ -59,8 +60,8 @@ func TestPresenceCarriesTheDropCount(t *testing.T) {
 		t.Fatalf("grow outbox: %v", err)
 	}
 	f.Close()
-	if err := outbox.Append(event.NewEvent("prompt", "sess-test")); err != nil {
-		t.Fatalf("Append: %v", err)
+	if err := outbox.Append(event.NewEvent("prompt", "sess-test")); !errors.Is(err, outbox.ErrQueueFull) {
+		t.Fatalf("Append onto a full lane = %v, want ErrQueueFull", err)
 	}
 
 	data := buildPresenceEvent(Session{DeviceID: "dev-1"}).Data.(map[string]interface{})
