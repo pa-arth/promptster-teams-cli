@@ -11,6 +11,7 @@ import (
 
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
 // The tests here pin ONE rule on both transcript rails: a record whose events
@@ -351,5 +352,117 @@ func TestCodexTailRewindsPastTheRecordsThatBuiltAFlushedEvent(t *testing.T) {
 	}
 	if !sawTool {
 		t.Fatalf("live lane holds %v after recovery — the tool event whose call record was already consumed was never rebuilt", kinds)
+	}
+}
+
+// fillBothLanes grows BOTH lanes to their cap, which is the only state in which
+// a durable-source producer can be sure an append would be refused. Sparse — no
+// 128 MiB is ever written.
+func fillBothLanes(t *testing.T) {
+	t.Helper()
+	fillLiveOutbox(t)
+	f, err := os.OpenFile(state.OutboxBackfillPath(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open backfill outbox: %v", err)
+	}
+	defer f.Close()
+	if err := f.Truncate(outbox.OutboxMaxBytes); err != nil {
+		t.Fatalf("grow backfill outbox: %v", err)
+	}
+}
+
+func drainBothLanes(t *testing.T) {
+	t.Helper()
+	for _, p := range []string{os.Getenv("PROMPTSTER_OUTBOX_PATH"), state.OutboxBackfillPath()} {
+		if err := os.Truncate(p, 0); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("empty %s: %v", p, err)
+		}
+	}
+}
+
+// TestClaudePollDefersProcessorEvictionWhileTheQueueIsFull covers the one place
+// the tail's rewind cannot reach.
+//
+// The poll's force-flush passes iterate EVERY processor, not just the one that
+// took a refusal, and they run after the offsets are committed. A flush releases
+// the accumulator and memoizes its message id, so an ai_response minted into a
+// full lane is unrecoverable in the fullest sense: the lines that built it sit
+// behind a committed offset and the processor no longer remembers them. There is
+// no rewind available at that point and never was — the Codex rail has always
+// gated its stale-prompt flush on `!res.truncated`, and this rail had nothing.
+//
+// Skipping the flush costs nothing: the accumulator stays where it is and the
+// next poll with room mints the same event off the same state. Eviction is
+// gated with it, because deleting the processor after skipping its flush would
+// lose the event just as completely and more quietly.
+func TestClaudePollDefersProcessorEvictionWhileTheQueueIsFull(t *testing.T) {
+	root := claudeProjectsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	// Package-global, so a sibling test's misses would otherwise decide when this
+	// one evicts.
+	clear(claudeProcessorMisses)
+
+	workspace := t.TempDir()
+	now := time.Now().UTC()
+	ts := now.Format(time.RFC3339)
+	dir := filepath.Join(root, "-Users-me-repo")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "evicted-sess.jsonl")
+	// A prompt to establish the session, then an assistant message that only
+	// ACCUMULATES — nothing mints it until a boundary line or a flush.
+	body := fmt.Sprintf(`{"type":"user","uuid":"u-1","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"go"}}`+"\n"+
+		`{"type":"assistant","uuid":"a-1","cwd":%q,"timestamp":%q,"message":{"id":"msg_evict","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"the answer"}],"usage":{"input_tokens":10,"output_tokens":5}}}`+"\n",
+		resolvePath(workspace), ts, resolvePath(workspace), ts)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "dev-evict", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	cutoff := transcriptHistoryCutoff(now)
+	processors := map[string]*normalize.ClaudeTranscriptProcessor{}
+
+	// Poll 1, healthy queue: the transcript is read and msg_evict is left
+	// buffered in the processor.
+	pollClaudeTranscripts(session, resolvePath(workspace), cutoff, processors, false, false)
+	if len(processors) != 1 {
+		t.Fatalf("expected one processor after the first poll, got %d", len(processors))
+	}
+
+	// The transcript ages out of the walk while the queue is wedged.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	fillBothLanes(t)
+	for range claudeProcessorMissThreshold + 1 {
+		pollClaudeTranscripts(session, resolvePath(workspace), cutoff, processors, false, false)
+	}
+	if len(processors) != 1 {
+		t.Fatalf("processor was evicted into a full queue — its buffered ai_response is now unrecoverable (%d left)", len(processors))
+	}
+
+	// The drain catches up: the same state mints the same event, on the same
+	// eviction path, with nowhere for it to have been lost in between.
+	drainBothLanes(t)
+	for range claudeProcessorMissThreshold + 1 {
+		pollClaudeTranscripts(session, resolvePath(workspace), cutoff, processors, false, false)
+	}
+	if len(processors) != 0 {
+		t.Errorf("processor was never evicted after the queue drained (%d left)", len(processors))
+	}
+	kinds := queuedKinds(t, os.Getenv("PROMPTSTER_OUTBOX_PATH"))
+	kinds = append(kinds, queuedKinds(t, state.OutboxBackfillPath())...)
+	var sawResponse bool
+	for _, k := range kinds {
+		if k == "ai_response" {
+			sawResponse = true
+		}
+	}
+	if !sawResponse {
+		t.Fatalf("lanes hold %v after the drain — the buffered ai_response never survived the wedge", kinds)
 	}
 }

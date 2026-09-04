@@ -886,6 +886,16 @@ func tailCodexRollout(
 	}
 	defer f.Close()
 
+	// PRE-FLIGHT, same rule and same reason as the Claude rail (see
+	// tailClaudeTranscript for the long version): both lanes at their cap means
+	// every event this poll derives would be refused, so the read is work whose
+	// only outcome is the rewind. Returns before any write to progress, so a
+	// skipped poll leaves the oversize-discard flag — a fact about the file, not
+	// about the queue — exactly as it found it.
+	if outbox.BothLanesFull() {
+		return 0, transcriptReadOutcome{truncated: true}
+	}
+
 	offset := progress.Offsets[path]
 	if _, err := f.Seek(offset, 0); err != nil {
 		return 0, transcriptReadOutcome{}

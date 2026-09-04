@@ -933,13 +933,26 @@ func pollClaudeTranscripts(
 
 	// Force-flush assistant messages that stopped receiving lines (turn ended
 	// without a prompt boundary yet).
-	for _, proc := range processors {
-		for _, ev := range proc.FlushStale(claudeAccumFlushAge) {
-			parsed++
-			if dryRun {
-				continue
+	//
+	// SKIPPED ENTIRELY WHILE THE QUEUE IS FULL, which is the same rule the tail's
+	// rewind lives by, applied to the one place the tail cannot reach. A flush
+	// releases the accumulator and memoizes its message id, and the lines that
+	// built it sit behind an offset this poll already committed — so minting an
+	// ai_response into a lane that will discard it is the unrecoverable loss, in
+	// full, with no rewind available. Not flushing costs nothing: the accumulator
+	// stays exactly where it is and the next poll with room mints the same event
+	// off the same state. Codex's stale-prompt flush has always been gated (on
+	// `!res.truncated`); this rail had no equivalent.
+	queueFull := outbox.BothLanesFull()
+	if !queueFull {
+		for _, proc := range processors {
+			for _, ev := range proc.FlushStale(claudeAccumFlushAge) {
+				parsed++
+				if dryRun {
+					continue
+				}
+				queueClaudeWatchEvent(ev, session, captureProse)
 			}
-			queueClaudeWatchEvent(ev, session, captureProse)
 		}
 	}
 
@@ -963,7 +976,17 @@ func pollClaudeTranscripts(
 	// At the 3s poll interval two consecutive misses costs ~6s of extra
 	// eviction latency once a transcript is genuinely gone, which is what
 	// actually bounds the leak — while absorbing one-off walk hiccups.
+	//
+	// The whole pass is skipped while the queue is full, gate and all. Evicting
+	// means flushing, and a flush into a full lane loses the event outright (see
+	// the stale pass above) — but skipping only the flush and keeping the delete
+	// would lose it just as completely, and more quietly. So the eviction waits.
+	// It costs one *ClaudeTranscriptProcessor per out-of-window transcript for the
+	// duration of a wedge, against the events the eviction would otherwise burn.
 	for key, proc := range processors {
+		if queueFull {
+			break
+		}
 		if liveKeys[key] {
 			delete(claudeProcessorMisses, key)
 			continue
@@ -1449,6 +1472,24 @@ func tailClaudeTranscript(
 		return 0, transcriptReadOutcome{}
 	}
 	defer f.Close()
+
+	// PRE-FLIGHT. Both lanes already at their cap means every event this poll
+	// derives would be refused, so the whole read is work whose only outcome is
+	// the rewind below. Declining it keeps a multi-day wedge from re-parsing a
+	// long prefix on every poll — the cost the rewind deliberately accepts, and
+	// which there is no reason to pay while the answer is known in advance.
+	//
+	// Returns BEFORE any write to progress, deliberately: a skipped poll must not
+	// clear this transcript's oversize-discard flag, which is a fact about the
+	// file and not about the queue. `truncated` is literally true — readable bytes
+	// were left behind — and is what keeps the caller from reading a wedged file
+	// as drained.
+	//
+	// Advisory, not an invariant: the lane can fill between here and the append,
+	// which is why the rewind still exists.
+	if outbox.BothLanesFull() {
+		return 0, transcriptReadOutcome{truncated: true}
+	}
 
 	key := claudeProgressKey(path)
 	offset := progress.Offsets[key]
