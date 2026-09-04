@@ -3,6 +3,7 @@ package capture
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -697,7 +698,10 @@ func RunClaudeWatcher() error {
 						continue // hooks owned this window and already emitted
 					}
 					eventsCaptured++
-					queueClaudeWatchEvent(ev, session, captureProse)
+					// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+					// event came out of in-memory state the flush has already released, so
+					// there is no byte range to rewind to.
+					_ = queueClaudeWatchEvent(ev, session, captureProse)
 				}
 			}
 			// Now return and let the drain die with the process. There is
@@ -932,13 +936,29 @@ func pollClaudeTranscripts(
 
 	// Force-flush assistant messages that stopped receiving lines (turn ended
 	// without a prompt boundary yet).
-	for _, proc := range processors {
-		for _, ev := range proc.FlushStale(claudeAccumFlushAge) {
-			parsed++
-			if dryRun {
-				continue
+	//
+	// SKIPPED ENTIRELY WHILE THE QUEUE IS FULL, which is the same rule the tail's
+	// rewind lives by, applied to the one place the tail cannot reach. A flush
+	// releases the accumulator and memoizes its message id, and the lines that
+	// built it sit behind an offset this poll already committed — so minting an
+	// ai_response into a lane that will discard it is the unrecoverable loss, in
+	// full, with no rewind available. Not flushing costs nothing: the accumulator
+	// stays exactly where it is and the next poll with room mints the same event
+	// off the same state. Codex's stale-prompt flush has always been gated (on
+	// `!res.truncated`); this rail had no equivalent.
+	queueFull := outbox.BothLanesFull()
+	if !queueFull {
+		for _, proc := range processors {
+			for _, ev := range proc.FlushStale(claudeAccumFlushAge) {
+				parsed++
+				if dryRun {
+					continue
+				}
+				// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+				// event came out of in-memory state the flush has already released, so
+				// there is no byte range to rewind to.
+				_ = queueClaudeWatchEvent(ev, session, captureProse)
 			}
-			queueClaudeWatchEvent(ev, session, captureProse)
 		}
 	}
 
@@ -962,7 +982,17 @@ func pollClaudeTranscripts(
 	// At the 3s poll interval two consecutive misses costs ~6s of extra
 	// eviction latency once a transcript is genuinely gone, which is what
 	// actually bounds the leak — while absorbing one-off walk hiccups.
+	//
+	// The whole pass is skipped while the queue is full, gate and all. Evicting
+	// means flushing, and a flush into a full lane loses the event outright (see
+	// the stale pass above) — but skipping only the flush and keeping the delete
+	// would lose it just as completely, and more quietly. So the eviction waits.
+	// It costs one *ClaudeTranscriptProcessor per out-of-window transcript for the
+	// duration of a wedge, against the events the eviction would otherwise burn.
 	for key, proc := range processors {
+		if queueFull {
+			break
+		}
 		if liveKeys[key] {
 			delete(claudeProcessorMisses, key)
 			continue
@@ -974,7 +1004,10 @@ func pollClaudeTranscripts(
 		for _, ev := range proc.FlushStale(0) {
 			parsed++
 			if !dryRun {
-				queueClaudeWatchEvent(ev, session, captureProse)
+				// Discarded explicitly: see queueClaudeWatchEvent's own note — this
+				// event came out of in-memory state the flush has already released, so
+				// there is no byte range to rewind to.
+				_ = queueClaudeWatchEvent(ev, session, captureProse)
 			}
 		}
 		delete(processors, key)
@@ -1338,7 +1371,7 @@ func classifyClaudeTranscriptBounded(
 	}
 
 	result := claudeMatchUndecided
-	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
+	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte, _ int64) bool {
 		if result != claudeMatchUndecided {
 			return false
 		}
@@ -1420,12 +1453,18 @@ func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 // oversizeProbe carries the poll's single allowance to read past that budget,
 // and only to establish that one record exceeds transcriptMaxRecordBytes.
 //
-// Advancing the offset unconditionally is now SAFE, which it was not before.
-// This loop used to POST inline and advance regardless of the result, so a
-// 429/5xx/timeout silently and permanently destroyed the event — there was no
-// retry anywhere in the CLI. Durability now lives in the outbox: once an event
-// is queued it will be delivered or loudly dropped, so the transcript offset no
-// longer has to double as a delivery receipt.
+// Advancing the offset is safe for every record the outbox ACCEPTED, which it
+// was not before. This loop used to POST inline and advance regardless of the
+// result, so a 429/5xx/timeout silently and permanently destroyed the event —
+// there was no retry anywhere in the CLI. Durability now lives in the outbox:
+// once an event is queued it will be delivered or loudly dropped, so the
+// transcript offset no longer has to double as a delivery receipt.
+//
+// It is NOT safe for a record the outbox refused. A queue at OutboxMaxBytes
+// discards the event and says so with outbox.ErrQueueFull, and advancing over
+// that record would file it as read while nothing holds it any more — see the
+// rewind inside, which is the one case where consumed bytes do not become
+// offset.
 func tailClaudeTranscript(
 	path string,
 	progress claudeWatchProgress,
@@ -1443,6 +1482,24 @@ func tailClaudeTranscript(
 	}
 	defer f.Close()
 
+	// PRE-FLIGHT. Both lanes already at their cap means every event this poll
+	// derives would be refused, so the whole read is work whose only outcome is
+	// the rewind below. Declining it keeps a multi-day wedge from re-parsing a
+	// long prefix on every poll — the cost the rewind deliberately accepts, and
+	// which there is no reason to pay while the answer is known in advance.
+	//
+	// Returns BEFORE any write to progress, deliberately: a skipped poll must not
+	// clear this transcript's oversize-discard flag, which is a fact about the
+	// file and not about the queue. `truncated` is literally true — readable bytes
+	// were left behind — and is what keeps the caller from reading a wedged file
+	// as drained.
+	//
+	// Advisory, not an invariant: the lane can fill between here and the append,
+	// which is why the rewind still exists.
+	if outbox.BothLanesFull() {
+		return 0, transcriptReadOutcome{truncated: true}
+	}
+
 	key := claudeProgressKey(path)
 	offset := progress.Offsets[key]
 	// Seeking past EOF is not an error, so a shorter alias of an
@@ -1453,8 +1510,19 @@ func tailClaudeTranscript(
 	}
 
 	parsed := 0
+	// queueFullAt is the read-relative start of the FIRST record whose events the
+	// outbox refused, or -1 while none has. See the rewind below.
+	queueFullAt := int64(-1)
 	wasDiscarding := progress.Discarding[key]
-	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte) bool {
+	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte, recordStart int64) bool {
+		// A record the processor enters holding NOTHING buffered is a point the
+		// offset can be rewound to, because from here on everything is rebuildable
+		// from bytes alone. Recorded before Process, which is what does the
+		// buffering — and kept on the processor, so it survives the poll exactly as
+		// long as the state it describes does.
+		if !proc.HasBufferedState() {
+			proc.RewindOffset = offset + recordStart
+		}
 		// Scrub secrets BEFORE parsing and before anything is persisted or
 		// queued — transcript lines carry prompt text, command output, and file
 		// content. This ordering is load-bearing; do not move it.
@@ -1464,10 +1532,38 @@ func tailClaudeTranscript(
 			if dryRun {
 				continue
 			}
-			queueClaudeWatchEvent(ev, session, captureProse)
+			if err := queueClaudeWatchEvent(ev, session, captureProse); errors.Is(err, outbox.ErrQueueFull) {
+				queueFullAt = recordStart
+				return false
+			}
 		}
 		return true
 	})
+
+	// A full outbox means this byte range was NOT consumed, whatever the reader
+	// counted. The queue DROPPED the event (outbox.ErrQueueFull), and the offset
+	// commit below would otherwise mark the record that produced it as read —
+	// which is how a stalled ingest turns a recoverable backlog into permanent
+	// loss: the transcript still holds every one of those events, but nothing
+	// will ever look at those bytes again. That is the ops.ai shape, where a
+	// three-day wedge dropped ~54k events off devices whose watchers had already
+	// recorded the source transcripts as fully read.
+	//
+	// Rewinding to the FIRST failing record is a PREFIX rule, forced by the
+	// medium exactly as it is for outbox.advanceOver: the offset is a single
+	// number, so it cannot say "records 4-10 queued but 3 did not". Records after
+	// the failing one are re-read next poll, which is free — the normalizers
+	// derive STABLE event ids from each record's own uuid/message id, so a
+	// re-queued event collapses to one row on the backend rather than
+	// duplicating. Marking the outcome truncated is literally true (readable
+	// bytes were left behind) and is what stops the caller treating this as a
+	// clean end-of-file.
+	if queueFullAt >= 0 {
+		if res.consumed > queueFullAt {
+			res.consumed = queueFullAt
+		}
+		res.truncated = true
+	}
 
 	if res.discarded > 0 {
 		fmt.Fprintf(os.Stderr, "claude-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
@@ -1479,6 +1575,36 @@ func tailClaudeTranscript(
 			fmt.Fprintf(os.Stderr, "claude-watcher: queued %d event(s) from %s\n", parsed, filepath.Base(path))
 		}
 	}
+
+	// The record rewind above is necessary but NOT sufficient, and only for one
+	// reason: not every event comes from the record that produced it. Process
+	// accumulates an assistant message across many lines and mints it when a
+	// later line closes the turn, and it holds a tool call until the record
+	// carrying its result. An event flushed out of that buffer was built from
+	// records BEFORE the one being rewound to, and the flush has already released
+	// them — accum cleared, msgID memoized as emitted, pending call deleted — so
+	// re-reading from the refusing record reproduces nothing and the event is
+	// gone for good. That is the same permanent loss by a different door, and on
+	// the worst possible event: ai_response is the flush-derived one.
+	//
+	// So rewind to the last offset the processor was CLEAN at, whichever is
+	// earlier, and drop what it is holding so the replay rebuilds it rather than
+	// stacking on top of it. Those bytes are still on disk — that is the whole
+	// premise of AppendFromDurableSource — and the replay is idempotent, because
+	// every id in it is derived from the record's own uuid/message id.
+	//
+	// A processor stuck holding state (a tool call whose result never lands)
+	// pins this offset, so a long stall re-reads a long prefix each poll. That
+	// is deliberate: a wasted read costs a poll, and the alternative costs the
+	// events. Note the ordering — it runs AFTER the commit above, and overrides
+	// it, because a rewind target can legitimately sit behind where this poll
+	// even started reading.
+	if queueFullAt >= 0 {
+		if proc.RewindOffset < progress.Offsets[key] {
+			progress.Offsets[key] = proc.RewindOffset
+		}
+		proc.DiscardBufferedState()
+	}
 	if res.discardingOversize {
 		progress.Discarding[key] = true
 	} else {
@@ -1489,7 +1615,17 @@ func tailClaudeTranscript(
 
 // queueClaudeWatchEvent runs the shared per-event funnel: stamp device
 // identity, path relativize, cross-channel file_diff dedup, local signed
-// ledger, then the send queue.
+// ledger, then the send queue. It returns the QUEUE's error (nil for an event
+// the dedup skipped, and nil for a ledger-only failure, which does not stop the
+// event shipping).
+//
+// The return exists for one caller: the tail, which reads from a durable file
+// and can therefore answer outbox.ErrQueueFull by rewinding rather than by
+// losing the event. The accumulator-flush callers (FlushStale on shutdown, on a
+// stale turn, on processor eviction) deliberately ignore it — their event came
+// out of in-memory state that the flush has already released, so there is no
+// byte range to re-read and nothing better to do than the warning outbox
+// already printed.
 //
 // Ordering here is load-bearing twice over, and the two rules compose:
 //
@@ -1513,7 +1649,7 @@ func tailClaudeTranscript(
 // what machine it runs on. SessionID comes from the transcript; DeviceID comes
 // from the environment. Keeping the two sourced separately is what stops them
 // collapsing back into one value.
-func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
+func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) error {
 	ev.DeviceID = session.DeviceID
 	normalize.RelativizeEventPaths(&ev, session.TaskRoot)
 	// Record AI bash execution windows for later commit-attribution recovery
@@ -1529,19 +1665,25 @@ func queueClaudeWatchEvent(ev event.Event, session Session, captureProse bool) {
 	// Cross-channel idempotency: skip a file_diff whose resulting content the
 	// hook or git watcher already emitted.
 	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
-		return
+		return nil
 	}
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: buffer error: %v\n", err)
 	}
-	// AppendFromDurableSource, not Append: the transcript is on disk and this
-	// funnel's read offset has not advanced, so an event this queue defers is
-	// never one it loses. That is the property that earns the backfill lane —
+	// AppendFromDurableSource, not Append: the transcript is on disk, so an event
+	// this queue DEFERS is never one it loses — and, since the tail now rewinds
+	// its offset on ErrQueueFull, neither is one this queue DROPS. Both halves
+	// matter and only the first used to hold: the read offset was committed from
+	// the bytes consumed whatever the queue answered, so a drop advanced past
+	// records nothing would ever look at again. That is the property that earns
+	// the backfill lane —
 	// outbox classifies by the EVENT's own age (outbox.LiveHorizon), so the live
 	// tail of an actively-running session still goes down the live lane. See the
 	// `replay` flag above: same input, but a different question and a different
 	// window, so they are deliberately not the same call.
 	if err := outbox.AppendFromDurableSource(ev); err != nil {
 		fmt.Fprintf(os.Stderr, "claude-watcher: queue error (%s): %v\n", ev.Kind, err)
+		return err
 	}
+	return nil
 }

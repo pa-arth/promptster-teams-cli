@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -747,7 +748,7 @@ func classifyCodexRolloutBounded(
 	}
 
 	result := codexMatchUndecided
-	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte) bool {
+	out := readTranscriptRecords(f, budget, oversizeProbe, discarding, func(line []byte, _ int64) bool {
 		if result != codexMatchUndecided {
 			return false
 		}
@@ -864,9 +865,11 @@ func codexRolloutCwd(path string) string {
 // to read past that budget, and only to establish that one record exceeds
 // transcriptMaxRecordBytes.
 //
-// As in the claude watcher, advancing the offset unconditionally is only safe
-// because delivery is now durable: this loop used to POST inline and advance
-// regardless, so any 429/5xx/timeout destroyed the event permanently.
+// As in the claude watcher, advancing the offset over a QUEUED record is only
+// safe because delivery is now durable: this loop used to POST inline and
+// advance regardless, so any 429/5xx/timeout destroyed the event permanently.
+// A record the outbox REFUSED (outbox.ErrQueueFull) is the exception and is
+// rewound rather than committed — see the block inside.
 func tailCodexRollout(
 	path string,
 	progress codexWatchProgress,
@@ -883,24 +886,69 @@ func tailCodexRollout(
 	}
 	defer f.Close()
 
+	// PRE-FLIGHT, same rule and same reason as the Claude rail (see
+	// tailClaudeTranscript for the long version): both lanes at their cap means
+	// every event this poll derives would be refused, so the read is work whose
+	// only outcome is the rewind. Returns before any write to progress, so a
+	// skipped poll leaves the oversize-discard flag — a fact about the file, not
+	// about the queue — exactly as it found it.
+	if outbox.BothLanesFull() {
+		return 0, transcriptReadOutcome{truncated: true}
+	}
+
 	offset := progress.Offsets[path]
 	if _, err := f.Seek(offset, 0); err != nil {
 		return 0, transcriptReadOutcome{}
 	}
 
 	queued := 0
-	emit := func(ev event.Event) int { return emitCodexEvent(ev, session, captureProse) }
+	emit := func(ev event.Event) (int, error) { return emitCodexEvent(ev, session, captureProse) }
+	// queueFullAt is the read-relative start of the FIRST record whose events the
+	// outbox refused, or -1 while none has. See the rewind below.
+	queueFullAt := int64(-1)
 	wasDiscarding := progress.Discarding[path]
-	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte) bool {
+	res := readTranscriptRecords(f, budget, oversizeProbe, wasDiscarding, func(record []byte, recordStart int64) bool {
+		// A record the processor enters holding NOTHING buffered is a point the
+		// offset can be rewound to: from here on everything is rebuildable from
+		// bytes alone. Recorded before Process, which is what does the buffering.
+		if !proc.HasBufferedState() {
+			proc.RewindOffset = offset + recordStart
+		}
 		// Scrub secrets before parsing/ingest — same redaction the hook path
 		// applies. Rollout lines carry prompt text, command output, and file
 		// patches that may contain keys/tokens the candidate pasted or printed.
 		redacted := redact.RedactBytes(record)
 		for _, ev := range proc.Process(redacted) {
-			queued += emit(ev)
+			n, err := emit(ev)
+			queued += n
+			if errors.Is(err, outbox.ErrQueueFull) {
+				queueFullAt = recordStart
+				return false
+			}
 		}
 		return true
 	})
+
+	// A full outbox means this byte range was NOT consumed — same rule and same
+	// reason as the Claude rail (see tailClaudeTranscript). The queue DROPPED the
+	// event, so committing the offset over the record that produced it would file
+	// it as read while nothing holds it any more, turning a recoverable stall
+	// into permanent loss. The rewind stops at the FIRST failing record because
+	// an offset is a single number and cannot express a hole; re-reading the rest
+	// next poll is free, since the normalizer derives stable per-record event ids
+	// and the backend collapses a re-queued event onto the same row.
+	//
+	// Applied BEFORE the stale-prompt flush below, deliberately: that flush
+	// RELEASES in-memory state, and an event released into a full queue is gone
+	// for good — the rollout bytes that would rebuild it are exactly the ones
+	// this rewind has just declined to consume.
+	if queueFullAt >= 0 {
+		if res.consumed > queueFullAt {
+			res.consumed = queueFullAt
+		}
+		res.truncated = true
+	}
+
 	if res.discarded > 0 {
 		fmt.Fprintf(os.Stderr, "codex-watcher: discarded %d bytes of an unsupported record (over %d bytes) in %s\n",
 			res.discarded, transcriptMaxRecordBytes, filepath.Base(path))
@@ -914,7 +962,11 @@ func tailCodexRollout(
 	// that turn are sitting unread in the file, not absent.
 	if !res.truncated {
 		for _, ev := range proc.FlushStaleUserPrompt() {
-			queued += emit(ev)
+			// Error ignored on purpose: this event came out of in-memory state
+			// the flush has already released, so there is no byte range to
+			// rewind to and nothing better to do than outbox's own warning.
+			n, _ := emit(ev)
+			queued += n
 		}
 	}
 
@@ -924,6 +976,23 @@ func tailCodexRollout(
 			fmt.Fprintf(os.Stderr, "codex-watcher: queued %d event(s) from %s\n", queued, filepath.Base(path))
 		}
 	}
+
+	// The record rewind is necessary but not sufficient, for the same reason it
+	// is not on the Claude rail (see tailClaudeTranscript, which carries the long
+	// version). Process buffers: a human turn deferred until the following line
+	// decides it, a tool call held until the record carrying its output. An event
+	// flushed out of that buffer was built from records BEFORE the one being
+	// rewound to, and the flush already released them, so a replay from the
+	// refusing record reproduces nothing. Rewind instead to the last offset the
+	// processor was clean at, and drop what it holds so the replay rebuilds it
+	// rather than stacking on top of it. Runs after the commit above and
+	// overrides it, because the target can sit behind where this poll started.
+	if queueFullAt >= 0 {
+		if proc.RewindOffset < progress.Offsets[path] {
+			progress.Offsets[path] = proc.RewindOffset
+		}
+		proc.DiscardBufferedState()
+	}
 	if res.discardingOversize {
 		progress.Discarding[path] = true
 	} else {
@@ -932,11 +1001,13 @@ func tailCodexRollout(
 	return queued, res
 }
 
-// emitCodexEvent stamps, dedupes, ledgers and queues one normalized event.
+// emitCodexEvent stamps, dedupes, ledgers and queues one normalized event, and
+// reports how many events it queued (0 or 1) plus the QUEUE's error, which the
+// tail reads to decide whether the record it came from may be marked consumed.
 // Shared by the line-by-line tail and the stale-prompt flush so a recovered
 // prompt goes through the IDENTICAL path as every other event — same device
 // stamping, same path relativization, same signing.
-func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
+func emitCodexEvent(ev event.Event, session Session, captureProse bool) (int, error) {
 	// SessionID comes from the rollout; DeviceID comes from the environment.
 	// Stamped here rather than in the normalizer, which has no business knowing
 	// what machine it runs on — keeping the two sourced separately is what stops
@@ -955,20 +1026,21 @@ func emitCodexEvent(ev event.Event, session Session, captureProse bool) int {
 	// another channel) has already emitted, so an apply_patch edit isn't
 	// double-counted when the working-tree poll sees it later.
 	if !dedupeFileDiff(session.TaskRoot, &ev, replay) {
-		return 0
+		return 0, nil
 	}
 	// Ledger first — it projects, scrubs, and signs ev in place, so the queued
 	// copy is the exact bytes to ship. See queueClaudeWatchEvent.
 	if err := sign.AppendEventToLocalBuffer(&ev, captureProse); err != nil {
 		fmt.Fprintf(os.Stderr, "codex-watcher: buffer error: %v\n", err)
 	}
-	// Durable source — the rollout file is on disk and the offset has not moved.
-	// Same terms as queueClaudeWatchEvent; see the note there.
+	// Durable source — the rollout file is on disk and, on ErrQueueFull, the
+	// caller declines to move the offset past this record. Same terms as
+	// queueClaudeWatchEvent; see the note there.
 	if err := outbox.AppendFromDurableSource(ev); err != nil {
 		fmt.Fprintf(os.Stderr, "codex-watcher: queue error (%s): %v\n", ev.Kind, err)
-		return 0
+		return 0, err
 	}
-	return 1
+	return 1, nil
 }
 
 // resolvePath resolves symlinks (falling back to a cleaned path) so workspace

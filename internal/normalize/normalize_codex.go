@@ -131,6 +131,13 @@ type CodexRolloutProcessor struct {
 	// codexUserMessageLine for why the deferral (rather than a flag) is the only
 	// shape that works, and recoverUserPrompt for why the fallback exists.
 	pendingUser codexPendingUserTurn
+	// RewindOffset is CALLER-OWNED bookkeeping, stashed on the processor so it
+	// shares this processor's exact lifetime instead of needing a parallel map in
+	// the watcher. The capture layer keeps in it the absolute rollout offset of
+	// the last record this processor entered holding NOTHING buffered — the
+	// earliest byte a re-read has to start from to rebuild what it holds now. The
+	// normalizer never reads it. See tailCodexRollout.
+	RewindOffset int64
 }
 
 // codexPendingUserTurn is one buffered response_item user turn awaiting the
@@ -379,6 +386,36 @@ func (p *CodexRolloutProcessor) recoverUserPrompt(payload map[string]interface{}
 	// whose repeats keep landing one per poll would never flush at all.
 	aged := p.pendingUser.aged && p.pendingUser.text == text
 	p.pendingUser = codexPendingUserTurn{text: text, ts: ts, raw: raw, aged: aged}
+}
+
+// HasBufferedState reports whether the processor is holding partial state that
+// only a re-read of earlier rollout bytes could rebuild: a deferred human turn,
+// a tool call awaiting its output, or a call awaiting its exec cell.
+//
+// Same role as the Claude rail's method of the same name, for the same reason.
+// An event minted from buffered state does NOT belong to the record that
+// flushed it — it was built out of records BEFORE that one — so rewinding the
+// read offset to the flushing record puts none of those bytes back in play. The
+// watcher asks before each record and remembers the last offset at which the
+// answer was false.
+func (p *CodexRolloutProcessor) HasBufferedState() bool {
+	return p.pendingUser.text != "" || len(p.pending) > 0 || len(p.running) > 0
+}
+
+// DiscardBufferedState throws away exactly what a re-read from RewindOffset
+// rebuilds, so a rewind's replay lands on an empty processor rather than on top
+// of a duplicate pending call or a turn it is about to re-derive.
+//
+// The "latest seen" stamps — lastTokenUsage, lastContextWindow, model, workdir
+// and the session identity — are deliberately NOT cleared. They are not
+// buffered work awaiting a boundary; they are the most recent value of a field
+// restated throughout the file, and dropping them would strip usage and model
+// off the very events the replay re-emits before their own token_count and
+// turn_context lines come round again.
+func (p *CodexRolloutProcessor) DiscardBufferedState() {
+	p.pendingUser = codexPendingUserTurn{}
+	clear(p.pending)
+	clear(p.running)
 }
 
 // FlushStaleUserPrompt releases a buffered turn that the next line will never

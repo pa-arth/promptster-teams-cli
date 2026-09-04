@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -161,6 +162,65 @@ func UnderPressure() bool {
 	return fi.Size() >= PressureHighWater
 }
 
+// LaneFull reports whether a lane has already reached OutboxMaxBytes, which is
+// the exact condition AppendTo turns into ErrQueueFull.
+//
+// It is the ADVISORY form of that check and nothing more. Between this Stat and
+// the append the drainer may free the lane or another producer may fill it, so
+// a caller must still handle ErrQueueFull; what this buys is the chance to
+// decline work BEFORE doing it. Distinct from UnderPressure, which asks a softer
+// question (half full) of one specific lane for one specific caller.
+//
+// BothLanesFull is the form the transcript watchers want, because
+// AppendFromDurableSource routes by the event's own age: a full backfill lane
+// says nothing about whether a live event would land.
+func LaneFull(lane Lane) bool {
+	fi, err := os.Stat(lane.path())
+	if err != nil {
+		// No file is an empty lane; an unreadable one is not evidence of fullness,
+		// and answering "full" would stall a watcher on a Stat hiccup.
+		return false
+	}
+	return fi.Size() >= OutboxMaxBytes
+}
+
+// BothLanesFull reports whether NEITHER lane can accept an event — the only
+// state in which a durable-source producer can be sure that reading more would
+// queue nothing.
+func BothLanesFull() bool {
+	return LaneFull(LaneLive()) && LaneFull(LaneBackfill())
+}
+
+// ErrQueueFull reports that an append was DISCARDED because its lane had
+// already reached OutboxMaxBytes. Match it with errors.Is; AppendTo wraps it
+// with the lane and the size it measured.
+//
+// It exists because the drop used to return nil — "success" — so no caller
+// could tell a queued event from a discarded one. That silence was invisible in
+// exactly the case it mattered: the transcript watchers commit their read offset
+// from the bytes they consumed, so a drop marked the transcript READ while
+// discarding the event derived from it. A three-day ingest wedge on one customer
+// device dropped ~54,000 events that way, every one of them still sitting in a
+// transcript on disk that the watcher had already recorded as fully read — a
+// loss no restart, redeploy, or backend fix could recover without hand-rewinding
+// the cursor.
+//
+// The contract this establishes is asymmetric, deliberately:
+//
+//   - A producer with a DURABLE SOURCE (the Claude and Codex transcript
+//     watchers) must treat it as "these bytes were NOT consumed" and leave its
+//     read offset short of the failing record. Re-reading the transcript next
+//     poll costs nothing and normalizers derive STABLE event ids, so a re-queued
+//     record collapses to one row on the backend.
+//   - Every other producer (tool hooks, presence, census, durability, commit
+//     attribution, window usage — see Append) has no second copy of the event.
+//     For them a full queue is still a real loss and there is nothing better to
+//     do than log and carry on. The ones that gate durable state on the queue
+//     (commit attribution's ledger, the durability inventory throttle) simply
+//     decline to mark the work done and retry it later, which is the correct
+//     reading of a failed enqueue.
+var ErrQueueFull = errors.New("outbox queue is full: event dropped")
+
 // Append enqueues an already-signed, already-redacted event on the LIVE lane.
 //
 // This is the right call for every producer whose input is NOT durable on disk:
@@ -225,11 +285,25 @@ func AppendTo(lane Lane, ev event.Event) error {
 		if fi, err := os.Stat(p); err == nil && fi.Size() >= OutboxMaxBytes {
 			// Dropping is a real loss of telemetry, never a normal condition, so
 			// it is reported unconditionally rather than through the debug-gated
-			// logger. The event still exists in the signed ledger — the audit
-			// trail stays complete; only the upload is lost.
-			warnf("%s outbox is full (%d bytes) — DROPPING event (%s). Delivery has been failing long enough to fill the queue; check connectivity and the ingest endpoint.",
+			// logger.
+			//
+			// This warning used to reassure the operator that "the event still
+			// exists in the signed ledger — the audit trail stays complete; only
+			// the upload is lost." That was FALSE exactly when it printed. The
+			// ledger is bounded too, on the same order and over the same window:
+			// sign.rotateLedgerIfLarge rotates at 16 MiB and keeps
+			// state.LedgerRetainedSegments (3) beside the live one — ~64 MiB
+			// across 4 segments, the same 64 MiB this lane caps at. The two
+			// bounds evict from OPPOSITE ends: this queue drops the NEWEST event,
+			// the ledger drops the OLDEST segment. A stall long enough to fill
+			// 64 MiB of queue has been filling the ledger over that same period,
+			// so the event may already have rotated out of it. MAY, not has: the
+			// two files do not fill at the same rate (the ledger also carries
+			// presence and census; the projector strips fields on the way in), so
+			// the text below claims possibility, not loss.
+			warnf("%s outbox is full (%d bytes) — DROPPING event (%s). Delivery has been failing long enough to fill the queue; check connectivity and the ingest endpoint. The signed ledger is bounded too (~64 MiB across 4 segments, oldest dropped first), so a stall this long may already have rotated this event out of it.",
 				lane.Name, fi.Size(), ev.Kind)
-			return nil
+			return fmt.Errorf("%s lane at %d bytes: %w", lane.Name, fi.Size(), ErrQueueFull)
 		}
 		// #nosec G304 -- p is lane.path(), derived from state.StateDir(), not user input.
 		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)

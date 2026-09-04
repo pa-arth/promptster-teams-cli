@@ -247,6 +247,14 @@ type ClaudeTranscriptProcessor struct {
 	pendingTools  map[string]claudePendingTool
 	emittedMsgIDs map[string]bool
 	accum         *claudeMsgAccum
+	// RewindOffset is CALLER-OWNED bookkeeping, stashed on the processor so it
+	// shares this processor's exact lifetime — same map, same eviction — instead
+	// of needing a parallel one in the watcher. The capture layer keeps in it the
+	// absolute transcript offset of the last record this processor entered
+	// holding NOTHING buffered, which is the earliest byte a re-read has to start
+	// from to rebuild everything the processor holds now. The normalizer never
+	// reads it. See tailClaudeTranscript for the one thing it is for.
+	RewindOffset int64
 	// lastPromptTs is the TRANSCRIPT timestamp of the previous human prompt,
 	// retained only as lane state.
 	lastPromptTs time.Time
@@ -712,6 +720,37 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 	e.Data = data
 	e.RawPayload = strPreview(a.text.String(), 500)
 	return []event.Event{e}
+}
+
+// HasBufferedState reports whether the processor is holding partial state that
+// only a re-read of earlier transcript bytes could rebuild: an assistant
+// message still accumulating, or a tool call still waiting for its result.
+//
+// It exists for the watchers' queue-full rewind, and answers the question that
+// rewind cannot answer on its own. An event minted from buffered state does NOT
+// belong to the record whose arrival flushed it — it was built out of records
+// BEFORE that one — so backing the read offset up to the flushing record puts
+// none of those bytes back in play. The watcher therefore asks this before each
+// record, and remembers the last offset at which the answer was false.
+func (p *ClaudeTranscriptProcessor) HasBufferedState() bool {
+	return p.accum != nil || len(p.pendingTools) > 0
+}
+
+// DiscardBufferedState throws away exactly what a re-read from RewindOffset
+// rebuilds, so a rewind's replay lands on an empty processor rather than on top
+// of state it already holds — which would otherwise double an assistant body or
+// re-register a pending call.
+//
+// emittedMsgIDs goes with it, and has to: it is the memo that stops one
+// assistant message flushing twice, so leaving it populated would make the
+// replay emit NOTHING for the very message the rewind was performed to recover.
+// Re-emitting an ai_response the queue already accepted is the cheap side of
+// that trade — its id is derived from the message's own id, so the backend
+// collapses the repeat onto the same row.
+func (p *ClaudeTranscriptProcessor) DiscardBufferedState() {
+	p.accum = nil
+	clear(p.pendingTools)
+	clear(p.emittedMsgIDs)
 }
 
 // flushStale force-flushes an accumulated assistant message that has not seen
