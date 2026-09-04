@@ -1,12 +1,15 @@
 package outbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -515,5 +518,112 @@ func TestBackfillBatchesAreLabelledOnTheWire(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("no batch reached the backend")
+	}
+}
+
+// TestAFullLaneReportsErrQueueFullInsteadOfSuccess pins the signal a dropped
+// event now carries. The drop used to `return nil`, so every caller was told the
+// event was queued — and the transcript watchers, which commit their read offset
+// from the bytes they consumed, marked the source records read while the events
+// derived from them were being discarded. A three-day ingest wedge on one
+// customer device dropped ~54k events that way, none of them recoverable without
+// hand-rewinding a cursor.
+//
+// The assertion is errors.Is, not a string match: the callers that matter branch
+// on the sentinel, and a wrapped-but-unmatched error would read as an ordinary
+// I/O failure at exactly the moment the distinction decides whether bytes are
+// re-read or lost.
+func TestAFullLaneReportsErrQueueFullInsteadOfSuccess(t *testing.T) {
+	laneTest(t)
+
+	f, err := os.OpenFile(LaneLive().path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open live queue: %v", err)
+	}
+	if err := f.Truncate(OutboxMaxBytes); err != nil {
+		t.Fatalf("grow live queue: %v", err)
+	}
+	f.Close()
+
+	err = Append(event.NewEvent("prompt", "sess-test"))
+	if err == nil {
+		t.Fatal("Append onto a lane at OutboxMaxBytes returned nil — a dropped event must never report success")
+	}
+	if !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("Append error = %v, want one matching ErrQueueFull", err)
+	}
+	if !strings.Contains(err.Error(), "live") {
+		t.Errorf("error %q does not name the lane it dropped from", err)
+	}
+
+	// The durable-source door must report it too — that is the door the
+	// transcript watchers use, and the only one whose caller can act on it.
+	stale := event.NewEvent("prompt", "sess-test")
+	stale.Ts = time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339Nano)
+	bf, err := os.OpenFile(LaneBackfill().path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open backfill queue: %v", err)
+	}
+	if err := bf.Truncate(OutboxMaxBytes); err != nil {
+		t.Fatalf("grow backfill queue: %v", err)
+	}
+	bf.Close()
+	if err := AppendFromDurableSource(stale); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("AppendFromDurableSource error = %v, want one matching ErrQueueFull", err)
+	}
+}
+
+// TestTheFullQueueWarningDoesNotPromiseTheLedgerStillHasIt pins the text, which
+// is load-bearing: it is the only thing an operator sees at the moment of loss.
+//
+// It used to end "The event still exists in the signed ledger — the audit trail
+// stays complete; only the upload is lost." That was least true exactly when it
+// printed. sign.rotateLedgerIfLarge rotates at 16 MiB and keeps
+// state.LedgerRetainedSegments beside the live one — ~64 MiB across 4 segments,
+// the same bound this lane caps at — and it drops the OLDEST segment while this
+// queue drops the NEWEST event. A stall long enough to fill 64 MiB of queue has
+// been filling the ledger over the same period, so the reassurance was a guess
+// stated as a fact.
+func TestTheFullQueueWarningDoesNotPromiseTheLedgerStillHasIt(t *testing.T) {
+	newOutboxTest(t)
+
+	var buf bytes.Buffer
+	warnMu.Lock()
+	warnOut = &buf
+	warnMu.Unlock()
+	t.Cleanup(func() {
+		warnMu.Lock()
+		warnOut = os.Stderr
+		warnMu.Unlock()
+	})
+
+	f, err := os.OpenFile(LaneLive().path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open live queue: %v", err)
+	}
+	if err := f.Truncate(OutboxMaxBytes); err != nil {
+		t.Fatalf("grow live queue: %v", err)
+	}
+	f.Close()
+
+	if err := Append(event.NewEvent("prompt", "sess-test")); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("Append error = %v, want ErrQueueFull", err)
+	}
+
+	warnMu.Lock()
+	got := buf.String()
+	warnMu.Unlock()
+
+	if strings.Contains(got, "audit trail stays complete") || strings.Contains(got, "still exists in the signed ledger") {
+		t.Errorf("warning still promises the ledger kept the event: %q", got)
+	}
+	for _, want := range []string{"DROPPING event", "check connectivity", "ledger is bounded too", "may already have rotated"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("warning %q is missing %q — an operator needs the loss, the bound, and the thing to check", got, want)
+		}
+	}
+	// One line: an operator reading stderr must not have to reassemble it.
+	if n := strings.Count(strings.TrimRight(got, "\n"), "\n"); n != 0 {
+		t.Errorf("warning spans %d extra lines, want one: %q", n+1, got)
 	}
 }

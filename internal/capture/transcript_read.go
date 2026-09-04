@@ -34,6 +34,16 @@ type transcriptReadOutcome struct {
 // handing each trimmed record to handle, and reports how far the caller's
 // durable offset may advance.
 //
+// handle receives recordStart: how many bytes THIS call had consumed before the
+// record it is being handed. A caller that discovers, mid-record, that the
+// record was not really processed (the tail rails' case is outbox.ErrQueueFull —
+// the event was parsed and then dropped by a full queue) returns false and caps
+// its offset advance at that number, so the record is re-read next poll instead
+// of being marked read. The reader cannot make that decision itself: whether an
+// unprocessed record is recoverable depends on the CALLER's source, and the
+// classification rails deliberately do want the record they stopped on counted
+// as scanned.
+//
 // budget is the caller's REMAINING shared per-poll budget, and it is a hard
 // boundary: a record that does not fit in it is left intact for the next poll
 // rather than half-read, because the file is the durable buffer and a deferred
@@ -53,7 +63,7 @@ type transcriptReadOutcome struct {
 // because the probe only ever DISCARDS — a record that terminates inside the
 // supported maximum is still deferred intact, so no complete record is ever
 // consumed past the shared budget.
-func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe, discardingOversize bool, handle func(record []byte) bool) transcriptReadOutcome {
+func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe, discardingOversize bool, handle func(record []byte, recordStart int64) bool) transcriptReadOutcome {
 	out := transcriptReadOutcome{discardingOversize: discardingOversize}
 	if budget <= 0 {
 		out.truncated = true
@@ -98,12 +108,13 @@ func readTranscriptRecords(src io.Reader, budget int64, oversizeProbe, discardin
 			}
 			break
 		}
+		recordStart := out.consumed
 		out.consumed += int64(len(line))
 		record := bytes.TrimSpace(line)
 		if len(record) == 0 {
 			continue
 		}
-		if !handle(record) {
+		if !handle(record, recordStart) {
 			break
 		}
 	}
