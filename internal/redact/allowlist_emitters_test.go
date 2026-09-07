@@ -330,6 +330,14 @@ var kindsAssertedUnconstructed = map[string]string{
 	"api_error":           "Sibling of api_request; the allowlist entry covers the backend proxy rail, not this binary.",
 	"tool_decision":       "serverOnlyFields[tool_decision] rests on this: approval decisions are an OTel-wire concept.",
 	"heartbeat":           "deviceOnlyFields[heartbeat] rests on this: the beat this CLI builds is `presence`.",
+	// THE ONLY ENTRY HERE THAT IS A GAP RATHER THAN A BOUNDARY. The other five
+	// say "this kind belongs to another process". This one says "the producer
+	// this CLI is supposed to have does not exist yet" — the backend has shipped
+	// a consumer for it since BE#881 (2026-08-30). The emitter walk below is
+	// what turns that from a grep into proof, and it is the reason declaring it
+	// is better than leaving the kind unmirrored.
+	"commit_rewrite": "kindsNotEmittedOnDevice[commit_rewrite] rests on this: the Git post-rewrite " +
+		"producer promptster-backend documents for this CLI has not been built, so no constructor exists.",
 }
 
 // TestDeclaredNonEmittedKindsAreReallyNotEmitted — the finding this file exists

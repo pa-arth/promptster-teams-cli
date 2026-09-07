@@ -64,7 +64,13 @@ var projectUsageFields = []string{
 // newString, content, stdout/stderr, tool args/results, assistant text) are
 // listed for NO kind, so they can never survive projection.
 var projectFieldAllowlist = map[string][]string{
-	"cursorVendorUsage":    {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId"},
+	// cloudAgentId / automationId / serviceAccountId are OPAQUE VENDOR-MINTED
+	// IDS — Cursor's own identifiers for the cloud agent, automation or service
+	// account that opened the conversation. No path, no free text, no user
+	// content, which is what makes them admissible under a default-deny keyed on
+	// keys. They are the vendor stating who ran the work, and they supersede the
+	// backend's `sand-subagent-` conversation-id prefix heuristic.
+	"cursorVendorUsage":    {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId", "cloudAgentId", "automationId", "serviceAccountId"},
 	"cursorVendorSnapshot": {"snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason"},
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.

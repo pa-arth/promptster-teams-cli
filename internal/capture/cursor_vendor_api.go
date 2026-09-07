@@ -173,16 +173,30 @@ func (c *cursorVendorClient) call(cred cursorCredential, method string, payload 
 
 // cursorVendorTokenUsage is the vendor's nested count object.
 //
-// NOTE WHAT IS NOT HERE: a cache-WRITE count. The row carries input, output and
-// cache-read and nothing else. And `cacheReadTokens` is NOT a subset of
-// `inputTokens` — it exceeded it on 169 of 198 sampled rows, which makes a
-// subset relation arithmetically impossible and keeps this rail out of the
-// backend's SUBSET_CACHE_INTEGRATIONS.
+// TWO DATED OBSERVATIONS, NOT ONE CORRECTED INTO THE OTHER:
+//
+//   - 2026-08-27, individual-Pro wire probe: the row carried input, output and
+//     cache-read and nothing else. "There is no cache-WRITE count" was true of
+//     what was on the wire that day, and the contract froze the field set on it.
+//   - 2026-09-06, Cursor 3.19.13: `tokenUsage.cacheWriteTokens` is present in
+//     `shapeObservedFields` on every completion the live org has emitted. It was
+//     arriving and being discarded, because nothing here had a slot for it.
+//
+// Both readings are kept because the fleet is not version-homogeneous: an
+// engineer on an older Cursor legitimately omits the field, which is exactly why
+// it is a pointer and NOT in cursorVendorExpectedRowFields (see there).
+//
+// `cacheWriteTokens` is a FOURTH INDEPENDENT QUANTITY, summed alongside the
+// other three and never carved out of them. It changes nothing about the subset
+// question: `cacheReadTokens` is NOT a subset of `inputTokens` — it exceeded it
+// on 169 of 198 sampled rows, which makes a subset relation arithmetically
+// impossible and keeps this rail out of the backend's SUBSET_CACHE_INTEGRATIONS.
 type cursorVendorTokenUsage struct {
-	InputTokens     *int64   `json:"inputTokens"`
-	OutputTokens    *int64   `json:"outputTokens"`
-	CacheReadTokens *int64   `json:"cacheReadTokens"`
-	TotalCents      *float64 `json:"totalCents"`
+	InputTokens      *int64   `json:"inputTokens"`
+	OutputTokens     *int64   `json:"outputTokens"`
+	CacheReadTokens  *int64   `json:"cacheReadTokens"`
+	CacheWriteTokens *int64   `json:"cacheWriteTokens"`
+	TotalCents       *float64 `json:"totalCents"`
 }
 
 // cursorVendorRow is one line item as the vendor reports it.
@@ -191,6 +205,22 @@ type cursorVendorTokenUsage struct {
 // type system rather than in a comment. A row whose `chargedCents` the vendor
 // omitted must emit no `chargedCents`, not a 0 — a zero here is an assertion
 // that a request was free, on the population whose cost was the question.
+//
+// THE THREE IDENTITY FIELDS ARE OPAQUE VENDOR-MINTED IDS — no path, no free
+// text, no user content, which is the whole reason they are emittable at all.
+// They supersede the backend's `sand-subagent-` prefix bridge: a prefix is a
+// customer-shaped observation generalised into a rule, whereas these are the
+// vendor stating who opened the conversation.
+//
+// THEY ARE PLAIN STRINGS, NOT POINTERS, AND THAT IS DELIBERATE. Cursor sends
+// `""` for the identities that do not apply to a row rather than omitting the
+// key, so a pointer would distinguish two states the vendor does not actually
+// emit differently. `putStr` drops the empty ones at the capture boundary — the
+// same treatment `conversationId`, `model` and `subscriptionProductId` already
+// get — and the backend's `nonEmptyString` maps absent and `""` to the same
+// `null`. Absent and empty are therefore ONE reading end to end, on purpose;
+// only `cacheWriteTokens` needs absent and zero kept apart, and it is a pointer
+// for exactly that reason.
 type cursorVendorRow struct {
 	Timestamp             string                  `json:"timestamp"`
 	Model                 string                  `json:"model"`
@@ -203,6 +233,9 @@ type cursorVendorRow struct {
 	IsChargeable          *bool                   `json:"isChargeable"`
 	OwningUser            string                  `json:"owningUser"`
 	SubscriptionProductID string                  `json:"subscriptionProductId"`
+	CloudAgentID          string                  `json:"cloudAgentId"`
+	AutomationID          string                  `json:"automationId"`
+	ServiceAccountID      string                  `json:"serviceAccountId"`
 }
 
 type cursorVendorUsagePage struct {
@@ -210,10 +243,29 @@ type cursorVendorUsagePage struct {
 	UsageEventsDisplay    []cursorVendorRow `json:"usageEventsDisplay"`
 }
 
-// cursorVendorExpectedRowFields is what the collector PARSES, in the dotted form
-// the shape record uses. An expected field missing from a 200 is the monitor's
-// trigger; a field the vendor added that we do not parse is recorded as observed
-// and is not an alarm.
+// cursorVendorExpectedRowFields is what the collector PARSES **and whose absence
+// is a fault**, in the dotted form the shape record uses. An expected field
+// missing from a 200 is the monitor's trigger; a field the vendor added that we
+// do not parse is recorded as observed and is not an alarm.
+//
+// PARSED-BUT-NOT-EXPECTED IS A REAL CATEGORY, AND FOUR FIELDS ARE IN IT.
+// `tokenUsage.cacheWriteTokens`, `cloudAgentId`, `automationId` and
+// `serviceAccountId` are parsed as of this change and are deliberately NOT
+// listed below. "Expected" means an operator gets paged when it goes missing, so
+// the bar is that its absence can only mean the vendor broke — and for these
+// four, absence has an ordinary innocent cause:
+//
+//   - `cacheWriteTokens` was ABSENT from the 2026-08-27 probe and PRESENT on
+//     Cursor 3.19.13. The fleet runs whatever version each engineer installed,
+//     so listing it pages someone every time an older Cursor polls. That is a
+//     monitor crying wolf about version skew, not a shape change.
+//   - the three identities are populated only on rows that HAVE such an
+//     identity. The vendor sends `""` on the rest today, but "absent on an
+//     interactive row" is a fact about the row, not a fault.
+//
+// NOTHING IS LOST BY OMITTING THEM: `shapeObservedFields` carries what the
+// response actually held, so the day one of these disappears fleet-wide it is
+// still visible on every completion — it just does not wake anybody up.
 var cursorVendorExpectedRowFields = []string{
 	"chargedCents",
 	"conversationId",

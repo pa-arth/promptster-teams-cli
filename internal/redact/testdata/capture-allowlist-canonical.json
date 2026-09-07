@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:061d85b915f5194b70ae466081696eb9ae19ac9f50e6b936aeeaafb286e9a980",
+  "checksum": "sha256:24fd18eddc5b9c3cf57d17eb6e20858bf6baf02e18bc596e0b161b3f2de1f86c",
   "counts": {
-    "kinds": 47,
-    "fields": 250,
+    "kinds": 48,
+    "fields": 258,
     "elementFields": 37
   },
   "kinds": {
@@ -87,6 +87,14 @@
           "attribution"
         ]
       }
+    },
+    "commit_rewrite": {
+      "fields": [
+        "oldSha",
+        "newSha",
+        "workspaceKey",
+        "rewriteKind"
+      ]
     },
     "config_census": {
       "fields": [
@@ -181,11 +189,15 @@
         "inputTokens",
         "outputTokens",
         "cacheReadTokens",
+        "cacheWriteTokens",
         "totalCents",
         "isTokenBasedCall",
         "isChargeable",
         "owningUser",
-        "subscriptionProductId"
+        "subscriptionProductId",
+        "cloudAgentId",
+        "automationId",
+        "serviceAccountId"
       ]
     },
     "decision_event": {

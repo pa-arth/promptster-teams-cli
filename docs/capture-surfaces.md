@@ -220,6 +220,15 @@ agreement consequences is contractual risk that disabling the collector cannot
 undo. Operationally, the policy kill switch stops calls within the 15-minute
 cache TTL.
 
+What comes back and is forwarded is counts plus opaque identifiers: token counts
+(input, output, cache-read, and — since 2026-09-06 — cache-write), charges, the
+model and event kind, and the vendor's own ids for the conversation and for the
+cloud agent, automation or service account that opened it (`cloudAgentId`,
+`automationId`, `serviceAccountId`). Those three are vendor-minted opaque
+strings carrying no path, no prose and no user content; they exist so automated
+spend can be told apart from a person's without guessing from an id prefix. No
+prompt, response, diff or file content is read by this rail at all.
+
 This disclosure is repeated during enrollment and retained here so it remains
 available after the enrollment output is gone. It describes the operations our
 code performs; it does not claim the credential itself is read-only.

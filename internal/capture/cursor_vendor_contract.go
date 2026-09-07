@@ -249,7 +249,13 @@ const (
 // style. The vendor nests its counts under `tokenUsage`; the device's
 // default-deny projector admits KEYS, and admitting `tokenUsage` would admit
 // whatever arbitrary object the vendor puts there — including fields nobody has
-// seen. Four named scalars carry the same numbers and nothing else.
+// seen. FIVE named scalars carry the same numbers and nothing else (four until
+// `cacheWriteTokens` joined them 2026-09-06).
+//
+// The trailing three are the vendor's own automation identity — opaque minted
+// ids, never a path or free text. They are LAST because this list is the
+// contract's order and the backend appended them; it is not the digest's order,
+// which is frozen at fourteen fields (see canonicalRowLine).
 var cursorVendorSnapshotRowFields = []string{
 	"snapshotId",
 	"ordinal",
@@ -263,11 +269,15 @@ var cursorVendorSnapshotRowFields = []string{
 	"inputTokens",
 	"outputTokens",
 	"cacheReadTokens",
+	"cacheWriteTokens",
 	"totalCents",
 	"isTokenBasedCall",
 	"isChargeable",
 	"owningUser",
 	"subscriptionProductId",
+	"cloudAgentId",
+	"automationId",
+	"serviceAccountId",
 }
 
 // cursorVendorSnapshotCompletionFields is the emitted key set for the
