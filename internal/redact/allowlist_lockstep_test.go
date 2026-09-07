@@ -92,6 +92,33 @@ var kindsNotEmittedOnDevice = map[string]string{
 	"instructions_loaded": "Not a watcher kind. It is minted SERVER-side by the tier-B hook route " +
 		"(apps/api/src/routes/team/teams-tier-b-hooks.ts), which classifies a memory-file load from " +
 		"the hook payload. No code path in this repo constructs it.",
+
+	// NOT A DELIBERATE ASYMMETRY — AN UNBUILT PRODUCER, RECORDED AS ONE.
+	//
+	// This entry is different in kind from the one above, and the difference is
+	// the point. `instructions_loaded` is server-minted and no CLI will ever
+	// emit it. `commit_rewrite` is the opposite: promptster-backend
+	// `docs/commit-rewrite-attribution.md` opens with "CLI producer contract"
+	// and specifies THIS CLI installing or chaining a Git `post-rewrite` hook
+	// and emitting one event per rewritten SHA pair. BE#881 (2026-08-30) shipped
+	// the entire server half — ingest kind, `commit_rewrite_aliases` table,
+	// alias resolution in the AI-ROI join — against a producer that does not
+	// exist here. `grep -rn commit_rewrite --include=*.go` returns nothing.
+	//
+	// So amend and local-rebase attribution repair is DARK end to end, and has
+	// been since 2026-08-30. It surfaced only now because the mirror had not
+	// been re-synced since, which meant this lockstep test did not know the kind
+	// existed — the exact "reads to a user as an older CLI" silence the test was
+	// written to break.
+	//
+	// DELETE THIS ENTRY, do not extend it, when the post-rewrite rail lands: it
+	// is a dated record of a gap, not a design decision.
+	"commit_rewrite": "NO PRODUCER IN THIS REPO YET — a gap, not a decision. The backend added the " +
+		"kind, the aliases table and the rollup join in BE#881 (2026-08-30) and documents a Git " +
+		"post-rewrite hook in THIS CLI as the intended producer (see promptster-backend " +
+		"docs/commit-rewrite-attribution.md, 'CLI producer contract'). Nothing in internal/capture " +
+		"constructs the kind, so rewrite-alias attribution is dark end to end. Remove this entry and " +
+		"add the kind to projectFieldAllowlist when the post-rewrite rail is built.",
 }
 
 // serverOnlyFields — allowlisted at the backend write boundary and deliberately

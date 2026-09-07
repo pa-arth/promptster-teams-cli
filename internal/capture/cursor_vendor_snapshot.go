@@ -137,6 +137,24 @@ type cursorVendorShapeRecord struct {
 // FIELD ORDER IS THE CONTRACT'S ORDER and must not be "tidied". Every optional
 // value is either its canonical rendering or the absent marker; nothing is
 // defaulted.
+//
+// FOURTEEN FIELDS, AND THE FOUR ADDED 2026-09-06 ARE NOT AMONG THEM. This list
+// is a wire contract with `canonicalSnapshotSha256` in promptster-backend
+// `packages/shared/src/cursorVendorUsage.ts`, which RECOMPUTES this digest over
+// the staged rows and refuses the whole snapshot with `content_digest_mismatch`
+// when it disagrees. The backend's list is these same fourteen. So
+// `cacheWriteTokens`, `cloudAgentId`, `automationId` and `serviceAccountId` ride
+// on the staged row's payload and stay OUT of the digest: adding them here
+// unilaterally would not "improve the digest", it would refuse 100% of snapshots
+// and take the rail dark. Widening it is a two-repo change that has to bump
+// cursorVendorSnapshotDigestVersion on both sides in the same release.
+//
+// THE COST OF THAT, STATED RATHER THAN HIDDEN: a row whose ONLY change between
+// two polls is one of those four hashes identically, so it reuses the snapshot
+// id and dedups, and the new value never lands. That needs `cacheWriteTokens` to
+// move while input, output, cache-read, totalCents and chargedCents all hold
+// still, or an identity to appear on an otherwise byte-identical row — neither
+// has been observed. It is the lesser failure by a wide margin.
 func canonicalRowLine(r cursorVendorRow) string {
 	fields := []string{
 		r.Timestamp,
@@ -176,6 +194,20 @@ func tokenCacheRead(r cursorVendorRow) *int64 {
 		return nil
 	}
 	return r.TokenUsage.CacheReadTokens
+}
+
+// tokenCacheWrite is a POINTER for the same reason every other count here is:
+// the vendor omitting a cache-write figure and the vendor reporting zero cache
+// writes are opposite readings on a rail whose subject is context waste, and a
+// `0` default would assert the second when we only observed the first.
+//
+// Read by rowEvents and deliberately NOT by canonicalRowLine — see the note
+// above canonicalRowLine for why the digest cannot widen unilaterally.
+func tokenCacheWrite(r cursorVendorRow) *int64 {
+	if r.TokenUsage == nil {
+		return nil
+	}
+	return r.TokenUsage.CacheWriteTokens
 }
 
 func tokenTotalCents(r cursorVendorRow) *float64 {
@@ -332,11 +364,20 @@ func (s cursorVendorSnapshot) rowEvents(deviceID string) []event.Event {
 		putInt(data, "inputTokens", tokenInput(r))
 		putInt(data, "outputTokens", tokenOutput(r))
 		putInt(data, "cacheReadTokens", tokenCacheRead(r))
+		putInt(data, "cacheWriteTokens", tokenCacheWrite(r))
 		putFloat(data, "totalCents", tokenTotalCents(r))
 		putBool(data, "isTokenBasedCall", r.IsTokenBasedCall)
 		putBool(data, "isChargeable", r.IsChargeable)
 		putStr(data, "owningUser", emittableOwningUser(r.OwningUser))
 		putStr(data, "subscriptionProductId", r.SubscriptionProductID)
+		// The vendor's own automation identity. `putStr` drops the empty ones,
+		// which is the SAME treatment every other string on this row gets and
+		// lands on the same `null` the backend's `nonEmptyString` produces from
+		// a literal `""`. An interactive row therefore carries none of the three
+		// keys at all, rather than three blanks.
+		putStr(data, "cloudAgentId", r.CloudAgentID)
+		putStr(data, "automationId", r.AutomationID)
+		putStr(data, "serviceAccountId", r.ServiceAccountID)
 		e.Data = data
 
 		// snapshotId + ordinal, and NOTHING from the row. The row's own content
