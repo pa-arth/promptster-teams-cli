@@ -6,6 +6,53 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.27.0] — 2026-09-07
+
+### Fixed
+
+- A dropped event marked its transcript as READ. `AppendTo` returned `nil` when
+  a lane hit `OutboxMaxBytes`, so no caller could tell a queued event from a
+  discarded one, and both transcript watchers commit their read offset from the
+  bytes they consumed — a drop therefore recorded the transcript as fully read
+  while throwing away the event derived from it. One customer's three-day wedge
+  discarded ~54k events that were still sitting in transcripts marked read.
+  `AppendTo` now returns `outbox.ErrQueueFull` and the tails rewind instead of
+  committing. The rewind targets the last offset the processor was CLEAN at,
+  not the refusing record, because the processors accumulate an assistant
+  message across lines and mint it on a later boundary. The two `FlushStale`
+  passes and the eviction after them skip while both lanes are at cap, since
+  they run after offsets are committed and have no rewind available.
+
+### Added
+
+- The outbox now reports what it discarded. A per-lane discard counter that
+  survives restart (its own file, its own lock, recorded outside the lane lock),
+  plus `outboxBytes` — the FULLEST lane, a max and deliberately not a sum,
+  because the cap is per lane and 32+32 MiB is not the same situation as
+  64+0 — and `outboxCapacityBytes`, this client's own cap on the wire so the
+  server computes a real ratio rather than hardcoding one against a CLI that
+  ships independently. Until now the only report was a `warnf` to a detached
+  daemon's stderr.
+- The Cursor vendor rail forwards four fields it was receiving and discarding:
+  `tokenUsage.cacheWriteTokens`, `cloudAgentId`, `automationId` and
+  `serviceAccountId`. All four appear in `shapeObservedFields` on every
+  completion the live org has emitted against Cursor 3.19.13; the contract had
+  frozen the field set on a 2026-08-27 probe where the cache-write count
+  genuinely was not on the wire. The three identities are the vendor stating who
+  opened a conversation, which is what the lane classifier needs to stop
+  reporting automation as a person's usage. `cacheWriteTokens` is a fourth
+  independent quantity beside input/output/cache-read, summed alongside them and
+  never carved out of them.
+
+### Unchanged, deliberately
+
+- `canonicalRowLine` still hashes the same FOURTEEN fields. The four added above
+  ride on the staged row's payload and stay OUT of the digest: the backend
+  recomputes it and refuses the snapshot with `content_digest_mismatch` on
+  disagreement, so widening it on one side alone would refuse 100% of snapshots
+  and take the rail dark. Widening is a two-repo flag day that has to bump
+  `cursorVendorSnapshotDigestVersion` on both sides in the same release.
+
 ## [0.26.0] — 2026-09-01
 
 ### Fixed
