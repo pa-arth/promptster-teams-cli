@@ -134,10 +134,11 @@ func readCursorAgentKeychainToken() string {
 // `~/.cursor/auth.json` on darwin. Only `accessToken` is decoded.
 func readCursorAgentAuthFileToken() string {
 	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
+	if err != nil || !filepath.IsAbs(home) {
 		return ""
 	}
-	b, err := os.ReadFile(filepath.Join(home, ".cursor", "auth.json")) // #nosec G304 -- fixed path under the engineer's home.
+	// #nosec G304 G703 -- absolute, Cleaned home dir with a constant relative path; read-only.
+	b, err := os.ReadFile(filepath.Join(filepath.Clean(home), ".cursor", "auth.json"))
 	if err != nil {
 		return ""
 	}
@@ -164,10 +165,13 @@ func readCursorAgentAuthInfo(installKey []byte) (authID, emailHMAC string) {
 			dir = filepath.Join(home, ".cursor")
 		}
 	}
-	if dir == "" {
+	// The directory comes from the environment, so only an absolute path is
+	// accepted and it is Cleaned; the basename is a constant.
+	if dir == "" || !filepath.IsAbs(dir) {
 		return "", ""
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "cli-config.json")) // #nosec G304 -- cursor-agent's config path.
+	// #nosec G304 G703 -- absolute, Cleaned config dir (cursor-agent's own env resolution) with a constant basename; read-only.
+	b, err := os.ReadFile(filepath.Join(filepath.Clean(dir), "cli-config.json"))
 	if err != nil {
 		return "", ""
 	}
