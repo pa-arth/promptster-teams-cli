@@ -204,14 +204,15 @@ func readCursorCredential() (cursorCredential, error) {
 		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the state store")
 	}
 
-	return cursorCredentialFromToken(token, emailHMAC)
-}
-
-// cursorCredentialFromToken wraps a token read from any store (IDE or
-// cursor-agent) with its expiry, account ref and email HMAC.
-func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error) {
 	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token),
 		accountRef: cursorAccountRef(token), emailHMAC: emailHMAC}
+	if cred.accountRef == cursorAccountRefUnknown {
+		// A token with no parseable `sub` is not a usable credential. There is no
+		// account to scope its snapshot to, and it would be collected and recorded
+		// under "unknown". It is treated as an absent credential: no vendor call,
+		// no login-map entry.
+		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "token has no parseable sub")
+	}
 	if !cred.expiresAt.IsZero() && time.Now().After(cred.expiresAt) {
 		// PRE-FLIGHT, not the authority. A 401 from the vendor is the other, and
 		// both resolve to the same emitted absence — the engineer must re-login

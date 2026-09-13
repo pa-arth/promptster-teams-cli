@@ -34,71 +34,29 @@ func runCursorVendorUsageCollector(ctx context.Context, deviceID string, resolve
 }
 
 func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
+	accountRef := cursorAccountRefUnknown
+	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
+	}
 	if !resolver.CursorVendorUsage() {
-		// The kill switch runs BEFORE any store is read, and covers attribution
-		// too: without the map the hook stops stamping cursorAccountRef, instead
-		// of stamping refs from logins read while collection was still allowed.
+		// The kill switch covers attribution too: without the map the hook stops
+		// stamping cursorAccountRef, instead of stamping refs from logins read
+		// while collection was still allowed.
 		forgetCursorAccountLogins()
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown,
-			CursorVendorAbsenceCollectorNotPermitted, capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
+		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
 		return
 	}
-	pollCursorVendorAccounts(deviceID, client, capturedAt, readCursorCredentials())
-}
-
-// pollCursorVendorAccounts collects once per DISTINCT account across every
-// credential source (§2.2). The same login in the IDE and in cursor-agent is
-// one account, so its snapshot is read and emitted once.
-//
-// Absences are per account too. A source that is present but unusable
-// (expired) emits an absence naming its accountRef, unless another source
-// collected that same account this cycle. An absence with no known account
-// ("unknown", e.g. no IDE store at all) is emitted only when no account was
-// collected. Otherwise it would say "no Cursor credential" on a cycle that
-// collected one.
-func pollCursorVendorAccounts(deviceID string, client *cursorVendorClient, capturedAt time.Time, sources []cursorCredentialSource) {
-	usable := map[string]cursorCredential{}
-	var order []string
-	for _, s := range sources {
-		if s.err != nil {
-			continue
-		}
-		// BEFORE any network call, so a vendor outage does not also turn every
-		// hook turn into `unreadable:` — the store WAS read; only the vendor
-		// failed. Every source is recorded, so a login seen with an email in one
-		// client attributes turns even when the other copy has none.
-		recordCursorAccountReading(s.cred, time.Now())
-		if _, dup := usable[s.cred.accountRef]; !dup {
-			usable[s.cred.accountRef] = s.cred
-			order = append(order, s.cred.accountRef)
-		}
+	cred, err := readCursorCredential()
+	if cred.accountRef != "" {
+		accountRef = cred.accountRef
 	}
-	for _, ref := range order {
-		pollCursorVendorAccount(deviceID, client, capturedAt, usable[ref])
+	if err != nil {
+		emitAbsence(cursorCredentialAbsence(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
+		return
 	}
-	absent := map[string]bool{}
-	for _, s := range sources {
-		ref := s.cred.accountRef
-		if ref == "" {
-			ref = cursorAccountRefUnknown
-		}
-		if s.err == nil || absent[ref] {
-			continue
-		}
-		if _, collected := usable[ref]; collected || (ref == cursorAccountRefUnknown && len(usable) > 0) {
-			continue
-		}
-		absent[ref] = true
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, ref, cursorCredentialAbsence(s.err),
-			capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
-	}
-}
-
-// pollCursorVendorAccount is one account's full current-period restatement.
-func pollCursorVendorAccount(deviceID string, client *cursorVendorClient, capturedAt time.Time, cred cursorCredential) {
-	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cred.accountRef, reason, capturedAt, start, end, shape))
-	}
+	// BEFORE any network call, so a vendor outage does not also turn every hook
+	// turn into `unreadable:` — the store WAS read; only the vendor failed.
+	recordCursorAccountReading(cred, time.Now())
 	onTeam, err := client.cursorAccountIsOnTeam(cred)
 	if err != nil {
 		emitAbsence(vendorAbsenceForError(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
