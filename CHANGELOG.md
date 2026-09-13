@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.0] — 2026-09-13
+
 ### Added
 
 - Cursor account identity, so "how many Cursor logins does this engineer use,
