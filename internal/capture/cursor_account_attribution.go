@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,47 +19,89 @@ import (
 // works under two, the second login's spend is invisible and reads as a vendor
 // that stopped metering. Phase A does not read the second login; it makes it
 // COUNTABLE: every hook `stop` turn carries `cursorAccountRef`, either the
-// accountRef of the store whose cachedEmail matches the turn's user_email, or
-// `unreadable:<hmac8>` — a stable per-install token for a login we cannot read.
+// accountRef of a login whose cachedEmail matches the turn's user_email, or
+// `unreadable:<hmac8>` — a stable per-install token for a login this device has
+// never read.
 //
 // NO EMAIL LEAVES THE DEVICE, AND NONE IS STORED. Both sides of the comparison
 // are reduced to HMAC-SHA256(installKey, lower(trim(email))) at the moment they
 // are read (cursorEmailHMAC); the key is state.CursorAttributionKey and is never
-// emitted.
+// emitted. What IS stored — an email HMAC and a sha256-of-sub ref — is not a
+// credential, which is why this does not conflict with D1 (store no credential).
 //
 // WHY A FILE BETWEEN THE DAEMON AND THE HOOK. The hook runs inside the
 // engineer's agent loop with a 2s budget, and blowing the budget abandons the
 // turn's usage row entirely. Cloning and opening a ~1GB SQLite store there is a
 // risk to spend data for an attribution nicety, so the daemon's vendor cycle —
-// which already reads the store — writes the digest here, and the hook reads a
+// which already reads the store — records the login here, and the hook reads a
 // few hundred bytes.
+//
+// WHY EVERY LOGIN EVER SEEN, NOT THE CURRENT ONE. A login's sub and email do not
+// change, so {emailHmac -> accountRef} is a permanent fact, never a stale one.
+// Gating it on freshness only manufactures false `unreadable:` refs across
+// laptop sleep, a dead daemon, or the IDE being switched between logins — and
+// inflates exactly the "accounts we cannot read" count Phase A exists to take.
+// Consequence worth stating: `unreadable:` means "never read on this device",
+// not "not readable right now". Whether a KNOWN login's usage is currently being
+// collected is the snapshot's question, answered per accountRef on the backend.
 
-// cursorAccountReadingMaxAge bounds how long a store reading may attribute
-// turns. Logins rotate, so a reading is good for ONE collection cycle; the
-// extra minute covers the poll's own latency (the policy lookup precedes the
-// store read), so a turn landing just as the next cycle starts is not
-// misfiled as unreadable.
-const cursorAccountReadingMaxAge = cursorVendorPollInterval + time.Minute
+const (
+	cursorAccountRefUnreadablePrefix = "unreadable:"
+	cursorAccountLoginsVersion       = 1
+	// ponytail: capped at 16 logins, evicting the least recently seen. An engineer
+	// with more than 16 Cursor logins on one device would see the oldest re-read
+	// login flip to unreadable until it is read again; raise the cap if that is
+	// ever observed.
+	cursorAccountLoginsMax = 16
+)
 
-const cursorAccountRefUnreadablePrefix = "unreadable:"
-
-// cursorAccountReading is the ONLY thing persisted: a digest, a ref, a time.
-type cursorAccountReading struct {
+// cursorAccountLogin is one login this device has read: a digest, a ref, times.
+type cursorAccountLogin struct {
 	EmailHMAC  string    `json:"emailHmac"`
 	AccountRef string    `json:"accountRef"`
-	ObservedAt time.Time `json:"observedAt"`
+	FirstSeen  time.Time `json:"firstSeen"`
+	LastSeen   time.Time `json:"lastSeen"`
+}
+
+type cursorAccountLogins struct {
+	Version int                  `json:"version"`
+	Logins  []cursorAccountLogin `json:"logins"`
 }
 
 func cursorAccountReadingPath() string {
 	return filepath.Join(state.StateDir(), "cursor-account.json")
 }
 
-// recordCursorAccountReading persists what this cycle's store read established.
-// Best-effort: a failed write degrades turns to unreadable, never to wrong.
-func recordCursorAccountReading(cred cursorCredential, observedAt time.Time) {
-	b, err := json.Marshal(cursorAccountReading{
-		EmailHMAC: cred.emailHMAC, AccountRef: cred.accountRef, ObservedAt: observedAt.UTC(),
-	})
+// recordCursorAccountReading upserts the login this cycle's store read
+// established. Best-effort: a failed write degrades turns to unreadable, never
+// to wrong. Only the daemon writes this file, so there is no writer race; the
+// rename keeps the hook from reading a torn file.
+func recordCursorAccountReading(cred cursorCredential, seen time.Time) {
+	if cred.emailHMAC == "" || cred.accountRef == "" {
+		return
+	}
+	seen = seen.UTC()
+	file := loadCursorAccountLogins()
+	found := false
+	for i := range file.Logins {
+		if file.Logins[i].EmailHMAC == cred.emailHMAC {
+			file.Logins[i].AccountRef = cred.accountRef
+			file.Logins[i].LastSeen = seen
+			found = true
+		}
+	}
+	if !found {
+		file.Logins = append(file.Logins, cursorAccountLogin{
+			EmailHMAC: cred.emailHMAC, AccountRef: cred.accountRef, FirstSeen: seen, LastSeen: seen,
+		})
+	}
+	sort.SliceStable(file.Logins, func(i, j int) bool { return file.Logins[i].LastSeen.After(file.Logins[j].LastSeen) })
+	if len(file.Logins) > cursorAccountLoginsMax {
+		file.Logins = file.Logins[:cursorAccountLoginsMax]
+	}
+	file.Version = cursorAccountLoginsVersion
+
+	b, err := json.Marshal(file)
 	if err != nil {
 		return
 	}
@@ -73,13 +116,15 @@ func recordCursorAccountReading(cred cursorCredential, observedAt time.Time) {
 	_ = os.Rename(tmp, path)
 }
 
-func loadCursorAccountReading() (cursorAccountReading, bool) {
-	var r cursorAccountReading
+// loadCursorAccountLogins reads the map; anything missing, unparseable or of
+// another version is an empty map (turns become unreadable, never misfiled).
+func loadCursorAccountLogins() cursorAccountLogins {
+	var f cursorAccountLogins
 	b, err := os.ReadFile(cursorAccountReadingPath()) // #nosec G304 -- state dir path.
-	if err != nil || json.Unmarshal(b, &r) != nil {
-		return cursorAccountReading{}, false
+	if err != nil || json.Unmarshal(b, &f) != nil || f.Version != cursorAccountLoginsVersion {
+		return cursorAccountLogins{}
 	}
-	return r, true
+	return f
 }
 
 // cursorHookAccountRef derives `cursorAccountRef` for one `stop` payload.
@@ -92,7 +137,7 @@ func loadCursorAccountReading() (cursorAccountReading, bool) {
 //
 // ok=false (field omitted) when the payload has no user_email, or when the
 // install key cannot be persisted — see state.CursorAttributionKey.
-func cursorHookAccountRef(raw []byte, now time.Time) (string, bool) {
+func cursorHookAccountRef(raw []byte) (string, bool) {
 	var p struct {
 		UserEmail string `json:"user_email"`
 	}
@@ -103,10 +148,10 @@ func cursorHookAccountRef(raw []byte, now time.Time) (string, bool) {
 	if mac == "" {
 		return "", false
 	}
-	if r, ok := loadCursorAccountReading(); ok && r.EmailHMAC != "" && r.AccountRef != "" &&
-		now.Sub(r.ObservedAt) <= cursorAccountReadingMaxAge &&
-		hmac.Equal([]byte(r.EmailHMAC), []byte(mac)) {
-		return r.AccountRef, true
+	for _, l := range loadCursorAccountLogins().Logins {
+		if l.AccountRef != "" && hmac.Equal([]byte(l.EmailHMAC), []byte(mac)) {
+			return l.AccountRef, true
+		}
 	}
 	return cursorAccountRefUnreadablePrefix + mac[:8], true
 }

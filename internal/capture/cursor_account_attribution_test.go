@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"regexp"
 	"strings"
@@ -59,21 +60,23 @@ func stopPayload(t *testing.T, email string) []byte {
 	return b
 }
 
+// seeLogin records one vendor-cycle store read of `email` under `ref` at `at`.
+func seeLogin(key []byte, email, ref string, at time.Time) {
+	recordCursorAccountReading(cursorCredential{accountRef: ref, emailHMAC: cursorEmailHMAC(key, email)}, at)
+}
+
 func TestCursorHookAccountRefMatchUnreadableAbsent(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
-	now := time.Now()
 	key := state.CursorAttributionKey()
-	recordCursorAccountReading(cursorCredential{
-		accountRef: "0123456789abcdef", emailHMAC: cursorEmailHMAC(key, "Login.One@Example.com"),
-	}, now.Add(-time.Minute))
+	seeLogin(key, "Login.One@Example.com", "0123456789abcdef", time.Now().Add(-time.Minute))
 
 	// Match: case and surrounding whitespace do not make a different login.
-	if ref, ok := cursorHookAccountRef(stopPayload(t, "  login.one@example.COM "), now); !ok || ref != "0123456789abcdef" {
+	if ref, ok := cursorHookAccountRef(stopPayload(t, "  login.one@example.COM ")); !ok || ref != "0123456789abcdef" {
 		t.Fatalf("match: ref=%q ok=%v", ref, ok)
 	}
 
 	// Non-match: unreadable plus 8 hex of THIS install's HMAC of the turn's email.
-	ref, ok := cursorHookAccountRef(stopPayload(t, "login.two@example.com"), now)
+	ref, ok := cursorHookAccountRef(stopPayload(t, "login.two@example.com"))
 	if !ok || !regexp.MustCompile(`^unreadable:[0-9a-f]{8}$`).MatchString(ref) {
 		t.Fatalf("non-match: ref=%q ok=%v", ref, ok)
 	}
@@ -81,17 +84,55 @@ func TestCursorHookAccountRefMatchUnreadableAbsent(t *testing.T) {
 		t.Fatalf("non-match: ref=%q, want %q (stable per install)", ref, want)
 	}
 
-	// A reading older than one cycle no longer attributes: logins rotate.
-	recordCursorAccountReading(cursorCredential{
-		accountRef: "0123456789abcdef", emailHMAC: cursorEmailHMAC(key, "login.one@example.com"),
-	}, now.Add(-cursorAccountReadingMaxAge-time.Second))
-	if ref, _ := cursorHookAccountRef(stopPayload(t, "login.one@example.com"), now); !strings.HasPrefix(ref, "unreadable:") {
-		t.Fatalf("stale reading still attributed: %q", ref)
-	}
-
 	// No email: the field is absent, not "unreadable".
-	if ref, ok := cursorHookAccountRef(stopPayload(t, ""), now); ok || ref != "" {
+	if ref, ok := cursorHookAccountRef(stopPayload(t, "")); ok || ref != "" {
 		t.Fatalf("no email: ref=%q ok=%v, want omitted", ref, ok)
+	}
+}
+
+// A login's {email -> sub} never changes, so a login read in an OLD cycle — the
+// laptop slept, the daemon died, the IDE has since switched logins — must still
+// attribute. And a second login read in a later cycle must not displace it.
+func TestCursorHookAccountRefMatchesEveryLoginEverSeen(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	key := state.CursorAttributionKey()
+	now := time.Now()
+	seeLogin(key, "one@example.com", "1111111111111111", now.Add(-72*time.Hour))
+	seeLogin(key, "two@example.com", "2222222222222222", now)
+
+	for email, want := range map[string]string{"one@example.com": "1111111111111111", "two@example.com": "2222222222222222"} {
+		if ref, _ := cursorHookAccountRef(stopPayload(t, email)); ref != want {
+			t.Errorf("%s: ref=%q, want %q", email, ref, want)
+		}
+	}
+}
+
+// The map is capped, evicting by LAST SEEN — a login re-read recently survives
+// even if it was first seen before everything else.
+func TestCursorAccountLoginsCapEvictsLeastRecentlySeen(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	key := state.CursorAttributionKey()
+	base := time.Now().Add(-100 * time.Hour)
+	email := func(i int) string { return fmt.Sprintf("login%02d@example.com", i) }
+	ref := func(i int) string { return fmt.Sprintf("%016d", i) }
+
+	for i := 0; i < cursorAccountLoginsMax; i++ {
+		seeLogin(key, email(i), ref(i), base.Add(time.Duration(i)*time.Hour))
+	}
+	// Re-read login 0 (first seen earliest) most recently, then add one more.
+	seeLogin(key, email(0), ref(0), base.Add(50*time.Hour))
+	seeLogin(key, email(cursorAccountLoginsMax), ref(cursorAccountLoginsMax), base.Add(51*time.Hour))
+
+	if n := len(loadCursorAccountLogins().Logins); n != cursorAccountLoginsMax {
+		t.Fatalf("logins = %d, want cap %d", n, cursorAccountLoginsMax)
+	}
+	if got, _ := cursorHookAccountRef(stopPayload(t, email(1))); !strings.HasPrefix(got, "unreadable:") {
+		t.Fatalf("least recently seen login survived the cap: %q", got)
+	}
+	for _, i := range []int{0, 2, cursorAccountLoginsMax} {
+		if got, _ := cursorHookAccountRef(stopPayload(t, email(i))); got != ref(i) {
+			t.Errorf("login %d: ref=%q, want %q", i, got, ref(i))
+		}
 	}
 }
 
@@ -130,7 +171,7 @@ func TestCursorAccountAttributionNeverEmitsEmailOrKey(t *testing.T) {
 	}
 	// The ref's VALUE is asserted after projection, below the leak check, so a
 	// ref that carried the email fails as a leak rather than as a mismatch.
-	ref, ok := cursorHookAccountRef(stopPayload(t, hookEmail), time.Now())
+	ref, ok := cursorHookAccountRef(stopPayload(t, hookEmail))
 	if !ok {
 		t.Fatal("a stop with user_email must yield a cursorAccountRef")
 	}

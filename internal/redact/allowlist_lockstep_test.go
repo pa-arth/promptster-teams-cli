@@ -269,27 +269,6 @@ var deviceDeclinesToEmit = map[string]map[string]string{
 // never appears, for no visible reason. An entry here needs a positive account of
 // where the value IS consumed, not merely a note that it is dropped.
 var deviceOnlyFields = map[string]map[string]string{
-	// NOT A DESIGN DECISION — A SHIP-ORDER GAP, DATED 2026-09-13, RECORDED AS ONE.
-	//
-	// openspec cursor-vendor-multi-account Phase A. The server half (§3.1:
-	// allowlist + normalizer in promptster-backend) was not merged when this CLI
-	// change was written. Until it deploys, these three are discarded at ingest.
-	// DO NOT RELEASE THE CLI AHEAD OF THE BACKEND DEPLOY, or the rollout window's
-	// attribution is lost. This test's staleness check deletes these entries for
-	// us: once `make sync-capture-allowlist` brings the server fields in, each
-	// entry below fails as no longer describing a divergence.
-	"cursorVendorUsage": {
-		"accountRef": "SHIP-ORDER GAP (2026-09-13): consumed by backend §3.1 per-account snapshot " +
-			"resolution once cursor-vendor-multi-account lands server-side. Remove on artifact re-sync.",
-	},
-	"cursorVendorSnapshot": {
-		"accountRef": "SHIP-ORDER GAP (2026-09-13): consumed by backend §3.1 per-(userId, accountRef) " +
-			"active-snapshot resolution. Remove on artifact re-sync.",
-	},
-	"ai_response": {
-		"cursorAccountRef": "SHIP-ORDER GAP (2026-09-13): consumed by backend §3.1 ai_response normalize " +
-			"output; counts Cursor logins per engineer and which are unreadable. Remove on artifact re-sync.",
-	},
 	"presence": {
 		"pendingEvents": "Consumed at ingest BEFORE projection, then deliberately not persisted onto " +
 			"the timeline row. teams-ingest.ts reads event.data.pendingEvents off the raw beat and " +
