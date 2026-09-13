@@ -25,17 +25,18 @@ func TestCursorVendorUsageFailsClosedAndExpires(t *testing.T) {
 
 func TestCursorVendorUsageDecisionSeparatesUnknownFromOff(t *testing.T) {
 	for name, tc := range map[string]struct {
-		usage                bool
+		usage, explicit      bool
 		fetchedAt            time.Time
 		permitted, wantKnown bool
 	}{
-		"never fetched":   {usage: true, permitted: false, wantKnown: false},
-		"stale permitted": {usage: true, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
-		"stale off":       {usage: false, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
-		"fresh off":       {usage: false, fetchedAt: time.Now(), permitted: false, wantKnown: true},
-		"fresh permitted": {usage: true, fetchedAt: time.Now(), permitted: true, wantKnown: true},
+		"never fetched":       {usage: true, explicit: true, permitted: false, wantKnown: false},
+		"stale permitted":     {usage: true, explicit: true, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
+		"stale off":           {usage: false, explicit: true, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
+		"fresh off":           {usage: false, explicit: true, fetchedAt: time.Now(), permitted: false, wantKnown: true},
+		"fresh permitted":     {usage: true, explicit: true, fetchedAt: time.Now(), permitted: true, wantKnown: true},
+		"fresh field omitted": {usage: false, explicit: false, fetchedAt: time.Now(), permitted: false, wantKnown: false},
 	} {
-		r := &Resolver{cursorVendorUsage: tc.usage, fetchedAt: tc.fetchedAt}
+		r := &Resolver{cursorVendorUsage: tc.usage, cursorVendorUsageKnown: tc.explicit, fetchedAt: tc.fetchedAt}
 		permitted, known := r.CursorVendorUsageDecision()
 		if permitted != tc.permitted || known != tc.wantKnown {
 			t.Errorf("%s: permitted=%v known=%v, want %v %v", name, permitted, known, tc.permitted, tc.wantKnown)
@@ -43,6 +44,30 @@ func TestCursorVendorUsageDecisionSeparatesUnknownFromOff(t *testing.T) {
 		if permitted != r.CursorVendorUsage() {
 			t.Errorf("%s: decision disagrees with CursorVendorUsage()", name)
 		}
+	}
+}
+
+// An omitted cursorVendorUsage is "no decision" through Refresh AND through the
+// disk cache a fresh process adopts; an explicit false stays a decision through
+// both. CursorVendorUsage() is false (fail-closed) in every case.
+func TestCursorVendorUsagePresenceRoundTripsDiskCache(t *testing.T) {
+	for body, wantKnown := range map[string]bool{
+		`{"captureAssistantProse":true}`: false,
+		`{"cursorVendorUsage":false}`:    true,
+	} {
+		t.Run(body, func(t *testing.T) {
+			setup(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(body)) })
+			fetched := NewResolver("PSE-TEST")
+			fetched.Refresh()
+			adopted := NewResolver("PSE-TEST") // no Refresh: disk cache only
+			for name, r := range map[string]*Resolver{"refresh": fetched, "disk cache": adopted} {
+				permitted, known := r.CursorVendorUsageDecision()
+				if permitted || known != wantKnown || r.CursorVendorUsage() {
+					t.Errorf("%s: permitted=%v known=%v CursorVendorUsage=%v, want false %v false",
+						name, permitted, known, r.CursorVendorUsage(), wantKnown)
+				}
+			}
+		})
 	}
 }
 

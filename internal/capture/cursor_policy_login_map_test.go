@@ -38,6 +38,10 @@ func TestCursorVendorPollUnknownPolicyKeepsLoginsAndDoesNotCollect(t *testing.T)
 		"fetch failed": func(t *testing.T) *policy.Resolver {
 			return fetchedCursorPolicy(t, http.StatusServiceUnavailable, `{}`)
 		},
+		// A 200 that omits cursorVendorUsage is not an "off": the map is kept.
+		"field omitted": func(t *testing.T) *policy.Resolver {
+			return fetchedCursorPolicy(t, http.StatusOK, `{"captureAssistantProse":true}`)
+		},
 		"network error": func(t *testing.T) *policy.Resolver {
 			t.Setenv("PROMPTSTER_API_URL", "http://127.0.0.1:1")
 			r := policy.NewResolver("PSE-TEST")

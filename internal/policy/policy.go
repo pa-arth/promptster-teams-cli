@@ -89,11 +89,15 @@ type Ingest struct {
 }
 
 type apiResponse struct {
-	CaptureAssistantProse bool   `json:"captureAssistantProse"`
-	CursorVendorUsage     bool   `json:"cursorVendorUsage"`
-	AutoUpdate            *bool  `json:"autoUpdate"`
-	PinnedCliVersion      string `json:"pinnedCliVersion"`
-	MinCliVersion         string `json:"minCliVersion"`
+	CaptureAssistantProse bool `json:"captureAssistantProse"`
+	// CursorVendorUsage is a POINTER for the same reason as AutoUpdate: an
+	// omitted field is "no decision", not "off". It still fails CLOSED for
+	// collection. Only an explicit false may revoke state (see
+	// CursorVendorUsageDecision).
+	CursorVendorUsage *bool  `json:"cursorVendorUsage"`
+	AutoUpdate        *bool  `json:"autoUpdate"`
+	PinnedCliVersion  string `json:"pinnedCliVersion"`
+	MinCliVersion     string `json:"minCliVersion"`
 	// Ingest is a POINTER so an absent block ("this backend predates batch") is
 	// distinguishable from one that explicitly advertises batch:false. Both
 	// resolve to per-event delivery today, but only one of them is a backend
@@ -105,13 +109,15 @@ type apiResponse struct {
 // fetched. AutoUpdate is a pointer for the same unknown-vs-false reason as
 // apiResponse.
 type diskCache struct {
-	CaptureAssistantProse bool      `json:"captureAssistantProse"`
-	CursorVendorUsage     bool      `json:"cursorVendorUsage"`
-	AutoUpdate            *bool     `json:"autoUpdate"`
-	PinnedCliVersion      string    `json:"pinnedCliVersion"`
-	MinCliVersion         string    `json:"minCliVersion"`
-	Ingest                *Ingest   `json:"ingest"`
-	FetchedAt             time.Time `json:"fetchedAt"`
+	CaptureAssistantProse bool `json:"captureAssistantProse"`
+	// A pointer so an omitted policy field round-trips as omitted: cached as a
+	// plain false, it would become an explicit "off" on the next process start.
+	CursorVendorUsage *bool     `json:"cursorVendorUsage"`
+	AutoUpdate        *bool     `json:"autoUpdate"`
+	PinnedCliVersion  string    `json:"pinnedCliVersion"`
+	MinCliVersion     string    `json:"minCliVersion"`
+	Ingest            *Ingest   `json:"ingest"`
+	FetchedAt         time.Time `json:"fetchedAt"`
 }
 
 // Resolver caches the org's capture policy for one CLI process. Safe for
@@ -123,7 +129,11 @@ type Resolver struct {
 	mu                sync.Mutex
 	value             bool
 	cursorVendorUsage bool
-	fetchedAt         time.Time // time of the last SUCCESSFUL fetch (zero = never)
+	// cursorVendorUsageKnown records whether the fetched policy EXPLICITLY
+	// carried cursorVendorUsage. False on an omitted field, which leaves
+	// cursorVendorUsage false (fail-closed) but is not an org decision.
+	cursorVendorUsageKnown bool
+	fetchedAt              time.Time // time of the last SUCCESSFUL fetch (zero = never)
 
 	// autoUpdate is the org's self-update switch. It defaults to true and is
 	// only flipped off by an explicit `autoUpdate:false` from the backend, so an
@@ -162,7 +172,8 @@ func NewResolver(apiKey string) *Resolver {
 	if c, ok := readDiskCache(); ok {
 		if time.Since(c.FetchedAt) < cacheTTL {
 			r.value = c.CaptureAssistantProse
-			r.cursorVendorUsage = c.CursorVendorUsage
+			r.cursorVendorUsage = c.CursorVendorUsage != nil && *c.CursorVendorUsage
+			r.cursorVendorUsageKnown = c.CursorVendorUsage != nil
 			r.fetchedAt = c.FetchedAt
 			// TTL-gated like prose, not TTL-free like the self-update fields. An
 			// aged-out capability resolves to per-event, which every backend
@@ -234,7 +245,9 @@ func (r *Resolver) CursorVendorUsage() bool {
 func (r *Resolver) CursorVendorUsageDecision() (permitted, known bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	known = !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
+	// A fetch that OMITTED the field is not a decision either: the backend said
+	// nothing, and nothing may be revoked on silence.
+	known = r.cursorVendorUsageKnown && !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
 	return known && r.cursorVendorUsage, known
 }
 
@@ -380,7 +393,8 @@ func (r *Resolver) Refresh() {
 	}
 	r.mu.Lock()
 	r.value = parsed.CaptureAssistantProse
-	r.cursorVendorUsage = parsed.CursorVendorUsage
+	r.cursorVendorUsage = parsed.CursorVendorUsage != nil && *parsed.CursorVendorUsage
+	r.cursorVendorUsageKnown = parsed.CursorVendorUsage != nil
 	r.fetchedAt = now
 	r.autoUpdate = autoUpdate
 	r.autoUpdateKnown = parsed.AutoUpdate != nil
