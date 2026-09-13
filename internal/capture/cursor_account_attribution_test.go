@@ -207,9 +207,8 @@ func TestCursorAccountAttributionNeverEmitsEmailOrKey(t *testing.T) {
 	}
 	stampCursorAccountRef(res.Events, ref)
 
-	snap := buildCursorVendorSnapshot([]cursorVendorRow{{Timestamp: "1787873137139", ConversationID: "conv-1"}},
+	snap := buildCursorVendorSnapshot(cred.accountRef, []cursorVendorRow{{Timestamp: "1787873137139", ConversationID: "conv-1"}},
 		time.Unix(0, 0), time.Unix(1, 0), nil, cursorVendorShapeRecord{})
-	snap.AccountRef = cred.accountRef
 	evs := append(res.Events, snap.rowEvents("dev")...)
 	evs = append(evs, snap.completionEvent("dev", time.Now(), ""),
 		buildCursorVendorAbsenceEvent("dev", cred.accountRef, CursorVendorAbsenceVendorUnreachable, time.Now(), time.Time{}, time.Time{}, cursorVendorShapeRecord{}))

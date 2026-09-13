@@ -204,6 +204,12 @@ func readCursorCredential() (cursorCredential, error) {
 		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the state store")
 	}
 
+	return cursorCredentialFromToken(token, emailHMAC)
+}
+
+// cursorCredentialFromToken wraps a token read from any store (IDE or
+// cursor-agent) with its expiry, account ref and email HMAC.
+func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error) {
 	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token),
 		accountRef: cursorAccountRef(token), emailHMAC: emailHMAC}
 	if !cred.expiresAt.IsZero() && time.Now().After(cred.expiresAt) {

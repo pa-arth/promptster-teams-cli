@@ -29,7 +29,7 @@ func stageOneRow(t *testing.T, rawRow string) map[string]interface{} {
 		t.Fatalf("rows=%d, want 1", len(page.UsageEventsDisplay))
 	}
 	start := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
-	snap := buildCursorVendorSnapshot(
+	snap := buildCursorVendorSnapshot("0123456789abcdef",
 		page.UsageEventsDisplay, start, start.Add(30*24*time.Hour), nil,
 		cursorVendorShapeRecord{HTTPStatus: 200},
 	)

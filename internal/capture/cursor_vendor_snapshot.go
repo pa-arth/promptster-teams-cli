@@ -63,7 +63,13 @@ const (
 	// field order or the absent-marker changes, every snapshot's id changes with
 	// no other visible symptom, and this prefix is what makes that a decision
 	// rather than an accident.
-	cursorVendorSnapshotDigestVersion = "cursorVendorSnapshot/v1"
+	//
+	// v2 (cursor-vendor-multi-account Phase B) adds accountRef to the snapshot
+	// id and the absence id, so two accounts with identical periods — most
+	// plainly two empty ones — no longer share an id. The backend never
+	// recomputes either id (it recomputes only contentSha256, which has no
+	// version prefix and did not change), so this is a one-sided change.
+	cursorVendorSnapshotDigestVersion = "cursorVendorSnapshot/v2"
 
 	// The canonical separators. Unit separator between a row's fields, record
 	// separator between rows — control characters, so no field value can contain
@@ -109,8 +115,9 @@ type cursorVendorSnapshot struct {
 	// Shape is what the vendor's response actually carried.
 	Shape cursorVendorShapeRecord
 	// AccountRef is the login this snapshot was read with (cursorAccountRef).
-	// Emitted on every row and on the completion; deliberately NOT a digest
-	// input — see canonicalRowLine for why the digest cannot widen on one side.
+	// Emitted on every row and on the completion. It is an input to SnapshotID
+	// (identity) and NOT to ContentSha256 (integrity) — see canonicalRowLine for
+	// why the content digest cannot widen on one side.
 	AccountRef string
 }
 
@@ -274,7 +281,7 @@ func emittableOwningUser(s string) string {
 // nothing. Sorting on the FULL canonical line (not just the timestamp) is what
 // makes it total: two rows sharing a timestamp and a conversation are ordered by
 // their content, so the order is a function of the SET.
-func buildCursorVendorSnapshot(rows []cursorVendorRow, cycleStart, cycleEnd time.Time,
+func buildCursorVendorSnapshot(accountRef string, rows []cursorVendorRow, cycleStart, cycleEnd time.Time,
 	quota *cursorVendorQuotaReading, shape cursorVendorShapeRecord) cursorVendorSnapshot {
 
 	lines := make([]string, 0, len(rows))
@@ -303,6 +310,7 @@ func buildCursorVendorSnapshot(rows []cursorVendorRow, cycleStart, cycleEnd time
 
 	identity := strings.Join([]string{
 		cursorVendorSnapshotDigestVersion,
+		accountRef,
 		cycleStart.UTC().Format(cursorVendorCycleTimeFormat),
 		cycleEnd.UTC().Format(cursorVendorCycleTimeFormat),
 		strconv.Itoa(len(lines)),
@@ -318,6 +326,7 @@ func buildCursorVendorSnapshot(rows []cursorVendorRow, cycleStart, cycleEnd time
 		CycleEnd:      cycleEnd,
 		Quota:         quota,
 		Shape:         shape,
+		AccountRef:    accountRef,
 	}
 }
 
@@ -474,7 +483,7 @@ func buildCursorVendorAbsenceEvent(deviceID, accountRef string, reason CursorVen
 	empty := sha256.Sum256([]byte(""))
 
 	data := map[string]interface{}{
-		"snapshotId":           cursorVendorAbsenceSnapshotID(deviceID, reason, cycleStart, cycleEnd),
+		"snapshotId":           cursorVendorAbsenceSnapshotID(deviceID, accountRef, reason, cycleStart, cycleEnd),
 		"status":               CursorVendorSnapshotStatusAbsent,
 		"capturedAt":           capturedAt.UTC().Format(cursorVendorCycleTimeFormat),
 		"billingCycleStartsAt": cycleStart.UTC().Format(cursorVendorCycleTimeFormat),
@@ -486,7 +495,10 @@ func buildCursorVendorAbsenceEvent(deviceID, accountRef string, reason CursorVen
 	}
 	applyShapeFields(data, shape, shape.CursorVersion)
 	e.Data = data
-	e.ID = event.DeterministicUUID("cursorVendorSnapshotAbsent:" + deviceID + ":" +
+	// accountRef is in the event id for the same reason it is in the snapshot
+	// id: two accounts expiring in the same cycle are two absences, and without
+	// it the second would dedup away on ingest.
+	e.ID = event.DeterministicUUID("cursorVendorSnapshotAbsent:" + deviceID + ":" + accountRef + ":" +
 		string(reason) + ":" + capturedAt.UTC().Format(time.RFC3339))
 	return e
 }
@@ -498,12 +510,13 @@ func buildCursorVendorAbsenceEvent(deviceID, accountRef string, reason CursorVen
 // function of the reason and the cycle rather than of the instant, so repeated
 // absences for the same reason in the same cycle carry one id and read as one
 // ongoing condition rather than as a stream of distinct incidents.
-func cursorVendorAbsenceSnapshotID(deviceID string, reason CursorVendorAbsenceReason,
+func cursorVendorAbsenceSnapshotID(deviceID, accountRef string, reason CursorVendorAbsenceReason,
 	cycleStart, cycleEnd time.Time) string {
 	canonical := strings.Join([]string{
 		cursorVendorSnapshotDigestVersion,
 		"absent",
 		deviceID,
+		accountRef,
 		string(reason),
 		cycleStart.UTC().Format(cursorVendorCycleTimeFormat),
 		cycleEnd.UTC().Format(cursorVendorCycleTimeFormat),

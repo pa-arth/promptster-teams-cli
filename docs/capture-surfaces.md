@@ -204,11 +204,25 @@ re-uploads months of unbounded history.
 
 On macOS, the background watcher also measures the engineer's current Cursor
 billing period every 15 minutes when the organization policy explicitly permits
-`cursorVendorUsage`. It creates a private copy-on-write temporary clone of
-`~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (falling
-back to a byte copy), reads only `cursorAuth/accessToken` and
-`cursorAuth/refreshToken` from that clone, then deletes it. It never opens the
-live database and never reads neighbouring keys.
+`cursorVendorUsage`. It reads every Cursor login on the device, each cycle, and
+stores none of them:
+
+- **Cursor app.** It creates a private copy-on-write temporary clone of
+  `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (falling
+  back to a byte copy), reads only `cursorAuth/accessToken`,
+  `cursorAuth/refreshToken` and `cursorAuth/cachedEmail` from that clone, then
+  deletes it. It never opens the live database and never reads neighbouring keys.
+- **cursor-agent.** It runs `/usr/bin/security find-generic-password -a
+  cursor-user -s cursor-access-token -w` (3s timeout; any failure means "no
+  cursor-agent login"), and reads `accessToken` from `~/.cursor/auth.json`, the
+  file store cursor-agent falls back to. Its email comes from `authInfo.email` in
+  `~/.cursor/cli-config.json`, and is used only when `authInfo.authId` equals the
+  token's `sub`.
+
+Each email is reduced on the device to an HMAC under a local install key, and
+is used only to tell which login ran a hook turn. Each login is identified on
+the wire as `accountRef = hex(sha256(sub))[:16]`, and the same login found in
+both clients is collected once.
 
 The credential is used only as an Authorization header for three operations at
 `api2.cursor.sh`: `GetTeams` (to refuse individual-account collection for Teams
