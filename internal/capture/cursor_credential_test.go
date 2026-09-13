@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -43,9 +44,13 @@ func TestReadCursorAuthKeysOpensDisposableCloneAndOnlyAuthKeys(t *testing.T) {
 		cursorAuthAccessTokenKey: "access", cursorAuthRefreshTokenKey: "refresh",
 		"cursorAuth/cachedEmail": "private@example.com", "composer.planRegistry": "/private/project",
 	})
-	values, opened, err := readCursorAuthKeys(live)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	values, emailHMAC, opened, err := readCursorAuthKeys(live)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(emailHMAC) {
+		t.Fatalf("cachedEmail must come back only as a 64-hex HMAC, got %q", emailHMAC)
 	}
 	if opened == live || filepath.Dir(opened) == filepath.Dir(live) {
 		t.Fatalf("opened live state store: %q", opened)
@@ -91,7 +96,7 @@ func TestReadCursorCredentialRereadsStoreEveryCycle(t *testing.T) {
 
 func TestCredentialSecretMutationCannotReachErrorsOrPayload(t *testing.T) {
 	secret := "mutation-canary-cursor-bearer"
-	for _, text := range []string{credentialErr(CursorVendorAbsenceCredentialAbsent, "no token").Error(), buildCursorVendorAbsenceEvent("device", CursorVendorAbsenceCredentialAbsent, time.Now(), time.Time{}, time.Time{}, cursorVendorShapeRecord{}).Data.(map[string]interface{})["absenceReason"].(string)} {
+	for _, text := range []string{credentialErr(CursorVendorAbsenceCredentialAbsent, "no token").Error(), buildCursorVendorAbsenceEvent("device", "unknown", CursorVendorAbsenceCredentialAbsent, time.Now(), time.Time{}, time.Time{}, cursorVendorShapeRecord{}).Data.(map[string]interface{})["absenceReason"].(string)} {
 		if err := assertNoCredentialInText(text, secret); err != nil {
 			t.Fatal(err)
 		}

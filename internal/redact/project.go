@@ -70,8 +70,10 @@ var projectFieldAllowlist = map[string][]string{
 	// content, which is what makes them admissible under a default-deny keyed on
 	// keys. They are the vendor stating who ran the work, and they supersede the
 	// backend's `sand-subagent-` conversation-id prefix heuristic.
-	"cursorVendorUsage":    {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId", "cloudAgentId", "automationId", "serviceAccountId"},
-	"cursorVendorSnapshot": {"snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason"},
+	"cursorVendorUsage": {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId", "cloudAgentId", "automationId", "serviceAccountId", "accountRef"},
+	// accountRef on both vendor kinds is hex(sha256(jwt.sub))[:16] of the Cursor
+	// login that was read, or "unknown" — a truncated digest, never the sub.
+	"cursorVendorSnapshot": {"snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason", "accountRef"},
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
 	// followsInterrupt is a boolean flag marking a redirect prompt (the one
@@ -146,7 +148,11 @@ var projectFieldAllowlist = map[string][]string{
 	// key that can join a usage row to Cursor's own model-resolution step and to
 	// its server-side usage API; the row id folds it in but a hash cannot be
 	// joined on.
-	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId"),
+	// cursorAccountRef names the Cursor login a hook turn ran under: the
+	// matching store's accountRef, or "unreadable:<8 hex of a per-install
+	// HMAC>". Neither form carries the email; the HMAC key never leaves the
+	// device. Per-kind for the same lockstep reason as the three above.
+	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId", "cursorAccountRef"),
 	// `sidechain` marks work done by a subagent. Its events roll up to the
 	// PARENT session's id (a subagent transcript records its parent's sessionId),
 	// so without this flag subagent work is indistinguishable from the main
