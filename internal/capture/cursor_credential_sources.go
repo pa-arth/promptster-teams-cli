@@ -91,28 +91,37 @@ func readCursorCredentials() []cursorCredentialSource {
 	if !cursorAgentSourcesSupported {
 		return sources
 	}
-	tokens := []struct {
-		kind  cursorCredentialSourceKind
-		token string
-	}{
-		{cursorSourceAgentKeychain, readCursorAgentKeychainToken()},
-		{cursorSourceAgentFile, readCursorAgentAuthFileToken()},
+	// ONE cursor-agent store, never both. cursor-agent picks exactly one
+	// (bundle 2026.08.25-3e8eec8, `cli-credentials` `jo`):
+	//   "memory"===n ? memory : "file"===n ? file : darwin ? keychain : file
+	// where n is `AGENT_CLI_CREDENTIAL_STORE` ("file" | "memory" | "default").
+	// It never falls back from keychain to file at runtime. Our daemon cannot
+	// see cursor-agent's environment, so the nearest faithful rule is: the
+	// keychain wins whenever it yields a token, and auth.json is read only when
+	// it yields nothing. A stale auth.json left by a store switch is therefore
+	// never collected as a second, live account.
+	kind, token := cursorSourceAgentKeychain, readCursorAgentKeychainToken()
+	if token == "" {
+		kind, token = cursorSourceAgentFile, readCursorAgentAuthFileToken()
 	}
-	authID, emailHMAC, authInfoRead := "", "", false
-	for _, t := range tokens {
-		if t.token == "" {
-			continue
-		}
-		if !authInfoRead {
-			authID, emailHMAC = readCursorAgentAuthInfo(state.CursorAttributionKey())
-			authInfoRead = true
-		}
+	if token != "" {
+		authID, emailHMAC := readCursorAgentAuthInfo(state.CursorAttributionKey())
 		sourceEmail := ""
-		if sub := strings.TrimSpace(cursorTokenClaims(t.token).Sub); sub != "" && sub == authID {
+		if sub := strings.TrimSpace(cursorTokenClaims(token).Sub); sub != "" && sub == authID {
 			sourceEmail = emailHMAC
 		}
-		cred, err := cursorCredentialFromToken(t.token, sourceEmail)
-		sources = append(sources, cursorCredentialSource{kind: t.kind, cred: cred, err: err})
+		cred, err := cursorCredentialFromToken(token, sourceEmail)
+		sources = append(sources, cursorCredentialSource{kind: kind, cred: cred, err: err})
+	}
+	for i := range sources {
+		// A token with no parseable `sub` is not a usable credential: it has no
+		// account to scope a snapshot to, and two such tokens would merge under
+		// "unknown". Treated as that source being absent — no vendor call, no
+		// login-map entry.
+		if sources[i].err == nil && sources[i].cred.accountRef == cursorAccountRefUnknown {
+			sources[i] = cursorCredentialSource{kind: sources[i].kind,
+				err: credentialErr(CursorVendorAbsenceCredentialAbsent, "token has no parseable sub")}
+		}
 	}
 	return sources
 }

@@ -224,6 +224,47 @@ func TestCursorAgentAuthFileIsASource(t *testing.T) {
 	}
 }
 
+// cursor-agent uses one store. A keychain login plus a stale auth.json from an
+// earlier store switch is ONE cursor-agent account: the keychain's.
+func TestCursorAgentKeychainTokenShadowsAuthFile(t *testing.T) {
+	home := agentSourceEnv(t, keychainReturns(t, liveToken(t, subAgent)))
+	ideStore(t, liveToken(t, subIDE), "")
+	writeJSON(t, filepath.Join(home, ".cursor", "auth.json"), map[string]string{"accessToken": liveToken(t, "auth0|stale_file_login")})
+
+	sources := readCursorCredentials()
+	if got := sourceKinds(sources); !reflect.DeepEqual(got, []cursorCredentialSourceKind{cursorSourceIDE, cursorSourceAgentKeychain}) {
+		t.Fatalf("sources = %v, want IDE + keychain only", got)
+	}
+	if sources[1].cred.accountRef != cursorAccountRef(liveToken(t, subAgent)) {
+		t.Fatalf("cursor-agent account = %q, want the keychain login", sources[1].cred.accountRef)
+	}
+}
+
+// A malformed keychain value is an absent source: exactly the IDE account is
+// collected, the malformed bytes never reach the vendor, and nothing is added
+// to the login map under "unknown".
+func TestCursorSourcesMalformedTokenIsAbsent(t *testing.T) {
+	const malformed = "not-a-jwt-keychain-value"
+	agentSourceEnv(t, keychainReturns(t, malformed))
+	ideStore(t, liveToken(t, subIDE), "ide@example.com")
+
+	client, calls := fakeVendor(t, emptyUsage)
+	evs := captureVendorEvents(t)
+	pollCursorVendorAccounts("dev", client, time.Now(), readCursorCredentials())
+
+	if calls[malformed] != 0 || len(calls) != 1 {
+		t.Fatalf("collections=%v, want only the IDE token", calls)
+	}
+	if c, a := snapshotsByStatus(t, *evs, CursorVendorSnapshotStatusComplete), snapshotsByStatus(t, *evs, CursorVendorSnapshotStatusAbsent); len(c) != 1 || len(a) != 0 {
+		t.Fatalf("complete=%v absent=%v", c, a)
+	}
+	for _, l := range loadCursorAccountLogins().Logins {
+		if l.AccountRef == cursorAccountRefUnknown {
+			t.Fatal("malformed token entered the login map")
+		}
+	}
+}
+
 // cli-config's authInfo is a cache refreshed apart from login; its email is
 // only trusted for the token whose sub it names.
 func TestCursorAgentEmailRequiresAuthIDMatchingSub(t *testing.T) {
