@@ -2488,7 +2488,11 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.1...v0.28.0
+[0.27.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.0...v0.27.1
+[0.27.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.26.0...v0.27.0
+[0.26.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.23.0...v0.24.0
 [0.23.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.22.0...v0.23.0
