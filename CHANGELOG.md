@@ -19,9 +19,10 @@ follows [Semantic Versioning](https://semver.org/).
   HMAC-SHA256 under a per-install key that never leaves the device, and no
   email is stored or sent. Every login the vendor cycle has ever read on the
   device (up to 16, least recently seen evicted) stays attributable, so
-  `unreadable:` means "never read here", not "not read this cycle". With the
-  org's `cursorVendorUsage` switch off, no login is read and every turn is
-  `unreadable:`. **Requires promptster-backend#920 deployed before release**,
+  `unreadable:` means "no login in the map matched", not "not read this
+  cycle". With no map (before the first vendor cycle) the field is omitted.
+  With the org's `cursorVendorUsage` switch off, the vendor cycle deletes the
+  map, so the field is omitted there too. **Requires promptster-backend#920 deployed before release**,
   or the fields are discarded at ingest.
 
 ## [0.27.1] — 2026-09-12

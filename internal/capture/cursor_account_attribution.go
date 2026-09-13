@@ -41,9 +41,14 @@ import (
 // Gating it on freshness only manufactures false `unreadable:` refs across
 // laptop sleep, a dead daemon, or the IDE being switched between logins — and
 // inflates exactly the "accounts we cannot read" count Phase A exists to take.
-// Consequence worth stating: `unreadable:` means "never read on this device",
-// not "not readable right now". Whether a KNOWN login's usage is currently being
-// collected is the snapshot's question, answered per accountRef on the backend.
+// Consequence worth stating: `unreadable:` means "the map exists and this email
+// matched no login in it", not "not readable right now". Whether a KNOWN login's
+// usage is currently being collected is the snapshot's question, answered per
+// accountRef on the backend.
+//
+// NO MAP, NO FIELD. The map is absent before the first vendor cycle and after
+// the org turns the collector off (forgetCursorAccountLogins); in both cases
+// nothing is being read, so the hook says nothing rather than `unreadable:`.
 
 const (
 	cursorAccountRefUnreadablePrefix = "unreadable:"
@@ -70,6 +75,11 @@ type cursorAccountLogins struct {
 
 func cursorAccountReadingPath() string {
 	return filepath.Join(state.StateDir(), "cursor-account.json")
+}
+
+// forgetCursorAccountLogins deletes the map. Idempotent.
+func forgetCursorAccountLogins() {
+	_ = os.Remove(cursorAccountReadingPath())
 }
 
 // recordCursorAccountReading upserts the login this cycle's store read
@@ -135,8 +145,9 @@ func loadCursorAccountLogins() cursorAccountLogins {
 // matched. It decodes exactly one key, holds the address only long enough to
 // HMAC it, and returns a value that cannot contain it.
 //
-// ok=false (field omitted) when the payload has no user_email, or when the
-// install key cannot be persisted — see state.CursorAttributionKey.
+// ok=false (field omitted) when the payload has no user_email, when there is no
+// usable login map (never collected, or the collector was switched off), or
+// when the install key cannot be persisted — see state.CursorAttributionKey.
 func cursorHookAccountRef(raw []byte) (string, bool) {
 	var p struct {
 		UserEmail string `json:"user_email"`
@@ -144,11 +155,15 @@ func cursorHookAccountRef(raw []byte) (string, bool) {
 	if json.Unmarshal(raw, &p) != nil || strings.TrimSpace(p.UserEmail) == "" {
 		return "", false
 	}
+	logins := loadCursorAccountLogins()
+	if logins.Version != cursorAccountLoginsVersion {
+		return "", false
+	}
 	mac := cursorEmailHMAC(state.CursorAttributionKey(), p.UserEmail)
 	if mac == "" {
 		return "", false
 	}
-	for _, l := range loadCursorAccountLogins().Logins {
+	for _, l := range logins.Logins {
 		if l.AccountRef != "" && hmac.Equal([]byte(l.EmailHMAC), []byte(mac)) {
 			return l.AccountRef, true
 		}

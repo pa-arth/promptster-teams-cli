@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -87,6 +88,35 @@ func TestCursorHookAccountRefMatchUnreadableAbsent(t *testing.T) {
 	// No email: the field is absent, not "unreadable".
 	if ref, ok := cursorHookAccountRef(stopPayload(t, "")); ok || ref != "" {
 		t.Fatalf("no email: ref=%q ok=%v, want omitted", ref, ok)
+	}
+}
+
+// No login map — a fresh install before its first vendor cycle — means nothing
+// has been read, so the turn says nothing rather than `unreadable:`.
+func TestCursorHookAccountRefOmittedWithoutLoginMap(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	if ref, ok := cursorHookAccountRef(stopPayload(t, "login.one@example.com")); ok || ref != "" {
+		t.Fatalf("no map: ref=%q ok=%v, want omitted", ref, ok)
+	}
+}
+
+// The org kill switch must also stop attribution: a login read while collection
+// was allowed may not keep stamping refs after it is switched off.
+func TestCursorVendorPollPolicyOffForgetsLogins(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	seeLogin(state.CursorAttributionKey(), "login.one@example.com", "0123456789abcdef", time.Now())
+	if _, err := os.Stat(cursorAccountReadingPath()); err != nil {
+		t.Fatalf("precondition: login map not written: %v", err)
+	}
+
+	off := &policy.Resolver{} // never fetched: CursorVendorUsage() is false
+	pollCursorVendorUsage("dev", off, nil, time.Now())
+	if _, err := os.Stat(cursorAccountReadingPath()); !os.IsNotExist(err) {
+		t.Fatalf("policy off left the login map in place: %v", err)
+	}
+	pollCursorVendorUsage("dev", off, nil, time.Now()) // idempotent: no file, no panic
+	if ref, ok := cursorHookAccountRef(stopPayload(t, "login.one@example.com")); ok || ref != "" {
+		t.Fatalf("after kill switch: ref=%q ok=%v, want omitted", ref, ok)
 	}
 }
 

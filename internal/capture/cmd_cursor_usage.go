@@ -39,6 +39,10 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
 	}
 	if !resolver.CursorVendorUsage() {
+		// The kill switch covers attribution too: without the map the hook stops
+		// stamping cursorAccountRef, instead of stamping refs from logins read
+		// while collection was still allowed.
+		forgetCursorAccountLogins()
 		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
 		return
 	}
