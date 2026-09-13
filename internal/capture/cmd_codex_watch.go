@@ -961,7 +961,8 @@ func tailCodexRollout(
 	// Skipped when the budget cut the read short: the lines that would complete
 	// that turn are sitting unread in the file, not absent.
 	if !res.truncated {
-		for _, ev := range proc.FlushStaleUserPrompt() {
+		// Same for a buffered final answer whose task_complete never came.
+		for _, ev := range append(proc.FlushStaleUserPrompt(), proc.FlushStaleFinal()...) {
 			// Error ignored on purpose: this event came out of in-memory state
 			// the flush has already released, so there is no byte range to
 			// rewind to and nothing better to do than outbox's own warning.

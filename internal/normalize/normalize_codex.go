@@ -158,6 +158,8 @@ type codexPendingFinal struct {
 	text string
 	ts   string
 	raw  string
+	// aged: survived one end-of-poll check (see FlushStaleFinal).
+	aged bool
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -454,6 +456,35 @@ func (p *CodexRolloutProcessor) FlushStaleUserPrompt() []event.Event {
 		return nil
 	}
 	return p.flushPendingUserPrompt()
+}
+
+// FlushStaleFinal releases a buffered response_item final answer whose
+// task_complete never arrives — Codex interrupted or exited mid-turn and nothing
+// is appended again. Same two-poll rule as FlushStaleUserPrompt: the first poll
+// only ages it, so a task_complete written in the same instant still wins and
+// carries the turn's last cumulative token_count.
+func (p *CodexRolloutProcessor) FlushStaleFinal() []event.Event {
+	if p.pendingFinal.ts == "" {
+		return nil
+	}
+	if !p.pendingFinal.aged {
+		p.pendingFinal.aged = true
+		return nil
+	}
+	return p.flushPendingFinal()
+}
+
+// flushPendingFinal mints the buffered final answer through the ordinary
+// final-answer path (model + latest cumulative usage) and clears it.
+func (p *CodexRolloutProcessor) flushPendingFinal() []event.Event {
+	final := p.pendingFinal
+	p.pendingFinal = codexPendingFinal{}
+	if final.ts == "" || p.finalEmitted {
+		return nil
+	}
+	return p.eventMsg(map[string]interface{}{
+		"type": "agent_message", "phase": "final_answer", "message": final.text,
+	}, final.ts, final.raw)
 }
 
 // flushPendingUserPrompt mints the buffered turn as a prompt and clears it.
@@ -757,9 +788,11 @@ func (p *CodexRolloutProcessor) newPromptEvent(text, ts, raw string) []event.Eve
 func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []event.Event {
 	switch stringField(payload, "type") {
 	case "task_started":
-		p.pendingFinal = codexPendingFinal{}
+		// A new turn starting means the previous one will get no task_complete
+		// (interrupted). Its buffered final answer is still a real response.
+		out := p.flushPendingFinal()
 		p.finalEmitted = false
-		return nil
+		return out
 	case "user_message":
 		// A DELEGATED thread's user_message is the orchestrator's instruction to a
 		// subagent — machine-authored, never something a person typed. The Claude
@@ -815,16 +848,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		return []event.Event{e}
 
 	case "task_complete":
-		final := p.pendingFinal
-		p.pendingFinal = codexPendingFinal{}
-		if final.ts == "" || p.finalEmitted {
-			return nil
-		}
 		// The post-0.149 response_item final precedes its last token_count.
 		// Flush here so the cumulative counters include the completed turn.
-		return p.eventMsg(map[string]interface{}{
-			"type": "agent_message", "phase": "final_answer", "message": final.text,
-		}, final.ts, final.raw)
+		return p.flushPendingFinal()
 
 	case "context_compacted":
 		return p.contextCompacted(ts, raw)
@@ -1045,7 +1071,7 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 		if stringField(payload, "role") == "user" {
 			p.recoverUserPrompt(payload, ts, raw)
 		} else if stringField(payload, "role") == "assistant" && stringField(payload, "phase") == "final_answer" && !p.finalEmitted {
-			p.pendingFinal = codexPendingFinal{codexUserContentText(payload["content"]), ts, raw}
+			p.pendingFinal = codexPendingFinal{text: codexUserContentText(payload["content"]), ts: ts, raw: raw}
 		}
 		return nil
 

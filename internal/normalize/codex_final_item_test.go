@@ -1,6 +1,10 @@
 package normalize
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
+)
 
 func TestCodexResponseItemFinalUsesFollowingCumulativeUsage(t *testing.T) {
 	p := NewCodexRolloutProcessor("thread-1")
@@ -32,6 +36,59 @@ func TestCodexResponseItemFinalUsesFollowingCumulativeUsage(t *testing.T) {
 	if count != 1 {
 		t.Fatalf("ai_response count = %d, want 1", count)
 	}
+}
+
+// A rollout interrupted after the final answer never writes task_complete.
+func TestCodexStaleFinalFlushesWithoutTaskComplete(t *testing.T) {
+	p := NewCodexRolloutProcessor("thread-1")
+	for _, line := range []string{
+		`{"timestamp":"2026-08-27T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}`,
+		`{"timestamp":"2026-08-27T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}}`,
+		`{"timestamp":"2026-08-27T00:00:05Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":5}}}}`,
+	} {
+		if got := p.Process([]byte(line)); len(aiResponses(got)) != 0 {
+			t.Fatal("no ai_response before task_complete or a stale flush")
+		}
+	}
+	if got := p.FlushStaleFinal(); len(got) != 0 {
+		t.Fatal("first poll must only age the buffered final")
+	}
+	got := aiResponses(p.FlushStaleFinal())
+	if len(got) != 1 {
+		t.Fatalf("stale flush ai_response count = %d, want 1", len(got))
+	}
+	if d := got[0].Data.(map[string]interface{}); d["inputTokens"] != int64(20) {
+		t.Fatalf("usage = %v", d)
+	}
+	if again := p.FlushStaleFinal(); len(again) != 0 {
+		t.Fatal("flush must not repeat")
+	}
+}
+
+// The next turn starting also proves the previous one ended without task_complete.
+func TestCodexNextTurnFlushesUnfinishedFinal(t *testing.T) {
+	p := NewCodexRolloutProcessor("thread-1")
+	count := 0
+	for _, line := range []string{
+		`{"timestamp":"2026-08-27T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}`,
+		`{"timestamp":"2026-08-27T00:00:04Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Done"}]}}`,
+		`{"timestamp":"2026-08-27T00:01:00Z","type":"event_msg","payload":{"type":"task_started"}}`,
+	} {
+		count += len(aiResponses(p.Process([]byte(line))))
+	}
+	if count != 1 {
+		t.Fatalf("ai_response count = %d, want 1", count)
+	}
+}
+
+func aiResponses(evs []event.Event) []event.Event {
+	var out []event.Event
+	for _, e := range evs {
+		if e.Kind == "ai_response" {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func TestCodexOldFinalAnswerCopyDoesNotDuplicate(t *testing.T) {
