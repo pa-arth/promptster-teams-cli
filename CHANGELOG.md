@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.27.1] — 2026-09-12
+
+### Fixed
+
+- Codex main-agent turns stopped producing `ai_response`, so Codex spend read
+  **$0** from about 2026-08-28 while prompts, tool calls and subagent usage kept
+  arriving. Since Codex CLI 0.149 a main-thread final answer is written as a
+  `response_item` message (`role: assistant`, `phase: final_answer`) instead of
+  `event_msg`/`agent_message`, and the normalizer only read the old shape.
+  Replaying real rollouts: a 0.149.1 file went from 0 to 18 responses, a 0.150.1
+  file from 0 to 5; v0.22.0 and v0.24.0 also emitted 0, so this was a Codex
+  format change, not a CLI regression. The final answer is buffered and emitted
+  at `task_complete`, after the turn's last cumulative `token_count`, so usage
+  covers the completed turn. The old `event_msg` path still wins and suppresses
+  the copy. A turn Codex interrupts before `task_complete` still produces its
+  response: it flushes when the next `task_started` arrives, or after two
+  end-of-poll checks.
+- **Requires upgrading to 0.27.1.** Sessions captured by older versions are not
+  backfilled and keep their missing Codex responses.
+
 ## [0.27.0] — 2026-09-07
 
 ### Fixed
