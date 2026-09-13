@@ -130,7 +130,9 @@ type CodexRolloutProcessor struct {
 	// authoritative `event_msg`/user_message follows it. See
 	// codexUserMessageLine for why the deferral (rather than a flag) is the only
 	// shape that works, and recoverUserPrompt for why the fallback exists.
-	pendingUser codexPendingUserTurn
+	pendingUser  codexPendingUserTurn
+	pendingFinal codexPendingFinal
+	finalEmitted bool
 	// RewindOffset is CALLER-OWNED bookkeeping, stashed on the processor so it
 	// shares this processor's exact lifetime instead of needing a parallel map in
 	// the watcher. The capture layer keeps in it the absolute rollout offset of
@@ -150,6 +152,12 @@ type codexPendingUserTurn struct {
 	// i.e. a full poll interval elapsed with no following line. See
 	// FlushStaleUserPrompt.
 	aged bool
+}
+
+type codexPendingFinal struct {
+	text string
+	ts   string
+	raw  string
 }
 
 func NewCodexRolloutProcessor(sessionID string) *CodexRolloutProcessor {
@@ -264,6 +272,7 @@ func (p *CodexRolloutProcessor) process(line []byte) []event.Event {
 	case "response_item":
 		return append(recovered, p.responseItem(payload, ts, raw)...)
 	case "turn_context":
+		p.finalEmitted = false
 		// turn_context carries the per-turn model (the only rollout line that does);
 		// stash it for the turn's ai_response. Assigned UNCONDITIONALLY: a
 		// turn_context that declares no model clears any prior value rather than
@@ -399,7 +408,7 @@ func (p *CodexRolloutProcessor) recoverUserPrompt(payload map[string]interface{}
 // watcher asks before each record and remembers the last offset at which the
 // answer was false.
 func (p *CodexRolloutProcessor) HasBufferedState() bool {
-	return p.pendingUser.text != "" || len(p.pending) > 0 || len(p.running) > 0
+	return p.pendingUser.text != "" || p.pendingFinal.ts != "" || len(p.pending) > 0 || len(p.running) > 0
 }
 
 // DiscardBufferedState throws away exactly what a re-read from RewindOffset
@@ -414,6 +423,8 @@ func (p *CodexRolloutProcessor) HasBufferedState() bool {
 // turn_context lines come round again.
 func (p *CodexRolloutProcessor) DiscardBufferedState() {
 	p.pendingUser = codexPendingUserTurn{}
+	p.pendingFinal = codexPendingFinal{}
+	p.finalEmitted = false
 	clear(p.pending)
 	clear(p.running)
 }
@@ -745,6 +756,10 @@ func (p *CodexRolloutProcessor) newPromptEvent(text, ts, raw string) []event.Eve
 
 func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []event.Event {
 	switch stringField(payload, "type") {
+	case "task_started":
+		p.pendingFinal = codexPendingFinal{}
+		p.finalEmitted = false
+		return nil
 	case "user_message":
 		// A DELEGATED thread's user_message is the orchestrator's instruction to a
 		// subagent — machine-authored, never something a person typed. The Claude
@@ -773,6 +788,8 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		if stringField(payload, "phase") != "final_answer" {
 			return nil
 		}
+		p.pendingFinal = codexPendingFinal{}
+		p.finalEmitted = true
 		// A delegated thread's answer is written to its orchestrator, not to the
 		// human, and its turn is not the human's turn. Keep the SPEND (it is real
 		// and belongs to the session that spawned the subagent) and drop the prose
@@ -796,6 +813,18 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		e.Data = data
 		e.RawPayload = raw
 		return []event.Event{e}
+
+	case "task_complete":
+		final := p.pendingFinal
+		p.pendingFinal = codexPendingFinal{}
+		if final.ts == "" || p.finalEmitted {
+			return nil
+		}
+		// The post-0.149 response_item final precedes its last token_count.
+		// Flush here so the cumulative counters include the completed turn.
+		return p.eventMsg(map[string]interface{}{
+			"type": "agent_message", "phase": "final_answer", "message": final.text,
+		}, final.ts, final.raw)
 
 	case "context_compacted":
 		return p.contextCompacted(ts, raw)
@@ -1015,6 +1044,8 @@ func (p *CodexRolloutProcessor) responseItem(payload map[string]interface{}, ts,
 		// arrives. Assistant/developer messages carry no signal this channel owns.
 		if stringField(payload, "role") == "user" {
 			p.recoverUserPrompt(payload, ts, raw)
+		} else if stringField(payload, "role") == "assistant" && stringField(payload, "phase") == "final_answer" && !p.finalEmitted {
+			p.pendingFinal = codexPendingFinal{codexUserContentText(payload["content"]), ts, raw}
 		}
 		return nil
 
