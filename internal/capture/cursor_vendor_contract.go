@@ -278,6 +278,9 @@ var cursorVendorSnapshotRowFields = []string{
 	"cloudAgentId",
 	"automationId",
 	"serviceAccountId",
+	// accountRef (cursor-vendor-multi-account Phase A): hex(sha256(jwt.sub))[:16]
+	// of the credential that read the snapshot, or "unknown". Not a digest input.
+	"accountRef",
 }
 
 // cursorVendorSnapshotCompletionFields is the emitted key set for the
@@ -303,6 +306,8 @@ var cursorVendorSnapshotCompletionFields = []string{
 	"shapeCursorVersion",
 	"shapeHttpStatus",
 	"absenceReason",
+	// accountRef — see the row list. Present on complete AND absent records.
+	"accountRef",
 }
 
 // CursorVendorSnapshotRowFields returns the staged-row key set, as a copy.

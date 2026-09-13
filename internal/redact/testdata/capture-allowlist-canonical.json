@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:24fd18eddc5b9c3cf57d17eb6e20858bf6baf02e18bc596e0b161b3f2de1f86c",
+  "checksum": "sha256:8bd714ff26ba364d677aaac85d0761f7d12ba3f6bf983d0a1117a9c1757d470c",
   "counts": {
     "kinds": 48,
-    "fields": 258,
+    "fields": 261,
     "elementFields": 37
   },
   "kinds": {
@@ -30,7 +30,8 @@
         "effort",
         "speed",
         "contextWindowTokens",
-        "generationId"
+        "generationId",
+        "cursorAccountRef"
       ]
     },
     "api_error": {
@@ -160,7 +161,8 @@
         "shapeMissingFields",
         "shapeCursorVersion",
         "shapeHttpStatus",
-        "absenceReason"
+        "absenceReason",
+        "accountRef"
       ],
       "stringArrays": {
         "shapeMissingFields": {
@@ -197,7 +199,8 @@
         "subscriptionProductId",
         "cloudAgentId",
         "automationId",
-        "serviceAccountId"
+        "serviceAccountId",
+        "accountRef"
       ]
     },
     "decision_event": {

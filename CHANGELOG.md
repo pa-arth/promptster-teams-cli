@@ -6,6 +6,25 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Cursor account identity, so "how many Cursor logins does this engineer use,
+  and which can't we read" becomes a number. `cursorVendorUsage`,
+  `cursorVendorSnapshot` and vendor absence records carry `accountRef`:
+  `hex(sha256(jwt.sub))[:16]` of the login that was read, or `"unknown"`. Hook
+  `ai_response` rows from `stop` carry `cursorAccountRef`: the matching login's
+  `accountRef` when the turn's `user_email` matches the store's
+  `cursorAuth/cachedEmail`, otherwise `unreadable:<8 hex>`; absent when the
+  payload has no email. Both emails are compared as
+  HMAC-SHA256 under a per-install key that never leaves the device, and no
+  email is stored or sent. Every login the vendor cycle has ever read on the
+  device (up to 16, least recently seen evicted) stays attributable, so
+  `unreadable:` means "no login in the map matched", not "not read this
+  cycle". With no map (before the first vendor cycle) the field is omitted.
+  With the org's `cursorVendorUsage` switch off, the vendor cycle deletes the
+  map, so the field is omitted there too. **Requires promptster-backend#920 deployed before release**,
+  or the fields are discarded at ingest.
+
 ## [0.27.1] — 2026-09-12
 
 ### Fixed

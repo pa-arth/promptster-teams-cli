@@ -49,7 +49,7 @@ func publishInstallationID(path, value string) string {
 		return ""
 	}
 	// #nosec G304 -- dir is always StateDir(), not user input.
-	tmp, err := os.CreateTemp(dir, "installation-id-*.tmp")
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+"-*.tmp")
 	if err != nil {
 		return ""
 	}
@@ -69,6 +69,44 @@ func publishInstallationID(path, value string) string {
 		return value
 	}
 	return readInstallationID(path)
+}
+
+// CursorAttributionKey is this installation's 32-byte HMAC key for matching a
+// Cursor hook's `user_email` to a readable Cursor login WITHOUT either email
+// leaving the device (openspec cursor-vendor-multi-account, Phase A).
+//
+// NEVER EMITTED. It lives beside the state it keys and nowhere else; an emitted
+// key would turn every `unreadable:<hmac8>` into a dictionary attack on the
+// engineer's address. Created once with the same atomic create-if-absent as
+// InstallationID, so concurrent first hooks agree on one key.
+//
+// Nil when the key cannot be persisted. Callers must then emit NOTHING rather
+// than use a throwaway key: a key that changes per process makes one login look
+// like a new unreadable account on every turn.
+func CursorAttributionKey() []byte {
+	path := filepath.Join(StateDir(), "cursor-attribution-key")
+	if key := readCursorAttributionKey(path); key != nil {
+		return key
+	}
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return nil
+	}
+	_ = publishInstallationID(path, hex.EncodeToString(raw[:]))
+	return readCursorAttributionKey(path)
+}
+
+func readCursorAttributionKey(path string) []byte {
+	// #nosec G304 -- callers pass only StateDir()/cursor-attribution-key.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	key, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil || len(key) != 32 {
+		return nil
+	}
+	return key
 }
 
 func readInstallationID(path string) string {

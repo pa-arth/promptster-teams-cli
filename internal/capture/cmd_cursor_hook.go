@@ -154,6 +154,15 @@ func runCursorHookInner() {
 		return
 	}
 
+	// Which Cursor login ran this turn (cursor-vendor-multi-account Phase A).
+	// Off the RAW payload: redaction has already rewritten the email in
+	// `redacted`. See cursorHookAccountRef for what is and is not kept.
+	if res.Step == "stop" {
+		if ref, ok := cursorHookAccountRef(raw); ok {
+			stampCursorAccountRef(res.Events, ref)
+		}
+	}
+
 	// Stamp the repo identity, exactly as the transcript rail does. This rail
 	// CLAIMS the session away from the watcher, so skipping it would silently
 	// lose repo attribution for every Cursor session on an enrolled machine.

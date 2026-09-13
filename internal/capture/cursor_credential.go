@@ -2,8 +2,11 @@ package capture
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/state"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; keeps the 6-platform cross-build CGO-free.
 )
 
@@ -46,6 +50,13 @@ const (
 	// process's memory before discarding it; the query below never asks for it.
 	cursorAuthAccessTokenKey  = "cursorAuth/accessToken"  // #nosec G101 -- a STORE KEY name, not a credential.
 	cursorAuthRefreshTokenKey = "cursorAuth/refreshToken" // #nosec G101 -- a STORE KEY name, not a credential.
+
+	// cursorAuthCachedEmailKey is the THIRD and last key, added for hook
+	// attribution (cursor-vendor-multi-account Phase A). Asked for BY NAME like
+	// the two above, and its value is HMAC'd inside the row scan: the raw address
+	// is never put in a map, a struct, a log line, a file or an event. See
+	// queryCursorAuthKeys.
+	cursorAuthCachedEmailKey = "cursorAuth/cachedEmail"
 
 	// cursorStateDBEnv is a TEST-ONLY override, ours rather than a documented
 	// Cursor variable (same status as PROMPTSTER_CURSOR_HOME). It exists so the
@@ -93,6 +104,13 @@ type cursorCredential struct {
 	// expiresAt is the `exp` claim, zero when unparseable. A PRE-FLIGHT ONLY —
 	// see readCursorCredential.
 	expiresAt time.Time
+	// accountRef names the Cursor login this token belongs to — see
+	// cursorAccountRef. Set even on an expired credential, so the absence that
+	// reports the expiry can say WHICH account expired.
+	accountRef string
+	// emailHMAC is hex HMAC-SHA256(installKey, lower(trim(cachedEmail))), "" when
+	// the store has no email or the install key is unavailable.
+	emailHMAC string
 }
 
 // cursorCredentialError names a failure without carrying a value.
@@ -171,7 +189,7 @@ func readCursorCredential() (cursorCredential, error) {
 		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no state store on this device")
 	}
 
-	values, _, err := readCursorAuthKeys(path)
+	values, emailHMAC, _, err := readCursorAuthKeys(path)
 	if err != nil {
 		return cursorCredential{}, err
 	}
@@ -186,12 +204,14 @@ func readCursorCredential() (cursorCredential, error) {
 		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the state store")
 	}
 
-	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token)}
+	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token),
+		accountRef: cursorAccountRef(token), emailHMAC: emailHMAC}
 	if !cred.expiresAt.IsZero() && time.Now().After(cred.expiresAt) {
 		// PRE-FLIGHT, not the authority. A 401 from the vendor is the other, and
 		// both resolve to the same emitted absence — the engineer must re-login
-		// in Cursor either way.
-		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialExpired, "the store's current token is past its exp claim")
+		// in Cursor either way. The account ref survives (the token does not) so
+		// the absence names the account that expired.
+		return cursorCredential{accountRef: cred.accountRef}, credentialErr(CursorVendorAbsenceCredentialExpired, "the store's current token is past its exp claim")
 	}
 	return cred, nil
 }
@@ -222,25 +242,29 @@ func readCursorCredential() (cursorCredential, error) {
 // snapshot and never the live store. That assertion is the guard on the whole
 // paragraph above: the rule is invisible in the type system and one refactor
 // away from being lost.
-func readCursorAuthKeys(path string) (map[string]string, string, error) {
+func readCursorAuthKeys(path string) (map[string]string, string, string, error) {
 	snapshot, cleanup, err := snapshotCursorStateDB(path)
 	if err != nil {
-		return nil, "", credentialErr(CursorVendorAbsenceCredentialAbsent, "state store could not be snapshotted")
+		return nil, "", "", credentialErr(CursorVendorAbsenceCredentialAbsent, "state store could not be snapshotted")
 	}
 	defer cleanup()
 
-	values, queryErr := queryCursorAuthKeys("file:" + escapeSQLiteURI(snapshot) + "?mode=ro")
+	values, emailHMAC, queryErr := queryCursorAuthKeys("file:"+escapeSQLiteURI(snapshot)+"?mode=ro", state.CursorAttributionKey())
 	if queryErr != nil {
-		return nil, snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, "state store unreadable")
+		return nil, "", snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, "state store unreadable")
 	}
-	return values, snapshot, nil
+	return values, emailHMAC, snapshot, nil
 }
 
-// queryCursorAuthKeys asks for two rows BY NAME and nothing else.
-func queryCursorAuthKeys(dsn string) (map[string]string, error) {
+// queryCursorAuthKeys asks for three rows BY NAME and nothing else.
+//
+// The two token rows come back in the map. The cachedEmail row NEVER does: it
+// is HMAC'd with installKey inside the scan and only the digest is returned, so
+// no caller of this function can hold the address even by mistake.
+func queryCursorAuthKeys(dsn string, installKey []byte) (map[string]string, string, error) {
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = db.Close() }()
 
@@ -248,29 +272,34 @@ func queryCursorAuthKeys(dsn string) (map[string]string, error) {
 	defer cancel()
 
 	rows, err := db.QueryContext(ctx,
-		`SELECT key, value FROM ItemTable WHERE key IN (?, ?)`,
-		cursorAuthAccessTokenKey, cursorAuthRefreshTokenKey)
+		`SELECT key, value FROM ItemTable WHERE key IN (?, ?, ?)`,
+		cursorAuthAccessTokenKey, cursorAuthRefreshTokenKey, cursorAuthCachedEmailKey)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = rows.Close() }()
 
 	out := map[string]string{}
+	emailHMAC := ""
 	for rows.Next() {
 		var key string
 		var value []byte
 		if err := rows.Scan(&key, &value); err != nil {
-			return nil, err
+			return nil, "", err
+		}
+		if key == cursorAuthCachedEmailKey {
+			emailHMAC = cursorEmailHMAC(installKey, string(value))
+			continue
 		}
 		out[key] = string(value)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(out) == 0 {
-		return nil, errors.New("no cursorAuth rows")
+		return nil, "", errors.New("no cursorAuth rows")
 	}
-	return out, nil
+	return out, emailHMAC, nil
 }
 
 // snapshotCursorStateDB puts a private, disposable copy of the store in a
@@ -356,21 +385,66 @@ func escapeSQLiteURI(path string) string {
 // will 401, and nothing more. An unparseable token yields a zero time, which
 // means "no pre-flight opinion" and lets the vendor decide.
 func cursorTokenExpiry(token string) time.Time {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		return time.Time{}
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return time.Time{}
-	}
-	var claims struct {
-		Exp int64 `json:"exp"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+	claims := cursorTokenClaims(token)
+	if claims.Exp <= 0 {
 		return time.Time{}
 	}
 	return time.Unix(claims.Exp, 0).UTC()
+}
+
+type cursorJWTClaims struct {
+	Exp int64  `json:"exp"`
+	Sub string `json:"sub"`
+}
+
+// cursorTokenClaims decodes the JWT payload locally: no signature check, no
+// network. Zero claims for anything unparseable.
+func cursorTokenClaims(token string) cursorJWTClaims {
+	var claims cursorJWTClaims
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return claims
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return claims
+	}
+	if json.Unmarshal(payload, &claims) != nil {
+		return cursorJWTClaims{}
+	}
+	return claims
+}
+
+// cursorAccountRefUnknown is the accountRef of a token with no parseable `sub`.
+const cursorAccountRefUnknown = "unknown"
+
+// cursorAccountRef is the wire identity of a Cursor login:
+// hex(sha256(jwt.sub))[:16], or "unknown".
+//
+// HASHED, NOT THE SUB ITSELF. `sub` is Cursor's user id for the login; the
+// backend only needs to tell logins apart and join them across events, and a
+// truncated digest does that without shipping the vendor's identifier.
+func cursorAccountRef(token string) string {
+	sub := strings.TrimSpace(cursorTokenClaims(token).Sub)
+	if sub == "" {
+		return cursorAccountRefUnknown
+	}
+	sum := sha256.Sum256([]byte(sub))
+	return hex.EncodeToString(sum[:])[:16]
+}
+
+// cursorEmailHMAC is hex HMAC-SHA256(installKey, lower(trim(email))), or ""
+// when there is no email or no key. The ONE place an email is reduced to
+// something this CLI may keep; both the store's cachedEmail and the hook's
+// user_email go through it, so they cannot be normalized differently.
+func cursorEmailHMAC(installKey []byte, email string) string {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || len(installKey) == 0 {
+		return ""
+	}
+	mac := hmac.New(sha256.New, installKey)
+	mac.Write([]byte(email))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 // cursorCredentialAbsence maps any error from this file onto the emitted

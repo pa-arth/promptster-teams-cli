@@ -108,6 +108,10 @@ type cursorVendorSnapshot struct {
 	Quota *cursorVendorQuotaReading
 	// Shape is what the vendor's response actually carried.
 	Shape cursorVendorShapeRecord
+	// AccountRef is the login this snapshot was read with (cursorAccountRef).
+	// Emitted on every row and on the completion; deliberately NOT a digest
+	// input — see canonicalRowLine for why the digest cannot widen on one side.
+	AccountRef string
 }
 
 // cursorVendorQuotaReading is the flattened quota reading.
@@ -378,6 +382,7 @@ func (s cursorVendorSnapshot) rowEvents(deviceID string) []event.Event {
 		putStr(data, "cloudAgentId", r.CloudAgentID)
 		putStr(data, "automationId", r.AutomationID)
 		putStr(data, "serviceAccountId", r.ServiceAccountID)
+		putStr(data, "accountRef", s.AccountRef)
 		e.Data = data
 
 		// snapshotId + ordinal, and NOTHING from the row. The row's own content
@@ -412,6 +417,7 @@ func (s cursorVendorSnapshot) completionEvent(deviceID string, capturedAt time.T
 		"rowCount":             len(s.Rows),
 		"contentSha256":        s.ContentSha256,
 	}
+	putStr(data, "accountRef", s.AccountRef)
 	applyQuotaFields(data, s.Quota)
 	applyShapeFields(data, s.Shape, cursorVersion)
 	e.Data = data
@@ -440,7 +446,11 @@ func (s cursorVendorSnapshot) completionEvent(deviceID string, capturedAt time.T
 // It stages NO rows and its status is `absent`, so a consumer must never let it
 // supersede the last good snapshot. An absence is a fact about the collector,
 // never a restatement of the account to zero.
-func buildCursorVendorAbsenceEvent(deviceID string, reason CursorVendorAbsenceReason,
+//
+// accountRef is the login the absence is FOR; "unknown" when no credential with
+// a parseable `sub` was read before the failure (including the kill switch,
+// which stops before the store is read at all).
+func buildCursorVendorAbsenceEvent(deviceID, accountRef string, reason CursorVendorAbsenceReason,
 	capturedAt time.Time, cycleStart, cycleEnd time.Time, shape cursorVendorShapeRecord) event.Event {
 
 	e := event.NewEvent("cursorVendorSnapshot", deviceID)
@@ -472,6 +482,7 @@ func buildCursorVendorAbsenceEvent(deviceID string, reason CursorVendorAbsenceRe
 		"rowCount":             0,
 		"contentSha256":        hex.EncodeToString(empty[:]),
 		"absenceReason":        string(reason),
+		"accountRef":           accountRef,
 	}
 	applyShapeFields(data, shape, shape.CursorVersion)
 	e.Data = data

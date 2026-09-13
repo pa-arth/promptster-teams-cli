@@ -34,18 +34,29 @@ func runCursorVendorUsageCollector(ctx context.Context, deviceID string, resolve
 }
 
 func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
+	accountRef := cursorAccountRefUnknown
 	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, reason, capturedAt, start, end, shape))
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
 	}
 	if !resolver.CursorVendorUsage() {
+		// The kill switch covers attribution too: without the map the hook stops
+		// stamping cursorAccountRef, instead of stamping refs from logins read
+		// while collection was still allowed.
+		forgetCursorAccountLogins()
 		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
 		return
 	}
 	cred, err := readCursorCredential()
+	if cred.accountRef != "" {
+		accountRef = cred.accountRef
+	}
 	if err != nil {
 		emitAbsence(cursorCredentialAbsence(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
 		return
 	}
+	// BEFORE any network call, so a vendor outage does not also turn every hook
+	// turn into `unreadable:` — the store WAS read; only the vendor failed.
+	recordCursorAccountReading(cred, time.Now())
 	onTeam, err := client.cursorAccountIsOnTeam(cred)
 	if err != nil {
 		emitAbsence(vendorAbsenceForError(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
@@ -83,6 +94,7 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 		}
 	}
 	snapshot := buildCursorVendorSnapshot(rows, start, end, quota, shape)
+	snapshot.AccountRef = cred.accountRef
 	queuedAll := true
 	for _, ev := range snapshot.rowEvents(deviceID) {
 		queuedAll = queueCursorVendorEvent(ev) && queuedAll
