@@ -38,11 +38,22 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
 		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
 	}
-	if !resolver.CursorVendorUsage() {
-		// The kill switch covers attribution too: without the map the hook stops
-		// stamping cursorAccountRef, instead of stamping refs from logins read
-		// while collection was still allowed.
-		forgetCursorAccountLogins()
+	if permitted, known := resolver.CursorVendorUsageDecision(); !permitted {
+		// Collection is fail-closed either way: no store is read on doubt.
+		//
+		// The login map is deleted ONLY on an affirmative "off" from a fresh
+		// policy. The kill switch covers attribution too, so the hook stops
+		// stamping refs from logins read while collection was allowed. A policy
+		// that is merely unknown or stale (DNS or timeout failures to the policy
+		// endpoint) is not a revocation. Deleting on it would permanently forget
+		// every login not signed in when the network came back (observed
+		// 2026-09-13).
+		//
+		// Both paths emit collector_not_permitted, whose contract already covers
+		// "the policy channel could not be reached and fail-closed denied the poll".
+		if known {
+			forgetCursorAccountLogins()
+		}
 		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
 		return
 	}

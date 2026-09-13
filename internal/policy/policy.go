@@ -222,6 +222,22 @@ func (r *Resolver) CursorVendorUsage() bool {
 	return r.cursorVendorUsage && !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
 }
 
+// CursorVendorUsageDecision is CursorVendorUsage plus whether the answer is an
+// ORG DECISION. known is true only when a successful fetch (or an adopted disk
+// cache of one) is younger than cacheTTL; permitted is never true without it.
+//
+// The tri-state exists because fail-closed collapses two different facts into
+// one false: "the org turned the collector off" (known, !permitted) and "we
+// could not ask" (!known — never fetched, or DNS/timeout failures aged the last
+// fetch out). Both must stop collection. Only the first may destroy state the
+// org's permission produced, because an outage is not a revocation.
+func (r *Resolver) CursorVendorUsageDecision() (permitted, known bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	known = !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
+	return known && r.cursorVendorUsage, known
+}
+
 // CaptureAssistantProse returns the current policy WITHOUT any network call:
 // the cached value from the last successful fetch, but only while it is still
 // within cacheTTL. It is false until a successful Refresh (or an adopted disk

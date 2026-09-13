@@ -23,6 +23,29 @@ func TestCursorVendorUsageFailsClosedAndExpires(t *testing.T) {
 	}
 }
 
+func TestCursorVendorUsageDecisionSeparatesUnknownFromOff(t *testing.T) {
+	for name, tc := range map[string]struct {
+		usage                bool
+		fetchedAt            time.Time
+		permitted, wantKnown bool
+	}{
+		"never fetched":   {usage: true, permitted: false, wantKnown: false},
+		"stale permitted": {usage: true, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
+		"stale off":       {usage: false, fetchedAt: time.Now().Add(-cacheTTL - time.Second), permitted: false, wantKnown: false},
+		"fresh off":       {usage: false, fetchedAt: time.Now(), permitted: false, wantKnown: true},
+		"fresh permitted": {usage: true, fetchedAt: time.Now(), permitted: true, wantKnown: true},
+	} {
+		r := &Resolver{cursorVendorUsage: tc.usage, fetchedAt: tc.fetchedAt}
+		permitted, known := r.CursorVendorUsageDecision()
+		if permitted != tc.permitted || known != tc.wantKnown {
+			t.Errorf("%s: permitted=%v known=%v, want %v %v", name, permitted, known, tc.permitted, tc.wantKnown)
+		}
+		if permitted != r.CursorVendorUsage() {
+			t.Errorf("%s: decision disagrees with CursorVendorUsage()", name)
+		}
+	}
+}
+
 // setup points the resolver at a test server + a scratch state dir.
 func setup(t *testing.T, handler http.HandlerFunc) {
 	t.Helper()
