@@ -28,6 +28,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -95,6 +96,12 @@ var backoffBase = 500 * time.Millisecond
 //
 // A var so tests can compress it.
 var LiveHorizon = 30 * time.Minute
+
+// CompactTailAfter is how many DELIVERED bytes may sit under an undelivered
+// tail before compact rewrites the tail instead of waiting for the lane to
+// drain fully — which a lane with a steady trickle never does. A var so tests
+// can shrink it.
+var CompactTailAfter int64 = 8 << 20
 
 // Lane is one of the two queues. Two files, two cursors, two locks, two
 // independent heads — the last of those is what stops a wedged replay from
@@ -181,7 +188,7 @@ func LaneFull(lane Lane) bool {
 		// and answering "full" would stall a watcher on a Stat hiccup.
 		return false
 	}
-	return fi.Size() >= OutboxMaxBytes
+	return fi.Size()-readCursor(lane) >= OutboxMaxBytes
 }
 
 // BothLanesFull reports whether NEITHER lane can accept an event — the only
@@ -284,7 +291,11 @@ func AppendTo(lane Lane, ev event.Event) error {
 		// the headroom live capture needs — the drop below is the failure this
 		// whole package exists to avoid, and letting one lane cause it in the
 		// other would undo the split.
-		if fi, err := os.Stat(p); err == nil && fi.Size() >= OutboxMaxBytes {
+		// Backlog = bytes past the cursor. The file itself also holds delivered
+		// bytes until compaction, and on 2026-09-13 a lane that never fully
+		// drained (vendor rows trickle in every poll) reached the cap on
+		// delivered bytes alone: 8,284 events dropped with ~3.5k pending.
+		if fi, err := os.Stat(p); err == nil && fi.Size()-readCursor(lane) >= OutboxMaxBytes {
 			// Dropping is a real loss of telemetry, never a normal condition, so
 			// it is reported unconditionally rather than through the debug-gated
 			// logger.
@@ -1224,17 +1235,68 @@ func compact(lane Lane, cursor int64) {
 		if err != nil {
 			return nil //nolint:nilerr // nothing to compact
 		}
-		if fi.Size() != cursor {
+		if fi.Size() == cursor {
+			if err := os.Truncate(lane.path(), 0); err != nil {
+				return err
+			}
+			return writeCursor(lane, 0)
+		}
+		if cursor < CompactTailAfter {
 			return nil // raced with an append — leave it for the next pass
 		}
-		if err := os.Truncate(lane.path(), 0); err != nil {
-			return err
-		}
-		return writeCursor(lane, 0)
+		// Delivered bytes have piled up under an undelivered tail. Rewrite the
+		// tail to a fresh file under the append lock, so the delivered prefix
+		// stops counting against the cap. ponytail: copies the whole tail; a
+		// tail near the cap costs one 64 MiB copy, fine at 8 MiB granularity.
+		return rewriteTail(lane, cursor)
 	})
 	if err != nil {
 		warnf("%s compaction failed (queue will keep growing until it succeeds): %v", lane.Name, err)
 	}
+}
+
+// rewriteTail copies lane.path()[cursor:] into a new file, renames it over the
+// queue and zeroes the cursor. Caller holds the lane's buffer lock, so no
+// append can land between the copy and the rename.
+func rewriteTail(lane Lane, cursor int64) error {
+	src, err := os.Open(lane.path())
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if _, err := src.Seek(cursor, io.SeekStart); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(lane.path()), "outbox-compact-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(name)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(name)
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		os.Remove(name)
+		return err
+	}
+	// Cursor first: a crash between the two leaves cursor=0 over the old file,
+	// which re-sends delivered events (idempotent) rather than skipping any.
+	if err := writeCursor(lane, 0); err != nil {
+		os.Remove(name)
+		return err
+	}
+	return os.Rename(name, lane.path())
 }
 
 // sleepCtx sleeps for d, returning false if ctx was cancelled first.

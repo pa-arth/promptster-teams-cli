@@ -174,8 +174,8 @@ func OutboxBytes() int64 {
 		if err != nil {
 			continue // missing file is an empty lane, not an error
 		}
-		if fi.Size() > max {
-			max = fi.Size()
+		if n := fi.Size() - readCursor(lane); n > max {
+			max = n
 		}
 	}
 	return max
