@@ -76,6 +76,15 @@ type presenceData struct {
 	// 62k-queued-from-three-weeks-ago.
 	PendingOldestEventAt string `json:"pendingOldestEventAt,omitempty"`
 
+	// Last drain outcome. Closed status/class fields only; no response body,
+	// event payload, endpoint, or credentials are sent.
+	DeliveryState        string `json:"deliveryState"`
+	DeliveryLane         string `json:"deliveryLane,omitempty"`
+	DeliveryFailureClass string `json:"deliveryFailureClass,omitempty"`
+	DeliveryHTTPStatus   int    `json:"deliveryHTTPStatus,omitempty"`
+	DeliveryMemberStatus int    `json:"deliveryMemberStatus,omitempty"`
+	DeliveryFailureAt    string `json:"deliveryFailureAt,omitempty"`
+
 	// DELIVERY LOSS. Three integers about the queue, never about its contents.
 	//
 	// PendingEvents above says how far behind delivery is. It cannot say whether
@@ -240,6 +249,7 @@ func buildPresenceEvent(session Session) event.Event {
 	// Read the backlog at BUILD time, so the numbers are stamped alongside the
 	// `ts` they describe rather than sampled at some later point in the funnel.
 	pending := outbox.PendingStateNow()
+	delivery := outbox.DeliveryHealthNow()
 	oldest := ""
 	// Only alongside a non-empty queue, and only from the same observation. An
 	// age reported next to a count of 0 would leave a three-week-old timestamp
@@ -271,6 +281,12 @@ func buildPresenceEvent(session Session) event.Event {
 		Watching:             watchedTools(),
 		PendingEvents:        pending.Count,
 		PendingOldestEventAt: oldest,
+		DeliveryState:        delivery.State,
+		DeliveryLane:         delivery.Lane,
+		DeliveryFailureClass: delivery.FailureClass,
+		DeliveryHTTPStatus:   delivery.HTTPStatus,
+		DeliveryMemberStatus: delivery.MemberStatus,
+		DeliveryFailureAt:    delivery.FailureAt,
 
 		// Read on the SAME beat and at the same instant as the backlog above, so
 		// the count, the age, the fill and the loss all describe one observation

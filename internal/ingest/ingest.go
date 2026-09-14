@@ -146,6 +146,15 @@ func (e *ingestHTTPError) Error() string {
 	return fmt.Sprintf("ingest failed: HTTP %d: %s", e.status, e.body)
 }
 
+// HTTPStatus returns a response status without exposing the response body.
+func HTTPStatus(err error) int {
+	var httpErr *ingestHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.status
+	}
+	return 0
+}
+
 // IsRateLimited reports whether err is a 429, and returns the server's
 // Retry-After delay (0 when the header was absent or unparseable).
 func IsRateLimited(err error) (time.Duration, bool) {
