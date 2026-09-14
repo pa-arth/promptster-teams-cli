@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.1] — 2026-09-13
+
+### Fixed
+
+- A failed policy fetch no longer forgets Cursor logins. The vendor cycle
+  deleted the login map whenever `cursorVendorUsage` resolved false, and that
+  included a policy that was never fetched, whose last successful fetch was more
+  than 15 minutes old (DNS or timeout failures to the policy endpoint), or whose
+  response omitted the field. Every login not signed in when the network came
+  back was then lost, and its hook turns read `unreadable:` or untagged until
+  that account was read again. Observed 2026-09-13, when a second login was
+  forgotten. The map is now deleted only on an explicit `cursorVendorUsage:
+  false` from a fresh, successful fetch. Collection itself still stops on doubt,
+  and both cases still emit a `collector_not_permitted` absence. The policy
+  cache now records whether the field was present, so an omitted value does not
+  become an explicit `false` after a restart. No wire change.
+
 ## [0.28.0] — 2026-09-13
 
 ### Added
@@ -2488,7 +2505,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.26.0...v0.27.0
