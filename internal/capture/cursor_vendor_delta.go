@@ -48,6 +48,7 @@ func loadCursorVendorSeen() cursorVendorSeenState {
 	if cursorVendorSeenMemory.loaded && cursorVendorSeenMemory.path == path {
 		return cursorVendorSeenMemory.state
 	}
+	// #nosec G304 -- path is the fixed cursor-vendor-seen-v2.json under state.StateDir(), never an event field.
 	b, err := os.ReadFile(path)
 	var found cursorVendorSeenState
 	if err != nil || json.Unmarshal(b, &found) != nil || found.Pools == nil {
