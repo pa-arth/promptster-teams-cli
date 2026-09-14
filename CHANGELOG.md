@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.2] — 2026-09-14
+
+### Fixed
+
+- The outbox cap, the drop check and the reported outbox bytes now measure the
+  undelivered tail (`size − cursor`), not the file. Compaction rewrites the tail
+  once 8 MiB of delivered bytes sit under it instead of waiting for a lane to
+  drain completely, which a lane with a steady vendor trickle never does. On
+  2026-09-13 one device reached the 64 MiB cap on delivered bytes alone and
+  dropped 8,284 events with ~3.5k pending.
+
 ## [0.28.1] — 2026-09-14
 
 ### Fixed
