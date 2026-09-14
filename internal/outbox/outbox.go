@@ -1008,6 +1008,29 @@ func advanceOver(chunk []chunkLine, results []ingest.BatchMemberResult) (advance
 	return advance, lines
 }
 
+// firstBlockedMemberStatus mirrors advanceOver's ordered member lookup. A
+// missing result is a failure too, even when earlier members were accepted.
+func firstBlockedMemberStatus(results []ingest.BatchMemberResult, count int) (int, bool) {
+	byIndex := make(map[int]int, len(results))
+	for _, result := range results {
+		byIndex[result.Index] = result.Status
+	}
+	for index := 0; index < count; index++ {
+		status, found := byIndex[index]
+		if !found || !memberAdvanceable(status) {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+func blockedStatusOrMissing(status int) int {
+	if status == 0 {
+		return -1
+	}
+	return status
+}
+
 // deliverChunk delivers one chunk as a single batch request.
 //
 // Returns how many bytes the cursor may advance, how many lines that covers, and
@@ -1052,8 +1075,13 @@ func deliverChunk(
 		switch {
 		case err == nil:
 			adv, n := advanceOver(chunk, results)
+			blockedStatus, blocked := firstBlockedMemberStatus(results, len(bodies))
 			if adv > 0 {
-				recordDeliverySuccess(lane.Name)
+				if blocked {
+					recordDeliveryFailure(lane.Name, nil, blockedStatusOrMissing(blockedStatus))
+				} else {
+					recordDeliverySuccess(lane.Name)
+				}
 				if attempt >= stuckAttemptThreshold {
 					warnf("recovered — delivered %d event(s) after %d attempt(s) over %s",
 						n, attempt+1, time.Since(started).Round(time.Second))
@@ -1064,19 +1092,9 @@ func deliverChunk(
 			// result is missing). Retry only that member. Re-sending the rest of a
 			// 500-event chunk cannot move the ordered cursor and needlessly repeats
 			// backend validation and writes while the head is blocked.
-			headStatus := 0 // no result row
-			for _, result := range results {
-				if result.Index == 0 {
-					headStatus = result.Status
-					break
-				}
-			}
+			headStatus := blockedStatus // zero means no result row
 			err = fmt.Errorf("batch head not advanceable (member status %d)", headStatus)
-			if headStatus == 0 {
-				recordDeliveryFailure(lane.Name, err, -1)
-			} else {
-				recordDeliveryFailure(lane.Name, err, headStatus)
-			}
+			recordDeliveryFailure(lane.Name, err, blockedStatusOrMissing(headStatus))
 			memberFailure = true
 			bodies = bodies[:1]
 

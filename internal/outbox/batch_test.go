@@ -818,3 +818,25 @@ func TestBatchRetriesOnlyBlockedHead(t *testing.T) {
 		t.Fatalf("queue not drained after recovery: %d pending", PendingCount())
 	}
 }
+
+func TestBatchAcceptedPrefixStillReportsBlockedMember(t *testing.T) {
+	newBatchTest(t)
+	t.Cleanup(func() { recordDeliverySuccess("live") })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		respond207(w, []int{http.StatusCreated, http.StatusServiceUnavailable})
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+	chunk := []chunkLine{
+		{size: 4, body: []byte(`{"id":"a"}`)},
+		{size: 4, body: []byte(`{"id":"b"}`)},
+	}
+	advance, lines, fallback := deliverChunk(context.Background(), srv.Client(), "PSE-TEST", testBatchPath, Lane{Name: "live"}, chunk)
+	if advance != 4 || lines != 1 || fallback {
+		t.Fatalf("partial 207 cursor = %d bytes, %d lines, fallback %v", advance, lines, fallback)
+	}
+	health := DeliveryHealthNow()
+	if health.State != "retrying" || health.MemberStatus != http.StatusServiceUnavailable || health.Lane != "live" {
+		t.Fatalf("accepted prefix hid blocked member: %+v", health)
+	}
+}
