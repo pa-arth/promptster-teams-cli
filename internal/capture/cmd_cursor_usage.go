@@ -105,11 +105,7 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 		}
 	}
 	snapshot := buildCursorVendorSnapshot(cred.accountRef, rows, start, end, quota, shape)
-	queuedAll := true
-	for _, ev := range snapshot.rowEvents(deviceID) {
-		queuedAll = queueCursorVendorEvent(ev) && queuedAll
-	}
-	queuedAll = queueCursorVendorEvent(snapshot.completionEvent(deviceID, capturedAt, shape.CursorVersion)) && queuedAll
+	queuedAll := queueCursorVendorSnapshotV2(snapshot, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorEvent)
 	if queuedAll {
 		recordCursorVendorCostClaims(rows)
 	}

@@ -134,6 +134,12 @@ var kindsNotEmittedOnDevice = map[string]string{
 // lack, so nobody ever revisits it, and the open question is retired by filing
 // rather than by deciding. The two tables are asserted disjoint.
 var serverOnlyFields = map[string]map[string]string{
+	"cursorVendorUsage": {
+		"teamId": "This CLI vendor collector reads the personal billing scope and does not select a Cursor team id; the backend also accepts team-scoped reports from newer clients.",
+	},
+	"cursorVendorSnapshot": {
+		"teamId": "Same as cursorVendorUsage.teamId: this collector has no team-scope selection to report.",
+	},
 	"ai_response": {
 		"costUsd": "The CLI has no cost figure to send — it emits tokens and the backend prices " +
 			"them. This is the provider's own per-request number off the OTel wire " +
@@ -278,6 +284,12 @@ var deviceOnlyFields = map[string]map[string]string{
 			"instead of two that can disagree. NOT a silent drop — but nothing in " +
 			"captureAllowlist.ts says so, which is why it is written down here. Emitted at " +
 			"internal/capture/presence.go:139.",
+		"deliveryState":        "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
+		"deliveryLane":         "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
+		"deliveryFailureClass": "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
+		"deliveryHTTPStatus":   "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
+		"deliveryMemberStatus": "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
+		"deliveryFailureAt":    "Bounded drain status consumed from the raw presence beat by teams-ingest.ts and written to operational logs; no payload or response body.",
 		"pendingOldestEventAt": "Same beat, same pre-projection path; lands in " +
 			"engineer_keys.latest_pending_oldest_event_at. The two move as one — the count alone " +
 			"cannot tell 62k-queued-five-minutes-ago from 62k-queued-three-weeks-ago.",
@@ -362,7 +374,14 @@ var deviceOnlyFields = map[string]map[string]string{
 	"heartbeat": {
 		"pendingEvents": "Mirrors presence.pendingEvents for the server's other accepted beat " +
 			"spelling. This CLI constructs no `heartbeat` event, so no bytes leave here for it today.",
-		"pendingOldestEventAt":   "Mirrors presence.pendingOldestEventAt, same reason.",
+		"pendingOldestEventAt": "Mirrors presence.pendingOldestEventAt, same reason.",
+		"deliveryState":        "Mirrors presence.deliveryState for the server's other accepted beat spelling.",
+		"deliveryLane":         "Mirrors presence.deliveryLane for the server's other accepted beat spelling.",
+		"deliveryFailureClass": "Mirrors presence.deliveryFailureClass for the server's other accepted beat spelling.",
+		"deliveryHTTPStatus":   "Mirrors presence.deliveryHTTPStatus for the server's other accepted beat spelling.",
+		"deliveryMemberStatus": "Mirrors presence.deliveryMemberStatus for the server's other accepted beat spelling.",
+		"deliveryFailureAt":    "Mirrors presence.deliveryFailureAt for the server's other accepted beat spelling.",
+
 		"droppedEvents":          "Mirrors presence.droppedEvents for the server's other accepted beat spelling.",
 		"outboxBytes":            "Mirrors presence.outboxBytes, same reason.",
 		"outboxCapacityBytes":    "Mirrors presence.outboxCapacityBytes, same reason.",

@@ -6,6 +6,13 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.3] — 2026-09-14
+
+### Fixed
+
+- Send Cursor vendor usage as a content-addressed row pool with compact completion manifests. Unchanged polls no longer re-enqueue the entire billing cycle; corrections send only changed rows, and account switches reuse the pool without double-counting.
+- Report bounded per-lane delivery outcomes on device heartbeats, including retryable HTTP 207 member statuses and timeouts.
+
 ## [0.28.2] — 2026-09-14
 
 ### Fixed
@@ -2507,7 +2514,9 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.3...HEAD
+[0.28.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.2...v0.28.3
+[0.28.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.0...v0.27.1

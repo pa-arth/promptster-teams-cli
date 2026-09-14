@@ -807,7 +807,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 					if ctx.Err() != nil {
 						return delivered, nil
 					}
-					if ln.body != nil && !deliver(ctx, client, apiKey, ln.body) {
+					if ln.body != nil && !deliver(ctx, client, apiKey, lane, ln.body) {
 						return delivered, nil // ctx cancelled mid-retry
 					}
 					cursor += ln.size
@@ -856,7 +856,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 		if err != nil {
 			break // partial trailing line — an append is mid-flight; next pass
 		}
-		if !deliver(ctx, client, apiKey, line) {
+		if !deliver(ctx, client, apiKey, lane, line) {
 			return delivered, nil // ctx cancelled mid-retry; cursor stays put
 		}
 		cursor += int64(len(line))
@@ -1008,6 +1008,29 @@ func advanceOver(chunk []chunkLine, results []ingest.BatchMemberResult) (advance
 	return advance, lines
 }
 
+// firstBlockedMemberStatus mirrors advanceOver's ordered member lookup. A
+// missing result is a failure too, even when earlier members were accepted.
+func firstBlockedMemberStatus(results []ingest.BatchMemberResult, count int) (int, bool) {
+	byIndex := make(map[int]int, len(results))
+	for _, result := range results {
+		byIndex[result.Index] = result.Status
+	}
+	for index := 0; index < count; index++ {
+		status, found := byIndex[index]
+		if !found || !memberAdvanceable(status) {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+func blockedStatusOrMissing(status int) int {
+	if status == 0 {
+		return -1
+	}
+	return status
+}
+
 // deliverChunk delivers one chunk as a single batch request.
 //
 // Returns how many bytes the cursor may advance, how many lines that covers, and
@@ -1046,21 +1069,34 @@ func deliverChunk(
 	started := time.Now()
 	var lastWarn time.Time
 	for {
+		memberFailure := false
 		results, err := ingest.IngestBatchWithClient(client, endpoint, bodies, apiKey, lane.Name)
 
 		switch {
 		case err == nil:
 			adv, n := advanceOver(chunk, results)
+			blockedStatus, blocked := firstBlockedMemberStatus(results, len(bodies))
 			if adv > 0 {
+				if blocked {
+					recordDeliveryFailure(lane.Name, nil, blockedStatusOrMissing(blockedStatus))
+				} else {
+					recordDeliverySuccess(lane.Name)
+				}
 				if attempt >= stuckAttemptThreshold {
 					warnf("recovered — delivered %d event(s) after %d attempt(s) over %s",
 						n, attempt+1, time.Since(started).Round(time.Second))
 				}
 				return adv, n, false
 			}
-			// The head member was answered for, and the answer was neither
-			// acceptance nor rejection (403, 500, or no row at all). Nothing can
-			// advance past it, so this is the retry-in-place case.
+			// The head member was answered for, but is not advanceable (or its
+			// result is missing). Retry only that member. Re-sending the rest of a
+			// 500-event chunk cannot move the ordered cursor and needlessly repeats
+			// backend validation and writes while the head is blocked.
+			headStatus := blockedStatus // zero means no result row
+			err = fmt.Errorf("batch head not advanceable (member status %d)", headStatus)
+			recordDeliveryFailure(lane.Name, err, blockedStatusOrMissing(headStatus))
+			memberFailure = true
+			bodies = bodies[:1]
 
 		case ingest.IsBatchUnsupported(err):
 			// The policy advertises a route this backend does not serve — a
@@ -1094,12 +1130,15 @@ func deliverChunk(
 			wait = backoffFor(attempt)
 		}
 		attempt++
+		if !memberFailure {
+			recordDeliveryFailure(lane.Name, err, 0)
+		}
 
 		if attempt >= stuckAttemptThreshold && time.Since(lastWarn) >= stuckRepeatInterval {
-			warnf("STUCK on a %d-event batch for %s (%d attempts): %v — events are being captured "+
+			warnf("STUCK on batch head (original batch %d events) for %s (%d attempts): %v — events are being captured "+
 				"and queued but are NOT reaching the backend. Check that this device's engineer key "+
 				"is still valid and the API is reachable; %d event(s) are waiting.",
-				len(bodies), time.Since(started).Round(time.Second), attempt, err, PendingCount())
+				len(chunk), time.Since(started).Round(time.Second), attempt, err, PendingCount())
 			lastWarn = time.Now()
 		} else {
 			state.HookDebugf("outbox: batch delivery failed (%d events), retrying in %s: %v",
@@ -1118,7 +1157,7 @@ func deliverChunk(
 // re-marshalling them could change the canonical form the backend verifies
 // against (see ingest.IngestRawEventWithClient). The event is parsed only to
 // name its kind in log lines.
-func deliver(ctx context.Context, client *http.Client, apiKey string, line []byte) bool {
+func deliver(ctx context.Context, client *http.Client, apiKey string, lane Lane, line []byte) bool {
 	body := []byte(strings.TrimSpace(string(line)))
 	if len(body) == 0 {
 		return true // blank line: nothing to send, advance past it
@@ -1139,6 +1178,7 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, line []byt
 	for {
 		err := ingest.IngestRawEventWithClient(client, body, apiKey)
 		if err == nil {
+			recordDeliverySuccess(lane.Name)
 			// Say so if we previously complained, or the operator is left with a
 			// scary warning and no idea it cleared.
 			if attempt >= stuckAttemptThreshold {
@@ -1151,6 +1191,7 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, line []byt
 		// kind an older backend doesn't accept). Retrying can never help, and
 		// the channel itself is healthy — skip it.
 		if ingest.IsIngestRejection(err) {
+			recordDeliverySuccess(lane.Name)
 			state.HookDebugf("outbox: event rejected by backend (%s): %v", meta.Kind, err)
 			return true
 		}
@@ -1166,6 +1207,7 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, line []byt
 			wait = backoffFor(attempt)
 		}
 		attempt++
+		recordDeliveryFailure(lane.Name, err, 0)
 
 		// Escalate a persistently failing head-of-queue from debug to LOUD.
 		//
