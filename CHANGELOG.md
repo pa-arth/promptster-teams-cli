@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.28.1] — 2026-09-14
+
+### Fixed
+
+- Scope Cursor vendor snapshot and absence identifiers to the IDE login's account, so switching IDE accounts cannot reuse the prior account's identifiers. An IDE token without a parseable account subject is treated as absent and is never sent to the vendor API.
+- Keep the recent Cursor login attribution map when an organization policy is stale; clear it only when the policy explicitly disables vendor usage.
+
+
 ## [0.28.0] — 2026-09-13
 
 ### Added
@@ -2488,7 +2496,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...HEAD
+[0.28.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...v0.28.1
 [0.28.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.1...v0.28.0
 [0.27.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.27.0...v0.27.1
 [0.27.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.26.0...v0.27.0
