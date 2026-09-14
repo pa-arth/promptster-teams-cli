@@ -627,3 +627,75 @@ func TestTheFullQueueWarningDoesNotPromiseTheLedgerStillHasIt(t *testing.T) {
 		t.Errorf("warning spans %d extra lines, want one: %q", n+1, got)
 	}
 }
+
+// TestCompactRewritesTailWhenDeliveredBytesPileUp pins the 2026-09-13 loss: a
+// lane that never fully drains used to keep every delivered byte until the file
+// hit the cap, then drop new events with only a few thousand pending.
+func TestCompactRewritesTailWhenDeliveredBytesPileUp(t *testing.T) {
+	laneTest(t)
+	prev := CompactTailAfter
+	CompactTailAfter = 1
+	t.Cleanup(func() { CompactTailAfter = prev })
+
+	lane := LaneLive()
+	for _, k := range []string{"a", "b", "c"} {
+		if err := Append(event.NewEvent(k, "sess-test")); err != nil {
+			t.Fatalf("Append(%s): %v", k, err)
+		}
+	}
+	data, err := os.ReadFile(lane.path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	delivered := int64(len(lines[0]) + len(lines[1]))
+	if err := writeCursor(lane, delivered); err != nil {
+		t.Fatal(err)
+	}
+
+	compact(lane, delivered)
+
+	got, err := os.ReadFile(lane.path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != lines[2] {
+		t.Errorf("tail after compact = %q, want only the undelivered line %q", got, lines[2])
+	}
+	if c := readCursor(lane); c != 0 {
+		t.Errorf("cursor after compact = %d, want 0", c)
+	}
+	if n := pendingCountIn(lane); n != 1 {
+		t.Errorf("pending after compact = %d, want 1", n)
+	}
+}
+
+// TestFullCheckMeasuresBacklogNotFileSize: a lane whose delivered prefix alone
+// reaches the cap must still accept events — only the undelivered tail counts.
+func TestFullCheckMeasuresBacklogNotFileSize(t *testing.T) {
+	laneTest(t)
+	lane := LaneLive()
+	f, err := os.OpenFile(lane.path(), os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(OutboxMaxBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	if err := writeCursor(lane, OutboxMaxBytes+1); err != nil {
+		t.Fatal(err)
+	}
+	if LaneFull(lane) {
+		t.Fatal("LaneFull = true with zero backlog")
+	}
+	if err := Append(event.NewEvent("live-prompt", "sess-test")); err != nil {
+		t.Fatalf("Append over a fully-delivered prefix: %v", err)
+	}
+	if n := pendingCountIn(lane); n != 1 {
+		t.Errorf("pending = %d, want 1", n)
+	}
+	if b := OutboxBytes(); b <= 0 || b > 4096 {
+		t.Errorf("OutboxBytes = %d, want the one queued line, not the delivered prefix", b)
+	}
+}
