@@ -35,7 +35,7 @@ func makeCursorStateDB(t *testing.T, values map[string]string) string {
 
 func jwtWithExpiry(t *testing.T, expires time.Time, marker string) string {
 	t.Helper()
-	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d,"marker":%q}`, expires.Unix(), marker)))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"sub":"user_test","exp":%d,"marker":%q}`, expires.Unix(), marker)))
 	return "eyJhbGciOiJub25lIn0." + payload + ".signature"
 }
 

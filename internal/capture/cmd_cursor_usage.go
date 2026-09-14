@@ -104,8 +104,7 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 			quota.AbsenceReason = CursorVendorAbsenceVendorReportedNone
 		}
 	}
-	snapshot := buildCursorVendorSnapshot(rows, start, end, quota, shape)
-	snapshot.AccountRef = cred.accountRef
+	snapshot := buildCursorVendorSnapshot(cred.accountRef, rows, start, end, quota, shape)
 	queuedAll := true
 	for _, ev := range snapshot.rowEvents(deviceID) {
 		queuedAll = queueCursorVendorEvent(ev) && queuedAll
@@ -170,7 +169,8 @@ func httpStatusFor(err error) int {
 	return 0
 }
 
-func queueCursorVendorEvent(ev event.Event) bool {
+// queueCursorVendorEvent is a var so tests can capture the emitted events.
+var queueCursorVendorEvent = func(ev event.Event) bool {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: buffer error: %v\n", err)
 	}

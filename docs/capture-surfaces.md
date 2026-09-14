@@ -204,11 +204,20 @@ re-uploads months of unbounded history.
 
 On macOS, the background watcher also measures the engineer's current Cursor
 billing period every 15 minutes when the organization policy explicitly permits
-`cursorVendorUsage`. It creates a private copy-on-write temporary clone of
+`cursorVendorUsage`. It reads the Cursor IDE's signed-in login, fresh each
+cycle, which covers each account the engineer signs into over time. It creates a
+private copy-on-write temporary clone of
 `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (falling
-back to a byte copy), reads only `cursorAuth/accessToken` and
-`cursorAuth/refreshToken` from that clone, then deletes it. It never opens the
-live database and never reads neighbouring keys.
+back to a byte copy), reads only `cursorAuth/accessToken`,
+`cursorAuth/refreshToken` and `cursorAuth/cachedEmail` from that clone, then
+deletes it. It never opens the live database and never reads neighbouring keys.
+
+The email is reduced on the device to an HMAC under a local install key, and is
+used only to tell which login ran a hook turn. Each login is identified on the
+wire as `accountRef = hex(sha256(sub))[:16]`, and snapshot and absence ids are
+scoped by it, so two logins with identical billing periods never share an id. A
+token with no parseable `sub` is treated as no credential. No credential or
+email is stored or sent to Promptster.
 
 The credential is used only as an Authorization header for three operations at
 `api2.cursor.sh`: `GetTeams` (to refuse individual-account collection for Teams

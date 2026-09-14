@@ -137,7 +137,7 @@ func cmdLogin(args []string) {
 	}
 
 	if startErr == nil {
-		printlnIndent(dimStyle.Render("Cursor vendor usage: every 15 min Promptster clones Cursor's local state.vscdb, reads only its two auth-token keys plus the signed-in email (hashed on this device with a local key to tell Cursor logins apart; the email is never stored or sent), and calls api2.cursor.sh usage, billing-period, and team-membership endpoints. The token is never sent to Promptster."))
+		printlnIndent(dimStyle.Render("Cursor vendor usage: every 15 min Promptster reads the Cursor IDE's signed-in login, including each account you sign into over time. It clones Cursor's local state.vscdb and reads only the auth-token keys and the signed-in email. The email is hashed on this device with a local key to tell Cursor logins apart. It then calls api2.cursor.sh usage, billing-period, and team-membership endpoints for that login. No credential or email is ever stored or sent to Promptster."))
 		enableAutostartOnLogin()
 		enableStatuslineOnLogin()
 	}

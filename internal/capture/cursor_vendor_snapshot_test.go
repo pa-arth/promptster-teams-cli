@@ -127,8 +127,8 @@ func TestSnapshotIsDeterministicAndCompletionIsLastContract(t *testing.T) {
 	one, two := int64(1), int64(2)
 	r1 := cursorVendorRow{Timestamp: "1785542400000", ConversationID: "b", TokenUsage: &cursorVendorTokenUsage{InputTokens: &one}}
 	r2 := cursorVendorRow{Timestamp: "1785542401000", ConversationID: "a", TokenUsage: &cursorVendorTokenUsage{InputTokens: &two}}
-	a := buildCursorVendorSnapshot([]cursorVendorRow{r1, r2}, start, end, nil, cursorVendorShapeRecord{ObservedFields: []string{"timestamp"}, HTTPStatus: 200})
-	b := buildCursorVendorSnapshot([]cursorVendorRow{r2, r1}, start, end, nil, a.Shape)
+	a := buildCursorVendorSnapshot("0123456789abcdef", []cursorVendorRow{r1, r2}, start, end, nil, cursorVendorShapeRecord{ObservedFields: []string{"timestamp"}, HTTPStatus: 200})
+	b := buildCursorVendorSnapshot("0123456789abcdef", []cursorVendorRow{r2, r1}, start, end, nil, a.Shape)
 	if a.SnapshotID != b.SnapshotID || a.ContentSha256 != b.ContentSha256 || !reflect.DeepEqual(a.Rows, b.Rows) {
 		t.Fatal("snapshot depends on pagination order")
 	}
