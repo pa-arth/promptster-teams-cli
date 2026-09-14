@@ -2,6 +2,7 @@ package capture
 
 import (
 	"encoding/base64"
+	"os"
 	"testing"
 	"time"
 
@@ -131,6 +132,26 @@ func TestCursorVendorV2ManifestChangesWhenSnapshotDigestDoesNot(t *testing.T) {
 	queueCursorVendorSnapshotV2(second, "device-a", start.Add(2*time.Hour), "", enqueue)
 	if len(sent) != 2 || vendorV2Data(sent[1])["manifest"] == nil || vendorV2Data(sent[1])["manifestSha256"] == oldManifestHash {
 		t.Fatal("noncanonical row change did not send a new row and manifest")
+	}
+}
+
+func TestCursorVendorV2KeepsQueuedHashesWhenCheckpointIsStale(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", dir)
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	snap := buildCursorVendorSnapshot("account-a", []cursorVendorRow{{Timestamp: "1788200000000", ConversationID: "a"}}, start, start.Add(30*24*time.Hour), nil, cursorVendorShapeRecord{})
+	var sent []event.Event
+	enqueue := func(ev event.Event) bool { sent = append(sent, ev); return true }
+	queueCursorVendorSnapshotV2(snap, "device-a", start.Add(time.Hour), "", enqueue)
+	// A stale or failed disk checkpoint must not discard the successful queue
+	// update kept in this process. The next poll only sends its completion.
+	if err := os.WriteFile(cursorVendorSeenPath(), []byte(`{"pools":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sent = nil
+	queueCursorVendorSnapshotV2(snap, "device-a", start.Add(2*time.Hour), "", enqueue)
+	if len(sent) != 1 || sent[0].Kind != "cursorVendorSnapshot" {
+		t.Fatalf("stale checkpoint requeued historical rows: %d events", len(sent))
 	}
 }
 

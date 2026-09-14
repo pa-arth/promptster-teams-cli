@@ -5,9 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -27,15 +29,33 @@ type cursorVendorSeenState struct {
 	Pools map[string]cursorVendorSeenPool `json:"pools"`
 }
 
+// A failed disk checkpoint must not make every poll in this process replay the
+// historical cycle. Keep the queued identities in memory and retry the atomic
+// disk write on the next successful poll. A restart with an unwritable state
+// directory can still resend, but stable event IDs make that resend idempotent.
+var cursorVendorSeenMemory struct {
+	sync.Mutex
+	path   string
+	state  cursorVendorSeenState
+	loaded bool
+}
+
 func cursorVendorSeenPath() string {
 	return filepath.Join(state.StateDir(), "cursor-vendor-seen-v2.json")
 }
 func loadCursorVendorSeen() cursorVendorSeenState {
-	b, err := os.ReadFile(cursorVendorSeenPath())
+	path := cursorVendorSeenPath()
+	if cursorVendorSeenMemory.loaded && cursorVendorSeenMemory.path == path {
+		return cursorVendorSeenMemory.state
+	}
+	b, err := os.ReadFile(path)
 	var found cursorVendorSeenState
 	if err != nil || json.Unmarshal(b, &found) != nil || found.Pools == nil {
-		return cursorVendorSeenState{Pools: map[string]cursorVendorSeenPool{}}
+		found = cursorVendorSeenState{Pools: map[string]cursorVendorSeenPool{}}
 	}
+	cursorVendorSeenMemory.path = path
+	cursorVendorSeenMemory.state = found
+	cursorVendorSeenMemory.loaded = true
 	return found
 }
 func saveCursorVendorSeen(found cursorVendorSeenState) error {
@@ -53,16 +73,13 @@ func saveCursorVendorSeen(found cursorVendorSeenState) error {
 	}
 	defer os.Remove(tmp.Name())
 	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
+		return errors.Join(err, tmp.Close())
 	}
 	if err := tmp.Close(); err != nil {
 		return err
@@ -77,6 +94,8 @@ func saveCursorVendorSeen(found cursorVendorSeenState) error {
 // content digest still validates the reconstructed snapshot before publication.
 func queueCursorVendorSnapshotV2(snapshot cursorVendorSnapshot, deviceID string,
 	capturedAt time.Time, cursorVersion string, enqueue func(event.Event) bool) bool {
+	cursorVendorSeenMemory.Lock()
+	defer cursorVendorSeenMemory.Unlock()
 	poolSum := sha256.Sum256([]byte("cursor-vendor-pool/v2\x00" + deviceID + "\x00" +
 		snapshot.CycleStart.UTC().Format(cursorVendorCycleTimeFormat) + "\x00" +
 		snapshot.CycleEnd.UTC().Format(cursorVendorCycleTimeFormat)))
@@ -167,6 +186,7 @@ func queueCursorVendorSnapshotV2(snapshot cursorVendorSnapshot, deviceID string,
 			pool.Hashes[hash] = true
 		}
 		stored.Pools[poolID] = pool
+		cursorVendorSeenMemory.state = stored
 		for id, old := range stored.Pools {
 			if id != poolID && capturedAt.Sub(old.LastSeenAt) > 40*24*time.Hour {
 				delete(stored.Pools, id)
