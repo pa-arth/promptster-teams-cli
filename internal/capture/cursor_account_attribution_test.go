@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"regexp"
 	"strings"
@@ -14,7 +15,6 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
-	"github.com/pa-arth/promptster-teams-cli/internal/policy"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -109,7 +109,10 @@ func TestCursorVendorPollPolicyOffForgetsLogins(t *testing.T) {
 		t.Fatalf("precondition: login map not written: %v", err)
 	}
 
-	off := &policy.Resolver{} // never fetched: CursorVendorUsage() is false
+	off := fetchedCursorPolicy(t, http.StatusOK, `{"cursorVendorUsage":false}`) // an affirmative, fresh "off"
+	if _, known := off.CursorVendorUsageDecision(); !known {
+		t.Fatal("precondition: the policy fetch did not succeed")
+	}
 	pollCursorVendorUsage("dev", off, nil, time.Now())
 	if _, err := os.Stat(cursorAccountReadingPath()); !os.IsNotExist(err) {
 		t.Fatalf("policy off left the login map in place: %v", err)
