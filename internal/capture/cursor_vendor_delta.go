@@ -120,9 +120,6 @@ func queueCursorVendorSnapshotV2(snapshot cursorVendorSnapshot, deviceID string,
 	// repair clock; genuinely unseen rows are queued regardless of this flag.
 	repair := (lastRepair.IsZero() && len(pool.Hashes) == 0) ||
 		(!lastRepair.IsZero() && (repairAge < 0 || repairAge >= cursorVendorRepairInterval))
-	if lastRepair.IsZero() || repair {
-		pool.LastRepairByAccount[snapshot.AccountRef] = capturedAt.UTC()
-	}
 
 	events := snapshot.rowEvents(deviceID)
 	manifest := make([]byte, 0, 16*len(events))
@@ -180,6 +177,9 @@ func queueCursorVendorSnapshotV2(snapshot cursorVendorSnapshot, deviceID string,
 	}
 	if queuedAll {
 		pool.LastSeenAt = capturedAt.UTC()
+		if lastRepair.IsZero() || repair {
+			pool.LastRepairByAccount[snapshot.AccountRef] = capturedAt.UTC()
+		}
 		pool.LastSnapshotByAccount[snapshot.AccountRef] = snapshot.SnapshotID
 		pool.LastManifestByAccount[snapshot.AccountRef] = manifestHash
 		for hash := range attempted {

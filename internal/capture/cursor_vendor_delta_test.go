@@ -155,6 +155,21 @@ func TestCursorVendorV2KeepsQueuedHashesWhenCheckpointIsStale(t *testing.T) {
 	}
 }
 
+func TestCursorVendorV2FailedRepairKeepsRepairDue(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	snap := buildCursorVendorSnapshot("account-a", []cursorVendorRow{{Timestamp: "1788200000000", ConversationID: "a"}}, start, start.Add(30*24*time.Hour), nil, cursorVendorShapeRecord{})
+	queueCursorVendorSnapshotV2(snap, "device-a", start.Add(time.Hour), "", func(event.Event) bool { return true })
+	if queueCursorVendorSnapshotV2(snap, "device-a", start.Add(8*time.Hour), "", func(event.Event) bool { return false }) {
+		t.Fatal("failed repair reported success")
+	}
+	var sent []event.Event
+	queueCursorVendorSnapshotV2(snap, "device-a", start.Add(9*time.Hour), "", func(ev event.Event) bool { sent = append(sent, ev); return true })
+	if len(sent) != 2 || sent[0].Kind != "cursorVendorUsage" {
+		t.Fatalf("failed repair suppressed next row resend: %+v", sent)
+	}
+}
+
 func TestCursorVendorCrossLanguageDigestGolden(t *testing.T) {
 	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	tiny := 0.0000001
