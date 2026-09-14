@@ -14,8 +14,10 @@ package capture
 // built in parallel against one frozen vocabulary.
 //
 // WHY THE RAIL EXISTS. Cursor's on-device hook rail (`stop`, `afterAgentResponse`)
-// never fires on the headless `cursor-agent -p` path: no IDE, no hook dispatcher,
-// no `stop`. That is structural, not a configuration gap, and it is where the
+// does not receive request-token callbacks on the headless `cursor-agent -p`
+// path. Tool and sessionEnd hooks can still fire there, but `stop` and the
+// prompt/response callbacks do not. This is a provider hook coverage gap, and
+// it is where the
 // automated-agent spend lives. A machine-lane zero is by construction — which
 // describes the cause, not its acceptability.
 

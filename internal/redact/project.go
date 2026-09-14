@@ -73,7 +73,7 @@ var projectFieldAllowlist = map[string][]string{
 	"cursorVendorUsage": {"snapshotId", "ordinal", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId", "cloudAgentId", "automationId", "serviceAccountId", "accountRef"},
 	// accountRef on both vendor kinds is hex(sha256(jwt.sub))[:16] of the Cursor
 	// login that was read, or "unknown" — a truncated digest, never the sub.
-	"cursorVendorSnapshot": {"snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason", "accountRef"},
+	"cursorVendorSnapshot": {"protocolVersion", "snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason", "accountRef"},
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
 	// followsInterrupt is a boolean flag marking a redirect prompt (the one
@@ -263,6 +263,7 @@ var projectFieldAllowlist = map[string][]string{
 	"heartbeat": {
 		"device", "cliVersion", "os", "arch", "watching",
 		"pendingEvents", "pendingOldestEventAt",
+		"deliveryState", "deliveryLane", "deliveryFailureClass", "deliveryHTTPStatus", "deliveryMemberStatus", "deliveryFailureAt",
 		"droppedEvents", "outboxBytes", "outboxCapacityBytes",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
@@ -271,6 +272,7 @@ var projectFieldAllowlist = map[string][]string{
 	"presence": {
 		"device", "cliVersion", "os", "arch", "watching", "state",
 		"pendingEvents", "pendingOldestEventAt",
+		"deliveryState", "deliveryLane", "deliveryFailureClass", "deliveryHTTPStatus", "deliveryMemberStatus", "deliveryFailureAt",
 		"droppedEvents", "outboxBytes", "outboxCapacityBytes",
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
@@ -349,6 +351,9 @@ var projectFieldAllowlist = map[string][]string{
 	// allowlisted on BOTH sides in the same release — a field allowed here but not
 	// there is silently stripped at ingest and reads as an older CLI.
 	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState"},
+	// Cumulative Codex rollout counters, one reading per token_count line. No
+	// prompt, model, path, or prose. threadId distinguishes delegated rollouts.
+	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
@@ -995,6 +1000,11 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		if !isString || !isOpaqueLaneID(laneStr) {
 			delete(projected, laneField)
 			fmt.Fprintf(os.Stderr, "promptster-teams: redact: kind %q carried a %s that is not an opaque id — dropped\n", e.Kind, laneField)
+		}
+	}
+	if e.Kind == "codex_session_usage" {
+		if thread, ok := projected["threadId"].(string); !ok || !isOpaqueLaneID(thread) {
+			delete(projected, "threadId")
 		}
 	}
 	if shellCommandKinds[e.Kind] {

@@ -775,3 +775,46 @@ func TestBatchBodyCapDoesNotSkipEvents(t *testing.T) {
 			"inside a line, which corrupts every later read", cursor, fi.Size())
 	}
 }
+
+// A non-advanceable head must not cause the rest of a large batch to be
+// validated and written over and over while the ordered cursor is pinned.
+func TestBatchRetriesOnlyBlockedHead(t *testing.T) {
+	newBatchTest(t)
+	var mu sync.Mutex
+	var sizes []int
+	done := make(chan struct{})
+	var once sync.Once
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		env := readEnvelope(t, r)
+		mu.Lock()
+		sizes = append(sizes, len(env.Events))
+		attempt := len(sizes)
+		mu.Unlock()
+		statuses := make([]int, len(env.Events))
+		for i := range statuses {
+			statuses[i] = http.StatusCreated
+		}
+		if attempt <= 2 {
+			statuses[0] = http.StatusForbidden
+		}
+		respond207(w, statuses)
+		if attempt == 4 {
+			once.Do(func() { close(done) })
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+	enqueue(t, "prompt", "prompt", "prompt", "prompt", "prompt", "prompt")
+	if !runDrainCaps(t, srv, batchCaps(500), done, 15*time.Second) {
+		t.Fatal("queue never recovered")
+	}
+	mu.Lock()
+	got := append([]int(nil), sizes...)
+	mu.Unlock()
+	if len(got) < 4 || got[0] != 6 || got[1] != 1 || got[2] != 1 || got[3] != 5 {
+		t.Fatalf("batch sizes = %v, want [6 1 1 5]", got)
+	}
+	if !waitPendingZero(t, 5*time.Second) {
+		t.Fatalf("queue not drained after recovery: %d pending", PendingCount())
+	}
+}

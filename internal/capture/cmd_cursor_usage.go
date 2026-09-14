@@ -95,13 +95,24 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 	}
 	snapshot := buildCursorVendorSnapshot(rows, start, end, quota, shape)
 	snapshot.AccountRef = cred.accountRef
-	queuedAll := true
-	for _, ev := range snapshot.rowEvents(deviceID) {
-		queuedAll = queueCursorVendorEvent(ev) && queuedAll
-	}
-	queuedAll = queueCursorVendorEvent(snapshot.completionEvent(deviceID, capturedAt, shape.CursorVersion)) && queuedAll
-	if queuedAll {
+	if queueCompleteCursorVendorSnapshot(snapshot, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorEvent) {
 		recordCursorVendorCostClaims(rows)
+	}
+	// A 31-day chart crosses the preceding billing cycle for most of each
+	// month. The RPC can filter it directly; the former current-cycle-only
+	// collector discarded those otherwise available rows.
+	if priorStart, priorEnd, ok := previousCursorBillingCycle(start, end); ok {
+		priorRows, priorShape, priorErr := collectCursorVendorRows(client, cred, priorStart, priorEnd)
+		if priorErr == nil {
+			priorShape.CursorVersion = shape.CursorVersion
+			prior := buildCursorVendorSnapshot(priorRows, priorStart, priorEnd, nil, priorShape)
+			prior.AccountRef = cred.accountRef
+			if err := queueHistoricalCursorVendorSnapshot(prior, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorEvent); err != nil {
+				fmt.Fprintf(os.Stderr, "cursor-vendor: historical snapshot queue failed: %T\n", err)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "cursor-vendor: historical read failed: %T\n", priorErr)
+		}
 	}
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: queued complete snapshot (%s)\n", cursorVendorRowCount(len(rows)))
@@ -113,7 +124,7 @@ func collectCursorVendorRows(client *cursorVendorClient, cred cursorCredential, 
 	observedSet := map[string]bool{}
 	var expectedTotal *int64
 	for page := 1; page <= cursorVendorMaxPages; page++ {
-		p, observed, err := client.fetchUsagePage(cred, page)
+		p, observed, err := client.fetchUsagePage(cred, page, start, end)
 		if err != nil {
 			return nil, cursorVendorShapeRecord{ObservedFields: sortedSet(observedSet), HTTPStatus: httpStatusFor(err)}, err
 		}

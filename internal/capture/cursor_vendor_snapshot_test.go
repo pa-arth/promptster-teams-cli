@@ -2,6 +2,7 @@ package capture
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"net/http"
 	"reflect"
@@ -146,6 +147,10 @@ func TestCollectCursorVendorRowsBoundsCurrentPeriodAndPaginates(t *testing.T) {
 	page := 0
 	client := &cursorVendorClient{base: "https://api2.cursor.sh", http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		page++
+		var request map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil || request["startDate"] != "1785542400000" || request["endDate"] != "1785546000000" {
+			t.Fatalf("date-filter request missing bounded millisecond strings: %#v (%v)", request, err)
+		}
 		if page == 1 {
 			return response(`{"totalUsageEventsCount":2,"usageEventsDisplay":[{"timestamp":"1785542401000","model":"default","kind":"x","conversationId":"in","tokenUsage":{"inputTokens":1,"outputTokens":0,"cacheReadTokens":0,"totalCents":1}}]}`), nil
 		}

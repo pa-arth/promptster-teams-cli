@@ -279,18 +279,18 @@ var cursorVendorExpectedRowFields = []string{
 	"tokenUsage.totalCents",
 }
 
-// fetchUsagePage asks for one page and returns the parsed page plus the field
-// names the first row actually carried.
-func (c *cursorVendorClient) fetchUsagePage(cred cursorCredential, page int) (cursorVendorUsagePage, []string, error) {
-	// `teamId: 0` is what a personal account sends. `startDate`/`endDate` are
-	// DELIBERATELY ABSENT: measured, the server ignores them for filtering and
-	// merely drops `totalUsageEventsCount` from the response, so sending them
-	// costs the completeness check and buys nothing. Bounding to the current
-	// billing period is therefore CLIENT-SIDE (see collectCursorVendorSnapshot).
+// fetchUsagePage asks for one bounded page. A live personal-account probe on
+// 2026-09-14 returned 365 lifetime rows unfiltered, 106 for 31 days, and six
+// for one day, with totalUsageEventsCount present for each filtered response.
+// The previous claim that filters were ignored was wrong; filtering is needed
+// to fetch historical windows and keeps old lifetime rows off every poll.
+func (c *cursorVendorClient) fetchUsagePage(cred cursorCredential, page int, start, end time.Time) (cursorVendorUsagePage, []string, error) {
 	raw, _, err := c.call(cred, cursorMethodUsageEvents, map[string]any{
-		"teamId":   0,
-		"page":     page,
-		"pageSize": cursorVendorPageSize,
+		"teamId":    0,
+		"page":      page,
+		"pageSize":  cursorVendorPageSize,
+		"startDate": strconv.FormatInt(start.UnixMilli(), 10),
+		"endDate":   strconv.FormatInt(end.UnixMilli(), 10),
 	})
 	if err != nil {
 		return cursorVendorUsagePage{}, nil, err

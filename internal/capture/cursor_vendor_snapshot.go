@@ -31,6 +31,11 @@ import (
 //
 // SO THE UNIT OF TRUTH IS THE SNAPSHOT, NOT THE ROW.
 //
+// The builder below retains the v1 content-addressed snapshot contract for
+// compatibility. queueCompleteCursorVendorSnapshot emits v2: immutable append
+// ordinals under one generation until a vendor correction starts a replacement
+// generation. The backend validates each completion against its row-count prefix.
+//
 //	1. Re-read the WHOLE current billing period every cycle.
 //	2. Canonicalize and sort the rows deterministically, hash them together with
 //	   the cycle's identity → `snapshotId`. `capturedAt` is deliberately NOT an

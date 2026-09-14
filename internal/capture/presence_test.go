@@ -75,6 +75,8 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
+		"deliveryState": true, "deliveryLane": true, "deliveryFailureClass": true,
+		"deliveryHTTPStatus": true, "deliveryMemberStatus": true, "deliveryFailureAt": true,
 		"droppedEvents": true, "outboxBytes": true, "outboxCapacityBytes": true,
 		"cursorHooks": true, "cursorHookRepairs": true, "cursorHookUnverifiable": true,
 		"cursorStopSeen": true, "cursorStopUsageRows": true, "cursorStopEmpty": true,
@@ -86,8 +88,10 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 		}
 	}
 	for k := range allowed {
-		if k == "pendingOldestEventAt" {
-			continue // omitempty: absent on an empty queue, by design
+		if k == "pendingOldestEventAt" || k == "deliveryLane" ||
+			k == "deliveryFailureClass" || k == "deliveryHTTPStatus" ||
+			k == "deliveryMemberStatus" || k == "deliveryFailureAt" {
+			continue // omitempty: absent without a relevant observation
 		}
 		if _, ok := data[k]; !ok {
 			t.Errorf("presence data missing expected field %q", k)
