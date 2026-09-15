@@ -109,6 +109,7 @@ var cursorHookSteps = []string{
 	"sessionEnd",
 	"beforeSubmitPrompt",
 	"afterFileEdit",
+	"beforeShellExecution", // captures the pre-command lockfile hashes
 	"afterShellExecution",
 	"postToolUseFailure",
 	// The end of one generation, and the ONLY step carrying token counts. See

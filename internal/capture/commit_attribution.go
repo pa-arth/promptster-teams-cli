@@ -65,9 +65,10 @@ type attrLineRange struct {
 // whose ranges are `unknown`. Never the device id, and never a substitute for
 // one: see assembleCommitAttributionEvent.
 type attrFile struct {
-	Path       string          `json:"path"`
-	SessionID  string          `json:"sessionId,omitempty"`
-	LineRanges []attrLineRange `json:"lineRanges"`
+	Path           string          `json:"path"`
+	GenerationKind string          `json:"generationKind,omitempty"`
+	SessionID      string          `json:"sessionId,omitempty"`
+	LineRanges     []attrLineRange `json:"lineRanges"`
 }
 
 // commitAttributionData is the CLOSED payload of a commit_attribution event.
@@ -151,6 +152,14 @@ func commitAttributionFromDiff(root, taskRoot, sha string, lin siblingLineage) (
 	// key also keeps a same-named path AI-touched in a DIFFERENT repo from bleeding in.
 	scope := resolveLedgerScope(root, taskRoot, sha, lin)
 	files, primarySession = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
+	applyDependencyAttribution(root, sha, files)
+	sessions := map[string]int{}
+	for _, f := range files {
+		if f.SessionID != "" {
+			sessions[f.SessionID]++
+		}
+	}
+	primarySession = mostFrequentSession(sessions)
 	return diff, files, primarySession, true
 }
 

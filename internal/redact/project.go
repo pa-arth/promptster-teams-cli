@@ -412,7 +412,7 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 	// allowlist does not name is stripped to nothing with no error and no
 	// telemetry, and reads downstream as "the CLI does not send it".
 	"commit_attribution": {
-		"files":      {"path", "lineRanges", "sessionId"},
+		"files":      {"path", "lineRanges", "sessionId", "generationKind"},
 		"lineRanges": {"start", "end", "attribution"},
 	},
 	// durability_verdict's two range arrays are content-free by construction
