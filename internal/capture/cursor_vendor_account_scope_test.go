@@ -53,9 +53,10 @@ func fakeVendor(t *testing.T) (*cursorVendorClient, map[string]int) {
 
 func captureVendorEvents(t *testing.T) *[]event.Event {
 	var got []event.Event
-	prev := queueCursorVendorEvent
+	prev, prevBackfill := queueCursorVendorEvent, queueCursorVendorBackfillEvent
 	queueCursorVendorEvent = func(ev event.Event) bool { got = append(got, ev); return true }
-	t.Cleanup(func() { queueCursorVendorEvent = prev })
+	queueCursorVendorBackfillEvent = func(ev event.Event) bool { got = append(got, ev); return true }
+	t.Cleanup(func() { queueCursorVendorEvent, queueCursorVendorBackfillEvent = prev, prevBackfill })
 	return &got
 }
 
