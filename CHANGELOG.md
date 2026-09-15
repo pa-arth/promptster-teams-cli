@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.31.0] — 2026-09-15
+
 ### Added
 
 - Cursor vendor usage now reads every Cursor login on the device it can see, not
