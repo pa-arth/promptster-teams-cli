@@ -16,6 +16,13 @@ import (
 
 const cursorVendorPollInterval = 15 * time.Minute
 
+// cursorVendorPollBudget bounds one WHOLE poll (every account) below the poll
+// interval, so a slow or heavily paginated account cannot overrun into the next
+// tick. Accounts are polled one at a time on purpose: a device holds at most two
+// token-bearing logins (spike 1.1). An account the budget does not reach is
+// skipped with no absence, and the next cycle covers it (D1). A var for tests.
+var cursorVendorPollBudget = cursorVendorPollInterval - time.Minute
+
 // runCursorVendorUsageCollector performs one full current-period restatement
 // immediately and then at the policy-aligned 15 minute cadence. Credentials are
 // intentionally acquired inside pollCursorVendorUsage, once per cycle.
@@ -34,10 +41,6 @@ func runCursorVendorUsageCollector(ctx context.Context, deviceID string, resolve
 }
 
 func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
-	accountRef := cursorAccountRefUnknown
-	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
-	}
 	if permitted, known := resolver.CursorVendorUsageDecision(); !permitted {
 		// Collection is fail-closed either way: no store is read on doubt.
 		//
@@ -54,20 +57,67 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 		if known {
 			forgetCursorAccountLogins()
 		}
-		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown, CursorVendorAbsenceCollectorNotPermitted, capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
 		return
 	}
-	cred, err := readCursorCredential()
-	if cred.accountRef != "" {
-		accountRef = cred.accountRef
+	sources := readCursorCredentialSources()
+	for _, s := range sources {
+		if s.err == nil {
+			// BEFORE any network call, so a vendor outage does not also turn every
+			// hook turn into `unreadable:`: the store WAS read, only the vendor
+			// failed. Every source is learned, including one deduped below.
+			recordCursorAccountReading(s.cred, time.Now())
+		} else if verboseWatch() {
+			// s.err text is built from a reason and a constant detail, never a value.
+			fmt.Fprintf(os.Stderr, "cursor-vendor: %s at %s: %v\n", s.kind, s.path, s.err)
+		}
 	}
-	if err != nil {
-		emitAbsence(cursorCredentialAbsence(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
+	// Attribution only (no snapshot, no absence): cursor-agent's cli-config.json
+	// names its login even when the token is in the unread keychain.
+	if login, ok := cursorAgentConfigLogin(); ok {
+		recordCursorAccountReading(login, time.Now())
+	}
+	accounts := cursorAccountsToCollect(sources)
+	if len(accounts) == 0 {
+		// No source identified a login: one absence under "unknown", carrying the
+		// IDE store's reason (sources[0]).
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown, cursorCredentialAbsence(sources[0].err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
 		return
 	}
-	// BEFORE any network call, so a vendor outage does not also turn every hook
-	// turn into `unreadable:` — the store WAS read; only the vendor failed.
-	recordCursorAccountReading(cred, time.Now())
+	ctx, cancel := context.WithTimeout(context.Background(), cursorVendorPollBudget)
+	defer cancel()
+	for _, a := range accounts {
+		if ctx.Err() != nil {
+			if verboseWatch() {
+				fmt.Fprintf(os.Stderr, "cursor-vendor: poll budget spent, account %s skipped this cycle\n", a.cred.accountRef)
+			}
+			continue
+		}
+		if a.err != nil {
+			queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, a.cred.accountRef, cursorCredentialAbsence(a.err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
+			continue
+		}
+		collectCursorVendorAccount(ctx, deviceID, client, a.cred, capturedAt)
+	}
+}
+
+// collectCursorVendorAccount collects one login's current period. Every vendor
+// request carries ctx, the poll's budget. D3: a team account is still declined.
+func collectCursorVendorAccount(ctx context.Context, deviceID string, client *cursorVendorClient, cred cursorCredential, capturedAt time.Time) {
+	scoped := *client
+	scoped.ctx = ctx
+	client = &scoped
+	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
+		if ctx.Err() != nil {
+			// Our own poll budget cut this account off, not the vendor. Emitting
+			// vendor_unreachable would be false; the next cycle covers it (D1).
+			if verboseWatch() {
+				fmt.Fprintf(os.Stderr, "cursor-vendor: poll budget spent during account %s, skipped this cycle\n", cred.accountRef)
+			}
+			return
+		}
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cred.accountRef, reason, capturedAt, start, end, shape))
+	}
 	onTeam, err := client.cursorAccountIsOnTeam(cred)
 	if err != nil {
 		emitAbsence(vendorAbsenceForError(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})

@@ -212,6 +212,21 @@ back to a byte copy), reads only `cursorAuth/accessToken`,
 `cursorAuth/refreshToken` and `cursorAuth/cachedEmail` from that clone, then
 deletes it. It never opens the live database and never reads neighbouring keys.
 
+It also reads the `cursor-agent` CLI's login when that login is in cursor-agent's
+file store: `~/.cursor/auth.json` on macOS (`$XDG_CONFIG_HOME/cursor/auth.json`
+elsewhere). Only `accessToken`/`refreshToken` are decoded from it.
+
+Separately, for hook attribution only, each cycle reads `authInfo.authId` and
+`authInfo.email` from cursor-agent's `cli-config.json` (`$CURSOR_CONFIG_DIR`,
+else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`). `authId` is the login's JWT
+`sub`, so the login map learns `{HMAC(email), sha256(authId)[:16]}` even when
+that login's token is in the keychain and is never read. This source makes no
+vendor call and emits no snapshot or absence. On macOS cursor-agent
+keeps its login in the keychain by default, which is not read (openspec
+`cursor-vendor-multi-account` tasks §2.1 step 2), so the file is usually absent;
+an absent file is not an absence event. When both stores hold the same login it
+is collected once.
+
 The email is reduced on the device to an HMAC under a local install key, and is
 used only to tell which login ran a hook turn. Each login is identified on the
 wire as `accountRef = hex(sha256(sub))[:16]`, and snapshot and absence ids are
