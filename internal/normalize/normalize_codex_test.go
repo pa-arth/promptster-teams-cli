@@ -850,6 +850,67 @@ func TestCodexContextWindowAbsentNotZero(t *testing.T) {
 	t.Fatal("no ai_response event")
 }
 
+// TestCodexCarriesLastRequestInput: a Codex turn holds many model requests, so
+// differencing consecutive cumulative totals sums N requests (prod: 4.9M-token
+// "peaks" on a 258,400 window). `info.last_token_usage` is the single most recent
+// request; its input_tokens (cached input included, OpenAI convention) is the
+// resident context. It rides beside, never instead of, the cumulative fields.
+func TestCodexCarriesLastRequestInput(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-08-03T20:34:59.495Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":4900000,"cached_input_tokens":4500000,"output_tokens":9000,"total_tokens":4909000},"last_token_usage":{"input_tokens":131072,"cached_input_tokens":130000,"output_tokens":400,"total_tokens":131472},"model_context_window":258400}}}`,
+		`{"timestamp":"2026-08-03T20:35:00.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-lastreq")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		data := e.Data.(map[string]interface{})
+		if got := data["lastRequestInputTokens"]; got != int64(131072) {
+			t.Fatalf("lastRequestInputTokens = %v (%T), want int64(131072)", got, got)
+		}
+		if got := data["inputTokens"]; got != int64(4900000) {
+			t.Fatalf("inputTokens = %v, cumulative total must be unchanged", got)
+		}
+		ev := e
+		redact.ProjectEvent(&ev, false)
+		if got := ev.Data.(map[string]interface{})["lastRequestInputTokens"]; got != int64(131072) {
+			t.Fatalf("lastRequestInputTokens after projection = %v (%T) — stripped by the on-device allowlist", got, got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
+// TestCodexLastRequestInputAbsentNotZero: no last_token_usage (or a stale one
+// from an earlier line) must OMIT the key, never send 0 or a previous request.
+func TestCodexLastRequestInputAbsentNotZero(t *testing.T) {
+	lines := []string{
+		`{"timestamp":"2026-06-06T20:38:51.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":10},"last_token_usage":{"input_tokens":50,"output_tokens":10}}}}`,
+		`{"timestamp":"2026-06-06T20:38:52.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120},"last_token_usage":"garbage"}}}`,
+		`{"timestamp":"2026-06-06T20:38:53.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+	}
+	p := NewCodexRolloutProcessor("sess-nolastreq")
+	var events []event.Event
+	for _, l := range lines {
+		events = append(events, p.Process([]byte(l))...)
+	}
+	for _, e := range events {
+		if e.Kind != "ai_response" {
+			continue
+		}
+		if got, present := e.Data.(map[string]interface{})["lastRequestInputTokens"]; present {
+			t.Fatalf("lastRequestInputTokens = %v, must be ABSENT when the latest token_count has no usable last_token_usage", got)
+		}
+		return
+	}
+	t.Fatal("no ai_response event")
+}
+
 // TestCodexContextWindowSurvivesProjection: the on-device allowlist is
 // default-deny, so a field the normalizer emits and the allowlist does not name
 // is stripped SILENTLY — and downstream that is indistinguishable from "the

@@ -6,6 +6,14 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `lastRequestInputTokens` on Codex `ai_response` and `subagent_usage`: the
+  input of the most recent single model request (`token_count.info.last_token_usage.input_tokens`,
+  cached input included). The cumulative fields are unchanged. The key is omitted,
+  never 0, when the latest `token_count` has no usable `last_token_usage`. Needs
+  the promptster-backend allowlist change first.
+
 ## [0.29.0] — 2026-09-15
 
 ### Added
