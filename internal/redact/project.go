@@ -351,6 +351,10 @@ var projectFieldAllowlist = map[string][]string{
 	// allowlisted on BOTH sides in the same release — a field allowed here but not
 	// there is silently stripped at ingest and reads as an older CLI.
 	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState"},
+	// Cumulative Codex rollout counters, one reading per token_count line. No
+	// prompt, model, path, or prose. threadId distinguishes delegated rollouts
+	// and is dropped unless it is an opaque id (see ProjectEvent).
+	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
@@ -997,6 +1001,11 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		if !isString || !isOpaqueLaneID(laneStr) {
 			delete(projected, laneField)
 			fmt.Fprintf(os.Stderr, "promptster-teams: redact: kind %q carried a %s that is not an opaque id — dropped\n", e.Kind, laneField)
+		}
+	}
+	if e.Kind == "codex_session_usage" {
+		if thread, ok := projected["threadId"].(string); !ok || !isOpaqueLaneID(thread) {
+			delete(projected, "threadId")
 		}
 	}
 	if shellCommandKinds[e.Kind] {
