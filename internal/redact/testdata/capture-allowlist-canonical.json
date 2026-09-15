@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:39f19f41c8716eb65d2885bf67932342799e01b21066ba71cb4ae2023ad0c089",
+  "checksum": "sha256:ea744af4bbb8b4c4c9cb78db327e795e5adad76ef0313e12d7ee55f80eea85ba",
   "counts": {
-    "kinds": 48,
-    "fields": 268,
+    "kinds": 49,
+    "fields": 272,
     "elementFields": 37
   },
   "kinds": {
@@ -59,6 +59,14 @@
         "label",
         "trigger",
         "summary"
+      ]
+    },
+    "codex_session_usage": {
+      "fields": [
+        "threadId",
+        "inputTokens",
+        "outputTokens",
+        "cacheReadTokens"
       ]
     },
     "command": {
