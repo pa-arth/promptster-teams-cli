@@ -6,9 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,6 +68,109 @@ func currentCycleComplete(evs []event.Event) []map[string]interface{} {
 		}
 	}
 	return out
+}
+
+// stderrOf returns what fn wrote to os.Stderr.
+func stderrOf(t *testing.T, fn func()) []byte {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stderr := os.Stderr
+	os.Stderr = w
+	fn()
+	os.Stderr = stderr
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	return out
+}
+
+// A valid-JSON auth.json and cli-config.json past the size limit are skipped as
+// OVERSIZED, never read truncated into "unparseable". The IDE login collects as
+// before, and the debug lines carry path and reason only.
+func TestCursorAgentFilesOversizedAreSkippedNotMalformed(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	t.Setenv("PROMPTSTER_DEBUG", "1")
+	resolver := permittedCursorPolicy(t)
+	client, calls := fakeVendor(t)
+	evs := captureVendorEvents(t)
+	ide := ideLogin(t, "auth0|ide_login", "ide@example.com", 4102444800)
+	agent := agentToken(t, "auth0|big_agent", 4102444800)
+	pad := strings.Repeat("x", cursorAgentFileMaxBytes)
+	dir := t.TempDir()
+	writeAgentFile(t, dir, cursorAgentAuthFileName, fmt.Sprintf(`{"accessToken":%q,"pad":%q}`, agent, pad))
+	writeAgentFile(t, dir, cursorAgentCLIConfigFileName, fmt.Sprintf(`{"authInfo":{"authId":"auth0|big_agent","email":"big.agent@example.com"},"pad":%q}`, pad))
+	t.Setenv(cursorAgentDirEnv, dir)
+
+	logged := stderrOf(t, func() { pollCursorVendorUsage("dev", resolver, client, time.Now()) })
+
+	complete := currentCycleComplete(*evs)
+	if len(complete) != 1 || complete[0]["accountRef"] != cursorAccountRef(ide) || len(calls) != 1 || calls[ide] != 1 {
+		t.Fatalf("complete=%v calls=%v, want only the IDE login collected", complete, calls)
+	}
+	if absent := vendorSnapshotData(*evs, CursorVendorSnapshotStatusAbsent); len(absent) != 0 {
+		t.Fatalf("absent=%v, want none", absent)
+	}
+	if ref, _ := cursorHookAccountRef(stopPayload(t, "big.agent@example.com")); !strings.HasPrefix(ref, cursorAccountRefUnreadablePrefix) {
+		t.Fatalf("oversized cli-config taught the map: ref=%q", ref)
+	}
+	for _, want := range []string{
+		filepath.Join(dir, cursorAgentAuthFileName) + ": cursor credential: credential_absent (cursor-agent auth file oversized)",
+		"cursor_agent_cli_config at " + filepath.Join(dir, cursorAgentCLIConfigFileName) + ": oversized",
+	} {
+		if !bytes.Contains(logged, []byte(want)) {
+			t.Fatalf("debug log missing %q:\n%s", want, logged)
+		}
+	}
+	for _, banned := range []string{"unparseable", agent, "big_agent", "big.agent", "xxxxxxxx"} {
+		if bytes.Contains(logged, []byte(banned)) {
+			t.Fatalf("debug log contains %q:\n%.400s", banned, logged)
+		}
+	}
+}
+
+// A vendor that never answers the first account must not overrun the poll: the
+// whole poll is bounded, the account cut off emits no absence (our budget, not
+// the vendor), and the account not reached is skipped this cycle, silently.
+func TestCursorVendorPollBudgetSkipsUnreachedAccounts(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	resolver := permittedCursorPolicy(t)
+	evs := captureVendorEvents(t)
+	prev := cursorVendorPollBudget
+	cursorVendorPollBudget = 300 * time.Millisecond
+	t.Cleanup(func() { cursorVendorPollBudget = prev })
+
+	ide := ideLogin(t, "auth0|slow_ide", "slow@example.com", 4102444800)
+	agent := agentToken(t, "auth0|agent_login", 4102444800)
+	agentLogin(t, agent, "", "")
+	var mu sync.Mutex
+	seen := map[string]int{}
+	client := &cursorVendorClient{base: cursorVendorAPIDefaultBase, http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		seen[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]++
+		mu.Unlock()
+		select { // a vendor that hangs; the 3s arm only keeps a regression from hanging the suite
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		case <-time.After(3 * time.Second):
+			return nil, fmt.Errorf("slow vendor timed out")
+		}
+	})}}
+
+	began := time.Now()
+	pollCursorVendorUsage("dev", resolver, client, time.Now())
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Fatalf("poll took %v, want it bounded by the %v budget", elapsed, cursorVendorPollBudget)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen[ide] == 0 || seen[agent] != 0 {
+		t.Fatalf("requests=%v, want the first account attempted and the second not reached", seen)
+	}
+	if len(*evs) != 0 {
+		t.Fatalf("events=%v, want no snapshot or absence from a budget-cut poll", *evs)
+	}
 }
 
 func refsOf(snaps []map[string]interface{}) map[string]bool {

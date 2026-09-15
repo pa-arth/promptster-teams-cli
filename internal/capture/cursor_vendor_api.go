@@ -2,6 +2,7 @@ package capture
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,9 @@ func (e *cursorVendorHTTPError) AbsenceReason() CursorVendorAbsenceReason {
 type cursorVendorClient struct {
 	http *http.Client
 	base string
+	// ctx is the poll's whole-poll budget (collectCursorVendorAccount sets it on
+	// a per-account copy). nil means only the per-request HTTP timeout applies.
+	ctx context.Context
 }
 
 func newCursorVendorClient() *cursorVendorClient {
@@ -131,7 +135,11 @@ func (c *cursorVendorClient) call(cred cursorCredential, method string, payload 
 	if err != nil {
 		return nil, 0, err
 	}
-	req, err := http.NewRequest(http.MethodPost, origin.String()+method, bytes.NewReader(body))
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, origin.String()+method, bytes.NewReader(body))
 	if err != nil {
 		return nil, 0, err
 	}

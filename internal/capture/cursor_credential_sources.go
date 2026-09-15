@@ -3,6 +3,7 @@ package capture
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -54,6 +55,11 @@ const (
 	cursorAgentAuthFileName                                 = "auth.json"
 	cursorAgentCLIConfigFileName                            = "cli-config.json"
 )
+
+// errCursorAgentFileOversized marks a cursor-agent file past
+// cursorAgentFileMaxBytes. It is skipped as oversized rather than read
+// truncated, which would look malformed and hide the cause.
+var errCursorAgentFileOversized = errors.New("cursor-agent file oversized")
 
 // cursorCredentialSource is one store read this cycle. cred.accountRef is the
 // source's accountRef, set on success and on an expired token. path names the
@@ -162,6 +168,10 @@ func readCursorAgentAuthFile() (cursorCredentialSource, bool) {
 	if errors.Is(err, fs.ErrNotExist) {
 		return src, false
 	}
+	if errors.Is(err, errCursorAgentFileOversized) {
+		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, "cursor-agent auth file oversized")
+		return src, true
+	}
 	if err != nil {
 		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, "cursor-agent auth file unreadable")
 		return src, true
@@ -195,6 +205,9 @@ func cursorAgentConfigLogin() (cursorCredential, bool) {
 	}
 	b, err := readCursorAgentFile(path)
 	if err != nil {
+		if errors.Is(err, errCursorAgentFileOversized) && verboseWatch() {
+			fmt.Fprintf(os.Stderr, "cursor-vendor: cursor_agent_cli_config at %s: oversized\n", path)
+		}
 		return cursorCredential{}, false
 	}
 	var c struct {
@@ -220,5 +233,13 @@ func readCursorAgentFile(path string) ([]byte, error) {
 		return nil, err
 	}
 	defer func() { _ = f.Close() }()
-	return io.ReadAll(io.LimitReader(f, cursorAgentFileMaxBytes))
+	// One byte past the limit tells "exactly at the limit" from "truncated".
+	b, err := io.ReadAll(io.LimitReader(f, cursorAgentFileMaxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > cursorAgentFileMaxBytes {
+		return nil, errCursorAgentFileOversized
+	}
+	return b, nil
 }

@@ -6,6 +6,23 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Cursor vendor usage now reads every Cursor login on the device it can see, not
+  only the IDE's. Each cycle also reads the `cursor-agent` CLI's
+  `~/.cursor/auth.json` file store, and collects one snapshot per distinct
+  `accountRef`; a login held in both stores is collected once. Separately, for
+  hook attribution only, cursor-agent's `cli-config.json` `authInfo` teaches the
+  login map `{HMAC(email), sha256(authId)[:16]}`, so a `stop` turn under a
+  cursor-agent login stamps its real `cursorAccountRef` instead of
+  `unreadable:` even when the token is not read. The macOS keychain, where
+  cursor-agent keeps its login by default, is not read, so such a login is
+  attributed but not collected. The whole poll is bounded below the 15-minute
+  interval; an account it does not reach is skipped until the next cycle, with
+  no absence. Files over 1 MiB are skipped as oversized. No new emitted fields,
+  and no email, token or authId leaves the device. openspec
+  `cursor-vendor-multi-account` §2.1.
+
 ## [0.30.0] — 2026-09-15
 
 ### Added
