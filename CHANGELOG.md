@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.30.0] — 2026-09-15
+
+### Added
+
+- Assistant response prose on Codex and Cursor, under the org's
+  `captureAssistantProse` policy. Codex final answers now carry `text` beside
+  `lastAssistantMessage`: the projector keeps only `text`, so no Codex prose had
+  ever left the device. Cursor's transcript watcher now emits each run of
+  assistant text items as an `ai_response` carrying `text` only — no model, no
+  tokens — so the hook rail's `stop` row still owns spend. On hook-claimed
+  transcripts it is admitted by payload, not by kind. Policy off: output
+  unchanged. Requires promptster-backend#956 (deployed), which stops text-only
+  rows counting as usage.
+- Cursor-generated dependency lockfiles are attributed. Before/after shell hooks
+  around npm, pnpm and yarn dependency commands record changed lockfile hashes
+  locally; a commit range is attributed only when the committed blob matches the
+  captured result, with `generationKind: dependency`. Missing or overlapping hook
+  pairs, changed blobs, expired evidence, symlinks and unsupported shell forms
+  produce no attribution. Hooks always allow execution; hashes and contents stay
+  local. Requires promptster-backend#958 (deployed).
+
 ## [0.29.0] — 2026-09-15
 
 ### Added
