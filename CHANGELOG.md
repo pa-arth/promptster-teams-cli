@@ -6,6 +6,26 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.29.0] — 2026-09-15
+
+### Added
+
+- Collect the previous Cursor billing cycle as its own vendor snapshot, with its
+  own `accountRef` and date bounds. A `cursor-vendor-history.json` checkpoint
+  skips unchanged re-sends until the 6h repair interval. Monthly periods with a
+  start day of 28 or earlier only.
+- `codex_session_usage` events from Codex rollout `token_count` lines:
+  `{threadId, inputTokens, outputTokens, cacheReadTokens}`. Counters must be
+  non-negative integers with `cacheReadTokens ≤ inputTokens`; a non-opaque
+  `threadId` is dropped. Pairs with promptster-backend#953, which allowlists the
+  kind at ingest.
+
+### Changed
+
+- Cursor usage pages are requested with `startDate`/`endDate`, so the vendor API
+  returns only the rows for the cycle being read. The client-side bound stays as
+  a guard.
+
 ## [0.28.3] — 2026-09-14
 
 ### Fixed
@@ -2514,7 +2534,8 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.3...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.3...v0.29.0
 [0.28.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.2...v0.28.3
 [0.28.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...v0.28.2
 [0.28.1]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.0...v0.28.1
