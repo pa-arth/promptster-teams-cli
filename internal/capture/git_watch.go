@@ -633,6 +633,15 @@ func discoverAiRepoRoots(taskRoot string) []string {
 			roots = append(roots, root)
 		}
 	}
+	// Generated dependency evidence discovers repositories without marking the
+	// path as generally AI-touched (which would bypass the committed-hash check).
+	for _, mark := range readDependencyMarks("") {
+		rel, err := filepath.Rel(base, mark.Root)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !seen[mark.Root] {
+			seen[mark.Root] = true
+			roots = append(roots, mark.Root)
+		}
+	}
 	return roots
 }
 

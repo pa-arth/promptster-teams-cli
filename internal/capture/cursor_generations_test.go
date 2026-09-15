@@ -234,8 +234,8 @@ func TestCursorHookStdoutIsAConstantThatCannotDriveTheAgent(t *testing.T) {
 	if err := json.Unmarshal([]byte(cursorHookStdout), &parsed); err != nil {
 		t.Fatalf("the hook response is not JSON Cursor can read: %v", err)
 	}
-	if len(parsed) != 1 || parsed["continue"] != true {
-		t.Fatalf("hook response = %v, want exactly {continue: true}", parsed)
+	if len(parsed) != 2 || parsed["continue"] != true || parsed["permission"] != "allow" {
+		t.Fatalf("hook response = %v, want exactly {continue: true, permission: allow}", parsed)
 	}
 	// And it is the ENTIRE contribution of this command to stdout — no other
 	// write, no format verb an operand could reach.

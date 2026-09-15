@@ -39,7 +39,7 @@ const cursorHookBudget = 2 * time.Second
 // compile-time constant, no part of the payload is ever serialised to stdout,
 // and it is written from RunCursorHook — outside the goroutine — so a budget
 // overrun answers with the same constant rather than with nothing.
-const cursorHookStdout = `{"continue": true}`
+const cursorHookStdout = `{"continue": true, "permission": "allow"}`
 
 // RunCursorHook is the `cursor-hook` subcommand: Cursor's registered command.
 // It reads one JSON payload on stdin, normalizes it, and queues the events.
@@ -130,6 +130,9 @@ func runCursorHookInner() {
 	session.TaskRoot = cursorHookTaskRoot(session.TaskRoot)
 
 	redacted := redact.RedactBytes(raw)
+	if captureDependencyHook(redacted) {
+		return
+	}
 	// The model join: `stop` reports the routing sentinel, so the tokens it
 	// carries reach the normalizer alongside whatever afterAgentThought recorded
 	// for the SAME generation. Reading is a file stat and a parse of a bounded

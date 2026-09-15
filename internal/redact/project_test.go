@@ -1140,3 +1140,16 @@ func TestCodexSubagentUsageSurvivesProjection(t *testing.T) {
 		t.Errorf("assistant prose survived projection: %v", got)
 	}
 }
+
+func TestProjectDependencyCategory(t *testing.T) {
+	for _, value := range []interface{}{"dependency", "private text", "", "DEPENDENCY", "dependency\n", 1, nil, map[string]interface{}{"content": "private"}, []interface{}{"dependency"}} {
+		e := eventWithData("commit_attribution", map[string]interface{}{"files": []interface{}{map[string]interface{}{"path": "yarn.lock", "generationKind": value}}})
+		ProjectEvent(&e, false)
+		f := e.Data.(map[string]interface{})["files"].([]interface{})[0].(map[string]interface{})
+		got, kept := f["generationKind"]
+		category, _ := value.(string)
+		if kept != (category == "dependency") || (kept && got != "dependency") {
+			t.Fatalf("category %#v projected as %#v", value, f)
+		}
+	}
+}
