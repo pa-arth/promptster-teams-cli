@@ -53,9 +53,10 @@ func fakeVendor(t *testing.T) (*cursorVendorClient, map[string]int) {
 
 func captureVendorEvents(t *testing.T) *[]event.Event {
 	var got []event.Event
-	prev := queueCursorVendorEvent
+	prev, prevBackfill := queueCursorVendorEvent, queueCursorVendorBackfillEvent
 	queueCursorVendorEvent = func(ev event.Event) bool { got = append(got, ev); return true }
-	t.Cleanup(func() { queueCursorVendorEvent = prev })
+	queueCursorVendorBackfillEvent = func(ev event.Event) bool { got = append(got, ev); return true }
+	t.Cleanup(func() { queueCursorVendorEvent, queueCursorVendorBackfillEvent = prev, prevBackfill })
 	return &got
 }
 
@@ -116,9 +117,19 @@ func TestCursorVendorIDELoginSwitchAcrossCycles(t *testing.T) {
 	if calls[one] != 1 || calls[two] != 1 {
 		t.Fatalf("collections=%v, want one per login", calls)
 	}
-	complete := vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete)
-	if len(complete) != 2 || complete[0]["snapshotId"] == complete[1]["snapshotId"] {
-		t.Fatalf("complete snapshots = %v, want 2 with distinct ids", complete)
+	// Each poll also stages the previous billing cycle (no quota reading), so
+	// split the completions by cycle: per cycle, two logins, two distinct ids.
+	byCycle := map[interface{}][]interface{}{}
+	for _, d := range vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete) {
+		byCycle[d["billingCycleStartsAt"]] = append(byCycle[d["billingCycleStartsAt"]], d["snapshotId"])
+	}
+	if len(byCycle) != 2 {
+		t.Fatalf("complete snapshots by cycle = %v, want current + previous", byCycle)
+	}
+	for cycle, ids := range byCycle {
+		if len(ids) != 2 || ids[0] == ids[1] {
+			t.Fatalf("cycle %v snapshots = %v, want 2 with distinct ids", cycle, ids)
+		}
 	}
 	for email, token := range map[string]string{"one@example.com": one, "two@example.com": two} {
 		if ref, ok := cursorHookAccountRef(stopPayload(t, email)); !ok || ref != cursorAccountRef(token) {

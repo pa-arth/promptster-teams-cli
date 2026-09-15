@@ -109,6 +109,22 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 	if queuedAll {
 		recordCursorVendorCostClaims(rows)
 	}
+	// A 31-day chart crosses the preceding billing cycle for most of each
+	// month. Its rows are staged under the prior cycle's own bounds and pool,
+	// and never touch current-cycle cost claims. Failure here is logged only:
+	// the current snapshot above is already queued.
+	if priorStart, priorEnd, ok := previousCursorBillingCycle(start, end); ok {
+		priorRows, priorShape, priorErr := collectCursorVendorRows(client, cred, priorStart, priorEnd)
+		if priorErr != nil {
+			fmt.Fprintf(os.Stderr, "cursor-vendor: historical read failed: %T\n", priorErr)
+		} else {
+			priorShape.CursorVersion = shape.CursorVersion
+			prior := buildCursorVendorSnapshot(cred.accountRef, priorRows, priorStart, priorEnd, nil, priorShape)
+			if err := queueHistoricalCursorVendorSnapshot(prior, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorBackfillEvent); err != nil {
+				fmt.Fprintf(os.Stderr, "cursor-vendor: historical snapshot queue failed: %v\n", err)
+			}
+		}
+	}
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: queued complete snapshot (%s)\n", cursorVendorRowCount(len(rows)))
 	}
@@ -119,7 +135,7 @@ func collectCursorVendorRows(client *cursorVendorClient, cred cursorCredential, 
 	observedSet := map[string]bool{}
 	var expectedTotal *int64
 	for page := 1; page <= cursorVendorMaxPages; page++ {
-		p, observed, err := client.fetchUsagePage(cred, page)
+		p, observed, err := client.fetchUsagePage(cred, page, start, end)
 		if err != nil {
 			return nil, cursorVendorShapeRecord{ObservedFields: sortedSet(observedSet), HTTPStatus: httpStatusFor(err)}, err
 		}
@@ -167,10 +183,22 @@ func httpStatusFor(err error) int {
 
 // queueCursorVendorEvent is a var so tests can capture the emitted events.
 var queueCursorVendorEvent = func(ev event.Event) bool {
+	return appendCursorVendorEvent(outbox.LaneLive(), ev)
+}
+
+// queueCursorVendorBackfillEvent carries a closed prior cycle (up to
+// cursorVendorMaxPages*pageSize rows) on the backfill lane so it never queues
+// ahead of current usage. Deferral is safe: the history checkpoint advances
+// only after every append succeeds, and the vendor re-serves the cycle.
+var queueCursorVendorBackfillEvent = func(ev event.Event) bool {
+	return appendCursorVendorEvent(outbox.LaneBackfill(), ev)
+}
+
+func appendCursorVendorEvent(lane outbox.Lane, ev event.Event) bool {
 	if err := sign.AppendEventToLocalBuffer(&ev, false); err != nil {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: buffer error: %v\n", err)
 	}
-	if err := outbox.Append(ev); err != nil {
+	if err := outbox.AppendTo(lane, ev); err != nil {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: queue error (%s): %v\n", ev.Kind, err)
 		return false
 	}

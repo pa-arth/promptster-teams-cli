@@ -217,7 +217,7 @@ func TestObservedFieldsSeeTheNewNamesOnTheWire(t *testing.T) {
 				`"cacheReadTokens":3,"cacheWriteTokens":4,"totalCents":5}}]}`), nil
 		}),
 	}}
-	_, observed, err := client.fetchUsagePage(cursorCredential{token: "t"}, 1)
+	_, observed, err := client.fetchUsagePage(cursorCredential{token: "t"}, 1, time.UnixMilli(0), time.UnixMilli(1788307200001))
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}

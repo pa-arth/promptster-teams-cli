@@ -17,6 +17,25 @@ func eventWithData(kind string, data map[string]interface{}) event.Event {
 	return e
 }
 
+func TestProjectCodexSessionUsageKeepsCountersAndOpaqueThreadOnly(t *testing.T) {
+	e := eventWithData("codex_session_usage", map[string]interface{}{
+		"threadId":    "019fb396-91d9-7770-bcc0-329fcedfa8e0",
+		"inputTokens": int64(120), "outputTokens": int64(15), "cacheReadTokens": int64(90),
+		"promptText": leakCanary,
+	})
+	ProjectEvent(&e, false)
+	d := e.Data.(map[string]interface{})
+	if len(d) != 4 || d["threadId"] != "019fb396-91d9-7770-bcc0-329fcedfa8e0" ||
+		d["inputTokens"] != int64(120) || d["outputTokens"] != int64(15) || d["cacheReadTokens"] != int64(90) {
+		t.Fatalf("projected = %+v", d)
+	}
+	e = eventWithData("codex_session_usage", map[string]interface{}{"threadId": "~/secret/path", "inputTokens": int64(1)})
+	ProjectEvent(&e, false)
+	if _, ok := e.Data.(map[string]interface{})["threadId"]; ok {
+		t.Fatal("path-shaped thread id survived")
+	}
+}
+
 func TestProjectEventStripsSourceFields(t *testing.T) {
 	cases := []struct {
 		name        string

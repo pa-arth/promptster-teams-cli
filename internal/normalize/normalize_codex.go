@@ -3,6 +3,7 @@ package normalize
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 	"time"
@@ -197,6 +198,34 @@ func (p *CodexRolloutProcessor) stableEventID(sourceKey, kind string) string {
 // tool/output event is the agent acting. sourceKey is the stable identity of the
 // source record (session id / tool call_id / rollout line ts); pass "" only when
 // no stable key exists.
+// codexSessionUsage turns one cumulative total_token_usage reading into a
+// codex_session_usage event, or nothing when the vector is incomplete: all
+// three counters must be non-negative integers (within float64's exact range)
+// and cached input cannot exceed input.
+func (p *CodexRolloutProcessor) codexSessionUsage(usage map[string]interface{}, ts string) []event.Event {
+	if p.threadID == "" {
+		return nil
+	}
+	input, hasInput := usage["input_tokens"].(float64)
+	output, hasOutput := usage["output_tokens"].(float64)
+	cacheRead, hasCacheRead := usage["cached_input_tokens"].(float64)
+	valid := func(v float64) bool { return v >= 0 && v <= 9_007_199_254_740_991 && math.Trunc(v) == v }
+	if !hasInput || !hasOutput || !hasCacheRead || !valid(input) || !valid(output) || !valid(cacheRead) || cacheRead > input {
+		return nil
+	}
+	// Counts disambiguate two token_count lines written in the same timestamp
+	// while keeping replay IDs deterministic.
+	sourceKey := fmt.Sprintf("%s\x1f%s\x1f%d\x1f%d\x1f%d", p.threadID, ts, int64(input), int64(output), int64(cacheRead))
+	e := p.newCodexEvent("codex_session_usage", ts, sourceKey)
+	e.Actor = event.SystemActor()
+	e.Data = map[string]interface{}{
+		"threadId": p.threadID, "inputTokens": int64(input),
+		"outputTokens": int64(output), "cacheReadTokens": int64(cacheRead),
+	}
+	e.RawPayload = "codex cumulative session usage"
+	return []event.Event{e}
+}
+
 func (p *CodexRolloutProcessor) newCodexEvent(kind, ts, sourceKey string) event.Event {
 	e := event.NewEvent(kind, p.sessionID)
 	// Overwrite NewEvent's random id with the stable, source-derived one (keeping
@@ -859,10 +888,14 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		return p.patchApplyEnd(payload, ts, raw)
 
 	case "token_count":
-		// Stash the latest usage; attached to the next final assistant message.
+		// Stash usage for the final response, and independently capture the
+		// cumulative session total. A final response is not guaranteed (exec,
+		// interruption, delegated threads), but the token_count line is durable.
+		var sessionUsage []event.Event
 		if info, ok := payload["info"].(map[string]interface{}); ok {
 			if usage, ok := info["total_token_usage"].(map[string]interface{}); ok {
 				p.lastTokenUsage = usage
+				sessionUsage = p.codexSessionUsage(usage, ts)
 			}
 			// Tracked independently of total_token_usage: the two are separate
 			// keys on `info` and a line can carry either without the other.
@@ -873,7 +906,7 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 				p.lastContextWindow = w
 			}
 		}
-		return nil
+		return sessionUsage
 
 	default:
 		return nil
