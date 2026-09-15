@@ -105,7 +105,26 @@ func attributionOf(t *testing.T, root, taskRoot, sha string) (map[string]string,
 	t.Helper()
 	// The lineage is resolved exactly as the watcher resolves it: one batched read
 	// per sibling for the range being polled, never a per-commit probe.
-	_, files, primarySession, ok := commitAttributionFromDiff(root, taskRoot, sha, newSiblingLineage(root, []string{sha}))
+	return attributionWith(t, root, taskRoot, sha, newSiblingLineage(root, []string{sha}))
+}
+
+// assertReaches pins a test's git geometry with `merge-base --is-ancestor`, a
+// path that shares no code with siblingLineage — so a mutation of the lineage
+// read cannot pass its own precondition check.
+func assertReaches(t *testing.T, checkout, sha string, want bool) {
+	t.Helper()
+	err := exec.Command("git", "-C", checkout, "merge-base", "--is-ancestor", sha, "HEAD").Run()
+	if got := err == nil; got != want {
+		t.Fatalf("setup: %s HEAD reaches %s = %v, want %v — this test is only meaningful with a genuinely MIXED range", checkout, sha, got, want)
+	}
+}
+
+// attributionWith is attributionOf against a lineage the caller built, so a test
+// can reconcile several commits of ONE range through the ONE lineage the watcher
+// would have resolved for it.
+func attributionWith(t *testing.T, root, taskRoot, sha string, lin siblingLineage) (map[string]string, string) {
+	t.Helper()
+	_, files, primarySession, ok := commitAttributionFromDiff(root, taskRoot, sha, lin)
 	if !ok {
 		t.Fatalf("commitAttributionFromDiff(%s) reported no attributable change", root)
 	}
@@ -647,5 +666,111 @@ func TestDurabilitySpentEvidenceCannotSeedTwiceAcrossASiblingThatMoved(t *testin
 	if n := trackedLineCount(t, primaryKey, "p.go"); n != 0 {
 		t.Fatalf("already-spent AI evidence seeded p.go a second time: %d lines tracked, want 0 (ranges %+v)",
 			n, ledgerRanges(t, primaryKey, "p.go"))
+	}
+}
+
+// THE MIXED RANGE HAS TO SURVIVE THE WHOLE WAY DOWN, not just out of the gate.
+//
+// TestCommitsHeldByAnswersEachShaInAMixedRange already pins the gate's own answer:
+// `commitsHeldBy` complements `rev-list <shas…> --not HEAD` per sha, and
+// `siblingLineage.reaches` agrees with it, on a batch mixing held and unheld
+// commits. This test starts where that one stops. `resolveLedgerScope` consults
+// the gate ONCE PER COMMIT, so between a correct lineage and a correct verdict
+// there is a step that a range-shaped answer can still be collapsed at — and
+// collapsing it there is invisible to every assertion made against the lineage
+// itself.
+//
+// So this reconciles TWO commits of ONE range through ONE lineage, with the
+// sibling's HEAD sitting between them, and follows both through to the
+// consequence:
+//
+//	positive — the sha the sibling HEAD reaches attributes to the recording
+//	           session and seeds its lines;
+//	negative — the sha it does NOT reach attributes to nothing. Absence on all
+//	           three of attribution, session and durability spans, so a wrong
+//	           answer and a missing answer cannot pass the same assertion.
+//
+// MUTATION-TESTED, and the mutation is the reason this exists rather than a
+// second copy of the gate test. Make `resolveLedgerScope` ask a RANGE-level
+// question — "does this sibling hold anything in the poll's range" instead of
+// "does it hold THIS commit" — which is exactly what an optimisation that hoists
+// the per-commit gate out of the commit loop would produce. It is
+// behaviour-identical for a single-commit range, so it leaves EVERY OTHER TEST IN
+// THE PACKAGE GREEN, including the gate test above; this is the only test that
+// fails, and it fails in the fabrication direction: the unheld commit attributes
+// `likely_ai`, carries a session it has no claim to, and seeds three of a human's
+// lines as AI off a sibling that never held that commit.
+func TestSiblingLineageSeparatesHeldFromUnheldWithinOneRange(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const t0 int64 = 1_000_000_000_000
+
+	home := t.TempDir()
+	primary := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, primary)
+	git("commit", "--allow-empty", "-m", "base")
+
+	// Both files are the agent's work, and BOTH are recorded under the SIBLING's
+	// path space — so neither resolves from the polled checkout's own key and the
+	// lineage gate is the only thing that can decide either one.
+	const sessionID = "sess-range"
+	wtKeySpace := "work/proj-wt/"
+	recordAiTouchedPath(sessionID, gitWatchRootKey(home), wtKeySpace+"held.go")
+	recordAiTouchedPath(sessionID, gitWatchRootKey(home), wtKeySpace+"unheld.go")
+
+	// Commit one, then park the sibling exactly on it.
+	writeCommitFile(t, primary, "held.go", "h1\nh2\nh3\n")
+	git("add", "-A")
+	git("commit", "-m", "held.go")
+	heldSha := gitOut("rev-parse", "HEAD")
+
+	wt := filepath.Join(home, "work", "proj-wt")
+	git("worktree", "add", "--detach", wt, heldSha)
+
+	// Commit two lands AFTER the sibling was parked, so the sibling's HEAD reaches
+	// heldSha and not this one — one range, one lineage, two answers.
+	writeCommitFile(t, primary, "unheld.go", "u1\nu2\nu3\n")
+	git("add", "-A")
+	git("commit", "-m", "unheld.go")
+	unheldSha := gitOut("rev-parse", "HEAD")
+
+	// The geometry is asserted with RAW GIT, never through siblingLineage: a
+	// precondition checked with the code under test would swallow the very
+	// mutation this test exists to catch, failing in setup instead of in the two
+	// assertions that name what actually went wrong.
+	assertReaches(t, wt, heldSha, true)
+	assertReaches(t, wt, unheldSha, false)
+
+	// Exactly what a poll builds: ONE lineage for the WHOLE range.
+	lin := newSiblingLineage(primary, []string{heldSha, unheldSha})
+
+	held, heldSess := attributionWith(t, primary, home, heldSha, lin)
+	if held["held.go"] != attributionLikelyAI {
+		t.Errorf("held sha in a mixed range: held.go = %q, want %q — the sibling's HEAD reaches this commit, so its evidence counts",
+			held["held.go"], attributionLikelyAI)
+	}
+	if heldSess != sessionID {
+		t.Errorf("held sha in a mixed range: session = %q, want %q", heldSess, sessionID)
+	}
+
+	unheld, unheldSess := attributionWith(t, primary, home, unheldSha, lin)
+	if unheld["unheld.go"] != attributionUnknown {
+		t.Errorf("unheld sha in a mixed range: unheld.go = %q, want %q — a sibling that does not hold the commit is not evidence about it",
+			unheld["unheld.go"], attributionUnknown)
+	}
+	if unheldSess != "" {
+		t.Errorf("unheld sha in a mixed range: session = %q, want no session at all", unheldSess)
+	}
+
+	primaryKey := gitWatchRootKey(primary)
+	sess := Session{DeviceID: "dev-range", TaskRoot: home}
+	pollDurabilityCommit(primary, primaryKey, sess, heldSha, t0, lin)
+	pollDurabilityCommit(primary, primaryKey, sess, unheldSha, t0+1, lin)
+
+	if n := trackedLineCount(t, primaryKey, "held.go"); n != 3 {
+		t.Errorf("held sha in a mixed range: held.go tracked = %d, want 3", n)
+	}
+	if n := trackedLineCount(t, primaryKey, "unheld.go"); n != 0 {
+		t.Errorf("unheld sha in a mixed range: %d lines seeded off a sibling that does not hold the commit, want 0 (ranges %+v)",
+			n, ledgerRanges(t, primaryKey, "unheld.go"))
 	}
 }

@@ -209,6 +209,12 @@ type ledgerScope struct {
 // answers "no sibling reaches anything", so a caller that resolves a scope without
 // one gets the polled checkout alone — the safe direction, and the reason the
 // parameter is not optional.
+//
+// The COMPUTATION is per poll; the ANSWER stays per COMMIT. Hoisting this gate out
+// of the commit loop — asking once whether the sibling holds ANYTHING in the range
+// — is behaviour-identical on a single-commit range and FABRICATES on every mixed
+// one, handing a commit the sibling never held that sibling's evidence.
+// TestSiblingLineageSeparatesHeldFromUnheldWithinOneRange is the test that fails.
 func resolveLedgerScope(root, taskRoot, commitSha string, lin siblingLineage) ledgerScope {
 	return ledgerScopeWithAlts(root, taskRoot, func(alt ledgerScope) bool {
 		return lin.reaches(alt.root, commitSha)
