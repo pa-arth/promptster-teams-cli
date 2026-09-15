@@ -1050,6 +1050,12 @@ func projectArrayElements(value interface{}, fields []string, elementAllowlists 
 			if !present || v == nil {
 				continue
 			}
+			// Fixed category; never retain free text or objects in this metadata.
+			if field == "generationKind" {
+				if category, ok := v.(string); !ok || category != "dependency" {
+					continue
+				}
+			}
 			if nested, hasNested := elementAllowlists[field]; hasNested {
 				projected[field] = projectArrayElements(v, nested, elementAllowlists)
 				continue

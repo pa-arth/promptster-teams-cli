@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -187,4 +188,29 @@ func TestDependencyCaptureDiscoversGeneratedOnlyRepository(t *testing.T) {
 	if len(readDependencyMarks(resolvePath(root))) != 0 {
 		t.Fatal("expired generated evidence remained readable")
 	}
+}
+
+func TestDependencyCaptureFullLedgerStillInvalidatesAmbiguousMark(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	root, _, _ := gitRepo(t)
+	dependencyHook(t, "beforeShellExecution", root, "first", "g1", "npm install")
+	writeCommitFile(t, root, "package-lock.json", "result")
+	dependencyHook(t, "afterShellExecution", root, "first", "g1", "npm install")
+	withDependencyLedger(func(l *dependencyLedger) {
+		for i := 0; len(l.Marks) < 2048; i++ {
+			l.Marks["filler"+strconv.Itoa(i)] = dependencyMark{Root: "elsewhere", Session: "filler", At: time.Now().UnixMilli()}
+		}
+	})
+	writeCommitFile(t, root, "package-lock.json", "old")
+	dependencyHook(t, "beforeShellExecution", root, "second", "g2", "npm install")
+	writeCommitFile(t, root, "package-lock.json", "result")
+	dependencyHook(t, "afterShellExecution", root, "second", "g2", "npm install")
+	if len(readDependencyMarks(resolvePath(root))) != 0 {
+		t.Fatal("full ledger retained attribution to the first session")
+	}
+	withDependencyLedger(func(l *dependencyLedger) {
+		if len(l.Marks) != 2048 {
+			t.Fatal("ledger cap changed")
+		}
+	})
 }

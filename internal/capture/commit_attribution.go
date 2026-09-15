@@ -151,7 +151,7 @@ func commitAttributionFromDiff(root, taskRoot, sha string, lin siblingLineage) (
 	// root == taskRoot (explicit repo) the scope is the identity. Scoping to one
 	// key also keeps a same-named path AI-touched in a DIFFERENT repo from bleeding in.
 	scope := resolveLedgerScope(root, taskRoot, sha, lin)
-	files, primarySession = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
+	files, _ = reconcileCommitAttribution(root, scope, fileRanges, readAiTouchedPaths(scope.aiKey), readBashWindows(scope.aiKey))
 	applyDependencyAttribution(root, sha, files)
 	sessions := map[string]int{}
 	for _, f := range files {

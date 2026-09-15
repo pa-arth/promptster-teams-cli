@@ -47,6 +47,7 @@ func withDependencyLedger(fn func(*dependencyLedger)) {
 	_ = os.MkdirAll(filepath.Dir(path), 0700)
 	_ = sign.WithBufferLock(path+".lock", func() error {
 		l := dependencyLedger{}
+		// #nosec G304 -- fixed ledger basename under the local application state directory.
 		if raw, err := os.ReadFile(path); err == nil {
 			if json.Unmarshal(raw, &l) != nil {
 				return nil
@@ -96,6 +97,7 @@ func dependencyFileHash(path string) (string, bool) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() > dependencyHashLimit {
 		return "", false
 	}
+	// #nosec G304 -- allowlisted lockfile under the observed checkout; regular-file checked, read-only, bounded hashing.
 	f, err := os.Open(path)
 	if err != nil {
 		return "", false
@@ -213,14 +215,18 @@ func captureDependencyHook(raw []byte) bool {
 		}
 		for path, old := range pending.Before {
 			hash, valid := dependencyFileHash(filepath.Join(root, path))
-			if !valid || hash == "" || hash == old || len(l.Marks) >= 2048 {
+			if !valid || hash == "" || hash == old {
 				continue
 			}
 			markKey := root + "\x00" + path + "\x00" + hash
 			// Multiple sessions producing identical bytes are not uniquely attributable.
-			if prior, exists := l.Marks[markKey]; exists && prior.Session != p.Session {
+			prior, exists := l.Marks[markKey]
+			if exists && prior.Session != p.Session {
 				prior.Session = ""
 				l.Marks[markKey] = prior
+				continue
+			}
+			if !exists && len(l.Marks) >= 2048 {
 				continue
 			}
 			l.Marks[markKey] = dependencyMark{Root: root, Path: path, Hash: hash, Session: p.Session, At: time.Now().UnixMilli()}
@@ -232,7 +238,8 @@ func captureDependencyHook(raw []byte) bool {
 func committedDependencyHash(root, sha, path string) (string, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "show", sha+":"+path)
+	// #nosec G204 -- fixed git argv, checkout and revision from the git watcher, no shell; option parsing terminated.
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "show", "--end-of-options", sha+":"+path)
 	pipe, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", false
@@ -260,7 +267,8 @@ func applyDependencyAttribution(root, sha string, files []attrFile) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	raw, err := exec.CommandContext(ctx, "git", "-C", root, "show", "-s", "--format=%ct", sha).Output()
+	// #nosec G204 -- fixed git argv with a watcher-discovered revision, no shell; option parsing terminated.
+	raw, err := exec.CommandContext(ctx, "git", "-C", root, "show", "-s", "--format=%ct", "--end-of-options", sha).Output()
 	if err != nil {
 		return
 	}
