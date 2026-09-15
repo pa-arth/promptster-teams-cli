@@ -34,10 +34,6 @@ func runCursorVendorUsageCollector(ctx context.Context, deviceID string, resolve
 }
 
 func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *cursorVendorClient, capturedAt time.Time) {
-	accountRef := cursorAccountRefUnknown
-	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, accountRef, reason, capturedAt, start, end, shape))
-	}
 	if permitted, known := resolver.CursorVendorUsageDecision(); !permitted {
 		// Collection is fail-closed either way: no store is read on doubt.
 		//
@@ -54,20 +50,42 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 		if known {
 			forgetCursorAccountLogins()
 		}
-		emitAbsence(CursorVendorAbsenceCollectorNotPermitted, time.Time{}, time.Time{}, cursorVendorShapeRecord{})
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown, CursorVendorAbsenceCollectorNotPermitted, capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
 		return
 	}
-	cred, err := readCursorCredential()
-	if cred.accountRef != "" {
-		accountRef = cred.accountRef
+	sources := readCursorCredentialSources()
+	for _, s := range sources {
+		if s.err == nil {
+			// BEFORE any network call, so a vendor outage does not also turn every
+			// hook turn into `unreadable:`: the store WAS read, only the vendor
+			// failed. Every source is learned, including one deduped below.
+			recordCursorAccountReading(s.cred, time.Now())
+		} else if verboseWatch() {
+			fmt.Fprintf(os.Stderr, "cursor-vendor: %s at %s: %s\n", s.kind, s.path, cursorCredentialAbsence(s.err))
+		}
 	}
-	if err != nil {
-		emitAbsence(cursorCredentialAbsence(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})
+	accounts := cursorAccountsToCollect(sources)
+	if len(accounts) == 0 {
+		// No source identified a login: one absence under "unknown", carrying the
+		// IDE store's reason (sources[0]).
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown, cursorCredentialAbsence(sources[0].err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
 		return
 	}
-	// BEFORE any network call, so a vendor outage does not also turn every hook
-	// turn into `unreadable:` — the store WAS read; only the vendor failed.
-	recordCursorAccountReading(cred, time.Now())
+	for _, a := range accounts {
+		if a.err != nil {
+			queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, a.cred.accountRef, cursorCredentialAbsence(a.err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
+			continue
+		}
+		collectCursorVendorAccount(deviceID, client, a.cred, capturedAt)
+	}
+}
+
+// collectCursorVendorAccount collects one login's current period. D3: a team
+// account is still declined.
+func collectCursorVendorAccount(deviceID string, client *cursorVendorClient, cred cursorCredential, capturedAt time.Time) {
+	emitAbsence := func(reason CursorVendorAbsenceReason, start, end time.Time, shape cursorVendorShapeRecord) {
+		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cred.accountRef, reason, capturedAt, start, end, shape))
+	}
 	onTeam, err := client.cursorAccountIsOnTeam(cred)
 	if err != nil {
 		emitAbsence(vendorAbsenceForError(err), time.Time{}, time.Time{}, cursorVendorShapeRecord{})

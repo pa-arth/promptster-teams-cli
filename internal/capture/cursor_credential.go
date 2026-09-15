@@ -200,8 +200,14 @@ func readCursorCredential() (cursorCredential, error) {
 	if token == "" {
 		token = strings.TrimSpace(values[cursorAuthRefreshTokenKey])
 	}
+	return cursorCredentialFromToken(token, emailHMAC)
+}
+
+// cursorCredentialFromToken applies the rules every credential source shares:
+// no token is absent, no parseable `sub` is absent, a past `exp` is expired.
+func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error) {
 	if token == "" {
-		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the state store")
+		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the store")
 	}
 
 	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token),
@@ -432,7 +438,13 @@ const cursorAccountRefUnknown = "unknown"
 // backend only needs to tell logins apart and join them across events, and a
 // truncated digest does that without shipping the vendor's identifier.
 func cursorAccountRef(token string) string {
-	sub := strings.TrimSpace(cursorTokenClaims(token).Sub)
+	return cursorSubAccountRef(cursorTokenClaims(token).Sub)
+}
+
+// cursorSubAccountRef is cursorAccountRef for a sub already in hand (for example
+// cursor-agent's cli-config.json authInfo.authId).
+func cursorSubAccountRef(sub string) string {
+	sub = strings.TrimSpace(sub)
 	if sub == "" {
 		return cursorAccountRefUnknown
 	}
