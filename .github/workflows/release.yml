@@ -149,12 +149,21 @@ jobs:
           # lookup here would abort an otherwise-valid release — and worse, it
           # would abort it AFTER the platform packages are published, i.e. in the
           # one state that cannot be undone. Only a package still unresolvable
-          # after ~1m is treated as genuinely absent.
+          # after ~15m is treated as genuinely absent.
+          #
+          # FIFTEEN MINUTES, NOT ONE. The ~1m budget this replaced failed the
+          # first attempt of BOTH v0.29.0 and v0.30.0, each with every package
+          # published successfully. On v0.30.0 all three x64 packages were
+          # missing after ~1m while every arm64 package resolved; win32-x64,
+          # published 18:44:28Z, still returned 404 at 18:51:22Z and resolved at
+          # 18:51:45Z. That is ~7.3m of propagation, so the budget is set at
+          # twice it. `--prefer-online` stops npm's local cache from pinning an
+          # early 404 across retries.
           for NAME in $(node -p "Object.keys(require('./npm/package.json').optionalDependencies||{}).join('\n')"); do
             FOUND=""
-            for DELAY in 0 2 4 8 15 30; do
+            for DELAY in 0 5 10 15 30 60 60 60 60 60 60 60 60 60 60 60 60 60 60; do
               [ "${DELAY}" -gt 0 ] && sleep "${DELAY}"
-              if npm view "${NAME}@${VER}" version >/dev/null 2>&1; then
+              if npm view "${NAME}@${VER}" version --prefer-online >/dev/null 2>&1; then
                 FOUND=1
                 break
               fi
@@ -162,7 +171,7 @@ jobs:
             if [ -n "${FOUND}" ]; then
               echo "  ok ${NAME}@${VER}"
             else
-              echo "  MISSING ${NAME}@${VER} (still unresolvable after ~1m)"
+              echo "  MISSING ${NAME}@${VER} (still unresolvable after ~15m)"
               MISSING="${MISSING} ${NAME}"
             fi
           done
