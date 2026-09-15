@@ -109,6 +109,22 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 	if queuedAll {
 		recordCursorVendorCostClaims(rows)
 	}
+	// A 31-day chart crosses the preceding billing cycle for most of each
+	// month. Its rows are staged under the prior cycle's own bounds and pool,
+	// and never touch current-cycle cost claims. Failure here is logged only:
+	// the current snapshot above is already queued.
+	if priorStart, priorEnd, ok := previousCursorBillingCycle(start, end); ok {
+		priorRows, priorShape, priorErr := collectCursorVendorRows(client, cred, priorStart, priorEnd)
+		if priorErr != nil {
+			fmt.Fprintf(os.Stderr, "cursor-vendor: historical read failed: %T\n", priorErr)
+		} else {
+			priorShape.CursorVersion = shape.CursorVersion
+			prior := buildCursorVendorSnapshot(cred.accountRef, priorRows, priorStart, priorEnd, nil, priorShape)
+			if err := queueHistoricalCursorVendorSnapshot(prior, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorEvent); err != nil {
+				fmt.Fprintf(os.Stderr, "cursor-vendor: historical snapshot queue failed: %v\n", err)
+			}
+		}
+	}
 	if verboseWatch() {
 		fmt.Fprintf(os.Stderr, "cursor-vendor: queued complete snapshot (%s)\n", cursorVendorRowCount(len(rows)))
 	}
@@ -119,7 +135,7 @@ func collectCursorVendorRows(client *cursorVendorClient, cred cursorCredential, 
 	observedSet := map[string]bool{}
 	var expectedTotal *int64
 	for page := 1; page <= cursorVendorMaxPages; page++ {
-		p, observed, err := client.fetchUsagePage(cred, page)
+		p, observed, err := client.fetchUsagePage(cred, page, start, end)
 		if err != nil {
 			return nil, cursorVendorShapeRecord{ObservedFields: sortedSet(observedSet), HTTPStatus: httpStatusFor(err)}, err
 		}

@@ -279,18 +279,24 @@ var cursorVendorExpectedRowFields = []string{
 	"tokenUsage.totalCents",
 }
 
-// fetchUsagePage asks for one page and returns the parsed page plus the field
-// names the first row actually carried.
-func (c *cursorVendorClient) fetchUsagePage(cred cursorCredential, page int) (cursorVendorUsagePage, []string, error) {
-	// `teamId: 0` is what a personal account sends. `startDate`/`endDate` are
-	// DELIBERATELY ABSENT: measured, the server ignores them for filtering and
-	// merely drops `totalUsageEventsCount` from the response, so sending them
-	// costs the completeness check and buys nothing. Bounding to the current
-	// billing period is therefore CLIENT-SIDE (see collectCursorVendorSnapshot).
+// fetchUsagePage asks for one page bounded to [start, end) and returns the
+// parsed page plus the field names the rows actually carried.
+//
+// `teamId: 0` is what a personal account sends. `startDate`/`endDate` ARE
+// honoured. An earlier note here said the server ignored them and dropped
+// `totalUsageEventsCount`; re-measured 2026-09-15 on a personal account, that
+// is wrong: unfiltered 376 rows, current billing cycle 107, previous cycle 216,
+// last 24h 13. No row fell outside its range, and totalUsageEventsCount was
+// present on every response. Filtering is what makes a historical cycle
+// fetchable and keeps lifetime rows off every poll. collectCursorVendorRows
+// still bounds client-side as a guard against a future server regression.
+func (c *cursorVendorClient) fetchUsagePage(cred cursorCredential, page int, start, end time.Time) (cursorVendorUsagePage, []string, error) {
 	raw, _, err := c.call(cred, cursorMethodUsageEvents, map[string]any{
-		"teamId":   0,
-		"page":     page,
-		"pageSize": cursorVendorPageSize,
+		"teamId":    0,
+		"page":      page,
+		"pageSize":  cursorVendorPageSize,
+		"startDate": strconv.FormatInt(start.UnixMilli(), 10),
+		"endDate":   strconv.FormatInt(end.UnixMilli(), 10),
 	})
 	if err != nil {
 		return cursorVendorUsagePage{}, nil, err
