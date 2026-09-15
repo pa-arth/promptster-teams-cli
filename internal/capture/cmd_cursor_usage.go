@@ -64,6 +64,11 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 			fmt.Fprintf(os.Stderr, "cursor-vendor: %s at %s: %s\n", s.kind, s.path, cursorCredentialAbsence(s.err))
 		}
 	}
+	// Attribution only (no snapshot, no absence): cursor-agent's cli-config.json
+	// names its login even when the token is in the unread keychain.
+	if login, ok := cursorAgentConfigLogin(); ok {
+		recordCursorAccountReading(login, time.Now())
+	}
 	accounts := cursorAccountsToCollect(sources)
 	if len(accounts) == 0 {
 		// No source identified a login: one absence under "unknown", carrying the

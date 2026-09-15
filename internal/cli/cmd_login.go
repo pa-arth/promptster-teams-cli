@@ -137,7 +137,7 @@ func cmdLogin(args []string) {
 	}
 
 	if startErr == nil {
-		printlnIndent(dimStyle.Render("Cursor vendor usage: every 15 min Promptster reads every Cursor login on this device it can see: the Cursor IDE's signed-in login, and the cursor-agent CLI's login when cursor-agent keeps it in its auth.json file. That includes each account you sign into over time. For the IDE it clones Cursor's local state.vscdb and reads only the auth-token keys and the signed-in email. For cursor-agent it reads the token from auth.json and the signed-in email from cli-config.json. The email is hashed on this device with a local key to tell Cursor logins apart. It then calls api2.cursor.sh usage, billing-period, and team-membership endpoints once for each distinct login. No credential or email is ever stored or sent to Promptster."))
+		printlnIndent(dimStyle.Render("Cursor vendor usage: every 15 min Promptster reads every Cursor login on this device it can see: the Cursor IDE's signed-in login, and the cursor-agent CLI's login when cursor-agent keeps it in its auth.json file. That includes each account you sign into over time. For the IDE it clones Cursor's local state.vscdb and reads only the auth-token keys and the signed-in email. For cursor-agent it reads the token from auth.json. It also reads cursor-agent's signed-in login id and email from cli-config.json, to tell which login ran a turn even when that login's token is in the keychain and is not read. Emails are hashed on this device with a local key to tell Cursor logins apart. It then calls api2.cursor.sh usage, billing-period, and team-membership endpoints once for each distinct login. No credential or email is ever stored or sent to Promptster."))
 		enableAutostartOnLogin()
 		enableStatuslineOnLogin()
 	}

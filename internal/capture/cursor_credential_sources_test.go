@@ -178,7 +178,7 @@ func TestCursorVendorAgentAuthFileBadStatesLeaveIDEUnaffected(t *testing.T) {
 		}},
 		"expired": {wantExpired: true, setup: func(t *testing.T) string {
 			tok := agentToken(t, "auth0|agent_expired", 1000000000)
-			agentLogin(t, tok, "auth0|agent_expired", "expired@example.com")
+			agentLogin(t, tok, "", "") // no cli-config: this case is about auth.json alone
 			return tok
 		}},
 	}
@@ -212,8 +212,9 @@ func TestCursorVendorAgentAuthFileBadStatesLeaveIDEUnaffected(t *testing.T) {
 }
 
 // authInfo naming a DIFFERENT login than the token (cursor-agent re-logged and
-// cli-config lags, say) must not attribute the token's account to that email.
-func TestCursorVendorAgentAuthFileMismatchedAuthInfoCollectsWithoutAttribution(t *testing.T) {
+// cli-config lags, say): the token's account is still collected, and the email
+// attributes to authInfo's OWN login, never to the token's account.
+func TestCursorVendorAgentAuthFileAuthInfoForAnotherLogin(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	resolver := permittedCursorPolicy(t)
 	client, calls := fakeVendor(t)
@@ -226,8 +227,73 @@ func TestCursorVendorAgentAuthFileMismatchedAuthInfoCollectsWithoutAttribution(t
 	if calls[agent] != 1 || calls[ide] != 1 {
 		t.Fatalf("collections=%v, want both logins collected", calls)
 	}
-	if ref, _ := cursorHookAccountRef(stopPayload(t, "someone.else@example.com")); !strings.HasPrefix(ref, cursorAccountRefUnreadablePrefix) {
-		t.Fatalf("mismatched authInfo attributed: ref=%q", ref)
+	if ref, _ := cursorHookAccountRef(stopPayload(t, "someone.else@example.com")); ref != cursorSubAccountRef("auth0|someone_else") || ref == cursorAccountRef(agent) {
+		t.Fatalf("authInfo email: ref=%q, want authInfo's own login %q", ref, cursorSubAccountRef("auth0|someone_else"))
+	}
+}
+
+// A keychain-held cursor-agent login: no auth.json, the IDE on another login.
+// cli-config.json alone teaches the map the login, so its hook turn stamps the
+// real ref, and it creates no snapshot, absence or vendor call.
+func TestCursorAgentConfigLoginAttributesWithoutCollecting(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	resolver := permittedCursorPolicy(t)
+	client, calls := fakeVendor(t)
+	evs := captureVendorEvents(t)
+	ide := ideLogin(t, "auth0|ide_login", "ide@example.com", 4102444800)
+	dir := t.TempDir()
+	writeAgentFile(t, dir, cursorAgentCLIConfigFileName, `{"authInfo":{"authId":"auth0|keychain_login","email":"Keychain@Example.com","userId":7}}`)
+	t.Setenv(cursorAgentDirEnv, dir)
+	pollCursorVendorUsage("dev", resolver, client, time.Now())
+
+	want := cursorSubAccountRef("auth0|keychain_login")
+	if ref, ok := cursorHookAccountRef(stopPayload(t, "keychain@example.com")); !ok || ref != want {
+		t.Fatalf("keychain login: ref=%q ok=%v, want %q", ref, ok, want)
+	}
+	if len(calls) != 1 || calls[ide] != 1 {
+		t.Fatalf("collections=%v, want only the IDE login", calls)
+	}
+	for _, e := range *evs {
+		if d := e.Data.(map[string]interface{}); d["accountRef"] == want {
+			t.Fatalf("attribution-only login emitted %s: %v", e.Kind, d)
+		}
+	}
+	if absent := vendorSnapshotData(*evs, CursorVendorSnapshotStatusAbsent); len(absent) != 0 {
+		t.Fatalf("absent=%v, want none", absent)
+	}
+}
+
+// A missing or malformed cli-config.json, or an authInfo without both an authId
+// and an email, teaches the map nothing.
+func TestCursorAgentConfigLoginBadStatesHaveNoEffect(t *testing.T) {
+	for name, body := range map[string]string{
+		"missing":      "",
+		"malformed":    `{"authInfo":{"authId":"auth0|k`,
+		"no authInfo":  `{"version":1}`,
+		"no authId":    `{"authInfo":{"email":"keychain@example.com"}}`,
+		"no email":     `{"authInfo":{"authId":"auth0|keychain_login"}}`,
+		"authId shape": `{"authInfo":{"authId":42,"email":"keychain@example.com"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+			resolver := permittedCursorPolicy(t)
+			client, _ := fakeVendor(t)
+			_ = captureVendorEvents(t)
+			ideLogin(t, "auth0|ide_login", "ide@example.com", 4102444800)
+			dir := t.TempDir()
+			if body != "" {
+				writeAgentFile(t, dir, cursorAgentCLIConfigFileName, body)
+			}
+			t.Setenv(cursorAgentDirEnv, dir)
+			pollCursorVendorUsage("dev", resolver, client, time.Now())
+
+			if n := len(loadCursorAccountLogins().Logins); n != 1 {
+				t.Fatalf("login map has %d logins, want only the IDE's", n)
+			}
+			if ref, _ := cursorHookAccountRef(stopPayload(t, "keychain@example.com")); !strings.HasPrefix(ref, cursorAccountRefUnreadablePrefix) {
+				t.Fatalf("ref=%q, want unreadable", ref)
+			}
+		})
 	}
 }
 
@@ -250,6 +316,14 @@ func TestCursorVendorAgentAuthFileNeverEmitsSecretsOrEmail(t *testing.T) {
 	stderr := os.Stderr
 	os.Stderr = w
 	pollCursorVendorUsage("dev", resolver, client, time.Now())
+	// Second poll, keychain-style: auth.json gone, cli-config.json alone names a
+	// different login, which must be learned without leaking its authId or email.
+	writeAgentFile(t, os.Getenv(cursorAgentDirEnv), cursorAgentCLIConfigFileName,
+		`{"authInfo":{"authId":"auth0|keychain_private","email":"Keychain.Private@Example.com"}}`)
+	if err := os.Remove(filepath.Join(os.Getenv(cursorAgentDirEnv), cursorAgentAuthFileName)); err != nil {
+		t.Fatal(err)
+	}
+	pollCursorVendorUsage("dev", resolver, client, time.Now())
 	os.Stderr = stderr
 	_ = w.Close()
 	logged, _ := io.ReadAll(r)
@@ -257,11 +331,15 @@ func TestCursorVendorAgentAuthFileNeverEmitsSecretsOrEmail(t *testing.T) {
 	if len(currentCycleComplete(*evs)) != 1 {
 		t.Fatalf("precondition: agent login not collected: %v", *evs)
 	}
+	if ref, _ := cursorHookAccountRef(stopPayload(t, "keychain.private@example.com")); ref != cursorSubAccountRef("auth0|keychain_private") {
+		t.Fatalf("precondition: keychain-style login not learned: %q", ref)
+	}
 	if !bytes.Contains(logged, []byte(string(cursorSourceIDEStateDB))) {
 		t.Fatalf("precondition: the debug source line was not written: %q", logged)
 	}
 	banned := []string{agent, "agent-api-key-secret", "bedrock-access-secret", "bedrock-secret-key",
-		"agent_private", "ide_private", "Agent.Private", "agent.private", "ide.private", "example.com", "Private Person",
+		"agent_private", "ide_private", "keychain_private", "Agent.Private", "agent.private", "ide.private",
+		"Keychain.Private", "keychain.private", "example.com", "Private Person",
 		hex.EncodeToString(state.CursorAttributionKey())}
 	var blobs [][]byte
 	for _, e := range *evs {

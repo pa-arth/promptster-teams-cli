@@ -32,9 +32,11 @@ import (
 //   - cli-config.json (`$CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else
 //     `~/.cursor`) carries `authInfo {authId, email, ...}` from cursor-agent's
 //     GetMe. authId is the JWT `sub`: on the owner's Mac, 2026-09-15,
-//     sha256(authId)[:16] equalled that login's accountRef in the login map. The
-//     email is paired with the auth.json token ONLY when authId's ref equals the
-//     token's ref. Otherwise the source collects but does not attribute.
+//     sha256(authId)[:16] equalled that login's accountRef in the login map. So
+//     it is an ATTRIBUTION-ONLY source: every cycle the login map learns
+//     {HMAC(email), sha256(authId)[:16]} from it, even when the login's token
+//     sits in the keychain and is not read. It never creates a snapshot or an
+//     absence, because collection needs a token.
 //
 // TODO(openspec cursor-vendor-multi-account tasks §2.1 step 2): the keychain
 // (acct "cursor-user", svce "cursor-access-token"/"cursor-refresh-token") is
@@ -127,6 +129,9 @@ func cursorAgentCLIConfigPath() string {
 	if dir := os.Getenv(cursorAgentDirEnv); dir != "" {
 		return filepath.Join(dir, cursorAgentCLIConfigFileName)
 	}
+	if !CursorVendorPlatformSupported(runtime.GOOS) {
+		return ""
+	}
 	if dir := strings.TrimSpace(os.Getenv("CURSOR_CONFIG_DIR")); dir != "" {
 		return filepath.Join(dir, cursorAgentCLIConfigFileName)
 	}
@@ -173,25 +178,24 @@ func readCursorAgentAuthFile() (cursorCredentialSource, bool) {
 	if token == "" {
 		token = strings.TrimSpace(f.RefreshToken)
 	}
+	// No email here: the auth.json login is attributed by cursorAgentConfigLogin,
+	// which learns the same {emailHmac, ref} whenever cli-config names this login.
 	src.cred, src.err = cursorCredentialFromToken(token, "")
-	if src.err == nil {
-		src.cred.emailHMAC = cursorAgentEmailHMAC(src.cred.accountRef)
-	}
 	return src, true
 }
 
-// cursorAgentEmailHMAC returns the HMAC of cli-config.json's authInfo.email
-// only when authInfo.authId is the same login as accountRef. Any other case
-// returns "": the login collects but is not learned for attribution. The
-// address is held only long enough to HMAC it.
-func cursorAgentEmailHMAC(accountRef string) string {
+// cursorAgentConfigLogin reads cli-config.json authInfo as a login for hook
+// attribution ONLY: an accountRef and email HMAC, never a token. ok=false for a
+// missing or malformed file, or an authInfo without both an authId and an email.
+// The address is held only long enough to HMAC it.
+func cursorAgentConfigLogin() (cursorCredential, bool) {
 	path := cursorAgentCLIConfigPath()
 	if path == "" {
-		return ""
+		return cursorCredential{}, false
 	}
 	b, err := readCursorAgentFile(path)
 	if err != nil {
-		return ""
+		return cursorCredential{}, false
 	}
 	var c struct {
 		AuthInfo struct {
@@ -199,10 +203,15 @@ func cursorAgentEmailHMAC(accountRef string) string {
 			Email  string `json:"email"`
 		} `json:"authInfo"`
 	}
-	if json.Unmarshal(b, &c) != nil || cursorSubAccountRef(c.AuthInfo.AuthID) != accountRef {
-		return ""
+	if json.Unmarshal(b, &c) != nil {
+		return cursorCredential{}, false
 	}
-	return cursorEmailHMAC(state.CursorAttributionKey(), c.AuthInfo.Email)
+	login := cursorCredential{accountRef: cursorSubAccountRef(c.AuthInfo.AuthID),
+		emailHMAC: cursorEmailHMAC(state.CursorAttributionKey(), c.AuthInfo.Email)}
+	if login.accountRef == cursorAccountRefUnknown || login.emailHMAC == "" {
+		return cursorCredential{}, false
+	}
+	return login, true
 }
 
 func readCursorAgentFile(path string) ([]byte, error) {

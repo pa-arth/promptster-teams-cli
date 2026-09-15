@@ -214,10 +214,14 @@ deletes it. It never opens the live database and never reads neighbouring keys.
 
 It also reads the `cursor-agent` CLI's login when that login is in cursor-agent's
 file store: `~/.cursor/auth.json` on macOS (`$XDG_CONFIG_HOME/cursor/auth.json`
-elsewhere). Only `accessToken`/`refreshToken` are decoded from it. The signed-in
-email comes from `authInfo.email` in cursor-agent's `cli-config.json`, and only
-when that file's `authInfo.authId` is the same login as the token; otherwise the
-login is collected but not used for hook attribution. On macOS cursor-agent
+elsewhere). Only `accessToken`/`refreshToken` are decoded from it.
+
+Separately, for hook attribution only, each cycle reads `authInfo.authId` and
+`authInfo.email` from cursor-agent's `cli-config.json` (`$CURSOR_CONFIG_DIR`,
+else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`). `authId` is the login's JWT
+`sub`, so the login map learns `{HMAC(email), sha256(authId)[:16]}` even when
+that login's token is in the keychain and is never read. This source makes no
+vendor call and emits no snapshot or absence. On macOS cursor-agent
 keeps its login in the keychain by default, which is not read (openspec
 `cursor-vendor-multi-account` tasks §2.1 step 2), so the file is usually absent;
 an absent file is not an absence event. When both stores hold the same login it
