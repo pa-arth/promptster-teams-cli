@@ -264,12 +264,10 @@ func RunCursorWatcher() error {
 	// EOF; every later poll tails a newly-appeared transcript from 0.
 	firstPoll := true
 
-	// Org capture policy, fail-closed and refreshed off the hot path. This
-	// watcher emits no assistant prose at all — a Cursor transcript carries no
-	// model and this rail mints no `ai_response` (the hook rail does, but it
-	// carries only a model name, never prose) — so the gate cannot change what
-	// ships here. It is threaded through anyway so every capture path reaches the
-	// buffer by the identical call, and a future kind cannot quietly bypass it.
+	// Org capture policy, fail-closed and refreshed off the hot path. It gates
+	// the one prose kind this rail mints: a text-only `ai_response` carrying the
+	// assistant's transcript text (no model, no tokens — the hook rail's `stop`
+	// row owns those). Off, this watcher emits exactly what it did before.
 	//
 	// Built BEFORE the drain because the drain reads its batch-ingest capability.
 	policyResolver := policy.NewResolver(session.SessionToken)
@@ -725,6 +723,33 @@ var cursorHookBlindKinds = map[string]bool{
 	"tool_use": true,
 }
 
+// isCursorTranscriptProse reports an `ai_response` that is assistant PROSE ONLY:
+// `text` present, no model and no usage field. It passes the claimed-transcript
+// filter even though `ai_response` is NOT hook-blind as a kind — the hook rail's
+// `stop` row is an ai_response too. The PAYLOADS are disjoint: that row never
+// carries text (afterAgentResponse is deliberately unregistered, afterAgentThought's
+// text is never read), and this one never carries model or tokens, so nothing
+// arrives twice and no token row is added. Checked on the payload rather than
+// by widening cursorHookBlindKinds, which must stay a pure kind-level guarantee.
+func isCursorTranscriptProse(ev event.Event) bool {
+	if ev.Kind != "ai_response" {
+		return false
+	}
+	d, ok := ev.Data.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if _, has := d["text"]; !has {
+		return false
+	}
+	for k := range d {
+		if k != "text" {
+			return false
+		}
+	}
+	return true
+}
+
 func tailCursorTranscript(
 	path, key string,
 	progress cursorWatchProgress,
@@ -746,6 +771,7 @@ func tailCursorTranscript(
 		return 0
 	}
 
+	proc.CaptureProse = captureProse
 	reader := bufio.NewReader(f)
 	consumed := int64(0)
 	queued := 0
@@ -766,7 +792,7 @@ func tailCursorTranscript(
 		// the engineer pasted or a tool printed.
 		redacted := redact.RedactBytes([]byte(trimmed))
 		for _, ev := range proc.Process(redacted, lineOffset) {
-			if only != nil && !only[ev.Kind] {
+			if only != nil && !only[ev.Kind] && !isCursorTranscriptProse(ev) {
 				continue
 			}
 			queued += emitCursorEvent(ev, session, captureProse)

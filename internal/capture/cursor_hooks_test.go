@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -391,6 +392,46 @@ func TestClaimedTranscriptStillYieldsTheKindsHooksCannotSee(t *testing.T) {
 
 	if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, false); queued != 2 {
 		t.Fatalf("claimed transcript queued %d event(s), want the mcp_call + skill use, not the prompt", queued)
+	}
+}
+
+// Prose is the one ai_response the hook rail cannot produce. On a claimed
+// transcript it must still ship when the org policy is on and stay absent when
+// off; the hook-covered command must be filtered either way.
+func TestClaimedTranscriptShipsProseOnlyUnderPolicy(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ws := resolvePath(t.TempDir())
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"}
+	cutoff := time.Now().Add(-time.Hour)
+
+	for _, tc := range []struct {
+		name  string
+		prose bool
+		want  int
+	}{{"off", false, 0}, {"on", true, 1}} {
+		t.Run(tc.name, func(t *testing.T) {
+			processors := map[string]*normalize.CursorTranscriptProcessor{}
+			pollCursorTranscripts(session, ws, cutoff, processors, true, tc.prose)
+			id := "prose-" + tc.name
+			path := writeCursorTranscript(t, root, "p/agent-transcripts/"+id+"/"+id+".jsonl",
+				`{"role":"assistant","message":{"content":[{"type":"text","text":"The handler swallowed the error; fixed."}]}}`,
+				cursorShellLine(ws),
+			)
+			recordCursorHookClaim(path, id)
+			if queued := pollCursorTranscripts(session, ws, cutoff, processors, false, tc.prose); queued != tc.want {
+				t.Fatalf("queued %d, want %d", queued, tc.want)
+			}
+		})
+	}
+}
+
+func TestTranscriptProsePredicateRejectsUsageRows(t *testing.T) {
+	prose := event.Event{Kind: "ai_response", Data: map[string]interface{}{"text": "hi"}}
+	usage := event.Event{Kind: "ai_response", Data: map[string]interface{}{"model": "m", "outputTokens": int64(3)}}
+	mixed := event.Event{Kind: "ai_response", Data: map[string]interface{}{"text": "hi", "model": "m"}}
+	if !isCursorTranscriptProse(prose) || isCursorTranscriptProse(usage) || isCursorTranscriptProse(mixed) {
+		t.Fatal("prose predicate must accept text-only and reject any model/usage-bearing ai_response")
 	}
 }
 

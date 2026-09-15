@@ -173,6 +173,10 @@ type CursorTranscriptProcessor struct {
 	RepoHost    string
 	RepoTracked bool
 
+	// CaptureProse is the org's captureAssistantProse policy, set by the watcher
+	// before each tail. False (fail-closed) emits exactly what it did before.
+	CaptureProse bool
+
 	// tsAnchor is the last wall-clock time recovered from a user turn's
 	// <timestamp>. Assistant records that follow inherit it (see cursorEventTs).
 	tsAnchor time.Time
@@ -249,7 +253,26 @@ func (p *CursorTranscriptProcessor) Process(line []byte, offset int64) []event.E
 	}
 
 	var out []event.Event
+	// A run of consecutive assistant text items is ONE response event, keyed on
+	// the first item's index. Coalescing stops at the record boundary on purpose:
+	// buffering across records would hold a turn's final answer until a record
+	// that may never come, and lose it on restart (the offset has advanced).
+	run, prose := -1, []string(nil)
+	flush := func() {
+		if ev, ok := p.proseEvent(prose, offset, run); ok {
+			out = append(out, ev)
+		}
+		run, prose = -1, nil
+	}
 	for i, item := range rec.Message.Content {
+		if rec.Role == "assistant" && item.Type == "text" {
+			if run < 0 {
+				run = i
+			}
+			prose = append(prose, item.Text)
+			continue
+		}
+		flush()
 		switch {
 		case rec.Role == "user" && item.Type == "text":
 			if ev, ok := p.promptEvent(item.Text, offset, i); ok {
@@ -261,7 +284,38 @@ func (p *CursorTranscriptProcessor) Process(line []byte, offset int64) []event.E
 			}
 		}
 	}
+	flush()
 	return stampLaneID(out, p.LaneID)
+}
+
+// proseEvent builds the assistant's response prose for one text run, only when
+// the org's captureAssistantProse policy is on.
+//
+// SHAPE: `ai_response` with `text` ONLY. It is the one kind whose `text` the
+// projector keeps (scrubAssistantProse, org-gated). It carries NO model and NO
+// token fields: the hook rail's `stop` row owns Cursor spend, and this
+// transcript has no usage to report anyway, so no token row can be doubled.
+// Session claiming is recorded by the hook process alone (recordCursorHookClaim),
+// never inferred from events, so emitting this cannot move a claim.
+//
+// Sidechain prose is written to the parent agent, not the human — skipped, the
+// same rule as prompts (and Codex's subagent answers).
+func (p *CursorTranscriptProcessor) proseEvent(parts []string, offset int64, idx int) (event.Event, bool) {
+	if !p.CaptureProse || p.Sidechain || idx < 0 {
+		return event.Event{}, false
+	}
+	var kept []string
+	for _, s := range parts {
+		if s = strings.TrimSpace(s); s != "" {
+			kept = append(kept, s)
+		}
+	}
+	if len(kept) == 0 {
+		return event.Event{}, false
+	}
+	e := p.newAIEvent("ai_response", offset, idx)
+	e.Data = map[string]interface{}{"text": strings.Join(kept, "\n\n")}
+	return e, true
 }
 
 // promptEvent builds the human `prompt` event from a user turn.
@@ -604,9 +658,10 @@ func (p *CursorTranscriptProcessor) newAIEvent(kind string, offset int64, idx in
 //
 // Applied at Process's single return, to EVERY event the sidechain emits, rather
 // than to one chosen kind. A first draft picked ai_response as "the one event per
-// turn"; the Cursor transcript never emits ai_response at all (its kinds are
-// command / file_create / file_delete / file_diff / mcp_call / prompt /
-// task_dispatch), so that carrier would have stamped nothing and the lane would
+// turn"; the Cursor transcript emits ai_response only as policy-gated main-chain
+// prose (never on a sidechain; its other kinds are command / file_create /
+// file_delete / file_diff / mcp_call / prompt / task_dispatch / tool_use), so
+// that carrier would have stamped nothing and the lane would
 // have stayed invisible while looking implemented. Stamping every event also
 // makes the span robust to a subagent whose whole life is, say, three commands.
 //

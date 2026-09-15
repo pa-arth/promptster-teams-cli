@@ -864,6 +864,10 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		e := p.newCodexEvent("ai_response", ts, ts)
 		data := map[string]interface{}{
 			"lastAssistantMessage": stringField(payload, "message"),
+			// ProjectEvent keeps only `text` (code-scrubbed, org-gated) and drops
+			// lastAssistantMessage unconditionally, so without this key Codex prose
+			// never left the device. Same pairing as the Claude processor.
+			"text": stringField(payload, "message"),
 		}
 		if p.model != "" {
 			data["model"] = p.model
