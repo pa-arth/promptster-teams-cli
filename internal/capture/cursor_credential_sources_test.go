@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/redact"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
@@ -55,6 +56,18 @@ func agentToken(t *testing.T, sub string, exp int64) string {
 	return jwtWithClaims(t, fmt.Sprintf(`{"sub":%q,"exp":%d}`, sub, exp))
 }
 
+// currentCycleComplete drops the previous-cycle snapshot each poll also stages
+// (#224), so counts are per login for fakeVendor's current cycle.
+func currentCycleComplete(evs []event.Event) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, d := range vendorSnapshotData(evs, CursorVendorSnapshotStatusComplete) {
+		if d["billingCycleStartsAt"] == "2026-08-01T00:00:00.000Z" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 func refsOf(snaps []map[string]interface{}) map[string]bool {
 	out := map[string]bool{}
 	for _, s := range snaps {
@@ -83,7 +96,7 @@ func TestCursorVendorAgentAuthFileDifferentLogin(t *testing.T) {
 			agentLogin(t, agent, "auth0|agent_login", "Agent@Example.com")
 			pollCursorVendorUsage("dev", resolver, client, time.Now())
 
-			complete := vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete)
+			complete := currentCycleComplete(*evs)
 			absent := vendorSnapshotData(*evs, CursorVendorSnapshotStatusAbsent)
 			wantRefs := map[string]bool{cursorAccountRef(agent): true}
 			if !ideAbsent {
@@ -123,7 +136,7 @@ func TestCursorVendorAgentAuthFileSameLoginDedupes(t *testing.T) {
 			agentLogin(t, agent, "auth0|shared", "shared@example.com")
 			pollCursorVendorUsage("dev", resolver, client, time.Now())
 
-			complete := vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete)
+			complete := currentCycleComplete(*evs)
 			absent := vendorSnapshotData(*evs, CursorVendorSnapshotStatusAbsent)
 			if len(complete) != 1 || complete[0]["accountRef"] != cursorAccountRef(ide) || len(absent) != 0 {
 				t.Fatalf("complete=%v absent=%v, want exactly one snapshot for the shared login", complete, absent)
@@ -179,7 +192,7 @@ func TestCursorVendorAgentAuthFileBadStatesLeaveIDEUnaffected(t *testing.T) {
 			agent := tc.setup(t)
 			pollCursorVendorUsage("dev", resolver, client, time.Now())
 
-			complete := vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete)
+			complete := currentCycleComplete(*evs)
 			if len(complete) != 1 || complete[0]["accountRef"] != cursorAccountRef(ide) || calls[ide] != 1 || len(calls) != 1 {
 				t.Fatalf("complete=%v calls=%v, want the IDE login collected once and nothing else", complete, calls)
 			}
@@ -241,7 +254,7 @@ func TestCursorVendorAgentAuthFileNeverEmitsSecretsOrEmail(t *testing.T) {
 	_ = w.Close()
 	logged, _ := io.ReadAll(r)
 
-	if len(vendorSnapshotData(*evs, CursorVendorSnapshotStatusComplete)) != 1 {
+	if len(currentCycleComplete(*evs)) != 1 {
 		t.Fatalf("precondition: agent login not collected: %v", *evs)
 	}
 	if !bytes.Contains(logged, []byte(string(cursorSourceIDEStateDB))) {
