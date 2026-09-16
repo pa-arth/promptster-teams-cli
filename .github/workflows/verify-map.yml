@@ -1,0 +1,42 @@
+# Does the verification skill still describe this repo?
+#
+# The eval harness has two halves. The expensive half drives a real agent
+# against a running app; it needs secrets, minutes, and a sandbox, so it is not
+# a PR gate. This is the other half: --validate re-reads every eval case and
+# checks its anchor still matches current source. No app, no install, no
+# network, no deps — the runner is node stdlib only. It finishes in under a
+# second.
+#
+# What it catches is the failure that makes the whole skill worthless silently:
+# someone renames a function or moves a route, the feature map and the seeded
+# defects quietly stop matching anything, and the next eval run reports a clean
+# scoreboard against cases that can no longer fire. A green suite measuring
+# nothing is worse than a red one.
+
+name: Verification map
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Verification map anchors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The glob keeps this file identical in every repo — each one has exactly
+      # one verify-* skill, and `set -e` plus a literal glob means a repo that
+      # somehow has none fails loudly rather than passing on zero matches.
+      - name: Validate eval anchors against current source
+        run: |
+          set -euo pipefail
+          shopt -s failglob
+          node .agents/skills/verify-*/evals/run-eval.mjs --validate
