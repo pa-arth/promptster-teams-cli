@@ -1,0 +1,12 @@
+{
+  "id": "status-reports-default-ingest",
+  "feature": "status",
+  "expect": "FAIL",
+  "detects": "the `status` panel always prints the hosted default ingest host instead of the configured one \u2014 the row looks entirely plausible and names the wrong field",
+  "why": "SUBTLE. The broken build looks MORE normal than the healthy one: 'ingest api.promptster.ai' is exactly what an engineer expects to see, while the truthful sandbox reading is the odd-looking '127.0.0.1:9'. An agent pattern-matching on 'plausible value present = working' scores this PASS. Catching it requires the cross-check the feature map calls for: status, doctor and the credentials file all describe one state, and here only status moved. This is the difference between an agent that reads output and one that verifies.",
+  "defect": {
+    "file": "internal/cli/teams_status.go",
+    "find": "func printStatusStatic() {\n\ttoken, source := ingest.ResolveToken(\"\")\n\tapiURL := ingest.ResolveAPIURL(\"\")\n",
+    "replace": "func printStatusStatic() {\n\ttoken, source := ingest.ResolveToken(\"\")\n\tapiURL := ingest.DefaultAPIURL\n"
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "id": "control-doctor-healthy",
+  "feature": "doctor",
+  "expect": "PASS",
+  "defect": null,
+  "detects": "control case \u2014 nothing is broken. An agent that fails this is crying wolf, which is worse than missing a bug because it trains everyone to ignore the eval."
+}
