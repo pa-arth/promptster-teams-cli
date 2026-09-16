@@ -1,0 +1,4 @@
+{
+  "install": "go build ./... && cd .agents/skills/verify-teams-cli && npm install",
+  "terminals": []
+}
