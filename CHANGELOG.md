@@ -11,8 +11,49 @@ follows [Semantic Versioning](https://semver.org/).
 - `lastRequestInputTokens` on Codex `ai_response` and `subagent_usage`: the
   input of the most recent single model request (`token_count.info.last_token_usage.input_tokens`,
   cached input included). The cumulative fields are unchanged. The key is omitted,
-  never 0, when the latest `token_count` has no usable `last_token_usage`. Needs
-  the promptster-backend allowlist change first.
+  never 0, when the latest `token_count` has no usable `last_token_usage`. The
+  promptster-backend capture allowlist already names the field on both kinds, so
+  no server change gates this.
+
+## [0.31.0] — 2026-09-15
+
+### Added
+
+- Cursor vendor usage now reads every Cursor login on the device it can see, not
+  only the IDE's. Each cycle also reads the `cursor-agent` CLI's
+  `~/.cursor/auth.json` file store, and collects one snapshot per distinct
+  `accountRef`; a login held in both stores is collected once. Separately, for
+  hook attribution only, cursor-agent's `cli-config.json` `authInfo` teaches the
+  login map `{HMAC(email), sha256(authId)[:16]}`, so a `stop` turn under a
+  cursor-agent login stamps its real `cursorAccountRef` instead of
+  `unreadable:` even when the token is not read. The macOS keychain, where
+  cursor-agent keeps its login by default, is not read, so such a login is
+  attributed but not collected. The whole poll is bounded below the 15-minute
+  interval; an account it does not reach is skipped until the next cycle, with
+  no absence. Files over 1 MiB are skipped as oversized. No new emitted fields,
+  and no email, token or authId leaves the device. openspec
+  `cursor-vendor-multi-account` §2.1.
+
+## [0.30.0] — 2026-09-15
+
+### Added
+
+- Assistant response prose on Codex and Cursor, under the org's
+  `captureAssistantProse` policy. Codex final answers now carry `text` beside
+  `lastAssistantMessage`: the projector keeps only `text`, so no Codex prose had
+  ever left the device. Cursor's transcript watcher now emits each run of
+  assistant text items as an `ai_response` carrying `text` only — no model, no
+  tokens — so the hook rail's `stop` row still owns spend. On hook-claimed
+  transcripts it is admitted by payload, not by kind. Policy off: output
+  unchanged. Requires promptster-backend#956 (deployed), which stops text-only
+  rows counting as usage.
+- Cursor-generated dependency lockfiles are attributed. Before/after shell hooks
+  around npm, pnpm and yarn dependency commands record changed lockfile hashes
+  locally; a commit range is attributed only when the committed blob matches the
+  captured result, with `generationKind: dependency`. Missing or overlapping hook
+  pairs, changed blobs, expired evidence, symlinks and unsupported shell forms
+  produce no attribution. Hooks always allow execution; hashes and contents stay
+  local. Requires promptster-backend#958 (deployed).
 
 ## [0.29.0] — 2026-09-15
 
@@ -2542,7 +2583,9 @@ displayed.
   Claude Code + Codex transcripts, redacts on-device, signs into a
   tamper-evident chain, and streams to a team backend.
 
-[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.30.0...v0.31.0
+[0.30.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.3...v0.29.0
 [0.28.3]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.2...v0.28.3
 [0.28.2]: https://github.com/pa-arth/promptster-teams-cli/compare/v0.28.1...v0.28.2
