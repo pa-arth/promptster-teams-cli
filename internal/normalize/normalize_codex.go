@@ -61,6 +61,14 @@ type CodexRolloutProcessor struct {
 	// lookup table would have produced, and a table has no subscriber to the
 	// vendor's next release. 0 means "not reported"; never emitted as 0.
 	lastContextWindow int64
+	// lastRequestInput is codex's `token_count.info.last_token_usage.input_tokens`:
+	// the input of the single MOST RECENT model request (cached input included,
+	// OpenAI convention) — the resident context. lastTokenUsage above is the
+	// CUMULATIVE total despite its name, and a turn spans many requests, so
+	// differencing totals sums N requests instead of reading one. Reset on every
+	// line that restates the total, so a stale request never pairs with a newer
+	// total. 0 means "not reported"; never emitted as 0.
+	lastRequestInput int64
 	// workdir is the session's cwd, home-collapsed to "~/…", captured from the
 	// session_meta header (the ONLY codex rollout line that carries cwd). It is
 	// stamped onto each prompt event so the teams dashboard can show where the
@@ -900,6 +908,10 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 			if usage, ok := info["total_token_usage"].(map[string]interface{}); ok {
 				p.lastTokenUsage = usage
 				sessionUsage = p.codexSessionUsage(usage, ts)
+				p.lastRequestInput = 0
+				if last, ok := info["last_token_usage"].(map[string]interface{}); ok {
+					p.lastRequestInput = intField(last, "input_tokens")
+				}
 			}
 			// Tracked independently of total_token_usage: the two are separate
 			// keys on `info` and a line can carry either without the other.
@@ -1215,6 +1227,10 @@ func (p *CodexRolloutProcessor) attachTokenUsage(data map[string]interface{}) {
 		data["inputTokens"] = input
 		data["outputTokens"] = output
 		data["cacheReadTokens"] = cacheRead
+		// Absent, never 0: see lastRequestInput.
+		if p.lastRequestInput > 0 {
+			data["lastRequestInputTokens"] = p.lastRequestInput
+		}
 		// reasoning_output_tokens is OpenAI-only and absent on non-reasoning
 		// turns. Attach reasoningTokens ONLY when the provider actually reported
 		// it — emitting 0 for an unreported count would conflate "no reasoning
