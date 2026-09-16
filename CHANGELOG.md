@@ -4,7 +4,7 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.32.0] — 2026-09-16
 
 ### Added
 
