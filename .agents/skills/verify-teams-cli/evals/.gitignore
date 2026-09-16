@@ -1,0 +1,6 @@
+# per-run scratch: prompts handed to interactive agents, verdict drop-files,
+# and the crash-recovery marker. None of it belongs in a commit.
+.prompt-*.txt
+.verdict-*.txt
+.pending-revert.json
+.eval-build-probe

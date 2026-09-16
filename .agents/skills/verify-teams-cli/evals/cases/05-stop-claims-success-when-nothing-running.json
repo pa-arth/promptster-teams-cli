@@ -1,0 +1,12 @@
+{
+  "id": "stop-claims-success-when-nothing-running",
+  "feature": "capture-daemon",
+  "expect": "FAIL",
+  "detects": "`stop` reports 'background capture stopped' even when no capture was running \u2014 the failure path now renders as the success path",
+  "why": "SUBTLE, and the defect this command was written to prevent. Driven once, the output is word-for-word what a healthy stop prints, so any single run looks like a pass. The agent has to know from the feature map that `stop` has THREE mutually exclusive outcomes and drive the pair: stop on a clean sandbox (must say 'no tracked background capture was running') and stop after start (must say 'stopped'). An agent that checks exitCode learns nothing either \u2014 every branch exits 0.",
+  "defect": {
+    "file": "internal/capture/daemon.go",
+    "find": "\twasRunning := len(targets) > 0 || watcherAlive\n",
+    "replace": "\twasRunning := len(targets) >= 0 || watcherAlive\n"
+  }
+}

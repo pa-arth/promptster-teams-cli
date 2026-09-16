@@ -1,0 +1,7 @@
+{
+  "id": "control-login-healthy",
+  "feature": "login",
+  "expect": "PASS",
+  "defect": null,
+  "detects": "control case on the onboarding path \u2014 login must save the key and start capture"
+}

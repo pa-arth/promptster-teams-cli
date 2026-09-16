@@ -1,0 +1,12 @@
+{
+  "id": "doctor-missing-key-not-reported",
+  "feature": "doctor",
+  "expect": "FAIL",
+  "detects": "doctor no longer reports a MISSING developer key as an error \u2014 an unconfigured install is told it is Ready",
+  "why": "The floor of the eval. Drive `doctor` on a fresh sandbox and the key line should be the red 'no developer key' line and the closing line should send you to `login`. An agent that misses this is not driving the binary at all; it is reading source or hallucinating.",
+  "defect": {
+    "file": "internal/cli/teams_status.go",
+    "find": "\tswitch {\n\tcase token == \"\":\n",
+    "replace": "\tswitch {\n\tcase false:\n"
+  }
+}
