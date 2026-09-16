@@ -5,6 +5,16 @@ launchd on macOS, `systemd --user` on Linux, Task Scheduler on Windows. This is
 the feature with the sharpest isolation edge in the repo — read the gotchas
 before driving it.
 
+> **What this harness can actually verify: macOS and Linux only.**
+> `control-teams-cli.mjs` intercepts `launchctl`, `systemctl` and `schtasks`
+> with extensionless `#!/bin/sh` shims, builds `PATH` with `:` separators, and
+> identifies processes with Unix `ps`. None of that works on Windows, so the
+> Task Scheduler path is **unverified by this skill** — do not report a verdict
+> on it from a run here. Verifying it needs a Windows host and a shim strategy
+> (`.cmd` on `PATHEXT`) that does not exist yet. Said plainly because a feature
+> map that silently implies coverage it does not have is the exact failure this
+> skill is built to prevent.
+
 ## Sub-features
 
 `cmdAutostart` (`internal/cli/autostart.go`) dispatches four subcommands; an

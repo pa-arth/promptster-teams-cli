@@ -90,10 +90,17 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { retu
 
 // Only ever act on a pid whose executable is OUR build. The engineer's own
 // capture daemon has the same process name; killing by name would take it out.
+//
+// Reads `args=`, not `comm=`. On Linux `comm=` is the basename ("promptster"),
+// so an absolute-path compare NEVER matches and cleanup silently skips the
+// harness's own daemon: procs.json is cleared and the sandbox removed while the
+// process is still live, leaving an untracked daemon to contaminate the next
+// run. `args=` carries the full argv[0] on both macOS and Linux, and we always
+// exec by absolute path, so the distinction the check exists to make survives.
 function isOurs(pid) {
   try {
-    const p = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
-    return p === BIN || p.startsWith(BIN);
+    const argv0 = execFileSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" }).trim().split(/\s+/)[0];
+    return argv0 === BIN;
   } catch { return false; }
 }
 
@@ -203,7 +210,13 @@ function cmdInspect(args) {
   };
   walk(sbxHome());
   if (only) {
-    const p = path.join(sbxHome(), only);
+    const p = path.resolve(sbxHome(), only);
+    // `inspect` reports sandbox contents and nothing else. Without this a value
+    // containing ../ resolves outside and hands back part of an arbitrary
+    // readable host file in the agent's output.
+    const base = path.resolve(sbxHome());
+    if (p !== base && !p.startsWith(base + path.sep))
+      return fail(`path escapes the sandbox: ${only}`, "inspect only reads inside the sandbox home. Pass a path relative to it, with no leading / and no `..`.");
     if (!fs.existsSync(p)) return fail(`no such file in the sandbox: ${only}`, "Run `inspect` with no argument to list what the sandbox actually contains.", { files: files.map((f) => f.path) });
     return out({ ok: true, file: only, content: fs.readFileSync(p, "utf8").slice(0, 20000) });
   }

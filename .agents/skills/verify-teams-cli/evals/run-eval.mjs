@@ -80,11 +80,59 @@ const ctl = (...a) => {
 // ------------------------------------------------------------ defect injection
 
 const PENDING = path.join(HERE, ".pending-revert.json");
+const LOCK = path.join(HERE, ".eval-lock");
+
+/**
+ * One evaluator per checkout, enforced.
+ *
+ * A run EDITS Go source in the shared working tree to inject a defect. Two runs
+ * in the same checkout are not merely racy, they corrupt each other: the second
+ * one's startup recovery sees the first one's PENDING file, restores the source
+ * underneath it and deletes its marker, so the first then builds and scores the
+ * wrong tree and a later crash leaves the defect in place permanently. This
+ * repo is routinely worked by several sessions at once, so that is a matter of
+ * course rather than bad luck.
+ *
+ * `wx` is atomic on every platform that matters: whoever creates the file owns
+ * the tree. A lock whose owner is gone is stale and is taken over, so a killed
+ * run does not wedge the next one.
+ */
+function takeLock() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(LOCK, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }), { flag: "wx" });
+      return;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw e;
+      let owner = null;
+      try { owner = JSON.parse(fs.readFileSync(LOCK, "utf8")); } catch { /* unreadable => stale */ }
+      const live = owner?.pid && (() => { try { process.kill(owner.pid, 0); return true; } catch { return false; } })();
+      if (live) {
+        console.error(
+          `REFUSING to start: another evaluation (pid ${owner.pid}, since ${owner.at}) holds this checkout.\n` +
+          `It injects defects into the shared Go source, so two at once corrupt each other's tree.\n` +
+          `Wait for it, or run this one against a separate worktree.`,
+        );
+        process.exit(2);
+      }
+      console.error(`Clearing a stale eval lock from pid ${owner?.pid ?? "?"} (no longer running).`);
+      try { fs.unlinkSync(LOCK); } catch { /* someone else cleared it; retry */ }
+    }
+  }
+  console.error("Could not take the eval lock after clearing a stale one. Remove .eval-lock by hand if nothing is running.");
+  process.exit(2);
+}
+
+const releaseLock = () => { try { fs.unlinkSync(LOCK); } catch { /* already gone */ } };
 
 // A `finally` does not run under SIGKILL, and an OOM kill is exactly what
 // happens when agents run concurrently on a loaded machine. Without this, a
 // killed run leaves an injected defect in Go source and the next build compiles
 // the sabotage. Pristine content goes to disk BEFORE the edit.
+//
+// Safe to run at startup only because takeLock() has already established that
+// no other evaluator owns this tree — otherwise this would restore a LIVE run's
+// source out from under it.
 function recoverPending() {
   if (!fs.existsSync(PENDING)) return;
   try {
@@ -97,8 +145,25 @@ function recoverPending() {
   }
 }
 
+/**
+ * Resolve a case's target path and prove it stays inside the repo.
+ *
+ * Case files declare `defect.file` as repo-relative, but nothing checked it. A
+ * typo or a future case containing `../` would make --validate read an outside
+ * file and make a real run OVERWRITE it — injection writes before it restores,
+ * so a crash in between leaves someone else's file holding sabotaged content.
+ * Both callers route through here so neither can be the one that forgets.
+ */
+function caseTarget(relative) {
+  const file = path.resolve(REPO, relative);
+  const base = path.resolve(REPO);
+  if (!file.startsWith(base + path.sep))
+    throw new Error(`case targets a path outside the repository: ${relative}`);
+  return file;
+}
+
 function inject(defect, caseId = "unknown") {
-  const file = path.join(REPO, defect.file);
+  const file = caseTarget(defect.file);
   if (!fs.existsSync(file)) throw new Error(`case targets a file that does not exist: ${defect.file}`);
   const original = fs.readFileSync(file, "utf8");
   const hits = original.split(defect.find).length - 1;
@@ -136,7 +201,9 @@ function validate() {
   for (const f of fs.readdirSync(CASES).filter((x) => x.endsWith(".json")).sort()) {
     const c = JSON.parse(fs.readFileSync(path.join(CASES, f), "utf8"));
     if (!c.defect) { rows.push({ case: c.id, anchor: "control — no defect", ok: true }); continue; }
-    const file = path.join(REPO, c.defect.file);
+    let file;
+    try { file = caseTarget(c.defect.file); }
+    catch (e) { rows.push({ case: c.id, ok: false, error: String(e.message) }); continue; }
     if (!fs.existsSync(file)) { rows.push({ case: c.id, ok: false, error: `missing file ${c.defect.file}` }); continue; }
     const hits = fs.readFileSync(file, "utf8").split(c.defect.find).length - 1;
     rows.push({ case: c.id, file: c.defect.file, matches: hits, ok: hits === 1, ...(hits === 1 ? {} : { error: "anchor must match EXACTLY ONCE" }) });
@@ -167,11 +234,16 @@ For example: printf PASS > ${verdictFile}
 PASS means the feature works as its feature-map file says it should. FAIL means it does not. Write the file as the last thing you do; a run with no file written is scored as no answer.`;
 
 async function main() {
+  // --validate only READS, so it needs no lock and must stay usable in CI while
+  // a run is in flight.
+  if (flag("validate")) validate();
+
+  takeLock();
+  process.on("exit", releaseLock);
   recoverPending();
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
-    process.on(sig, () => { recoverPending(); process.exit(130); });
+    process.on(sig, () => { recoverPending(); releaseLock(); process.exit(130); });
   }
-  if (flag("validate")) validate();
   fs.mkdirSync(RESULTS, { recursive: true });
 
   const agentNames = flag("all-agents") ? Object.keys(AGENTS) : [flag("agent", "claude")];
