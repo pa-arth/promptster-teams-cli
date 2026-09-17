@@ -43,6 +43,11 @@ const presenceSource = "promptster-teams"
 // large enough to be negligible traffic.
 const PresenceHeartbeatInterval = 5 * time.Minute
 
+// presenceStartupWait bounds how long the first beat waits for the drain's first
+// outcome. Long enough to cover one 5s-timeout POST; short enough that a new
+// install still shows up as onboarded within seconds.
+var presenceStartupWait = 15 * time.Second
+
 // presenceData is the CLOSED payload of a presence event. Every field here is
 // benign environment/routing metadata — no prompts, responses, file contents,
 // commands, or any other captured transcript data may ever be added. The test
@@ -342,6 +347,12 @@ func emitPresenceEvent(session Session) {
 // run registers the device as onboarded) and then once per interval until
 // stop is closed. Intended to run as a goroutine alongside the watchers.
 func runPresenceHeartbeat(session Session, stop <-chan struct{}) {
+	// The drain starts with the watchers, AFTER this goroutine. Beating at once
+	// reported "unknown" beside a queue nobody had tried yet, on every restart;
+	// see outbox.AwaitDeliveryOutcome.
+	if !outbox.AwaitDeliveryOutcome(stop, presenceStartupWait) {
+		return // stopped during the wait: no beat after stop
+	}
 	emitPresenceEvent(session)
 	ticker := time.NewTicker(PresenceHeartbeatInterval)
 	defer ticker.Stop()
