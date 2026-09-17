@@ -13,8 +13,13 @@ import (
 
 const dayMs int64 = 24 * 60 * 60 * 1000
 
-// durVerdictFor pulls the durability verdict event for a given path out of a
-// slice, or fails. Verdicts are emitted one per (commit, path).
+// durVerdictFor pulls the durability verdict event covering a given path out of
+// a slice, or fails.
+//
+// TWO SHAPES, because the kind carries two. Churn and durable are one event per
+// (commit, path) and name it at the top level. The living inventory is one event
+// per ROOT and names the path on each RANGE, so this falls through to the range
+// arrays — a caller asking for "ai.go" wants the event that reports it either way.
 func durVerdictFor(t *testing.T, evs []event.Event, path string) map[string]interface{} {
 	t.Helper()
 	for _, ev := range evs {
@@ -25,12 +30,25 @@ func durVerdictFor(t *testing.T, evs []event.Event, path string) map[string]inte
 		if !ok {
 			t.Fatalf("event Data is %T, want map", ev.Data)
 		}
-		if data["path"] == path {
+		if data["path"] == path || rangesNamePath(data, path) {
 			return data
 		}
 	}
 	t.Fatalf("no durability_verdict for %q in %d event(s)", path, len(evs))
 	return nil
+}
+
+// rangesNamePath reports whether any range in the verdict carries `path`.
+func rangesNamePath(data map[string]interface{}, path string) bool {
+	for _, field := range []string{"livingRanges", "durableRanges", "churnedRanges"} {
+		arr, _ := data[field].([]interface{})
+		for _, r := range arr {
+			if rm, ok := r.(map[string]interface{}); ok && rm["path"] == path {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rangeSet flattens a verdict's range array ("durableRanges" or "churnedRanges")
@@ -582,6 +600,110 @@ func TestLivingInventoryThrottledToOncePerDay(t *testing.T) {
 	first, _ := ranges[0].(map[string]any)
 	if age := first["ageDays"]; age != float64(1) && age != 1 {
 		t.Errorf("ageDays = %v, want 1 (age must be current, not frozen at seed)", age)
+	}
+}
+
+// seedTrackedPaths commits n AI-authored files into a fresh repo and runs the
+// durability poll over them, leaving n tracked paths in the ledger. Returns the
+// root, its key and the session.
+func seedTrackedPaths(t *testing.T, n int) (string, string, Session) {
+	t.Helper()
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	for i := 0; i < n; i++ {
+		p := "ai" + itoa(i) + ".go"
+		recordAiTouchedPath("sess-dur", key, p)
+		writeCommitFile(t, ws, p, "l1\nl2\n")
+	}
+	git("add", "-A")
+	git("commit", "-m", "ai adds files")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), 1_000_000_000_000, siblingLineage{})
+	return ws, key, sess
+}
+
+// TestLivingInventoryEmitsOneEventPerRoot — THE ROW-VOLUME FIX.
+//
+// The inventory used to emit one event per tracked path for a measurement that is
+// per-ROOT: on ops.ai it was 24,573 of 26,680 durability_verdict rows over 7 days
+// (92%) across only ~182 actual inventory runs. A root with N tracked paths must
+// now produce ONE event, with every path named on its own range — this fails on
+// the old code at N verdicts.
+func TestLivingInventoryEmitsOneEventPerRoot(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const paths = 12
+	ws, key, sess := seedTrackedPaths(t, paths)
+
+	v := inventoryLiving(sess, ws, key, 1_000_000_000_000+4*dayMs)
+	if len(v) != 1 {
+		t.Fatalf("inventory emitted %d events for %d tracked paths, want 1", len(v), paths)
+	}
+
+	data := v[0].Data.(map[string]interface{})
+	if _, hasTop := data["path"]; hasTop {
+		t.Errorf("a whole-root inventory must not claim a single top-level path: %v", data["path"])
+	}
+	ranges, _ := data["livingRanges"].([]interface{})
+	if len(ranges) != paths {
+		t.Fatalf("livingRanges = %d, want %d — one per tracked path", len(ranges), paths)
+	}
+	seen := map[string]bool{}
+	for _, r := range ranges {
+		rm := r.(map[string]interface{})
+		p, _ := rm["path"].(string)
+		if p == "" {
+			t.Fatalf("a range with no path: %v — the per-file identity is lost", rm)
+		}
+		if rm["lineageId"] == "" || rm["lineageId"] == nil {
+			t.Errorf("range %v lost its lineageId; the backend folds on it", rm)
+		}
+		seen[p] = true
+	}
+	if len(seen) != paths {
+		t.Errorf("inventory named %d distinct paths, want %d", len(seen), paths)
+	}
+}
+
+// TestLivingInventoryChunksAtTheRangeCeiling: one root per event is only safe
+// while the event stays under the wire's caps (see durabilityInventoryMaxRanges).
+// Past the ceiling it must SPLIT rather than build one the server refuses — and
+// every range must still be reported exactly once across the chunks.
+func TestLivingInventoryChunksAtTheRangeCeiling(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	orig := durabilityInventoryMaxRanges
+	durabilityInventoryMaxRanges = 4
+	t.Cleanup(func() { durabilityInventoryMaxRanges = orig })
+
+	const paths = 10 // ceil(10/4) = 3 events
+	ws, key, sess := seedTrackedPaths(t, paths)
+
+	v := inventoryLiving(sess, ws, key, 1_000_000_000_000+4*dayMs)
+	if len(v) != 3 {
+		t.Fatalf("inventory emitted %d events for %d ranges at a ceiling of 4, want 3", len(v), paths)
+	}
+	seen := map[string]int{}
+	for _, ev := range v {
+		data := ev.Data.(map[string]interface{})
+		ranges, _ := data["livingRanges"].([]interface{})
+		if len(ranges) > durabilityInventoryMaxRanges {
+			t.Errorf("a chunk carries %d ranges, over the ceiling of %d",
+				len(ranges), durabilityInventoryMaxRanges)
+		}
+		for _, r := range ranges {
+			seen[r.(map[string]interface{})["path"].(string)]++
+		}
+	}
+	if len(seen) != paths {
+		t.Errorf("chunking reported %d distinct paths, want %d", len(seen), paths)
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Errorf("%s appears in %d chunks, want exactly 1", p, n)
+		}
 	}
 }
 

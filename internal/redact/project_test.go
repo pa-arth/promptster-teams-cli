@@ -989,10 +989,17 @@ func TestProjectEventDurabilityVerdictLivingRanges(t *testing.T) {
 	e := eventWithData("durability_verdict", map[string]interface{}{
 		"commitSha":    "deadbeefcafe",
 		"workspaceKey": "owner/name",
-		"path":         "src/app.ts",
+		// No top-level path: the inventory reports a whole ROOT in one event and
+		// names the file on each range instead.
 		"measuredTsMs": 1000,
 		"livingRanges": []interface{}{
-			map[string]interface{}{"start": 1, "end": 3, "ageDays": 4, "lineageId": "abc:src/app.ts", "text": leakCanary},
+			map[string]interface{}{"start": 1, "end": 3, "ageDays": 4, "lineageId": "abc:src/app.ts", "path": "src/app.ts", "text": leakCanary},
+		},
+		// The SAME key on a TERMINAL range must still be stripped. The widening is
+		// scoped to livingRanges, the only array with nowhere else to put it; churn
+		// and durable are still one event per path and carry it at the top level.
+		"churnedRanges": []interface{}{
+			map[string]interface{}{"start": 9, "end": 9, "ageDays": 2, "lineageId": "abc:src/app.ts", "path": "src/app.ts"},
 		},
 	})
 	ProjectEvent(&e, false)
@@ -1007,8 +1014,16 @@ func TestProjectEventDurabilityVerdictLivingRanges(t *testing.T) {
 		t.Fatalf("livingRanges did not survive projection (survival would be unmeasurable): %T %+v", data["livingRanges"], data["livingRanges"])
 	}
 	first := living[0].(map[string]interface{})
-	if len(first) != 4 || first["start"] != 1 || first["end"] != 3 || first["ageDays"] != 4 || first["lineageId"] != "abc:src/app.ts" {
-		t.Errorf("living range not stripped to {start,end,ageDays,lineageId}: %+v", first)
+	if len(first) != 5 || first["start"] != 1 || first["end"] != 3 || first["ageDays"] != 4 ||
+		first["lineageId"] != "abc:src/app.ts" || first["path"] != "src/app.ts" {
+		t.Errorf("living range not stripped to {start,end,ageDays,lineageId,path}: %+v", first)
+	}
+	churned, ok := data["churnedRanges"].([]interface{})
+	if !ok || len(churned) != 1 {
+		t.Fatalf("churnedRanges did not survive projection: %+v", data["churnedRanges"])
+	}
+	if _, kept := churned[0].(map[string]interface{})["path"]; kept {
+		t.Errorf("path survived on a CHURNED range: the widening must stay scoped to livingRanges, got %+v", churned[0])
 	}
 }
 

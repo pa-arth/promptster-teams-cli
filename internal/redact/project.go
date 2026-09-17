@@ -420,14 +420,24 @@ var projectArrayElementAllowlist = map[string]map[string][]string{
 		"files":      {"path", "lineRanges", "sessionId", "generationKind"},
 		"lineRanges": {"start", "end", "attribution"},
 	},
-	// durability_verdict's two range arrays are content-free by construction
+	// durability_verdict's three range arrays are content-free by construction
 	// (ints + one lineage handle), but this allowlist is the LOAD-BEARING privacy
 	// line: it strips every element to exactly these scalar keys, so a smuggled
 	// `text`/byte/fingerprint key can never survive projection.
+	//
+	// `path` on livingRanges ONLY, and deliberately not on the other two. The
+	// living inventory is a WHOLE-ROOT measurement emitted as one event (it was one
+	// event per tracked path, 92% of this kind's rows on ops.ai), so it has no
+	// single top-level `path` to carry and each range names its own file instead.
+	// It is the SAME repo-relative path string this kind has always sent at the top
+	// level — no new class of data leaves the device, only a different place on the
+	// same event. churnedRanges/durableRanges are still one event per path and keep
+	// carrying it at the top level; adding it to them would be duplication, and
+	// this line is too load-bearing to widen without a use.
 	"durability_verdict": {
 		"durableRanges": {"start", "end", "ageDays", "lineageId"},
 		"churnedRanges": {"start", "end", "ageDays", "lineageId"},
-		"livingRanges":  {"start", "end", "ageDays", "lineageId"},
+		"livingRanges":  {"start", "end", "ageDays", "lineageId", "path"},
 	},
 	// rework_verdict's range array is content-free by construction (ints + a
 	// lineage handle), but this allowlist is the LOAD-BEARING privacy line: it

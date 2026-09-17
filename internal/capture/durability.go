@@ -724,7 +724,7 @@ func pollDurabilityCommit(root, rootKey string, session Session, sha string, now
 					tombstoneSeededPath(led, rootKey, path, recordedStamp(path))
 				}
 				if len(churned) > 0 {
-					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nil, nowMs))
+					verdicts = append(verdicts, buildDurabilityVerdict(session, root, sha, path, nil, churned, nowMs))
 				}
 				continue
 			}
@@ -861,7 +861,7 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 	measureSha, _ := gitHead(root)
 	var verdicts []event.Event
 	for _, h := range matured {
-		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, h.path, h.durable, nil, nil, nowMs))
+		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, h.path, h.durable, nil, nowMs))
 	}
 	for i := range verdicts {
 		emitDurabilityVerdict(verdicts[i])
@@ -874,6 +874,29 @@ func harvestDurable(session Session, root, rootKey string, nowMs int64) []event.
 // per tracked span and ageDays only changes at day granularity anyway, so a
 // tighter cadence would multiply event volume for no extra signal.
 var durabilityInventoryIntervalMs int64 = 24 * 60 * 60 * 1000
+
+// durabilityInventoryMaxRanges bounds how many living ranges ride on ONE
+// inventory event. A root is inventoried as a SINGLE event; this splits an
+// unusually large one into several bounded events rather than building one the
+// wire has to refuse. A var so a test can shrink it — the chunk boundary only
+// exists on big repos, and nothing else would exercise it.
+//
+// SIZED AGAINST THE REAL CAPS, each read off the code rather than assumed:
+//   - 4 MiB — outbox.batchMaxBodyBytes, this CLI's own cap on one batch request.
+//   - 10 MiB — the backend's Fastify bodyLimit (promptster-backend
+//     apps/api/src/app.ts:233). A body past it is a 413 the queue never clears.
+//   - 500 members — the backend's MAX_BATCH_MEMBERS
+//     (apps/api/src/routes/team/teams-ingest.ts:632). A COUNT, not a size: it
+//     bounds members per REQUEST and says nothing about ranges per event.
+//   - 16 MiB — the outbox reader's bufio token cap (internal/outbox/outbox.go),
+//     past which a queued line cannot even be read back.
+//
+// One range serializes to ~630 B at the pathological end (two line numbers, an
+// age, a `<40-hex sha>:<path>` lineage handle, and the path again, at a 255-char
+// path), so 500 of them is ~315 KB — an order of magnitude under the tightest of
+// those. A range measured in prod is ~150 B, putting a whole real inventory
+// (~130 paths for the median workspace) at ~20 KB in a single event.
+var durabilityInventoryMaxRanges = 500
 
 // inventoryLiving emits, at most once per root per day, the AI spans still
 // tracked and NOT yet decided — each stamped with its current ageDays. It does
@@ -934,14 +957,42 @@ func inventoryLiving(session Session, root, rootKey string, nowMs int64) []event
 	// gitHead is deliberately outside the ledger lock (matches harvestDurable):
 	// no git spawn ever runs while the lock is held.
 	measureSha, _ := gitHead(root)
-	var verdicts []event.Event
+
+	// ONE event for the whole root, not one per tracked path. Each range carries
+	// its own `path`, which is where that identity lived before — the top-level
+	// `path` is a per-file field and an inventory is not about one file. This is
+	// the row-volume fix: on ops.ai the inventory was 92% of all durability_verdict
+	// rows (24,573 of 26,680 over 7 days) purely because a root with N tracked
+	// paths emitted N events a day for the SAME daily measurement.
+	//
+	// Sorted by path so the chunk boundaries below are deterministic: `due` comes
+	// off a map, and a re-emit after a failed delivery should repartition the same
+	// ranges the same way rather than shuffle them across events.
+	sort.Slice(due, func(i, j int) bool { return due[i].path < due[j].path })
+	living := make([]durVerdictRange, 0, len(due))
 	for _, s := range due {
-		verdicts = append(verdicts, buildDurabilityVerdict(session, root, measureSha, s.path, nil, nil, s.living, nowMs))
+		for _, r := range toVerdictRanges(s.living, nowMs) {
+			r.Path = s.path
+			living = append(living, r)
+		}
 	}
-	delivered := false
+
+	var verdicts []event.Event
+	for start := 0; start < len(living); start += durabilityInventoryMaxRanges {
+		verdicts = append(verdicts, buildLivingInventory(session, root, measureSha,
+			living[start:min(start+durabilityInventoryMaxRanges, len(living))], nowMs))
+	}
+	// EVERY chunk must land before the daily slot is spent. "At least one landed"
+	// was enough while a path was its own event — a failure there lost one path.
+	// A chunk is a SLICE of one measurement, so a half-delivered inventory that
+	// burned the throttle would leave the rest of the root missing from that day's
+	// survival series for good. Re-emitting is the cheap side of the trade: living
+	// verdicts are PROVISIONAL and the backend folds a lineage by max
+	// measuredTsMs, so a duplicated chunk collapses to one.
+	delivered := true
 	for i := range verdicts {
-		if err := emitDurabilityVerdict(verdicts[i]); err == nil {
-			delivered = true
+		if err := emitDurabilityVerdict(verdicts[i]); err != nil {
+			delivered = false
 		}
 	}
 	// The throttle is stamped AFTER delivery, deliberately. Stamping it in the read
@@ -970,6 +1021,12 @@ type durVerdictRange struct {
 	End       int    `json:"end"`
 	AgeDays   int    `json:"ageDays"`
 	LineageID string `json:"lineageId"`
+	// Path is set ONLY on the living inventory, which covers a whole root in one
+	// event and so cannot carry one path at the top level. A repo-relative path —
+	// the same string the top-level `path` has always carried on the per-file
+	// verdicts, no new class of data. Empty (and omitted) on churn, durable and
+	// rework ranges, which are still one event per path.
+	Path string `json:"path,omitempty"`
 }
 
 // durabilityVerdictData is the CLOSED payload of a durability_verdict event.
@@ -979,9 +1036,15 @@ type durVerdictRange struct {
 // the PROVISIONAL one — those spans are still tracked and can still churn or
 // mature; the other two are terminal.
 type durabilityVerdictData struct {
-	CommitSha     string            `json:"commitSha"`
-	WorkspaceKey  string            `json:"workspaceKey"`
-	Path          string            `json:"path"`
+	CommitSha    string `json:"commitSha"`
+	WorkspaceKey string `json:"workspaceKey"`
+	// Path is the file a churn or durable verdict is about. OMITTED on the living
+	// inventory, which reports a whole root in one event and puts the path on each
+	// range instead. No consumer reads the top-level path for an inventory — the
+	// backend folds living ranges by (workspaceKey, lineageId) and
+	// flattenDurabilityVerdict never looks at it (promptster-backend
+	// packages/engine/src/lib/aiDurabilityJoin.ts:72-103).
+	Path          string            `json:"path,omitempty"`
 	DurableRanges []durVerdictRange `json:"durableRanges,omitempty"`
 	ChurnedRanges []durVerdictRange `json:"churnedRanges,omitempty"`
 	LivingRanges  []durVerdictRange `json:"livingRanges,omitempty"`
@@ -1008,20 +1071,37 @@ func toVerdictRanges(rs []durTrackedRange, nowMs int64) []durVerdictRange {
 // through eventDataMap (JSON round-trip) so nested arrays land as
 // []interface{} of map — the only shape the redaction projector's element
 // allowlist can walk (assigning the struct straight to Data ships {}).
-func buildDurabilityVerdict(session Session, root, sha, path string, durable, churned, living []durTrackedRange, nowMs int64) event.Event {
-	e := event.NewEvent("durability_verdict", session.DeviceID)
-	e.Source = presenceSource
-	e.DeviceID = session.DeviceID
-	e.Actor = event.SystemActor()
-	e.Data = eventDataMap(durabilityVerdictData{
+func buildDurabilityVerdict(session Session, root, sha, path string, durable, churned []durTrackedRange, nowMs int64) event.Event {
+	return newDurabilityVerdict(session, durabilityVerdictData{
 		CommitSha:     sha,
 		WorkspaceKey:  workspaceKey(root),
 		Path:          path,
 		DurableRanges: toVerdictRanges(durable, nowMs),
 		ChurnedRanges: toVerdictRanges(churned, nowMs),
-		LivingRanges:  toVerdictRanges(living, nowMs),
 		MeasuredTsMs:  nowMs,
 	})
+}
+
+// buildLivingInventory assembles ONE inventory event for a whole root. It takes
+// ranges already stamped with their own `path` (and, past
+// durabilityInventoryMaxRanges, already chunked) rather than tracked spans,
+// because an inventory spans many paths and a single []durTrackedRange has
+// nowhere to put them.
+func buildLivingInventory(session Session, root, sha string, living []durVerdictRange, nowMs int64) event.Event {
+	return newDurabilityVerdict(session, durabilityVerdictData{
+		CommitSha:    sha,
+		WorkspaceKey: workspaceKey(root),
+		LivingRanges: living,
+		MeasuredTsMs: nowMs,
+	})
+}
+
+func newDurabilityVerdict(session Session, data durabilityVerdictData) event.Event {
+	e := event.NewEvent("durability_verdict", session.DeviceID)
+	e.Source = presenceSource
+	e.DeviceID = session.DeviceID
+	e.Actor = event.SystemActor()
+	e.Data = eventDataMap(data)
 	return e
 }
 
