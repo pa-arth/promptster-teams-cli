@@ -4,6 +4,25 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.33.0] — 2026-09-17
+
+### Fixed
+
+- Delivery health now describes whether the outbox head ADVANCES, not whether the
+  backend answered 2xx. Success is recorded only after the cursor write lands, so a
+  drain that re-sends an accepted head on an unwritable state dir reports `retrying`
+  with failure class `local` instead of `ok`. The local-fault branch in `drainLane`
+  previously recorded nothing at all, leaving a frozen head reporting `unknown` for
+  the life of the process.
+- The first presence beat after start no longer reports `unknown` next to a queue the
+  drain is about to empty. It waits up to 15s for an outcome from every lane that is
+  not provably empty, and an unreadable queue counts as NOT empty. The backend stall
+  monitor reads `unknown` as "no health data" and falls back to paging on queue age,
+  so a startup beat sent before the drain answered paged a customer repeatedly on
+  2026-09-13/16 while every event was landing.
+- A heartbeat is no longer emitted after `stop`: the startup wait is cancellable, so a
+  watch that is stopped during it appends and POSTs nothing.
+
 ## [0.32.0] — 2026-09-16
 
 ### Added
