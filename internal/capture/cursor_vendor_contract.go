@@ -13,11 +13,11 @@ package capture
 // lands ahead of the collector so the CLI, backend, and frontend lanes can be
 // built in parallel against one frozen vocabulary.
 //
-// WHY THE RAIL EXISTS. Cursor's on-device hook rail (`stop`, `afterAgentResponse`)
-// never fires on the headless `cursor-agent -p` path: no IDE, no hook dispatcher,
-// no `stop`. That is structural, not a configuration gap, and it is where the
-// automated-agent spend lives. A machine-lane zero is by construction — which
-// describes the cause, not its acceptability.
+// WHY THE RAIL EXISTS. Headless `cursor-agent -p` still fires tool hooks and
+// `sessionEnd`; it does not fire `beforeSubmitPrompt` or `stop`. The on-device
+// usage row therefore never arrives. A machine-lane zero is by construction —
+// which describes the cause, not its acceptability. Those sessions stay
+// unpriced and must be shown that way.
 
 const (
 	// CursorHookIntegration is the on-device hook + transcript rail. Its usage

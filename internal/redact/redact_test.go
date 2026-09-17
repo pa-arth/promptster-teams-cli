@@ -335,3 +335,48 @@ func TestRedactDoesNotDowngradeAttributedMarkers(t *testing.T) {
 		}
 	}
 }
+
+func TestRedactJSONEscapeEmailKeepsParseableJSON(t *testing.T) {
+	in := []byte(`{"text":"hello\nuser@example.com","keep":1}`)
+	out := RedactBytes(in)
+	if !json.Valid(out) {
+		t.Fatalf("email after \\n broke JSON: %s", out)
+	}
+	if bytes.Contains(out, []byte("user@example.com")) {
+		t.Fatalf("email survived: %s", out)
+	}
+	tab := []byte(`{"text":"hello\talice@example.com"}`)
+	got := RedactBytes(tab)
+	if !json.Valid(got) {
+		t.Fatalf("email after \\t broke JSON: %s", got)
+	}
+}
+
+func TestRedactJSONEscapedQuoteAssignmentKeepsParseableJSON(t *testing.T) {
+	in := []byte(`{"cmd":"export API_KEY=secret\""}`)
+	out := RedactBytes(in)
+	if !json.Valid(out) {
+		t.Fatalf("KEY=value\\\" broke JSON: %s", out)
+	}
+	if bytes.Contains(out, []byte("secret")) {
+		t.Fatalf("secret survived: %s", out)
+	}
+}
+
+func TestRedactValidJSONStaysValidJSON(t *testing.T) {
+	inputs := [][]byte{
+		[]byte(`{"password":"hunter2","email":"a@b.co"}`),
+		[]byte(`{"cmd":"export API_KEY=secret\""}`),
+		[]byte(`{"text":"hello\nuser@example.com"}`),
+		[]byte(`{"keep":"me"}`),
+	}
+	for _, in := range inputs {
+		if !json.Valid(in) {
+			t.Fatalf("fixture is not JSON: %s", in)
+		}
+		out := RedactBytes(in)
+		if !json.Valid(out) {
+			t.Fatalf("redaction produced invalid JSON\n in: %s\nout: %s", in, out)
+		}
+	}
+}

@@ -150,7 +150,7 @@ func runCursorHookInner() {
 		// nothing — the one outcome worth measuring was the one outcome that left
 		// no record. 38% of one live machine's turns went missing this way with
 		// no evidence on the device for a single one of them.
-		recordCursorHookDrop(res)
+		recordCursorHookDrop(res, len(raw))
 		return
 	}
 
@@ -230,7 +230,7 @@ func runCursorHookInner() {
 	// direction: a kill between the enqueue and the claim leaves the watcher
 	// covering records the hook already sent, which costs duplicates rather than
 	// data. Given the choice, duplicate beats gone.
-	if queued > 0 && res.TranscriptPath != "" {
+	if queued > 0 && res.TranscriptPath != "" && res.Step == "stop" {
 		recordCursorHookClaim(res.TranscriptPath, res.SessionID)
 	}
 }
@@ -255,12 +255,12 @@ func runCursorHookInner() {
 // unregistered step; a prompt step with no prompt. None of those is a drop of
 // spend, and a counter that mixes "nothing to say" with "we lost a turn" is the
 // exact ambiguity this instrument exists to remove.
-func recordCursorHookDrop(res normalize.CursorHookResult) {
+func recordCursorHookDrop(res normalize.CursorHookResult, payloadBytes int) {
 	switch res.Step {
 	case "stop":
 		recordCursorStopOutcome(res.SessionID, res.Model, nil, nil)
 	case "":
-		recordCursorHookUnparsed()
+		recordCursorHookUnparsed(res.Step, payloadBytes)
 	}
 }
 

@@ -192,7 +192,7 @@ var genericPatterns = []redactRule{
 	// real secret like `API_KEY=[customer-secret]` is still masked. Markers
 	// written by an earlier stage are protected by skipIfMarked, not by narrowing
 	// the value class — see the field's comment for why that distinction matters.
-	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY))\s*=\s*[^\s"']+`), "$1=[REDACTED]"},
+	{regexp.MustCompile(`(?i)\b([A-Za-z0-9_.-]*(?:API[_-]?KEY|APIKEY|ACCESS[_-]?KEY|SECRET[_-]?KEY|CLIENT[_-]?SECRET|SECRET|PASSWORD|PASSWD|PRIVATE[_-]?KEY|AUTH[_-]?TOKEN|TOKEN|CREDENTIALS?|SESSION[_-]?KEY))\s*=\s*[^\s"'\\]+`), "$1=[REDACTED]"},
 	// Same secret-ish keys as a JSON/YAML "key": "value" pair. The value match
 	// `(?:[^"\\]|\\.)*` honours backslash-escaped quotes so it can't stop short
 	// inside the value and mis-bound the JSON. Value is rebuilt quoted. Carries
@@ -207,7 +207,8 @@ var genericPatterns = []redactRule{
 	{regexp.MustCompile(`([a-zA-Z][a-zA-Z0-9+.\-]*://[^\s:@/"']*):[^\s@/"']+@`), "$1:[REDACTED]@"},
 
 	// --- PII / business data ---------------------------------------------
-	{regexp.MustCompile(`(?i)\b[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}\b`), "[REDACTED_EMAIL]"},
+	// Emails are applied in redactEmails: `\b` after a JSON `\n`/`\t` escape
+	// would swallow the letter and leave a dangling backslash.
 	{regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`), "[REDACTED_SSN]"},
 	// Phone numbers that carry separators / parens / a country code. Bare
 	// 10-digit runs are left alone — they're far more often IDs or timestamps.
@@ -238,28 +239,78 @@ func titusScanner() *scanner.Core {
 	return titusCore
 }
 
+var emailPattern = regexp.MustCompile(`(?i)[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,24}`)
+
+func isWordByte(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+
+// redactEmails masks addresses without treating a JSON `\n`/`\t` escape as a
+// word boundary. That used to rewrite `nuser@x.com` after `\n` and leave
+// `\[REDACTED_EMAIL]`, which is invalid JSON and drops the payload as unparsed.
+func redactEmails(input []byte) []byte {
+	locs := emailPattern.FindAllIndex(input, -1)
+	if len(locs) == 0 {
+		return input
+	}
+	var out bytes.Buffer
+	out.Grow(len(input))
+	cursor := 0
+	for _, loc := range locs {
+		s, e := loc[0], loc[1]
+		if s < cursor {
+			continue
+		}
+		if s > 0 && isWordByte(input[s-1]) {
+			continue
+		}
+		if s > 0 && input[s-1] == '\\' && (input[s] == 'n' || input[s] == 't' || input[s] == 'N' || input[s] == 'T') {
+			s++
+			if s >= e || !emailPattern.Match(input[s:e]) {
+				continue
+			}
+		}
+		if e < len(input) && isWordByte(input[e]) {
+			continue
+		}
+		out.Write(input[cursor:s])
+		out.WriteString("[REDACTED_EMAIL]")
+		cursor = e
+	}
+	out.Write(input[cursor:])
+	return out.Bytes()
+}
+
 // RedactBytes masks secrets in raw bytes through the three ordered stages
 // documented at the top of this file: precise vendor shapes, then Titus's wide
 // net, then shape-blind generic fallbacks. The order is what preserves vendor
 // ATTRIBUTION in the marker; see that header before reordering anything.
+//
+// When the input is valid JSON, a stage that would make it unparseable is
+// skipped. Broken JSON is how a hook payload is dropped as unparsed.
 func RedactBytes(input []byte) []byte {
+	wasJSON := json.Valid(input)
 	out := input
 	for _, p := range vendorPatterns {
 		out = p.re.ReplaceAll(out, []byte(p.replacement))
 	}
 	out = titusRedact(out)
 	for _, p := range genericPatterns {
-		// Stage 3 is shape-blind, so it must not touch a value the attributed
-		// stages above already marked — see alreadyRedactedValue. Rules whose
-		// match can never contain a `KEY=` / `"key":` pair (email, SSN, phone, IP)
-		// are unaffected by the test; it simply never fires for them.
 		rule := p
-		out = rule.re.ReplaceAllFunc(out, func(m []byte) []byte {
+		candidate := rule.re.ReplaceAllFunc(out, func(m []byte) []byte {
 			if alreadyRedactedValue.Match(m) {
 				return m
 			}
 			return rule.re.Expand(nil, []byte(rule.replacement), m, rule.re.FindSubmatchIndex(m))
 		})
+		if wasJSON && !json.Valid(candidate) {
+			continue
+		}
+		out = candidate
+	}
+	candidate := redactEmails(out)
+	if !wasJSON || json.Valid(candidate) {
+		out = candidate
 	}
 	return out
 }
