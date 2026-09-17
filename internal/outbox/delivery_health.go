@@ -3,6 +3,7 @@ package outbox
 import (
 	"errors"
 	"net"
+	"os"
 	"sync"
 	"time"
 
@@ -24,35 +25,76 @@ type DeliveryHealth struct {
 var deliveryHealthMu sync.RWMutex
 var deliveryHealthByLane = map[string]DeliveryHealth{}
 
-// deliveryOutcomes counts every recorded outcome, so a waiter can tell "the
-// drain answered since I started waiting" from a stale entry. Guarded by
+// deliveryOutcomes counts recorded outcomes PER LANE, so a waiter can tell "this
+// lane's drain answered since I started waiting" from a stale entry. Guarded by
 // deliveryHealthMu.
-var deliveryOutcomes uint64
+var deliveryOutcomes = map[string]uint64{}
 
-// AwaitDeliveryOutcome blocks until this process's drain records an outcome, the
-// queue is empty, or timeout passes — whichever is first.
+// AwaitDeliveryOutcome blocks until every non-empty lane's drain has recorded an
+// outcome since the call, timeout passes, or stop closes. It reports false only
+// when stop closed first.
 //
 // It exists for the STARTUP beat. RunTeamsWatch starts the heartbeat before the
 // watchers that start the drain, so a beat built immediately describes a queue
 // nobody has tried yet: "unknown" beside whatever piled up while the daemon was
 // down. The backend reads "unknown" as "no health data" and pages on that queue's
 // age, while the drain empties it a second later. Waiting for the first answer
-// makes the first beat a measurement. The bound keeps a daemon whose drain never
-// starts honest: it still beats, and "unknown" is then the truth.
-func AwaitDeliveryOutcome(timeout time.Duration) {
+// makes the first beat a measurement.
+//
+// EVERY non-empty lane, not the first to answer: live succeeding while a backlog
+// sits untried in backfill would otherwise beat "ok" for the whole queue. The
+// bound keeps a daemon whose drain never starts honest: it still beats, and
+// "unknown" is then the truth.
+func AwaitDeliveryOutcome(stop <-chan struct{}, timeout time.Duration) bool {
+	lanes := []Lane{LaneLive(), LaneBackfill()}
 	deliveryHealthMu.RLock()
-	start := deliveryOutcomes
-	deliveryHealthMu.RUnlock()
-	deadline := time.Now().Add(timeout)
-	for {
-		deliveryHealthMu.RLock()
-		answered := deliveryOutcomes != start
-		deliveryHealthMu.RUnlock()
-		if answered || PendingStateNow().Count == 0 || !time.Now().Before(deadline) {
-			return
-		}
-		time.Sleep(100 * time.Millisecond)
+	start := map[string]uint64{}
+	for _, lane := range lanes {
+		start[lane.Name] = deliveryOutcomes[lane.Name]
 	}
+	deliveryHealthMu.RUnlock()
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		settled := true
+		for _, lane := range lanes {
+			deliveryHealthMu.RLock()
+			answered := deliveryOutcomes[lane.Name] != start[lane.Name]
+			deliveryHealthMu.RUnlock()
+			if !answered && !laneEmpty(lane) { // file IO outside the lock
+				settled = false
+			}
+		}
+		if settled {
+			return true
+		}
+		select {
+		case <-stop:
+			return false
+		case <-deadline.C:
+			return true
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// laneEmpty is true only when the lane PROVABLY holds nothing undelivered: no
+// file, or a cursor at its end. Any read error is "not empty" — an unreadable
+// queue is exactly the one whose drain is about to report a local failure, and
+// PendingStateNow's zero-on-error would release the wait before it could.
+func laneEmpty(lane Lane) bool {
+	fi, err := os.Stat(lane.path())
+	if os.IsNotExist(err) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	cursor := readCursor(lane)
+	if cursor > fi.Size() {
+		cursor = 0 // compacted underneath us, as pendingStateIn reads it
+	}
+	return fi.Size() == cursor
 }
 
 func DeliveryHealthNow() DeliveryHealth {
@@ -108,7 +150,7 @@ func recordLocalDeliveryFailure(lane string) {
 func recordRetrying(lane, class string, status, memberStatus int) {
 	deliveryHealthMu.Lock()
 	defer deliveryHealthMu.Unlock()
-	deliveryOutcomes++
+	deliveryOutcomes[lane]++
 	prior := deliveryHealthByLane[lane]
 	failureAt := time.Now().UTC().Format(time.RFC3339Nano)
 	if prior.State == "retrying" {
@@ -127,6 +169,6 @@ func recordRetrying(lane, class string, status, memberStatus int) {
 func recordDeliverySuccess(lane string) {
 	deliveryHealthMu.Lock()
 	defer deliveryHealthMu.Unlock()
-	deliveryOutcomes++
+	deliveryOutcomes[lane]++
 	deliveryHealthByLane[lane] = DeliveryHealth{State: "ok"}
 }

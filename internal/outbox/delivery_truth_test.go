@@ -1,7 +1,10 @@
 package outbox
 
 import (
+	"os"
+
 	"context"
+	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -109,7 +112,7 @@ func TestAwaitDeliveryOutcome(t *testing.T) {
 		newOutboxTest(t)
 		resetDeliveryHealth(t)
 		start := time.Now()
-		AwaitDeliveryOutcome(5 * time.Second)
+		AwaitDeliveryOutcome(nil, 5*time.Second)
 		if time.Since(start) > time.Second {
 			t.Fatalf("waited %v on an empty queue", time.Since(start))
 		}
@@ -124,7 +127,7 @@ func TestAwaitDeliveryOutcome(t *testing.T) {
 			recordDeliveryFailure("live", context.DeadlineExceeded, 0)
 		}()
 		start := time.Now()
-		AwaitDeliveryOutcome(5 * time.Second)
+		AwaitDeliveryOutcome(nil, 5*time.Second)
 		if waited := time.Since(start); waited < 250*time.Millisecond || waited > 3*time.Second {
 			t.Fatalf("waited %v, want roughly the 300ms until the drain answered", waited)
 		}
@@ -134,9 +137,49 @@ func TestAwaitDeliveryOutcome(t *testing.T) {
 		resetDeliveryHealth(t)
 		enqueue(t, "prompt")
 		start := time.Now()
-		AwaitDeliveryOutcome(300 * time.Millisecond)
+		AwaitDeliveryOutcome(nil, 300*time.Millisecond)
 		if waited := time.Since(start); waited > 2*time.Second {
 			t.Fatalf("waited %v past a 300ms bound", waited)
 		}
 	})
+}
+
+// TestAwaitDeliveryOutcomeCoversEveryLane: live answering first must not end the
+// wait while a non-empty backfill lane has not been tried — the beat would call
+// the whole queue ok on half of it.
+func TestAwaitDeliveryOutcomeCoversEveryLane(t *testing.T) {
+	newOutboxTest(t)
+	resetDeliveryHealth(t)
+	enqueue(t, "prompt")
+	if err := AppendTo(LaneBackfill(), event.NewEvent("prompt", "sess-test")); err != nil {
+		t.Fatalf("seed backfill: %v", err)
+	}
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		recordDeliverySuccess("live")
+		time.Sleep(500 * time.Millisecond)
+		recordDeliverySuccess("backfill")
+	}()
+	start := time.Now()
+	AwaitDeliveryOutcome(nil, 5*time.Second)
+	if waited := time.Since(start); waited < 550*time.Millisecond {
+		t.Fatalf("wait ended after %v, on live's outcome, before the non-empty backfill lane answered", waited)
+	}
+}
+
+// TestAwaitDeliveryOutcomeUnreadableQueueIsNotEmpty: a queue that cannot be read
+// is not an empty one, and must not release the wait before the drain reports.
+func TestAwaitDeliveryOutcomeUnreadableQueueIsNotEmpty(t *testing.T) {
+	newOutboxTest(t)
+	resetDeliveryHealth(t)
+	enqueue(t, "prompt")
+	if err := os.Chmod(LaneLive().path(), 0); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(LaneLive().path(), 0o600) })
+	start := time.Now()
+	AwaitDeliveryOutcome(nil, 700*time.Millisecond)
+	if waited := time.Since(start); waited < 600*time.Millisecond {
+		t.Fatalf("an unreadable queue released the wait as empty after %v", waited)
+	}
 }

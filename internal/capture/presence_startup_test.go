@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,5 +74,46 @@ func TestStartupBeatReportsTheDrainsFirstOutcome(t *testing.T) {
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("no startup beat")
+	}
+}
+
+// TestStartupBeatNotSentAfterStop: stopping during the startup wait must end the
+// goroutine without appending or POSTing a beat.
+func TestStartupBeatNotSentAfterStop(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(tmp, "claude"))
+	t.Setenv("PROMPTSTER_CURSOR_HOME", filepath.Join(tmp, "cursor"))
+	prev := presenceStartupWait
+	presenceStartupWait = 500 * time.Millisecond
+	t.Cleanup(func() { presenceStartupWait = prev })
+
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+	t.Setenv("PROMPTSTER_API_URL", srv.URL)
+	if err := outbox.Append(event.NewEvent("user_prompt", "sess-stop")); err != nil {
+		t.Fatalf("seed queue: %v", err)
+	}
+
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		runPresenceHeartbeat(Session{DeviceID: "dev-stop", SessionToken: "PSE-TEST", TaskRoot: tmp}, done)
+	}()
+	close(done)
+	select {
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("heartbeat goroutine still running 2s after stop")
+	}
+	if n := posts.Load(); n != 0 {
+		t.Fatalf("stopped heartbeat still POSTed %d beat(s)", n)
 	}
 }

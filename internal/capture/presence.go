@@ -46,7 +46,7 @@ const PresenceHeartbeatInterval = 5 * time.Minute
 // presenceStartupWait bounds how long the first beat waits for the drain's first
 // outcome. Long enough to cover one 5s-timeout POST; short enough that a new
 // install still shows up as onboarded within seconds.
-const presenceStartupWait = 15 * time.Second
+var presenceStartupWait = 15 * time.Second
 
 // presenceData is the CLOSED payload of a presence event. Every field here is
 // benign environment/routing metadata — no prompts, responses, file contents,
@@ -350,7 +350,9 @@ func runPresenceHeartbeat(session Session, stop <-chan struct{}) {
 	// The drain starts with the watchers, AFTER this goroutine. Beating at once
 	// reported "unknown" beside a queue nobody had tried yet, on every restart;
 	// see outbox.AwaitDeliveryOutcome.
-	outbox.AwaitDeliveryOutcome(presenceStartupWait)
+	if !outbox.AwaitDeliveryOutcome(stop, presenceStartupWait) {
+		return // stopped during the wait: no beat after stop
+	}
 	emitPresenceEvent(session)
 	ticker := time.NewTicker(PresenceHeartbeatInterval)
 	defer ticker.Stop()
