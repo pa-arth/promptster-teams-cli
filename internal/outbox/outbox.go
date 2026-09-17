@@ -714,6 +714,10 @@ func drainLane(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			// writable, and dropping capture over a transient disk blip is
 			// worse than a bounded duplicate the backend already dedupes.
 			failures++
+			// The head is not advancing, whatever the last POST said. Recorded
+			// here because some of these faults (a past-EOF cursor that cannot be
+			// rewound) fail before any POST, and recorded nothing at all.
+			recordLocalDeliveryFailure(lane.Name)
 			if failures == 1 || time.Since(lastWarn) >= stuckRepeatInterval {
 				warnf("cannot record %s delivery progress (%d consecutive failure(s)): %v — "+
 					"events are captured and queued, but %s cannot be written, so already-delivered "+
@@ -814,6 +818,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 					if err := writeCursor(lane, cursor); err != nil {
 						return delivered, fmt.Errorf("persist cursor: %w", err)
 					}
+					recordDeliverySuccess(lane.Name)
 					delivered++
 				}
 				continue
@@ -826,6 +831,11 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 					// cursor every further send is one we cannot prove.
 					return delivered, fmt.Errorf("persist cursor: %w", err)
 				}
+			}
+			if advance == chunkBytes(chunk) {
+				// Whole chunk cleared and the cursor says so. A partial advance
+				// keeps the failure deliverChunk recorded for the blocked member.
+				recordDeliverySuccess(lane.Name)
 			}
 			if advance < chunkBytes(chunk) {
 				// Some member was neither accepted nor rejected (403, 500, or an
@@ -869,6 +879,7 @@ func drainOnce(ctx context.Context, client *http.Client, apiKey string, caps Bat
 			// re-POST this same, already-accepted event at line rate.
 			return delivered, fmt.Errorf("persist cursor: %w", err)
 		}
+		recordDeliverySuccess(lane.Name)
 		delivered++
 	}
 	compact(lane, cursor)
@@ -1077,10 +1088,9 @@ func deliverChunk(
 			adv, n := advanceOver(chunk, results)
 			blockedStatus, blocked := firstBlockedMemberStatus(results, len(bodies))
 			if adv > 0 {
+				// Success is recorded by drainOnce once the cursor write lands.
 				if blocked {
 					recordDeliveryFailure(lane.Name, nil, blockedStatusOrMissing(blockedStatus))
-				} else {
-					recordDeliverySuccess(lane.Name)
 				}
 				if attempt >= stuckAttemptThreshold {
 					warnf("recovered — delivered %d event(s) after %d attempt(s) over %s",
@@ -1178,7 +1188,6 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, lane Lane,
 	for {
 		err := ingest.IngestRawEventWithClient(client, body, apiKey)
 		if err == nil {
-			recordDeliverySuccess(lane.Name)
 			// Say so if we previously complained, or the operator is left with a
 			// scary warning and no idea it cleared.
 			if attempt >= stuckAttemptThreshold {
@@ -1191,7 +1200,6 @@ func deliver(ctx context.Context, client *http.Client, apiKey string, lane Lane,
 		// kind an older backend doesn't accept). Retrying can never help, and
 		// the channel itself is healthy — skip it.
 		if ingest.IsIngestRejection(err) {
-			recordDeliverySuccess(lane.Name)
 			state.HookDebugf("outbox: event rejected by backend (%s): %v", meta.Kind, err)
 			return true
 		}
