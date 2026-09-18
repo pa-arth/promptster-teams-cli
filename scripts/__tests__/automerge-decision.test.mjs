@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
   GREPTILE_MIN_CONFIDENCE,
+  GREPTILE_P2_ONLY_CONFIDENCE,
   PRIVILEGED_PATHS,
   REQUIRED_CHECK_NAMES,
   REQUIRED_CHECKS,
@@ -202,20 +203,70 @@ test('Greptile check success is not enough without a summary', () => {
 
 test('Greptile confidence below the floor blocks merge', () => {
   const r = decide({
-    greptileSummaryBody:
-      '<!-- greptile_summary -->\n<h2>Confidence Score: 1/5</h2>\nThis PR is not safe to merge until X.',
+    greptileSummaryBody: '<!-- greptile_summary -->\n<h2>Confidence Score: 1/5</h2>\nRough.',
   });
   assert.equal(r.merge, false);
   assert.match(r.reason, /1\/5/);
 });
 
-test('Greptile P1s in the current summary block merge even at 5/5', () => {
+test('the narrative verdict is checked before the score, and fails closed', () => {
+  // A summary can say 5/5 and "not safe to merge" in the same breath. The
+  // sentence is rewritten every review, so it is as current as the score —
+  // and when the two disagree, take the pessimistic one.
   const r = decide({
     greptileSummaryBody:
-      '<!-- greptile_summary -->\n<h2>Confidence Score: 5/5</h2>\n<img alt="P1" src="https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9"> hole',
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 1/5</h2>\nThis PR is not safe to merge until X.',
   });
   assert.equal(r.merge, false);
-  assert.match(r.reason, /P1/);
+  assert.match(r.reason, /not safe to merge/);
+});
+
+test('"not safe to merge" blocks even at 5/5', () => {
+  const r = decide({
+    greptileSummaryBody:
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 5/5</h2>\nThis PR is not safe to merge until X.',
+  });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /not safe to merge/);
+});
+
+test('a 5/5 summary merges even with a stale P1 badge still listed', () => {
+  // Replaces a test that asserted the OPPOSITE. Measured on backend #974:
+  // Greptile rescored to 5/5 and wrote "both previous findings are fully
+  // addressed", but kept both badges in the Findings list. The list is
+  // cumulative; the score is not. Blocking on the badge made a resolved
+  // finding permanent, so the old assertion was deleted rather than loosened.
+  const r = decide({
+    greptileSummaryBody:
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 5/5</h2>\nBoth previous findings are fully addressed.\n<img alt="P1" src="https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9"> resolved',
+  });
+  assert.equal(r.merge, true, r.reason);
+});
+
+test('4/5 with only P2 findings merges — the nit tier', () => {
+  const r = decide({
+    greptileSummaryBody:
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 4/5</h2>\n<img alt="P2" src="https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9"> naming nit',
+  });
+  assert.equal(r.merge, true, r.reason);
+});
+
+test('4/5 with a P1 raised does not merge — ambiguous, fail closed', () => {
+  const r = decide({
+    greptileSummaryBody:
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 4/5</h2>\n<img alt="P1" src="https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9"> real bug',
+  });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /P1 has been raised/);
+});
+
+test('3/5 does not merge however clean the findings list looks', () => {
+  const r = decide({
+    greptileSummaryBody:
+      '<!-- greptile_summary -->\n<h2>Confidence Score: 3/5</h2>\nno badges here',
+  });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /3\/5 is below 5\/5/);
 });
 
 test('historical inline P1s do not block once the current summary is clean', () => {
@@ -252,14 +303,6 @@ test('Greptile P2 comments do not block at 5/5', () => {
     ],
   });
   assert.equal(r.merge, true, r.reason);
-});
-
-test('Greptile 4/5 does not merge — the floor is 5/5', () => {
-  const r = decide({
-    greptileSummaryBody: '<!-- greptile_summary -->\n<h2>Confidence Score: 4/5</h2>\nMostly fine.',
-  });
-  assert.equal(r.merge, false);
-  assert.match(r.reason, /4\/5 is below 5\/5/);
 });
 
 test('refuses a PR with no verify-teams-cli attestation', () => {
@@ -446,6 +489,7 @@ test('REQUIRED_CHECKS stay in lockstep with this repo\'s real workflow jobs', as
   assert.equal(REQUIRED_CHECKS[15].workflowPath, undefined);
 
   assert.equal(GREPTILE_MIN_CONFIDENCE, 5);
+  assert.equal(GREPTILE_P2_ONLY_CONFIDENCE, 4);
   assert.deepEqual(TRUSTED_ATTESTER_ASSOCIATIONS, ['OWNER', 'MEMBER', 'COLLABORATOR']);
 
   // The decision test has to actually run inside a check the gate requires,
