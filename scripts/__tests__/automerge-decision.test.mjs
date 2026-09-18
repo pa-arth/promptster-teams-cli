@@ -443,5 +443,12 @@ test("the automerge workflow runs main's copy of the script, not the PR's", asyn
     'must ignore its own check_run or it retriggers forever',
   );
   assert.match(wf, /issue_comment:/, 'must retry after Greptile posts its summary');
+  assert.equal(
+    wf.includes("github.event.comment.user.login == 'greptile-apps[bot]'"),
+    false,
+    'issue_comment must not be filtered to the Greptile bot — the verification ' +
+      'attestation is an agent/human comment and is the last step before merge, ' +
+      'so filtering it out means posting it re-evaluates nothing',
+  );
   assert.match(wf, /AUTOMERGE_BASE_REF: main/, 'this repo\'s default branch is main');
 });
