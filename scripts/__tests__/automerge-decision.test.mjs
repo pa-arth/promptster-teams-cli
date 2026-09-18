@@ -6,6 +6,7 @@ import {
   PRIVILEGED_PATHS,
   REQUIRED_CHECK_NAMES,
   REQUIRED_CHECKS,
+  TRUSTED_ATTESTER_ASSOCIATIONS,
   VERIFICATION_MARKER,
   greptileBlocksMerge,
   shouldAutomerge,
@@ -13,7 +14,10 @@ import {
 } from '../automerge-decision.mjs';
 
 const HEAD_SHA = 'f5eabde6ebc60d622fdc963031d1c74310b28e46';
-const attested = (sha = HEAD_SHA) => [`<!-- verified: verify-teams-cli sha=${sha} -->\nDrove it.`];
+const attested = (sha = HEAD_SHA, authorAssociation = 'OWNER') => [
+  { body: `<!-- verified: verify-teams-cli sha=${sha} -->\nDrove it.`, authorAssociation },
+];
+const said = (body, authorAssociation = 'OWNER') => ({ body, authorAssociation });
 
 // The check name + workflow path a spoofing PR would most want to imitate.
 const CI_NAME = 'race & coverage';
@@ -47,7 +51,7 @@ function decide(overrides = {}) {
     checkRuns: trustedSuccess(),
     changedFiles: ['README.md'],
     headSha: HEAD_SHA,
-    commentBodies: attested(),
+    comments: attested(),
     ...CLEAN_GREPTILE,
     ...overrides,
   });
@@ -259,45 +263,87 @@ test('Greptile 4/5 does not merge — the floor is 5/5', () => {
 });
 
 test('refuses a PR with no verify-teams-cli attestation', () => {
-  const r = decide({ commentBodies: ['nice work', '<!-- greptile_summary --> ...'] });
+  const r = decide({ comments: [said('nice work'), said('<!-- greptile_summary --> ...')] });
   assert.equal(r.merge, false);
   assert.match(r.reason, /no verify-teams-cli attestation/);
 });
 
 test('refuses an attestation for an earlier commit — verify A, push B', () => {
-  const r = decide({ commentBodies: attested('678d8411026e5d58cb43ea3bb8a91adc546ddafb') });
+  const r = decide({ comments: attested('678d8411026e5d58cb43ea3bb8a91adc546ddafb') });
   assert.equal(r.merge, false);
   assert.match(r.reason, /re-verify after the last push/);
 });
 
 test('accepts an abbreviated SHA that prefixes the real head', () => {
-  const r = decide({ commentBodies: attested(HEAD_SHA.slice(0, 7)) });
+  const r = decide({ comments: attested(HEAD_SHA.slice(0, 7)) });
   assert.equal(r.merge, true, r.reason);
 });
 
 test('an abbreviated SHA that is not a prefix of head does not count', () => {
-  const r = decide({ commentBodies: attested('deadbee') });
+  const r = decide({ comments: attested('deadbee') });
   assert.equal(r.merge, false);
   assert.match(r.reason, /not head/);
 });
 
 test('the attestation is found among many unrelated comments', () => {
   const r = decide({
-    commentBodies: ['lgtm', ...attested(), 'one more thought'],
+    comments: [said('lgtm'), ...attested(), said('one more thought')],
   });
   assert.equal(r.merge, true, r.reason);
 });
 
 test('a sibling repo attestation does not satisfy this gate', () => {
   const r = decide({
-    commentBodies: [`<!-- verified: verify-backend sha=${HEAD_SHA} -->`],
+    comments: [said(`<!-- verified: verify-backend sha=${HEAD_SHA} -->`)],
   });
   assert.equal(r.merge, false);
   assert.match(r.reason, /no verify-teams-cli attestation/);
 });
 
+test('an attestation from a stranger does not authorize a merge', () => {
+  // Three of these repos are PUBLIC. Anyone with a GitHub account can comment
+  // on a PR, so the marker alone is forgeable; the author is what makes it a
+  // claim by someone attached to the repository.
+  const r = decide({ comments: attested(HEAD_SHA, 'NONE') });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /untrusted author/);
+});
+
+test('CONTRIBUTOR is not enough to attest', () => {
+  // "has had a PR merged here once" is not "is trusted now".
+  const r = decide({ comments: attested(HEAD_SHA, 'CONTRIBUTOR') });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /untrusted author/);
+});
+
+test('an attestation with no author association at all fails closed', () => {
+  const r = decide({ comments: [{ body: attested()[0].body }] });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /untrusted author/);
+});
+
+test('every trusted association may attest', () => {
+  for (const assoc of TRUSTED_ATTESTER_ASSOCIATIONS) {
+    const r = decide({ comments: attested(HEAD_SHA, assoc) });
+    assert.equal(r.merge, true, `${assoc}: ${r.reason}`);
+  }
+});
+
+test('a trusted attestation still counts alongside a forged one', () => {
+  const r = decide({
+    comments: [...attested(HEAD_SHA, 'NONE'), ...attested(HEAD_SHA, 'OWNER')],
+  });
+  assert.equal(r.merge, true, r.reason);
+});
+
+test('a stranger cannot pre-empt the real attestation with a wrong SHA', () => {
+  const r = decide({ comments: attested('deadbee', 'NONE') });
+  assert.equal(r.merge, false);
+  assert.match(r.reason, /untrusted author/);
+});
+
 test('verificationBlocksMerge fails closed with no head SHA', () => {
-  const reason = verificationBlocksMerge({ commentBodies: attested(), headSha: null });
+  const reason = verificationBlocksMerge({ comments: attested(), headSha: null });
   assert.match(reason, /fail closed/);
 });
 
@@ -305,7 +351,7 @@ test('the marker regex is not global — repeated exec must not skip', () => {
   // A /g regex carries lastIndex between calls and would silently miss the
   // second comment in a PR. Guard the flag, not just the behaviour.
   assert.equal(VERIFICATION_MARKER.global, false);
-  const body = attested()[0];
+  const body = attested()[0].body;
   assert.ok(VERIFICATION_MARKER.exec(body));
   assert.ok(VERIFICATION_MARKER.exec(body));
 });
@@ -400,6 +446,7 @@ test('REQUIRED_CHECKS stay in lockstep with this repo\'s real workflow jobs', as
   assert.equal(REQUIRED_CHECKS[15].workflowPath, undefined);
 
   assert.equal(GREPTILE_MIN_CONFIDENCE, 5);
+  assert.deepEqual(TRUSTED_ATTESTER_ASSOCIATIONS, ['OWNER', 'MEMBER', 'COLLABORATOR']);
 
   // The decision test has to actually run inside a check the gate requires,
   // or these assertions never fire where it matters.
@@ -443,12 +490,13 @@ test("the automerge workflow runs main's copy of the script, not the PR's", asyn
     'must ignore its own check_run or it retriggers forever',
   );
   assert.match(wf, /issue_comment:/, 'must retry after Greptile posts its summary');
-  assert.equal(
-    wf.includes("github.event.comment.user.login == 'greptile-apps[bot]'"),
-    false,
-    'issue_comment must not be filtered to the Greptile bot — the verification ' +
-      'attestation is an agent/human comment and is the last step before merge, ' +
-      'so filtering it out means posting it re-evaluates nothing',
+  // Without this the gate deadlocks: once CI and Greptile have finished there
+  // is no event left to fire, so the attestation the decision is waiting for
+  // would be posted and never read.
+  assert.match(
+    wf,
+    /contains\(github\.event\.comment\.body, 'verified: verify-teams-cli'\)/,
+    'an attestation comment must retrigger the merge decision',
   );
   assert.match(wf, /AUTOMERGE_BASE_REF: main/, 'this repo\'s default branch is main');
 });

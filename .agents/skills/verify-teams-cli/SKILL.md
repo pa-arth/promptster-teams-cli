@@ -152,6 +152,10 @@ matching, so the PR blocks until you re-verify — verifying commit A and mergin
 commit B is the failure this closes. Automerge also needs Greptile at 5/5 with
 no P1s; see `scripts/automerge-decision.mjs`.
 
+Post it from an account that is an OWNER, MEMBER or COLLABORATOR on the repo.
+Anyone at all can comment on a public repo's PR, so the gate ignores a marker
+from anyone else — a stranger's attestation is not evidence of anything.
+
 This is still your own claim. It does not prove you drove anything — it means
 not driving is now a thing you had to assert, not a thing you could skip.
 

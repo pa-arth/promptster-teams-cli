@@ -134,7 +134,7 @@ async function changedFiles(number) {
 async function commentEvidence(number) {
   const comments = await paginate(`/repos/${owner}/${repo}/issues/${number}/comments`);
   if (!comments.complete) {
-    return { complete: false, summaryBody: null, bodies: [] };
+    return { complete: false, summaryBody: null, attestations: [] };
   }
   const fromBot = (c) =>
     c.user?.login === 'greptile-apps[bot]' || c.user?.login === 'greptile-apps';
@@ -143,9 +143,15 @@ async function commentEvidence(number) {
   );
   // Greptile edits the summary in place; take the last matching issue comment.
   const summaryBody = summaries.length ? summaries[summaries.length - 1].body : null;
-  // The attestation is not from the bot, so every body goes to the decision.
-  const bodies = comments.items.map((c) => c.body || '');
-  return { complete: true, summaryBody, bodies };
+  // The attestation is not from the bot, so every comment goes to the
+  // decision — but its AUTHOR goes with it. In a public repo anyone can
+  // comment, so an attestation is only worth something when the person making
+  // the claim is actually attached to the repository.
+  const attestations = comments.items.map((c) => ({
+    body: c.body || '',
+    authorAssociation: c.author_association ?? null,
+  }));
+  return { complete: true, summaryBody, attestations };
 }
 
 async function consider(number) {
@@ -184,7 +190,7 @@ async function consider(number) {
     checkRuns: checks.runs,
     changedFiles: files.files,
     greptileSummaryBody: comments.summaryBody,
-    commentBodies: comments.bodies,
+    comments: comments.attestations,
     headSha: sha,
   });
   log('decision', { number, sha, ...decision, eventName });
