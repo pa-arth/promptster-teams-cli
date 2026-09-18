@@ -126,6 +126,15 @@ export const PRIVILEGED_PATHS = [
 
 export const GREPTILE_MIN_CONFIDENCE = 5;
 
+// Who is allowed to attest. GitHub's author_association on a PR comment;
+// anyone at all can comment on a public repo's PR, so an attestation read out
+// of ANY comment is forgeable by a stranger. The other gates still hold in that
+// case (a fork PR is refused outright), but the proof-of-drive claim would be
+// coming from someone with no relationship to the repo, which makes it worth
+// nothing. CONTRIBUTOR is deliberately absent: it means "has had a PR merged
+// here before", not "is trusted now".
+export const TRUSTED_ATTESTER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
+
 // An agent posts this as a PR comment after it has driven verify-teams-cli.
 // The SHA is what makes it worth anything: it has to name the commit being
 // merged, so a proof cannot be inherited by a later push.
@@ -190,8 +199,9 @@ export function shouldAutomerge(input) {
   if (greptileBlock) return { merge: false, reason: greptileBlock };
 
   const verificationBlock = verificationBlocksMerge({
-    commentBodies: input.commentBodies,
+    comments: input.comments,
     headSha: input.headSha,
+    trustedAssociations: input.trustedAssociations,
   });
   if (verificationBlock) return { merge: false, reason: verificationBlock };
 
@@ -241,14 +251,30 @@ export function greptileBlocksMerge({ summaryBody, minConfidence = GREPTILE_MIN_
   return null;
 }
 
-export function verificationBlocksMerge({ commentBodies, headSha } = {}) {
+export function verificationBlocksMerge({
+  comments,
+  headSha,
+  trustedAssociations = TRUSTED_ATTESTER_ASSOCIATIONS,
+} = {}) {
   if (!headSha) return 'no head SHA to check a verification attestation against — fail closed';
   const claimed = [];
-  for (const body of commentBodies ?? []) {
-    const m = VERIFICATION_MARKER.exec(body || '');
-    if (m) claimed.push(m[1].toLowerCase());
+  let untrusted = 0;
+  for (const comment of comments ?? []) {
+    const m = VERIFICATION_MARKER.exec(comment?.body || '');
+    if (!m) continue;
+    // Association is checked BEFORE the SHA, so a stranger posting the right
+    // SHA is still a stranger. An entry with no association at all is
+    // untrusted: fail closed rather than trusting a field the caller forgot.
+    if (!trustedAssociations.includes(comment?.authorAssociation)) {
+      untrusted += 1;
+      continue;
+    }
+    claimed.push(m[1].toLowerCase());
   }
   if (!claimed.length) {
+    if (untrusted) {
+      return `the only verify-teams-cli attestation on this PR is from an untrusted author — anyone can comment, so only ${trustedAssociations.join('/')} counts`;
+    }
     return 'no verify-teams-cli attestation on this PR — run verify-teams-cli and post one';
   }
   const head = headSha.toLowerCase();

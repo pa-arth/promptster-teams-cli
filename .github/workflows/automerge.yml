@@ -51,21 +51,20 @@ jobs:
     name: Automerge on green
     # Ignore our own check_run or this workflow retriggers itself forever.
     # Ignore fork pull_request_target (decision script also refuses forks).
-    #
-    # issue_comment is NOT filtered by author, and that is deliberate. It used
-    # to require greptile-apps[bot], which silently broke the gate: the
-    # verification attestation is the LAST step the verify-* skill prescribes,
-    # it is posted by an agent or a human, and under that filter posting it
-    # fired no run at all. Everything would be green, the attestation would be
-    # there, and nothing would ever look again. Re-evaluating on any PR comment
-    # costs one cheap run and can only ever decline — the decision script
-    # re-reads every input from the API and fails closed.
+    # issue_comment / pull_request_review re-evaluate after Greptile posts, and
+    # after an attestation lands — without that second case a PR whose checks
+    # and review already finished has no event left to fire, so posting the
+    # marker it is waiting for would never be read. Letting any commenter
+    # retrigger is safe: the job runs main's script, which re-derives every
+    # signal from the API. A comment cannot fake a check run or a review.
     if: >
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'check_run' &&
        github.event.check_run.name != 'Automerge on green') ||
-      (github.event_name == 'issue_comment' && github.event.issue.pull_request) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       (github.event.comment.user.login == 'greptile-apps[bot]' ||
+        contains(github.event.comment.body, 'verified: verify-teams-cli'))) ||
       github.event_name == 'pull_request_review'
     runs-on: ubuntu-latest
     steps:
