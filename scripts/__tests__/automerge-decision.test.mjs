@@ -490,6 +490,13 @@ test("the automerge workflow runs main's copy of the script, not the PR's", asyn
     'must ignore its own check_run or it retriggers forever',
   );
   assert.match(wf, /issue_comment:/, 'must retry after Greptile posts its summary');
+  // main has the workflow before it has the script, for exactly as long as the
+  // introducing PR is open. Without this guard the gate goes red on that PR.
+  assert.match(
+    wf,
+    /if \[ ! -f scripts\/automerge\.mjs \]; then/,
+    'must no-op when the default branch does not have the script yet',
+  );
   // Without this the gate deadlocks: once CI and Greptile have finished there
   // is no event left to fire, so the attestation the decision is waiting for
   // would be posted and never read.
