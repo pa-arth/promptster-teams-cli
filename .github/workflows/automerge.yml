@@ -1,0 +1,77 @@
+name: Automerge
+
+# Squash-merge a ready PR once trusted CI + Greptile pass. Draft PRs never
+# merge: Cloud Agents open a draft BEFORE they finish verify-teams-cli, and CI
+# going green on that draft is not verification. Marking the PR ready is the
+# agent's signal that the live proof holds — not the merge.
+#
+# Checks are bound to GitHub App + workflow path, not name alone, so a PR
+# cannot gut ci.yml / add a decoy workflow and keep the job titles. Greptile's
+# check-run success only means "we reviewed"; the decision script also requires
+# confidence 5/5 and zero P1 comments.
+#
+# Ready-for-review used to be the only verification signal, and nothing read it.
+# The decision script now also requires a verify-teams-cli attestation naming the
+# head SHA:
+#
+#   gh pr comment <N> --body "<!-- verified: verify-teams-cli sha=$(git rev-parse HEAD) -->"
+#
+# That does not prove the agent drove the app. It does mean skipping the proof
+# is an explicit claim rather than a silent omission, and that a proof for an
+# earlier commit cannot carry a later push.
+#
+# pull_request_target + checkout of the default branch so this file and
+# scripts/automerge.mjs always run from MAIN. A PR cannot weaken the policy by
+# editing them. Forks are refused in the decision script.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  check_run:
+    types: [completed]
+  issue_comment:
+    types: [created, edited]
+  pull_request_review:
+    types: [submitted]
+
+concurrency:
+  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  issues: read
+  actions: read
+
+jobs:
+  merge:
+    name: Automerge on green
+    # Ignore our own check_run or this workflow retriggers itself forever.
+    # Ignore fork pull_request_target (decision script also refuses forks).
+    # issue_comment / pull_request_review re-evaluate after Greptile posts.
+    if: >
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'check_run' &&
+       github.event.check_run.name != 'Automerge on green') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       github.event.comment.user.login == 'greptile-apps[bot]') ||
+      github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+
+      - name: Squash-merge if ready and required checks are green
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AUTOMERGE_BASE_REF: main
+        run: node scripts/automerge.mjs
