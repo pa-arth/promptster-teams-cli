@@ -80,4 +80,14 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AUTOMERGE_BASE_REF: main
-        run: node scripts/automerge.mjs
+        # The checkout above is the DEFAULT branch, on purpose — policy runs from
+        # main, never from the PR. Until the PR that introduces this gate has
+        # merged, main has the workflow but not the script, and calling it
+        # anyway would fail the job on the introducing PR itself. "Not yet" is
+        # not a failure here; it is the pre-merge state.
+        run: |
+          if [ ! -f scripts/automerge.mjs ]; then
+            echo "automerge: scripts/automerge.mjs is not on the default branch yet — nothing to decide."
+            exit 0
+          fi
+          node scripts/automerge.mjs
