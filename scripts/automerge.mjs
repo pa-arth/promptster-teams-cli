@@ -144,9 +144,8 @@ async function commentEvidence(number) {
   // Greptile edits the summary in place; take the last matching issue comment.
   const summaryBody = summaries.length ? summaries[summaries.length - 1].body : null;
   // The attestation is not from the bot, so every comment goes to the
-  // decision — but its AUTHOR goes with it. In a public repo anyone can
-  // comment, so an attestation is only worth something when the person making
-  // the claim is actually attached to the repository.
+  // decision — carrying its author_association, because anyone at all can
+  // comment on a public repo's PR and a claim from a stranger is worth nothing.
   const attestations = comments.items.map((c) => ({
     body: c.body || '',
     authorAssociation: c.author_association ?? null,

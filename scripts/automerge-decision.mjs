@@ -14,12 +14,12 @@
 //      expected workflow PATHS (not a same-name job in a PR-added workflow).
 //   2. Those workflow files were not edited in the PR — otherwise the PR can
 //      gut ci.yml, keep the job names, and present a trivial success.
-//   3. Greptile has finished a pass on this PR, with confidence 5/5 and
-//      zero P1 comments. Greptile's check-run conclusion is "we reviewed",
-//      not "safe to merge" — it reports success even at 1/5 with P1s.
-//   4. A verify-teams-cli attestation names THIS head SHA. Ready-for-review was
-//      only ever a self-attestation that nothing read; this makes it a
-//      machine-checked one. It does not prove the agent drove the app — it
+//   3. Greptile has finished a pass on this PR, at 5/5 — or at 4/5 with no P1
+//      ever raised, which is a P2-only PR. Greptile's check-run conclusion is
+//      "we reviewed", not "safe to merge": it reports success even at 1/5.
+//   4. A verify-teams-cli attestation from a trusted author names THIS head SHA.
+//      Ready-for-review was only ever a self-attestation that nothing read;
+//      this makes it a machine-checked one. It does not prove the agent drove the app — it
 //      cannot — but it does turn a silent omission into an explicit claim,
 //      and it kills the stale-proof case: verify commit A, push commit B, and
 //      the attestation no longer matches the head SHA.
@@ -126,12 +126,18 @@ export const PRIVILEGED_PATHS = [
 
 export const GREPTILE_MIN_CONFIDENCE = 5;
 
-// Who is allowed to attest. GitHub's author_association on a PR comment;
-// anyone at all can comment on a public repo's PR, so an attestation read out
-// of ANY comment is forgeable by a stranger. The other gates still hold in that
-// case (a fork PR is refused outright), but the proof-of-drive claim would be
-// coming from someone with no relationship to the repo, which makes it worth
-// nothing. CONTRIBUTOR is deliberately absent: it means "has had a PR merged
+// A 4/5 with no P1 ever raised is a P2-only PR. Measured over 40 PRs: every
+// single 4/5 had at least one finding, and 10 of 21 were P2-only — the
+// severity Greptile itself calls non-blocking. A flat 5/5 floor blocks a doc
+// nit exactly as hard as a correctness bug.
+export const GREPTILE_P2_ONLY_CONFIDENCE = 4;
+
+// Who is allowed to attest. GitHub's author_association on a PR comment.
+// THIS REPO IS PUBLIC: anyone with a GitHub account can comment on a PR here,
+// so without this check the proof-of-drive claim is forgeable by a stranger
+// today — not hypothetically. (promptster-backend, where this gate came from,
+// is private, so the same code is latent there; the hole is in the DESIGN, not
+// the repo.) CONTRIBUTOR is deliberately absent: it means "has had a PR merged
 // here before", not "is trusted now".
 export const TRUSTED_ATTESTER_ASSOCIATIONS = ['OWNER', 'MEMBER', 'COLLABORATOR'];
 
@@ -201,7 +207,6 @@ export function shouldAutomerge(input) {
   const verificationBlock = verificationBlocksMerge({
     comments: input.comments,
     headSha: input.headSha,
-    trustedAssociations: input.trustedAssociations,
   });
   if (verificationBlock) return { merge: false, reason: verificationBlock };
 
@@ -229,26 +234,41 @@ export function latestMatchingRun(checkRuns, spec) {
 }
 
 export function greptileBlocksMerge({ summaryBody, minConfidence = GREPTILE_MIN_CONFIDENCE } = {}) {
-  // Greptile edits one summary comment in place. Inline P1s from earlier
-  // passes stay on the PR forever, even after they are fixed. The summary is
-  // the current verdict; scanning historical inline comments would make any
-  // PR that ever had a P1 unmergeable.
+  // Which fields here are CURRENT, measured over 40 PRs of history:
+  //
+  //   Confidence Score  recomputed every review. Trustworthy.
+  //   Findings list     CUMULATIVE. Resolved findings keep their badge, so a
+  //                     5/5 summary reading "both findings are fully
+  //                     addressed" still carries a P1 image. Presence of a
+  //                     badge proves nothing about now.
+  //
+  // The asymmetry is what makes the badge usable at all: it only ever
+  // accumulates, so ABSENCE is reliable (that severity was never raised) even
+  // though presence is not. So: trust the score, and read the badge in the
+  // one direction the data supports.
   if (!summaryBody || !/<!--\s*greptile_summary\s*-->/i.test(summaryBody)) {
     return 'Greptile has not posted a review summary yet';
   }
   const m = summaryBody.match(/Confidence Score:\s*(\d+)\s*\/\s*5/i);
   if (!m) return 'Greptile summary has no Confidence Score — fail closed';
   const score = Number(m[1]);
-  if (score < minConfidence) {
-    return `Greptile confidence ${score}/5 is below ${minConfidence}/5`;
-  }
-  if (/not safe to merge/i.test(summaryBody) || /not yet safe to merge/i.test(summaryBody)) {
+
+  // Narrative verdict overrides the number in the one direction that fails
+  // closed. Greptile writes this sentence per review, so it is current.
+  if (/not (?:yet )?safe to merge/i.test(summaryBody)) {
     return 'Greptile summary says not safe to merge';
   }
-  if (/badges\/p1\.svg/i.test(summaryBody)) {
-    return 'Greptile summary lists P1 findings';
+
+  if (score >= minConfidence) return null;
+
+  // One below the floor with no P1 ever raised: P2-only, merge it.
+  if (score === GREPTILE_P2_ONLY_CONFIDENCE && !/badges\/p1\.svg/i.test(summaryBody)) {
+    return null;
   }
-  return null;
+  if (score === GREPTILE_P2_ONLY_CONFIDENCE) {
+    return `Greptile confidence ${score}/5 and a P1 has been raised on this PR`;
+  }
+  return `Greptile confidence ${score}/5 is below ${minConfidence}/5`;
 }
 
 export function verificationBlocksMerge({
