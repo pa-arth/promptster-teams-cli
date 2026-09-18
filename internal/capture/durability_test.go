@@ -9,12 +9,18 @@ import (
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 )
 
 const dayMs int64 = 24 * 60 * 60 * 1000
 
-// durVerdictFor pulls the durability verdict event for a given path out of a
-// slice, or fails. Verdicts are emitted one per (commit, path).
+// durVerdictFor pulls the durability verdict event covering a given path out of
+// a slice, or fails.
+//
+// TWO SHAPES, because the kind carries two. Churn and durable are one event per
+// (commit, path) and name it at the top level. The living inventory is one event
+// per ROOT and names the path on each RANGE, so this falls through to the range
+// arrays — a caller asking for "ai.go" wants the event that reports it either way.
 func durVerdictFor(t *testing.T, evs []event.Event, path string) map[string]interface{} {
 	t.Helper()
 	for _, ev := range evs {
@@ -25,12 +31,25 @@ func durVerdictFor(t *testing.T, evs []event.Event, path string) map[string]inte
 		if !ok {
 			t.Fatalf("event Data is %T, want map", ev.Data)
 		}
-		if data["path"] == path {
+		if data["path"] == path || rangesNamePath(data, path) {
 			return data
 		}
 	}
 	t.Fatalf("no durability_verdict for %q in %d event(s)", path, len(evs))
 	return nil
+}
+
+// rangesNamePath reports whether any range in the verdict carries `path`.
+func rangesNamePath(data map[string]interface{}, path string) bool {
+	for _, field := range []string{"livingRanges", "durableRanges", "churnedRanges"} {
+		arr, _ := data[field].([]interface{})
+		for _, r := range arr {
+			if rm, ok := r.(map[string]interface{}); ok && rm["path"] == path {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rangeSet flattens a verdict's range array ("durableRanges" or "churnedRanges")
@@ -582,6 +601,167 @@ func TestLivingInventoryThrottledToOncePerDay(t *testing.T) {
 	first, _ := ranges[0].(map[string]any)
 	if age := first["ageDays"]; age != float64(1) && age != 1 {
 		t.Errorf("ageDays = %v, want 1 (age must be current, not frozen at seed)", age)
+	}
+}
+
+// seedTrackedPaths commits n AI-authored files into a fresh repo and runs the
+// durability poll over them, leaving n tracked paths in the ledger. Returns the
+// root, its key and the session.
+func seedTrackedPaths(t *testing.T, n int) (string, string, Session) {
+	t.Helper()
+	ws, git, gitOut := gitRepo(t)
+	writeCommitFile(t, ws, "base.txt", "base\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+
+	key := gitWatchRootKey(ws)
+	sess := Session{DeviceID: "dev", TaskRoot: ws}
+	for i := 0; i < n; i++ {
+		p := "ai" + itoa(i) + ".go"
+		recordAiTouchedPath("sess-dur", key, p)
+		writeCommitFile(t, ws, p, "l1\nl2\n")
+	}
+	git("add", "-A")
+	git("commit", "-m", "ai adds files")
+	pollDurabilityCommit(ws, key, sess, gitOut("rev-parse", "HEAD"), 1_000_000_000_000, siblingLineage{})
+	return ws, key, sess
+}
+
+// TestLivingInventoryEmitsOneEventPerRoot — THE ROW-VOLUME FIX.
+//
+// The inventory used to emit one event per tracked path for a measurement that is
+// per-ROOT: on ops.ai it was 24,573 of 26,680 durability_verdict rows over 7 days
+// (92%) across only ~182 actual inventory runs. A root with N tracked paths must
+// now produce ONE event, with every path named on its own range — this fails on
+// the old code at N verdicts.
+func TestLivingInventoryEmitsOneEventPerRoot(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const paths = 12
+	ws, key, sess := seedTrackedPaths(t, paths)
+
+	v := inventoryLiving(sess, ws, key, 1_000_000_000_000+4*dayMs)
+	if len(v) != 1 {
+		t.Fatalf("inventory emitted %d events for %d tracked paths, want 1", len(v), paths)
+	}
+
+	data := v[0].Data.(map[string]interface{})
+	if _, hasTop := data["path"]; hasTop {
+		t.Errorf("a whole-root inventory must not claim a single top-level path: %v", data["path"])
+	}
+	ranges, _ := data["livingRanges"].([]interface{})
+	if len(ranges) != paths {
+		t.Fatalf("livingRanges = %d, want %d — one per tracked path", len(ranges), paths)
+	}
+	seen := map[string]bool{}
+	for _, r := range ranges {
+		rm := r.(map[string]interface{})
+		p, _ := rm["path"].(string)
+		if p == "" {
+			t.Fatalf("a range with no path: %v — the per-file identity is lost", rm)
+		}
+		if rm["lineageId"] == "" || rm["lineageId"] == nil {
+			t.Errorf("range %v lost its lineageId; the backend folds on it", rm)
+		}
+		seen[p] = true
+	}
+	if len(seen) != paths {
+		t.Errorf("inventory named %d distinct paths, want %d", len(seen), paths)
+	}
+}
+
+// TestLivingInventoryChunksAtTheRangeCeiling: one root per event is only safe
+// while the event stays under the wire's caps (see durabilityInventoryMaxRanges).
+// Past the ceiling it must SPLIT rather than build one the server refuses — and
+// every range must still be reported exactly once across the chunks.
+func TestLivingInventoryChunksAtTheRangeCeiling(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	orig := durabilityInventoryMaxRanges
+	durabilityInventoryMaxRanges = 4
+	t.Cleanup(func() { durabilityInventoryMaxRanges = orig })
+
+	const paths = 10 // ceil(10/4) = 3 events
+	ws, key, sess := seedTrackedPaths(t, paths)
+
+	v := inventoryLiving(sess, ws, key, 1_000_000_000_000+4*dayMs)
+	if len(v) != 3 {
+		t.Fatalf("inventory emitted %d events for %d ranges at a ceiling of 4, want 3", len(v), paths)
+	}
+	seen := map[string]int{}
+	for _, ev := range v {
+		data := ev.Data.(map[string]interface{})
+		ranges, _ := data["livingRanges"].([]interface{})
+		if len(ranges) > durabilityInventoryMaxRanges {
+			t.Errorf("a chunk carries %d ranges, over the ceiling of %d",
+				len(ranges), durabilityInventoryMaxRanges)
+		}
+		for _, r := range ranges {
+			seen[r.(map[string]interface{})["path"].(string)]++
+		}
+	}
+	if len(seen) != paths {
+		t.Errorf("chunking reported %d distinct paths, want %d", len(seen), paths)
+	}
+	for p, n := range seen {
+		if n != 1 {
+			t.Errorf("%s appears in %d chunks, want exactly 1", p, n)
+		}
+	}
+}
+
+// TestLivingInventoryPartialChunkDeliveryDoesNotBurnTheThrottle — the case that
+// only exists because the inventory chunks.
+//
+// A chunk is a SLICE of one daily measurement, so "at least one chunk landed" is
+// not delivery: it stamps the throttle on an inventory that is missing paths, and
+// those paths are absent from that day's survival series until tomorrow. The
+// sibling test above covers a whole-inventory failure and would pass under either
+// rule, and the chunking test lets every append succeed — neither can see this.
+//
+// The failure injected is the REAL one: a live lane at OutboxMaxBytes, which is
+// what discarded ~15.6k of ops.ai's events in Aug 2026. The lane is pre-filled to
+// one byte under the cap (sparse, so it costs nothing), so the FIRST chunk's
+// append still fits and every later one is refused — genuinely partial, not a
+// blanket outage.
+func TestLivingInventoryPartialChunkDeliveryDoesNotBurnTheThrottle(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	orig := durabilityInventoryMaxRanges
+	durabilityInventoryMaxRanges = 1 // one path per chunk: 3 paths → 3 chunks
+	t.Cleanup(func() { durabilityInventoryMaxRanges = orig })
+
+	const t0 int64 = 1_000_000_000_000
+	ws, key, sess := seedTrackedPaths(t, 3)
+
+	// Fill the live lane to one byte under its cap.
+	lane := filepath.Join(stateDir, "outbox.jsonl")
+	if err := os.WriteFile(lane, nil, 0o600); err != nil {
+		t.Fatalf("creating the lane: %v", err)
+	}
+	if err := os.Truncate(lane, outbox.OutboxMaxBytes-1); err != nil {
+		t.Fatalf("filling the lane: %v", err)
+	}
+
+	v := inventoryLiving(sess, ws, key, t0)
+	if len(v) != 3 {
+		t.Fatalf("built %d chunks, want 3 — the injection needs more than one", len(v))
+	}
+	if !outbox.LaneFull(outbox.LaneLive()) {
+		t.Fatal("the lane never filled; no chunk was refused, so this proves nothing")
+	}
+
+	// Drain the lane and re-poll a minute later — the real cadence. If a partly
+	// delivered inventory stamped the throttle, this returns nothing and the
+	// undelivered paths are missing from today's survival series for good.
+	if err := os.Truncate(lane, 0); err != nil {
+		t.Fatalf("draining the lane: %v", err)
+	}
+	if again := inventoryLiving(sess, ws, key, t0+60_000); len(again) != 3 {
+		t.Fatalf("after a PARTIAL delivery the retry emitted %d chunks, want 3 — "+
+			"the daily slot was spent on an incomplete inventory", len(again))
+	}
+	// ...and a FULLY delivered one does still consume the slot.
+	if again := inventoryLiving(sess, ws, key, t0+120_000); len(again) != 0 {
+		t.Errorf("a complete inventory must throttle the next poll, got %d chunks", len(again))
 	}
 }
 

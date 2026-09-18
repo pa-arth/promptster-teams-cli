@@ -397,12 +397,49 @@ var deviceOnlyFields = map[string]map[string]string{
 }
 
 // serverOnlyElementFields / deviceOnlyElementFields — the same two directions for
-// array-ELEMENT allowlists. Both are empty: the element tables are in full
-// lockstep today, and that is worth checking precisely because they are the
+// array-ELEMENT allowlists. Worth checking precisely because they are the
 // load-bearing privacy line (the top-level projection is key-only, so an
 // allowlisted array rides through whole unless its elements are clamped).
 var serverOnlyElementFields = map[string]map[string]map[string]string{}
-var deviceOnlyElementFields = map[string]map[string]map[string]string{}
+var deviceOnlyElementFields = map[string]map[string]map[string]string{
+	"durability_verdict": {
+		// AHEAD OF THE SERVER BY ONE RELEASE, ON PURPOSE — a dated gap, not a
+		// design decision, and it deletes itself.
+		//
+		// The daily living inventory now reports a whole root in ONE event instead
+		// of one per tracked path (it was 92% of this kind's rows on ops.ai:
+		// 24,573 of 26,680 over 7 days), so it no longer has a single top-level
+		// `path` to carry and each range names its own file. Server side that key
+		// is not yet in CANONICAL_KIND_ALLOWLIST, so it is stripped at ingest until
+		// promptster-backend adds 'path' to livingRanges in
+		// packages/shared/src/captureAllowlist.ts:802 and regenerates the artifact.
+		//
+		// Shipping the device half first is safe HERE, for a specific reason rather
+		// than a general one: nothing downstream needs the field. The living fold
+		// keys on (workspaceKey, lineageId) and flattenDurabilityVerdict never
+		// reads a path at all (packages/engine/src/lib/aiDurabilityJoin.ts:72-103),
+		// and lineageId is already `<sha>:<path>`, so the fold is byte-identical
+		// with the key stripped. What ships on its own is the row-volume fix; the
+		// path becomes readable the day the server allows it. That is also why this
+		// is declared HERE instead of hand-editing the generated artifact — that
+		// would assert a server state which does not exist, and disarm this test
+		// for the one field it is currently the only guard on.
+		//
+		// DELETE THIS ENTRY when the backend line lands and the artifact is
+		// re-synced; TestCaptureAllowlistExceptionsAreStillReal fails until someone
+		// does.
+		"livingRanges": {
+			"path": "DEVICE AHEAD BY ONE RELEASE. The living inventory is now one event per ROOT " +
+				"(internal/capture/durability.go, inventoryLiving), so the per-file identity moved " +
+				"from the top-level `path` onto each range. The server has not allowlisted the " +
+				"element key yet: add 'path' to livingRanges in promptster-backend " +
+				"packages/shared/src/captureAllowlist.ts:802, run `pnpm gen:capture-manifest`, then " +
+				"`make sync-capture-allowlist` here and DELETE this entry. Nothing is lost " +
+				"meanwhile — aiDurabilityJoin folds living ranges by (workspaceKey, lineageId) and " +
+				"never reads a path, and lineageId already encodes `<sha>:<path>`.",
+		},
+	},
+}
 
 // ---------------------------------------------------------------------------
 // Loading the artifact — every failure mode here is fatal.
