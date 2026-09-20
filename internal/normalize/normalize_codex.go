@@ -224,11 +224,21 @@ func (p *CodexRolloutProcessor) codexSessionUsage(usage map[string]interface{}, 
 	// Counts disambiguate two token_count lines written in the same timestamp
 	// while keeping replay IDs deterministic.
 	sourceKey := fmt.Sprintf("%s\x1f%s\x1f%d\x1f%d\x1f%d", p.threadID, ts, int64(input), int64(output), int64(cacheRead))
+	// Enriched replay must not collide with an older counter whose model was
+	// stripped. Counter folding takes maxima per thread, so both IDs are safe.
+	if !p.subagentThread && p.model != "" {
+		sourceKey += "\x1fmain-model-v1:" + p.model
+	}
 	e := p.newCodexEvent("codex_session_usage", ts, sourceKey)
 	e.Actor = event.SystemActor()
 	e.Data = map[string]interface{}{
 		"threadId": p.threadID, "inputTokens": int64(input),
 		"outputTokens": int64(output), "cacheReadTokens": int64(cacheRead),
+	}
+	// Preserve the parent model even when no final answer is emitted. A delegate
+	// cannot nominate the main-loop model (its model may itself be a role alias).
+	if !p.subagentThread && p.model != "" {
+		e.Data.(map[string]interface{})["mainLoopModel"] = p.model
 	}
 	e.RawPayload = "codex cumulative session usage"
 	return []event.Event{e}

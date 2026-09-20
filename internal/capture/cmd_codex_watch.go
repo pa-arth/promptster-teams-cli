@@ -190,6 +190,19 @@ func loadCodexWatchProgress() codexWatchProgress {
 			}
 		}
 	}
+	// v3: emit model-bearing counters from retained transcripts once.
+	if p.V < 3 {
+		p.Offsets = map[string]int64{}
+		p.Discarding = map[string]bool{}
+		p.ClassifyOffsets = map[string]int64{}
+		p.ClassifyDiscarding = map[string]bool{}
+		p.ClassifyScanned = map[string]int{}
+		for k, v := range p.Match {
+			if v == "yes" {
+				delete(p.Match, k)
+			}
+		}
+	}
 	p.V = codexProgressSchemaV
 	return p
 }

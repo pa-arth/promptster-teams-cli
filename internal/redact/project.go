@@ -11,6 +11,8 @@ import (
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
+var mainLoopModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
 // Client-side source exclusion — the on-device twin of the backend's teams
 // write-boundary projection. projectEvent runs at the buffer/ingest choke point
 // (appendEventToLocalBuffer, before signing), so source-bearing fields are
@@ -357,9 +359,10 @@ var projectFieldAllowlist = map[string][]string{
 	// there is silently stripped at ingest and reads as an older CLI.
 	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState"},
 	// Cumulative Codex rollout counters, one reading per token_count line. No
-	// prompt, model, path, or prose. threadId distinguishes delegated rollouts
+	// prompt, path, or prose. mainLoopModel is a bounded model identifier.
+	// threadId distinguishes delegated rollouts
 	// and is dropped unless it is an opaque id (see ProjectEvent).
-	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens"},
+	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens", "mainLoopModel"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
@@ -1019,6 +1022,9 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		}
 	}
 	if e.Kind == "codex_session_usage" {
+		if model, ok := projected["mainLoopModel"].(string); !ok || !mainLoopModelPattern.MatchString(model) {
+			delete(projected, "mainLoopModel")
+		}
 		if thread, ok := projected["threadId"].(string); !ok || !isOpaqueLaneID(thread) {
 			delete(projected, "threadId")
 		}

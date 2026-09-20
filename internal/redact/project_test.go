@@ -1168,3 +1168,18 @@ func TestProjectDependencyCategory(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectMainLoopModelIsBoundedScalar(t *testing.T) {
+	for _, model := range []interface{}{"gpt-6-astra", "~/secret/path", "some user prose", map[string]interface{}{"text": leakCanary}, strings.Repeat("x", 129)} {
+		e := eventWithData("codex_session_usage", map[string]interface{}{"threadId": "parent", "mainLoopModel": model})
+		ProjectEvent(&e, false)
+		got, ok := e.Data.(map[string]interface{})["mainLoopModel"]
+		if text, isString := model.(string); isString && text == "gpt-6-astra" {
+			if got != model {
+				t.Fatal("model dropped")
+			}
+		} else if ok {
+			t.Fatal("non-model scalar survived")
+		}
+	}
+}
