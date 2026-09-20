@@ -261,6 +261,15 @@ jobs:
         # as a literal path, which fails with "Could not find test/*.test.js".
         run: node --test test/*.test.js
 
+      # The automerge gate's decision test. It is what keeps REQUIRED_CHECKS
+      # naming jobs that really exist — a required check that never reports is a
+      # gate that never merges — so it runs inside a check the gate itself
+      # requires. Node stdlib only; the scripts live at the repo root.
+      # No working-directory: unlike the steps above, these are not under npm/.
+      - name: Automerge decision tests
+        working-directory: ${{ github.workspace }}
+        run: node --test scripts/__tests__/automerge-decision.test.mjs
+
   # Static application security testing. All findings (any severity) are
   # published to the GitHub Security tab as SARIF so reviewers can see them;
   # the gate itself fails only on HIGH-severity/HIGH-confidence findings.
