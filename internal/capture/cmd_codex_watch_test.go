@@ -293,3 +293,38 @@ func TestLoadCodexWatchProgressV2PreservesCwdMismatch(t *testing.T) {
 		t.Fatalf("genuine cwd mismatch must survive v2 migration; got %v", got.Match)
 	}
 }
+
+func TestModelReplayMigrationPreservesOldActiveRolloutCursor(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	workspace := t.TempDir()
+	path := filepath.Join(root, "rollout-019eb780-3081-7ce0-9ba0-8a0bad13b532.jsonl")
+	oldTS := time.Now().Add(-35 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	history := codexSessionMetaLine(resolvePath(workspace), oldTS)
+	now := time.Now().UTC()
+	// The new line was appended after the v2 cursor was saved, before v3 runs.
+	fresh := `{"timestamp":"` + now.Format(time.RFC3339) + `","type":"event_msg","payload":{"type":"user_message","message":"new activity","images":[]}}` + "\n"
+	if err := os.WriteFile(path, []byte(history+fresh), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(codexWatchProgress{V: 2, Offsets: map[string]int64{path: int64(len(history))}, Match: map[string]string{path: "yes"}})
+	if err := os.WriteFile(codexWatchProgressPath(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	migrated := loadCodexWatchProgress()
+	if migrated.Offsets[path] != int64(len(history)) {
+		t.Fatal("migration lost live cursor")
+	}
+	session := Session{DeviceID: "model-replay", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	sent := pollCodexRollouts(session, resolvePath(workspace), transcriptHistoryCutoff(now), map[string]*normalize.CodexRolloutProcessor{}, false)
+	if sent != 1 {
+		t.Fatalf("new post-upgrade activity lost: queued %d, want 1", sent)
+	}
+	saved := loadCodexWatchProgress()
+	if saved.ModelReplayPending[path] {
+		t.Fatal("go-forward classification did not retire replay marker")
+	}
+}

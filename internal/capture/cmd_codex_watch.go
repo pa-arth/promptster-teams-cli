@@ -94,7 +94,8 @@ func codexWatcherLogPath() string   { return filepath.Join(state.StateDir(), "co
 // codexWatchProgress persists per-rollout-file byte offsets and the
 // workspace-match decision so each line is processed exactly once across polls.
 type codexWatchProgress struct {
-	Offsets map[string]int64 `json:"offsets"`
+	Offsets            map[string]int64 `json:"offsets"`
+	ModelReplayPending map[string]bool  `json:"model_replay_pending,omitempty"`
 	// Discarding marks offsets that are inside an unsupported oversized record.
 	// Persisting it prevents a restart from parsing the malformed suffix.
 	Discarding         map[string]bool  `json:"discarding,omitempty"`
@@ -190,19 +191,21 @@ func loadCodexWatchProgress() codexWatchProgress {
 			}
 		}
 	}
-	// v3: emit model-bearing counters from retained transcripts once.
+	// v3: reclassify before clearing an offset. A months-old active rollout
+	// must retain its go-forward cursor; seeding it at a later EOF loses usage.
 	if p.V < 3 {
-		p.Offsets = map[string]int64{}
-		p.Discarding = map[string]bool{}
+		p.ModelReplayPending = map[string]bool{}
 		p.ClassifyOffsets = map[string]int64{}
 		p.ClassifyDiscarding = map[string]bool{}
 		p.ClassifyScanned = map[string]int{}
-		for k, v := range p.Match {
-			if v == "yes" {
-				delete(p.Match, k)
+		for path := range p.Offsets {
+			p.ModelReplayPending[path] = true
+			if p.Match[path] == "yes" {
+				delete(p.Match, path)
 			}
 		}
 	}
+
 	p.V = codexProgressSchemaV
 	return p
 }
@@ -532,8 +535,14 @@ func pollCodexRollouts(
 			accrue(res.consumed)
 			switch match {
 			case codexMatchYes:
+				if progress.ModelReplayPending[path] {
+					delete(progress.Offsets, path)
+					delete(progress.Discarding, path)
+					delete(progress.ModelReplayPending, path)
+				}
 				progress.Match[path] = "yes"
 			case codexMatchYesPreexisting:
+				delete(progress.ModelReplayPending, path)
 				// Go-forward: capture ongoing activity but not out-of-window
 				// history. Seed the offset to current EOF so tailing starts at new
 				// content. Only when unseen — a real prior offset (a restart-spanning
