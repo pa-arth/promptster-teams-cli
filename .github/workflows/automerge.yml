@@ -35,9 +35,28 @@ on:
   pull_request_review:
     types: [submitted]
 
-concurrency:
-  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}
-  cancel-in-progress: true
+# One decision at a time per PR — but never cancel one in flight.
+#
+# `cancel-in-progress: true` here killed the only run that was visible. Three
+# of the four triggers (pull_request_target, issue_comment, pull_request_review)
+# collapse to the SAME key, so events arriving seconds apart cancelled each
+# other. What made that actively misleading is the asymmetry: issue_comment and
+# check_run runs execute with head_sha = main, so their check-runs post against
+# MAIN, not the PR. Only the pull_request_target run carries the PR head SHA —
+# and that was the one being cancelled. Net effect on promptster-teams #334:
+# the gate was deciding correctly while the PR showed nothing but a cancelled
+# run, for two days.
+#
+# Keying all four events on the PR number would need check_run's number out of
+# `check_run.pull_requests[0].number`, which is empty for fork PRs AND for check
+# runs on plain pushes to main — both of which reach this workflow. An empty key
+# collapses every such run into one shared `automerge-` group that then cancels
+# ACROSS unrelated PRs: worse than the bug being fixed. So queue instead of
+# cancel. For a gate whose entire job is to make a merge decision, a queued run
+# beats a cancelled one; the decision script is idempotent and exits 0 for "not
+# yet". GitHub keeps at most one running plus one pending run per group, so
+# nothing piles up.
+  cancel-in-progress: false
 
 permissions:
   contents: write
