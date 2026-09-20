@@ -89,6 +89,7 @@ var codexProgressMigrations = []progressMigration{
 		ReplayHorizon: transcriptHistoryWindow,
 		Why:           "reset matched offsets so classification replays only the new bounded window",
 	},
+	{V: 3, ReplayHorizon: transcriptHistoryWindow, Why: "recover Codex main-loop model evidence for unpriced guardian usage"},
 }
 
 // claudeProgressSchemaV / codexProgressSchemaV are the current schema versions,

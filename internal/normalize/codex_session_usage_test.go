@@ -40,3 +40,41 @@ func TestCodexCumulativeUsageRejectsIncompleteVector(t *testing.T) {
 		}
 	}
 }
+
+func TestCodexUsagePreservesOnlyMainThreadModel(t *testing.T) {
+	for _, delegated := range []bool{false, true} {
+		p := NewCodexRolloutProcessor("thread-1")
+		p.threadID = "thread-1"
+		p.subagentThread = delegated
+		p.Process([]byte(`{"timestamp":"2026-09-14T00:00:00Z","type":"turn_context","payload":{"model":"gpt-6-astra"}}`))
+		rows := p.codexSessionUsage(map[string]interface{}{"input_tokens": float64(100), "cached_input_tokens": float64(50), "output_tokens": float64(10)}, "2026-09-14T00:00:01Z")
+		model, hasModel := rows[0].Data.(map[string]interface{})["mainLoopModel"]
+		if delegated && hasModel {
+			t.Fatal("delegate nominated parent model")
+		}
+		if !delegated && model != "gpt-6-astra" {
+			t.Fatal("parent model lost without final answer")
+		}
+		p.Process([]byte(`{"timestamp":"2026-09-14T00:00:02Z","type":"turn_context","payload":{}}`))
+		rows = p.codexSessionUsage(map[string]interface{}{"input_tokens": float64(200), "cached_input_tokens": float64(50), "output_tokens": float64(20)}, "2026-09-14T00:00:03Z")
+		if _, ok := rows[0].Data.(map[string]interface{})["mainLoopModel"]; ok {
+			t.Fatal("stale model survived reset")
+		}
+	}
+}
+
+func TestModelEnrichedCounterDoesNotCollideWithLegacyReplay(t *testing.T) {
+	p := NewCodexRolloutProcessor("parent")
+	p.threadID = "parent"
+	usage := map[string]interface{}{"input_tokens": float64(100), "cached_input_tokens": float64(50), "output_tokens": float64(10)}
+	legacy := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
+	p.model = "gpt-6-astra"
+	enriched := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
+	if legacy.ID == enriched.ID {
+		t.Fatal("enriched evidence would be discarded as duplicate")
+	}
+	replay := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
+	if enriched.ID != replay.ID {
+		t.Fatal("enriched replay not idempotent")
+	}
+}
