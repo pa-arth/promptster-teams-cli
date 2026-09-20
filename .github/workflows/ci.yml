@@ -14,6 +14,28 @@ concurrency:
 permissions:
   contents: read
 
+# Toolchain policy: go.mod is the single source of truth for the Go version.
+# Every setup-go below uses `go-version-file: go.mod` and deliberately does NOT
+# set `check-latest: true`. That flag ignores go.mod's floor and installs
+# whatever is newest in the runner manifest, so the toolchain advances on its
+# own schedule while the tools pinned against it stay put — and CI's verdict
+# starts depending on the DAY it ran rather than on the commit.
+#
+# That is not hypothetical: Go advanced to 1.27, which emits export-data
+# version 4, while staticcheck was pinned at v0.7.0, which decodes at most
+# version 2. Lint died on "export data version 4 is greater than maximum
+# supported version 2" before reading a line of our code. It was repaired by
+# bumping the pin to v0.8.1, but the mechanism would have fired again at the
+# next Go release.
+#
+# So the Go version and the tools pinned against it move TOGETHER, in one
+# reviewed commit: bump go.mod's `go` directive and the staticcheck pin in the
+# lint job below at the same time.
+#
+# The one deliberate exception is `govulncheck`, which sets `go-version: stable`
+# on purpose so it scans against the newest patched stdlib. That job is
+# non-blocking precisely because its result IS date-dependent.
+
 jobs:
   # Cross-platform build + tests. The CLI ships darwin + windows binaries and
   # has platform-split files (signing_lock_unix.go / signing_lock_windows.go),
@@ -35,7 +57,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
@@ -68,7 +89,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
 
       # Linux: systemd --user needs a running user manager; enable-linger starts
       # one for the runner account, and XDG_RUNTIME_DIR points systemctl at it.
@@ -186,7 +206,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
       - run: go tool cover -func=coverage.out | tail -1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -202,7 +221,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -211,8 +229,14 @@ jobs:
             exit 1
           fi
       - name: staticcheck
-        # Keep the checker compatible with go.mod's Go 1.27 export format.
-        # v0.7.0 cannot decode its standard-library export data.
+        # Pinned, not @latest: an unpinned checker makes the verdict depend on
+        # the day the job ran. The pin must decode the export format of the Go
+        # version in go.mod — v0.7.0 cannot read Go 1.27's standard-library
+        # export data, hence v0.8.1.
+        #
+        # This pin and go.mod's `go` directive are one pair: bump them in the
+        # same commit, or this job breaks on a toolchain nobody chose. See the
+        # toolchain-policy note at the top of this file.
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
   # The binary ships as six per-platform npm packages pinned to the wrapper's
@@ -275,7 +299,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: gosec (report all → SARIF)
         run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out gosec.sarif ./...
       - name: upload SARIF to code scanning
@@ -411,7 +434,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: every offset-clearing migration declares a ReplayHorizon
         run: |
           go test ./internal/capture/ -run 'TestEveryOffsetClearingMigrationDeclaresItsReplayHorizon|TestSchemaVersionsComeFromTheMigrationTables|TestMigrationTablesAreGaplessAndOrdered' -v 2>&1 | tail -40
