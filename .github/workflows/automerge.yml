@@ -35,29 +35,32 @@ on:
   pull_request_review:
     types: [submitted]
 
-# One decision at a time per PR — but never cancel one in flight.
+# One decision at a time per PR — and never lose the run the PR can see.
 #
-# `cancel-in-progress: true` here killed the only run that was visible. Three
-# of the four triggers (pull_request_target, issue_comment, pull_request_review)
-# collapse to the SAME key, so events arriving seconds apart cancelled each
-# other. What made that actively misleading is the asymmetry: issue_comment and
-# check_run runs execute with head_sha = main, so their check-runs post against
-# MAIN, not the PR. Only the pull_request_target run carries the PR head SHA —
-# and that was the one being cancelled. Net effect on promptster-teams #334:
-# the gate was deciding correctly while the PR showed nothing but a cancelled
-# run, for two days.
+# The asymmetry that makes this matter: issue_comment and check_run runs
+# execute with head_sha = main, so their check-runs post against MAIN. Only the
+# pull_request_target run carries the PR head SHA, so it is the ONLY run
+# visible on the PR. promptster-teams #334 decided correctly for two days while
+# the PR showed nothing but a cancelled run.
 #
-# Keying all four events on the PR number would need check_run's number out of
-# `check_run.pull_requests[0].number`, which is empty for fork PRs AND for check
-# runs on plain pushes to main — both of which reach this workflow. An empty key
-# collapses every such run into one shared `automerge-` group that then cancels
-# ACROSS unrelated PRs: worse than the bug being fixed. So queue instead of
-# cancel. For a gate whose entire job is to make a merge decision, a queued run
-# beats a cancelled one; the decision script is idempotent and exits 0 for "not
-# yet". GitHub keeps at most one running plus one pending run per group, so
-# nothing piles up.
+# `cancel-in-progress: false` alone does NOT fix that. It protects the RUNNING
+# run; GitHub still evicts the PENDING one when a newer run joins the group. So
+# with a comment/review run executing and pull_request_target queued behind it,
+# one more comment or review on that PR replaces the pending pull_request_target
+# run — the PR-visible one, gone again. Putting the event name in the key is
+# what fixes it: pull_request_target never shares a group with comment/review
+# runs, so nothing can evict it.
+#
+# Keying everything on the PR number instead was rejected: check_run's number
+# comes from `check_run.pull_requests[0]`, which is empty for fork PRs AND for
+# check runs on pushes to main — both of which reach this workflow. The key
+# then degrades to a bare `automerge-` shared across unrelated PRs.
+#
+# Two gate runs racing costs nothing: the decision reads `merged` and refuses an
+# already-merged PR, and a non-200 from the merge API logs "will retry on next
+# event" and exits 0.
 concurrency:
-  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}
+  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:

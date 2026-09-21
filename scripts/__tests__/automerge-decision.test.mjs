@@ -534,6 +534,19 @@ test("the automerge workflow runs main's copy of the script, not the PR's", asyn
     'must ignore its own check_run or it retriggers forever',
   );
   assert.match(wf, /issue_comment:/, 'must retry after Greptile posts its summary');
+
+  // The PR-visible run is the pull_request_target one (the others execute
+  // against main), so it must not share a concurrency group with the
+  // comment/review runs that would evict it while it is PENDING —
+  // `cancel-in-progress: false` only protects a RUNNING run. Asserted as a
+  // whole block on purpose: a patch that drops `concurrency:`/`group:` and
+  // leaves an orphaned `cancel-in-progress: false` is still valid YAML (it
+  // parses as a key under `on:`) and would otherwise pass silently.
+  assert.match(
+    wf,
+    /^concurrency:\n  group: automerge-\$\{\{[^\n]*\}\}-\$\{\{ github\.event_name \}\}\n  cancel-in-progress: false$/m,
+    'concurrency must be a top-level block keyed by event name, queueing not cancelling',
+  );
   // main has the workflow before it has the script, for exactly as long as the
   // introducing PR is open. Without this guard the gate goes red on that PR.
   assert.match(
