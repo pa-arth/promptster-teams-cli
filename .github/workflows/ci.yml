@@ -37,9 +37,12 @@ permissions:
 # is the proof that the flag was never the variable.
 #
 # So the live hazard is the `go` directive moving out of step with the
-# staticcheck pin below, and nothing in this file prevents that. Bump them in
-# the same commit; when a dependency bump moves the directive on its own,
-# expect this job to break and move the pin with it.
+# staticcheck pin below. The `lint` job now guards it: a preflight step runs
+# scripts/check-toolchain-pair.sh, which holds the one pair observed to work
+# and fails — before staticcheck, naming which half moved and what to do — as
+# soon as either half changes. Bump them in the same commit and re-record the
+# pair there; when a dependency bump moves the directive on its own, that guard
+# is what tells you, instead of an export-data error naming none of our files.
 #
 # Two jobs here are genuinely date-dependent: `govulncheck` sets
 # `go-version: stable` on purpose, so it scans the newest patched stdlib, and
@@ -228,6 +231,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Preflight: catch a drifted (go directive, staticcheck pin) pair here,
+      # with an actionable message, instead of downstream as an export-data
+      # "internal error" against stdlib packages. See the toolchain-policy note
+      # at the top of this file.
+      - name: toolchain pair (go.mod <-> staticcheck pin)
+        run: scripts/check-toolchain-pair.sh
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
@@ -246,8 +255,9 @@ jobs:
         #
         # This pin and go.mod's `go` directive are one pair. A dependency bump
         # can raise that directive on its own (#222 did, via titus v1.2.9), and
-        # then this job fails on a toolchain nobody chose. See the
-        # toolchain-policy note at the top of this file.
+        # then this job fails on a toolchain nobody chose. The preflight step
+        # above records that pair and catches the drift first; if you change
+        # this version, change the recorded pair in the same commit.
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
   # The binary ships as six per-platform npm packages pinned to the wrapper's
