@@ -21,10 +21,23 @@ Run the same checks CI runs before pushing:
 
 ```sh
 go test -race ./...
-go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 go run github.com/securego/gosec/v2/cmd/gosec@latest ./...
 ```
+
+`staticcheck` is **pinned**, and this line has to keep matching the pin in
+`.github/workflows/ci.yml`. It said `@latest` until 2026-09-20, which is worse
+than a cosmetic drift: staticcheck can only decode standard-library export data
+up to a version, so running a different one than CI does gives you a different
+verdict than CI — or an `internal error in importing ...` that looks nothing
+like a lint finding.
+
+The pin is coupled to `go.mod`'s `go` directive and the two move together in
+one reviewed commit. Note the directive can be raised **by a dependency bump**:
+Go takes the highest `go` any dependency requires, so a Dependabot PR that
+touches no Go of ours can move the floor and break lint. That is what happened
+on 2026-09-18 (titus v1.2.7 -> v1.2.9 carried `go 1.27.0`).
 
 ## The one rule that matters
 
