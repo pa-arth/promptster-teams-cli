@@ -56,6 +56,8 @@ on:
 # beats a cancelled one; the decision script is idempotent and exits 0 for "not
 # yet". GitHub keeps at most one running plus one pending run per group, so
 # nothing piles up.
+concurrency:
+  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}
   cancel-in-progress: false
 
 permissions:
