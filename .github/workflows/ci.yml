@@ -14,6 +14,38 @@ concurrency:
 permissions:
   contents: read
 
+# Toolchain policy: go.mod is the single source of truth for the Go version.
+# Every setup-go below uses `go-version-file: go.mod` and does not set
+# `check-latest`. Dropping that flag is consistency cleanup, NOT a bug fix.
+#
+# It is worth being exact, because an earlier version of this note got it
+# wrong: `check-latest: true` did not cause the Go 1.27 lint breakage and
+# could not have. go.mod pins a patch-exact `go 1.27.0`, so setup-go resolves
+# the spec to that single version; `check-latest` only decides whether it is
+# fetched from the manifest or reused from the runner tool cache, never WHICH
+# version. The failing run logged `check-latest: true` + `Setup go version
+# spec 1.27.0`; this branch logs `check-latest: false` + `Setup go version
+# spec 1.27.0`. Same version, both ways.
+#
+# What actually broke lint on 2026-09-18: Dependabot (#222) bumped
+# praetorian-inc/titus to v1.2.9, whose own go.mod declares `go 1.27.0`. Go
+# raises the main module's `go` directive to the highest any dependency
+# requires, so a transitive dependency moved this repo's floor 1.25.8 -> 1.27.0
+# inside a bot commit. Go 1.27 emits export-data version 4; staticcheck was
+# pinned at v0.7.0, which decodes at most version 2. #238 repaired it by
+# bumping the pin to v0.8.1 — with `check-latest: true` still in place, which
+# is the proof that the flag was never the variable.
+#
+# So the live hazard is the `go` directive moving out of step with the
+# staticcheck pin below, and nothing in this file prevents that. Bump them in
+# the same commit; when a dependency bump moves the directive on its own,
+# expect this job to break and move the pin with it.
+#
+# Two jobs here are genuinely date-dependent: `govulncheck` sets
+# `go-version: stable` on purpose, so it scans the newest patched stdlib, and
+# is non-blocking for that reason. `gosec` runs `@latest` and IS blocking —
+# an inconsistency, not a policy.
+
 jobs:
   # Cross-platform build + tests. The CLI ships darwin + windows binaries and
   # has platform-split files (signing_lock_unix.go / signing_lock_windows.go),
@@ -35,7 +67,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
@@ -68,7 +99,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
 
       # Linux: systemd --user needs a running user manager; enable-linger starts
       # one for the runner account, and XDG_RUNTIME_DIR points systemctl at it.
@@ -186,7 +216,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
       - run: go tool cover -func=coverage.out | tail -1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -202,7 +231,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: gofmt
         run: |
           unformatted="$(gofmt -l .)"
@@ -211,8 +239,15 @@ jobs:
             exit 1
           fi
       - name: staticcheck
-        # Keep the checker compatible with go.mod's Go 1.27 export format.
-        # v0.7.0 cannot decode its standard-library export data.
+        # Pinned, not @latest: an unpinned checker makes the verdict depend on
+        # the day the job ran. The pin must decode the export format of the Go
+        # version in go.mod — v0.7.0 cannot read Go 1.27's standard-library
+        # export data, hence v0.8.1.
+        #
+        # This pin and go.mod's `go` directive are one pair. A dependency bump
+        # can raise that directive on its own (#222 did, via titus v1.2.9), and
+        # then this job fails on a toolchain nobody chose. See the
+        # toolchain-policy note at the top of this file.
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
 
   # The binary ships as six per-platform npm packages pinned to the wrapper's
@@ -284,7 +319,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: gosec (report all → SARIF)
         run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out gosec.sarif ./...
       - name: upload SARIF to code scanning
@@ -420,7 +454,6 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          check-latest: true
       - name: every offset-clearing migration declares a ReplayHorizon
         run: |
           go test ./internal/capture/ -run 'TestEveryOffsetClearingMigrationDeclaresItsReplayHorizon|TestSchemaVersionsComeFromTheMigrationTables|TestMigrationTablesAreGaplessAndOrdered' -v 2>&1 | tail -40
