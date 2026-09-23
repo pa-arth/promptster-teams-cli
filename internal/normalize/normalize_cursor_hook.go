@@ -168,6 +168,9 @@ type CursorHookResult struct {
 	// Model is the model this payload resolved, if any. Surfaced so the capture
 	// layer can suppress a repeat without re-parsing the events.
 	Model string
+	// Effort is the reasoning-effort tier this payload carried in model_params,
+	// if any. Cached with Model from afterAgentThought, joined onto `stop`.
+	Effort string
 	// Workdir is the RAW absolute cwd this payload observed, before any
 	// home-collapsing. Surfaced rather than resolved here because turning a cwd
 	// into repoRoot/repoHost/repoTracked means running git, and this package
@@ -189,6 +192,9 @@ type CursorHookOptions struct {
 	// turn, because Cursor auto-routes and genuinely switches models mid
 	// conversation. Nil is allowed and means "no cache" — the shape a test gets.
 	ResolveModel func(generationID string) string
+	// ResolveEffort is ResolveModel's twin for the reasoning-effort tier, filled
+	// from the same afterAgentThought step. Same "" and nil semantics.
+	ResolveEffort func(generationID string) string
 }
 
 // NormalizeCursorHook turns one hook payload into events.
@@ -216,12 +222,17 @@ func NormalizeCursorHook(line []byte, opts CursorHookOptions) (CursorHookResult,
 	if model == "" && p.HookEventName == "stop" && p.GenerationID != "" && opts.ResolveModel != nil {
 		model = opts.ResolveModel(p.GenerationID)
 	}
+	effort := p.effortParam()
+	if effort == "" && p.HookEventName == "stop" && p.GenerationID != "" && opts.ResolveEffort != nil {
+		effort = opts.ResolveEffort(p.GenerationID)
+	}
 	res := CursorHookResult{
 		SessionID:      sess,
 		TranscriptPath: p.TranscriptPath,
 		Step:           p.HookEventName,
 		GenerationID:   p.GenerationID,
 		Model:          model,
+		Effort:         effort,
 		Workdir:        p.workdirSource(),
 	}
 
@@ -247,7 +258,7 @@ func NormalizeCursorHook(line []byte, opts CursorHookOptions) (CursorHookResult,
 			res.Events = append(res.Events, e)
 		}
 	case "stop":
-		if e, ok := p.usageEvent(model); ok {
+		if e, ok := p.usageEvent(model, effort); ok {
 			res.Events = append(res.Events, e)
 		}
 	case "afterAgentThought":
@@ -340,12 +351,16 @@ func (p cursorHookPayload) modelLabel() string {
 	return ""
 }
 
-// NOTE ON model_params: afterAgentThought also carries a reasoning-effort
-// parameter (high/medium/low). It is deliberately NOT emitted. `effort` is not
-// allowlisted in internal/redact/project.go or the backend's
-// eventFieldProjection.ts, so emitting it would be stripped SILENTLY on one side
-// or the other and read as "an older CLI" — MUST-DO #2's exact trap. If it is
-// ever wanted, both allowlists learn it in the same change or not at all.
+// effortParam is the reasoning-effort tier in model_params ({effort high}), or
+// "". Allowlisted on ai_response on both sides (backend#634 and redact).
+func (p cursorHookPayload) effortParam() string {
+	for _, mp := range p.ModelParams {
+		if mp.ID == "effort" {
+			return clampEffort(mp.Value)
+		}
+	}
+	return ""
+}
 
 func (p cursorHookPayload) lifecycleEvent(kind string) event.Event {
 	e := p.newEvent(kind, p.Reason+"\x1f"+p.FinalStatus)
@@ -513,7 +528,7 @@ func hookAiProvenance() *event.Provenance {
 // cost nothing. Same rule for the model: no cache entry means no `model` key,
 // which the backend's readUsage declines to price — correct, and visible, where
 // a defaulted model would be confidently wrong.
-func (p cursorHookPayload) usageEvent(model string) (event.Event, bool) {
+func (p cursorHookPayload) usageEvent(model, effort string) (event.Event, bool) {
 	data := map[string]interface{}{}
 	putCount(data, "inputTokens", p.InputTokens)
 	putCount(data, "outputTokens", p.OutputTokens)
@@ -556,6 +571,10 @@ func (p cursorHookPayload) usageEvent(model string) (event.Event, bool) {
 	// assertion is about the PAYLOAD, not about this field.
 	if p.GenerationID != "" {
 		data["generationId"] = p.GenerationID
+	}
+	// Also after the emptiness check: effort alone measures nothing.
+	if effort != "" {
+		data["effort"] = effort
 	}
 	e := p.newAIEvent("ai_response", p.usageDiscriminator())
 	e.Data = data

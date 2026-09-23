@@ -249,23 +249,7 @@ var serverOnlyFields = map[string]map[string]string{
 // So an entry here is a QUESTION someone is expected to answer eventually, not a
 // closed fact. It must name the site that declines, so the next reader can go and
 // look rather than take this table's word for it.
-var deviceDeclinesToEmit = map[string]map[string]string{
-	"ai_response": {
-		"effort": "AVAILABLE ON THE CURSOR RAIL, DELIBERATELY UNEMITTED — a choice, not a gap. " +
-			"Cursor's afterAgentThought hook carries a reasoning-effort parameter in " +
-			"`model_params` ({effort high|medium|low}); normalize_cursor_hook.go:48 parses " +
-			"model_params into cursorHookModelParm and the emitter declines to put it on the " +
-			"event. The reason is written at normalize_cursor_hook.go:249 and is exactly this " +
-			"test's subject: `effort` was allowlisted on NEITHER side, so emitting it would be " +
-			"stripped silently on one and read as 'an older CLI'. Half of that is now false — " +
-			"the server allowlists it as of promptster-backend#634 — so the question 'should " +
-			"the Cursor rail emit effort?' is OPEN and belongs to whoever next touches Cursor " +
-			"capture. NOTE the grain (design.md §5): Claude reports effort per api_request and " +
-			"it can change mid-session, so it must ride on ai_response and must never be " +
-			"flattened onto the session. Contrast `speed` in serverOnlyFields: that one has no " +
-			"device source at all and nothing to decide.",
-	},
-}
+var deviceDeclinesToEmit = map[string]map[string]string{}
 
 // deviceOnlyFields — projected by this CLI and NOT allowlisted at the backend
 // write boundary, keyed kind → field → reason.

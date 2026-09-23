@@ -4,6 +4,26 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `ai_response` now carries `effort`, the reasoning-effort level each turn ran at,
+  on all three platforms:
+  - **Claude Code:** read from each assistant row in the transcript, using
+    `perTurnEffort` when present and `effort` otherwise.
+  - **Codex:** read from `turn_context`. Older rollouts have a top-level `effort`;
+    newer ones have `collaboration_mode.settings.reasoning_effort`, which is null
+    when the user left effort on the default. A null is omitted rather than
+    guessed.
+  - **Cursor:** read from `model_params` on the hook. When the model picker is on
+    Auto, the value comes from `afterAgentThought` and is joined onto `stop`
+    through the same per-turn cache that carries the model.
+
+  The backend has accepted this field since promptster-backend#634. Subagent turns
+  don't carry it yet, because the backend doesn't accept `effort` on
+  `subagent_usage`.
+
 ## [0.33.0] — 2026-09-17
 
 ### Fixed

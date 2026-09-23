@@ -159,7 +159,7 @@ var projectFieldAllowlist = map[string][]string{
 	// cumulative inputTokens sums every request so far. A bare integer. Per-kind
 	// for the same lockstep reason as the four above; appended LAST on both usage
 	// kinds, matching the server manifest's freeze-additions-at-the-end order.
-	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId", "cursorAccountRef", "lastRequestInputTokens"),
+	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId", "cursorAccountRef", "lastRequestInputTokens", "effort"),
 	// `sidechain` marks work done by a subagent. Its events roll up to the
 	// PARENT session's id (a subagent transcript records its parent's sessionId),
 	// so without this flag subagent work is indistinguishable from the main

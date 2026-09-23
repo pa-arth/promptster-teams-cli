@@ -493,23 +493,51 @@ func TestCursorHookWorkdirFallsBackToWorkspaceRoots(t *testing.T) {
 	}
 }
 
-// model_params carries a reasoning-effort token. It is NOT allowlisted on either
-// side, so emitting it would be stripped silently and read as "an older CLI".
-func TestCursorHookDoesNotEmitReasoningEffort(t *testing.T) {
-	res, _ := NormalizeCursorHook(stopPayload("g1", map[string]interface{}{
-		"model_params": []map[string]string{{"id": "effort", "value": "high"}},
-	}), CursorHookOptions{ResolveModel: func(string) string { return "grok-4.5" }})
-	e, found := firstOfKind(res.Events, "ai_response")
-	if !found {
-		t.Fatal("no ai_response")
+// Effort rides the usage row: from stop's own model_params when present, else
+// from the afterAgentThought cache (Auto), and is absent — never "" — when
+// neither knows it.
+func TestCursorHookEmitsReasoningEffort(t *testing.T) {
+	opts := CursorHookOptions{
+		ResolveModel:  func(string) string { return "grok-4.5" },
+		ResolveEffort: func(string) string { return "medium" },
 	}
-	// Exactly the model and the scope tag. Asserting on the whole serialized
-	// event would be a false negative waiting to happen — "high" is also the
-	// value of provenance.observability.
-	d := dataOf(t, e)
-	if len(d) != 3 || d["model"] != "grok-4.5" || d["usageScope"] != "request" ||
-		d["generationId"] != "g1" {
-		t.Fatalf("ai_response data = %v, want exactly {model, usageScope, generationId}", d)
+	cases := []struct {
+		name   string
+		extra  map[string]interface{}
+		opts   CursorHookOptions
+		effort interface{}
+	}{
+		{"own model_params", map[string]interface{}{
+			"model_params": []map[string]string{{"id": "effort", "value": "High"}},
+		}, opts, "high"},
+		{"cached from afterAgentThought", map[string]interface{}{}, opts, "medium"},
+		{"unknown", map[string]interface{}{}, CursorHookOptions{ResolveModel: opts.ResolveModel}, nil},
+		{"prose refused", map[string]interface{}{
+			"model_params": []map[string]string{{"id": "effort", "value": "/home/me high"}},
+		}, CursorHookOptions{ResolveModel: opts.ResolveModel}, nil},
+	}
+	for _, c := range cases {
+		res, _ := NormalizeCursorHook(stopPayload("g1", c.extra), c.opts)
+		e, found := firstOfKind(res.Events, "ai_response")
+		if !found {
+			t.Fatalf("%s: no ai_response", c.name)
+		}
+		got, present := dataOf(t, e)["effort"]
+		if c.effort == nil && present {
+			t.Fatalf("%s: effort = %v, want absent", c.name, got)
+		}
+		if c.effort != nil && got != c.effort {
+			t.Fatalf("%s: effort = %v, want %v", c.name, got, c.effort)
+		}
+	}
+
+	// afterAgentThought reports the effort for the capture layer to cache.
+	res, _ := NormalizeCursorHook(hookPayload("afterAgentThought", map[string]interface{}{
+		"model_id":     "grok-4.5",
+		"model_params": []map[string]string{{"id": "effort", "value": "xhigh"}},
+	}), CursorHookOptions{})
+	if res.Effort != "xhigh" {
+		t.Fatalf("afterAgentThought Effort = %q, want xhigh", res.Effort)
 	}
 }
 

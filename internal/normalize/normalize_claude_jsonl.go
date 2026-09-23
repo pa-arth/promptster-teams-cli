@@ -56,6 +56,7 @@ type claudeMsgAccum struct {
 	ts        string
 	model     string
 	requestID string
+	effort    string
 	text      strings.Builder
 	usage     map[string]interface{}
 	sidechain bool      // flush as subagent_usage (no text) instead of ai_response
@@ -597,6 +598,7 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 			ts:        ts,
 			model:     stringField(msg, "model"),
 			requestID: stringField(rec, "requestId"),
+			effort:    claudeRecordEffort(rec),
 		}
 	}
 	if p.accum != nil && p.accum.msgID == msgID {
@@ -659,6 +661,18 @@ func (p *ClaudeTranscriptProcessor) handleAssistant(rec map[string]interface{}, 
 	return events
 }
 
+// claudeRecordEffort reads the effort tier an assistant record ran at.
+// perTurnEffort is preferred when present: it is the per-turn value, where
+// `effort` may be the session setting. Subagent (sidechain) records carry it
+// too, but subagent_usage has no `effort` on the server allowlist, so only the
+// main-thread ai_response emits it.
+func claudeRecordEffort(rec map[string]interface{}) string {
+	if v := clampEffort(stringField(rec, "perTurnEffort")); v != "" {
+		return v
+	}
+	return clampEffort(stringField(rec, "effort"))
+}
+
 // flushAccum emits the accumulated assistant message as ONE ai_response event
 // carrying the request's token usage and model — the per-request usage series
 // the worker needs for context-trend signals and estimated pricing.
@@ -693,6 +707,9 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 	}
 	if a.requestID != "" {
 		data["requestId"] = a.requestID
+	}
+	if a.effort != "" {
+		data["effort"] = a.effort
 	}
 	if u := a.usage; u != nil {
 		data["inputTokens"] = intField(u, "input_tokens")
@@ -1062,6 +1079,13 @@ func clampPromptSource(v string) string {
 		return ""
 	}
 	return v
+}
+
+// clampEffort shape-clamps a vendor reasoning-effort token (low, medium, high,
+// xhigh, max, …) with the promptSource clamp: an unknown new tier still passes,
+// prose or a path cannot. "" means unknown, and callers then omit the field.
+func clampEffort(v string) string {
+	return clampPromptSource(strings.ToLower(strings.TrimSpace(v)))
 }
 
 // leadingCommandName returns the slash-command name from a leading
