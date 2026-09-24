@@ -336,12 +336,19 @@ func (p *CodexRolloutProcessor) process(line []byte) []event.Event {
 		p.model = stringField(payload, "model")
 		// Effort, same unconditional reset as model. Older rollouts carry it at
 		// the top of turn_context; newer ones only under collaboration_mode, where
-		// null means "the configured default" — unknown to us, so omitted.
+		// an explicit null means the user picked no tier and Codex sent none, so
+		// the vendor's default applied. That is recorded as "default" — a fact
+		// about the request, not a guess at which tier the default resolved to.
+		// A turn_context with no reasoning_effort key at all stays unknown.
 		p.effort = clampEffort(stringField(payload, "effort"))
 		if p.effort == "" {
 			cm, _ := payload["collaboration_mode"].(map[string]interface{})
 			settings, _ := cm["settings"].(map[string]interface{})
-			p.effort = clampEffort(stringField(settings, "reasoning_effort"))
+			if v, present := settings["reasoning_effort"]; present && v == nil {
+				p.effort = "default"
+			} else {
+				p.effort = clampEffort(stringField(settings, "reasoning_effort"))
+			}
 		}
 		return recovered
 	default:

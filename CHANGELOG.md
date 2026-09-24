@@ -4,6 +4,16 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- A Codex turn left on the default reasoning effort now records `effort: "default"`
+  instead of omitting the field. Codex writes `reasoning_effort: null` for these
+  turns, meaning no level was sent and the vendor's default applied. That makes
+  "user didn't choose" distinguishable from "unknown" (an older CLI, or a rollout
+  with no effort key at all).
+
 ## [0.34.0] — 2026-09-23
 
 ### Added

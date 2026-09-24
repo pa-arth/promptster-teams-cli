@@ -946,9 +946,9 @@ func TestCodexContextWindowSurvivesProjection(t *testing.T) {
 }
 
 // Effort comes from turn_context: the top-level `effort` on older rollouts,
-// collaboration_mode.settings.reasoning_effort on newer ones, where null is the
-// configured default and is omitted rather than guessed. Like model, a later
-// turn_context without it clears the prior value.
+// collaboration_mode.settings.reasoning_effort on newer ones, where an explicit
+// null is recorded as "default" (no tier sent). A turn_context without the key
+// at all is unknown and omits it. Like model, each turn_context resets it.
 func TestCodexAttachesEffortFromTurnContext(t *testing.T) {
 	turn := func(ctx string) []string {
 		return []string{
@@ -961,6 +961,7 @@ func TestCodexAttachesEffortFromTurnContext(t *testing.T) {
 	lines = append(lines, turn(`{"model":"gpt-5.5","effort":"low","collaboration_mode":{"settings":{"reasoning_effort":"low"}}}`)...)
 	lines = append(lines, turn(`{"model":"gpt-6-astra","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}`)...)
 	lines = append(lines, turn(`{"model":"gpt-6-astra","collaboration_mode":{"settings":{"reasoning_effort":null}}}`)...)
+	lines = append(lines, turn(`{"model":"gpt-6-astra"}`)...)
 	p := NewCodexRolloutProcessor("sess-e")
 	var got []interface{}
 	for _, l := range lines {
@@ -970,7 +971,7 @@ func TestCodexAttachesEffortFromTurnContext(t *testing.T) {
 			}
 		}
 	}
-	want := []interface{}{"low", "xhigh", nil}
+	want := []interface{}{"low", "xhigh", "default", nil}
 	if len(got) != len(want) {
 		t.Fatalf("got %d ai_response, want %d: %v", len(got), len(want), got)
 	}
