@@ -17,8 +17,8 @@ import (
 func TestGenerationModelJoinDoesNotLeakAcrossTurns(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 
-	recordCursorGenerationModel("g1", "composer-2.5")
-	recordCursorGenerationModel("g2", "claude-opus-5")
+	recordCursorGenerationModel("g1", "composer-2.5", "")
+	recordCursorGenerationModel("g2", "claude-opus-5", "")
 
 	if got := cursorGenerationModel("g1"); got != "composer-2.5" {
 		t.Fatalf("g1 = %q, want composer-2.5", got)
@@ -124,21 +124,28 @@ func TestThoughtThenStopProducesOnePricedUsageRow(t *testing.T) {
 	)
 
 	thought := []byte(`{"hook_event_name":"afterAgentThought","conversation_id":"c1",
-		"generation_id":"` + suffixed + `","model_id":"composer-2.5","text":"reasoning"}`)
+		"generation_id":"` + suffixed + `","model_id":"composer-2.5",
+		"model_params":[{"id":"effort","value":"high"}],"text":"reasoning"}`)
 	res, _ := normalize.NormalizeCursorHook(thought, normalize.CursorHookOptions{ResolveModel: cursorGenerationModel})
 	if res.Step != "afterAgentThought" || res.Model != "composer-2.5" || res.GenerationID != suffixed {
 		t.Fatalf("thought resolved %+v", res)
 	}
-	recordCursorGenerationModel(res.GenerationID, res.Model)
+	recordCursorGenerationModel(res.GenerationID, res.Model, res.Effort)
 
 	stop := []byte(`{"hook_event_name":"stop","conversation_id":"c1","generation_id":"` + bare + `",
 		"model":"default","model_id":"default","status":"completed",
 		"input_tokens":823043,"output_tokens":4914,"cache_read_tokens":94976,"cache_write_tokens":0}`)
-	res, ok := normalize.NormalizeCursorHook(stop, normalize.CursorHookOptions{ResolveModel: cursorGenerationModel})
+	res, ok := normalize.NormalizeCursorHook(stop, normalize.CursorHookOptions{
+		ResolveModel:  cursorGenerationModel,
+		ResolveEffort: cursorGenerationEffort,
+	})
 	if !ok || len(res.Events) != 1 {
 		t.Fatalf("stop produced %d events, want 1", len(res.Events))
 	}
 	d, _ := res.Events[0].Data.(map[string]interface{})
+	if d["effort"] != "high" {
+		t.Fatalf("effort = %v, want high — carried from the thought across the id suffix", d["effort"])
+	}
 	if d["model"] != "composer-2.5" {
 		t.Fatalf("model = %v, want composer-2.5 — the join did not happen across the id suffix", d["model"])
 	}
@@ -162,7 +169,7 @@ func TestBareThoughtSentinelNeverReachesTheCache(t *testing.T) {
 	if res.Model != "" {
 		t.Fatalf("sentinel thought resolved model %q, want empty", res.Model)
 	}
-	recordCursorGenerationModel(res.GenerationID, res.Model)
+	recordCursorGenerationModel(res.GenerationID, res.Model, "")
 	if got := cursorGenerationModel(bare); got != "" {
 		t.Fatalf("cache answered %q for a turn whose only thought was a sentinel", got)
 	}
@@ -173,8 +180,8 @@ func TestBareThoughtSentinelNeverReachesTheCache(t *testing.T) {
 func TestBaseIDJoinDoesNotLeakAcrossTurns(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 
-	recordCursorGenerationModel("3a8b6e45-a04d-4bca-8922-617844887809-3-1v0i", "composer-2.5")
-	recordCursorGenerationModel("ebec78b2-6800-42b7-b3b9-80f182d05e4a-1-9s93", "grok-4.6")
+	recordCursorGenerationModel("3a8b6e45-a04d-4bca-8922-617844887809-3-1v0i", "composer-2.5", "")
+	recordCursorGenerationModel("ebec78b2-6800-42b7-b3b9-80f182d05e4a-1-9s93", "grok-4.6", "")
 
 	if got := cursorGenerationModel("3a8b6e45-a04d-4bca-8922-617844887809"); got != "composer-2.5" {
 		t.Fatalf("turn A = %q, want composer-2.5", got)

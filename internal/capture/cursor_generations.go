@@ -119,8 +119,9 @@ type cursorGenerations struct {
 }
 
 type cursorGeneration struct {
-	Model string `json:"model"`
-	TsMs  int64  `json:"tsMs"`
+	Model  string `json:"model"`
+	Effort string `json:"effort,omitempty"`
+	TsMs   int64  `json:"tsMs"`
 }
 
 type cursorLastOutput struct {
@@ -297,18 +298,18 @@ func isCursorGenerationUUID(s string) bool {
 // model, so an unchanged entry is skipped rather than rewritten — the same churn
 // argument the transcript-claim ledger makes, and it matters more here because
 // this write is inside the agent loop.
-func recordCursorGenerationModel(generationID, model string) {
+func recordCursorGenerationModel(generationID, model, effort string) {
 	if generationID == "" || model == "" {
 		return
 	}
 	generationID = cursorGenerationBaseID(generationID)
 	_ = sign.WithBufferLock(cursorGenerationsPath()+".lock", func() error {
 		c := loadCursorGenerations()
-		if prev, ok := c.Entries[generationID]; ok && prev.Model == model {
+		if prev, ok := c.Entries[generationID]; ok && prev.Model == model && prev.Effort == effort {
 			return nil
 		}
 		now := time.Now()
-		c.Entries[generationID] = cursorGeneration{Model: model, TsMs: now.UnixMilli()}
+		c.Entries[generationID] = cursorGeneration{Model: model, Effort: effort, TsMs: now.UnixMilli()}
 		pruneCursorGenerations(&c, now)
 		saveCursorGenerations(c)
 		return nil
@@ -320,15 +321,24 @@ func recordCursorGenerationModel(generationID, model string) {
 // a stale model, because inheriting across the TTL is the failure this cache is
 // keyed per-generation to avoid.
 func cursorGenerationModel(generationID string) string {
+	return cursorGenerationEntry(generationID).Model
+}
+
+// cursorGenerationEffort is the same join for the reasoning-effort tier.
+func cursorGenerationEffort(generationID string) string {
+	return cursorGenerationEntry(generationID).Effort
+}
+
+func cursorGenerationEntry(generationID string) cursorGeneration {
 	if generationID == "" {
-		return ""
+		return cursorGeneration{}
 	}
 	generationID = cursorGenerationBaseID(generationID)
 	e, ok := loadCursorGenerations().Entries[generationID]
 	if !ok || time.Since(time.UnixMilli(e.TsMs)) > cursorGenerationTTL {
-		return ""
+		return cursorGeneration{}
 	}
-	return e.Model
+	return e
 }
 
 // The `stop`-step counters: what §0.1 measured with a probe, so the numbers

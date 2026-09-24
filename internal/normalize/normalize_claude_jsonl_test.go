@@ -1495,3 +1495,40 @@ func TestSidechainUsageBillsFinalOutputTokens(t *testing.T) {
 		t.Errorf("sidechain=%v usageScope=%v", d["sidechain"], d["usageScope"])
 	}
 }
+
+// Effort is read off the assistant record itself (Claude Code writes it on every
+// row); perTurnEffort wins over effort, and a row with neither omits the field.
+func TestClaudeTranscriptEffort(t *testing.T) {
+	cases := []struct {
+		name, fields string
+		want         interface{}
+	}{
+		{"effort only", `"effort":"high",`, "high"},
+		{"perTurnEffort wins", `"effort":"high","perTurnEffort":"medium",`, "medium"},
+		{"absent", ``, nil},
+		{"prose refused", `"effort":"see /home/me",`, nil},
+	}
+	for _, c := range cases {
+		p := NewClaudeTranscriptProcessor("sess-e")
+		events := processAll(t, p,
+			`{"type":"assistant",`+c.fields+`"requestId":"req-1","message":{"id":"msg-1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":1,"output_tokens":1}},"timestamp":"2026-09-23T10:00:05Z"}`,
+			`{"type":"user","message":{"role":"user","content":"next"},"timestamp":"2026-09-23T10:00:09Z"}`,
+		)
+		var ar *event.Event
+		for i := range events {
+			if events[i].Kind == "ai_response" {
+				ar = &events[i]
+			}
+		}
+		if ar == nil {
+			t.Fatalf("%s: no ai_response in %+v", c.name, events)
+		}
+		got, present := dm(*ar)["effort"]
+		if c.want == nil && present {
+			t.Errorf("%s: effort = %v, want absent", c.name, got)
+		}
+		if c.want != nil && got != c.want {
+			t.Errorf("%s: effort = %v, want %v", c.name, got, c.want)
+		}
+	}
+}

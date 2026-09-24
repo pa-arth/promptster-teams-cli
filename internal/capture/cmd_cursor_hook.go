@@ -138,14 +138,15 @@ func runCursorHookInner() {
 	// for the SAME generation. Reading is a file stat and a parse of a bounded
 	// file; it happens on `stop` alone, once per turn.
 	res, ok := normalize.NormalizeCursorHook(redacted, normalize.CursorHookOptions{
-		ResolveModel: cursorGenerationModel,
+		ResolveModel:  cursorGenerationModel,
+		ResolveEffort: cursorGenerationEffort,
 	})
 	// The cache write comes BEFORE the ok check, deliberately. afterAgentThought
 	// now emits no event of its own, so `ok` is false for exactly the payload
 	// whose only product is this entry — returning early on it would leave every
 	// usage row modelless while every individual piece looked correct.
 	if res.Step == "afterAgentThought" {
-		recordCursorGenerationModel(res.GenerationID, res.Model)
+		recordCursorGenerationModel(res.GenerationID, res.Model, res.Effort)
 	}
 	if !ok {
 		// COUNT THE DROP BEFORE RETURNING. Every counter this rail had was on the

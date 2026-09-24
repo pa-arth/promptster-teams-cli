@@ -944,3 +944,39 @@ func TestCodexContextWindowSurvivesProjection(t *testing.T) {
 	}
 	t.Fatal("no ai_response event")
 }
+
+// Effort comes from turn_context: the top-level `effort` on older rollouts,
+// collaboration_mode.settings.reasoning_effort on newer ones, where null is the
+// configured default and is omitted rather than guessed. Like model, a later
+// turn_context without it clears the prior value.
+func TestCodexAttachesEffortFromTurnContext(t *testing.T) {
+	turn := func(ctx string) []string {
+		return []string{
+			`{"timestamp":"2026-09-23T10:00:00.000Z","type":"turn_context","payload":` + ctx + `}`,
+			`{"timestamp":"2026-09-23T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"go"}}`,
+			`{"timestamp":"2026-09-23T10:00:02.000Z","type":"event_msg","payload":{"type":"agent_message","message":"Done.","phase":"final_answer"}}`,
+		}
+	}
+	lines := []string{`{"timestamp":"2026-09-23T09:59:59.000Z","type":"session_meta","payload":{"id":"s","cwd":"/tmp/ws","model_provider":"openai"}}`}
+	lines = append(lines, turn(`{"model":"gpt-5.5","effort":"low","collaboration_mode":{"settings":{"reasoning_effort":"low"}}}`)...)
+	lines = append(lines, turn(`{"model":"gpt-6-astra","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}`)...)
+	lines = append(lines, turn(`{"model":"gpt-6-astra","collaboration_mode":{"settings":{"reasoning_effort":null}}}`)...)
+	p := NewCodexRolloutProcessor("sess-e")
+	var got []interface{}
+	for _, l := range lines {
+		for _, e := range p.Process([]byte(l)) {
+			if e.Kind == "ai_response" {
+				got = append(got, e.Data.(map[string]interface{})["effort"])
+			}
+		}
+	}
+	want := []interface{}{"low", "xhigh", nil}
+	if len(got) != len(want) {
+		t.Fatalf("got %d ai_response, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("turn %d effort = %v, want %v (all: %v)", i, got[i], want[i], got)
+		}
+	}
+}

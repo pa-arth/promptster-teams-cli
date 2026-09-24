@@ -105,6 +105,10 @@ type CodexRolloutProcessor struct {
 	// real model. turn_context precedes the turn's agent messages, so the captured
 	// value is always the model in force for the response it lands on.
 	model string
+	// effort is the reasoning-effort tier from the same turn_context, with the
+	// same lifetime as model. Main-thread ai_response only: subagent_usage has
+	// no `effort` on the server allowlist.
+	effort string
 	// RepoRoot is the canonical per-session repository identity (a git remote slug
 	// owner/name, or a stable opaque hash for a no-remote/non-git dir). Unlike
 	// workdir — which normalize derives itself from the payload cwd via
@@ -330,6 +334,15 @@ func (p *CodexRolloutProcessor) process(line []byte) []event.Event {
 		// turn with no turn_context at all leaves the last value untouched — the model
 		// genuinely persists until the next turn_context changes it. Emits no event.
 		p.model = stringField(payload, "model")
+		// Effort, same unconditional reset as model. Older rollouts carry it at
+		// the top of turn_context; newer ones only under collaboration_mode, where
+		// null means "the configured default" — unknown to us, so omitted.
+		p.effort = clampEffort(stringField(payload, "effort"))
+		if p.effort == "" {
+			cm, _ := payload["collaboration_mode"].(map[string]interface{})
+			settings, _ := cm["settings"].(map[string]interface{})
+			p.effort = clampEffort(stringField(settings, "reasoning_effort"))
+		}
 		return recovered
 	default:
 		// Unknown wrappers carry no candidate-visible signal.
@@ -889,6 +902,9 @@ func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw
 		}
 		if p.model != "" {
 			data["model"] = p.model
+		}
+		if p.effort != "" {
+			data["effort"] = p.effort
 		}
 		p.attachTokenUsage(data)
 		if last := loadLastPromptTs(); !last.IsZero() {
