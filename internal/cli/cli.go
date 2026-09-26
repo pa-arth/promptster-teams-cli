@@ -88,6 +88,10 @@ func Main(argv []string) int {
 		// tick (reads stdin, spools the window reading, passes the prior line
 		// through); `status` reports the effective-statusline drift check.
 		return cmdStatusline(argv[2:])
+	case "keepalive":
+		// Opt-in: keep idle Claude sessions' prompt cache warm so a resume reads
+		// it instead of rebuilding it (capture/cache_keepalive.go).
+		return cmdKeepalive(argv[2:])
 	case "uninstall":
 		// Undo the install: stop capture, deregister the autostart unit, unenroll
 		// the Cursor hook, restore the statusline. --purge also deletes
@@ -131,6 +135,7 @@ Commands:
   stop         Stop background capture
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
+  keepalive    Keep idle Claude sessions' prompt cache warm so resuming doesn't rebuild it (enable|disable|status)
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   update       Install a newer signed release, or set how this machine updates (--check|--ask-each|--enable-auto|--disable-auto)
   status       Show capture status, whether the daemon is running, and event count

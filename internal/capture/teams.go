@@ -241,6 +241,11 @@ func RunTeamsWatch(args []string) error {
 	stopGitWatch := StartGitWatch(cfg)
 	defer stopGitWatch()
 
+	// Opt-in (`keepalive enable`): ping idle Claude sessions so their 1h prompt
+	// cache doesn't expire and bill a full rebuild on resume (cache_keepalive.go).
+	stopKeepalive := StartCacheKeepalive()
+	defer stopKeepalive()
+
 	errCh := make(chan error, 3)
 	go func() { errCh <- RunClaudeWatcher() }()
 	go func() { errCh <- RunCodexWatcher() }()

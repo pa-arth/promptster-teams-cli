@@ -184,6 +184,7 @@ func (m statusModel) capturePanel() string {
 		"state", state,
 		"watch", m.watch,
 		"autostart", m.autostart,
+		"keepalive", keepaliveStatusLine(),
 		"ingest", hostOf(m.apiURL),
 		"key", keyDisplay(m.token, m.source),
 		"installation", m.device,
