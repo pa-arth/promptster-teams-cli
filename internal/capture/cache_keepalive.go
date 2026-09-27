@@ -93,7 +93,9 @@ type claudeLastTurn struct {
 
 // readClaudeLastTurn scans the transcript's tail backwards for the newest
 // main-thread assistant record that carries usage from a claude-* model
-// (skipping "<synthetic>" rows, sidechains and a torn first line).
+// (skipping "<synthetic>" rows, sidechains and a torn first line). The window
+// grows 4x at a time, up to the whole file, so a large tool result after the
+// last assistant turn can't hide it.
 func readClaudeLastTurn(path string) (claudeLastTurn, bool) {
 	f, err := os.Open(path) // #nosec G304 -- a transcript under the Claude projects dir we already watch
 	if err != nil {
@@ -104,17 +106,28 @@ func readClaudeLastTurn(path string) (claudeLastTurn, bool) {
 	if err != nil {
 		return claudeLastTurn{}, false
 	}
-	off := info.Size() - keepaliveTailBytes
-	if off < 0 {
-		off = 0
+	size := info.Size()
+	for window := int64(keepaliveTailBytes); ; window *= 4 {
+		off := max(size-window, 0)
+		buf, err := io.ReadAll(io.NewSectionReader(f, off, size-off))
+		if err != nil {
+			return claudeLastTurn{}, false
+		}
+		if t, ok := lastTurnIn(buf, off > 0); ok {
+			return t, true
+		}
+		if off == 0 {
+			return claudeLastTurn{}, false
+		}
 	}
-	buf, err := io.ReadAll(io.NewSectionReader(f, off, info.Size()-off))
-	if err != nil {
-		return claudeLastTurn{}, false
-	}
+}
+
+// lastTurnIn finds the newest qualifying assistant record in buf. torn drops the
+// first line, which may start mid-record.
+func lastTurnIn(buf []byte, torn bool) (claudeLastTurn, bool) {
 	lines := bytes.Split(buf, []byte("\n"))
-	if off > 0 && len(lines) > 0 {
-		lines = lines[1:] // the first line may start mid-record
+	if torn && len(lines) > 0 {
+		lines = lines[1:]
 	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		var rec struct {
@@ -210,27 +223,32 @@ func findClaudeBinary() string {
 }
 
 // keepaliveTick pings every due session once. pinged is the daemon's memory of
-// its own pings (a restart forgets it: worst case one early extra ping).
-func keepaliveTick(now time.Time, pinged map[string]time.Time, ping func(claudeLastTurn) (keepalivePing, error)) {
-	for _, path := range candidateClaudeTranscripts(now.Add(-(keepaliveCap + keepaliveTTL))) {
+// its own SUCCESSFUL pings (a restart forgets it: worst case one early extra
+// ping). clock is read per session because each ping can take seconds, and a
+// session judged against the tick's start could slip past its TTL unnoticed.
+// A failed ping isn't recorded, so the next tick retries while the cache lives.
+func keepaliveTick(clock func() time.Time, pinged map[string]time.Time, ping func(claudeLastTurn) (keepalivePing, error)) {
+	start := clock()
+	for _, path := range candidateClaudeTranscripts(start.Add(-(keepaliveCap + keepaliveTTL))) {
 		if isClaudeSidechainFile(path) {
 			continue
 		}
 		t, ok := readClaudeLastTurn(path)
+		now := clock()
 		if !ok || !keepaliveDue(t, pinged[t.SessionID], now) {
 			continue
 		}
-		pinged[t.SessionID] = now
 		res, err := ping(t)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "cache-keepalive: ping %s failed: %v\n", t.SessionID, err)
 			continue
 		}
+		pinged[t.SessionID] = now
 		fmt.Fprintf(os.Stderr, "cache-keepalive: pinged %s (%s, idle %s): cache read %d, write %d\n",
 			t.SessionID, t.Model, now.Sub(t.At).Round(time.Minute), res.Read, res.Write)
 	}
 	for id, at := range pinged {
-		if now.Sub(at) > keepaliveCap+keepaliveTTL {
+		if start.Sub(at) > keepaliveCap+keepaliveTTL {
 			delete(pinged, id)
 		}
 	}
@@ -253,7 +271,7 @@ func runCacheKeepalive(stop <-chan struct{}) {
 				fmt.Fprintln(os.Stderr, "cache-keepalive: enabled but no claude binary found; skipping")
 				continue
 			}
-			keepaliveTick(time.Now(), pinged, func(t claudeLastTurn) (keepalivePing, error) {
+			keepaliveTick(time.Now, pinged, func(t claudeLastTurn) (keepalivePing, error) {
 				return pingClaudeSession(bin, t)
 			})
 		}
