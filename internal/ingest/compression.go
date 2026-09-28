@@ -3,6 +3,7 @@ package ingest
 import (
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"net/http"
 )
@@ -11,7 +12,7 @@ import (
 // requests only while the server advertises support. Signed JSON bytes are
 // untouched after decompression. Other requests and the original client stay
 // unchanged.
-func WithGzip(client *http.Client, supported func() bool) *http.Client {
+func WithGzip(client *http.Client, supported func() (batchEndpoint string, ok bool)) *http.Client {
 	copy := *client
 	base := client.Transport
 	if base == nil {
@@ -23,14 +24,19 @@ func WithGzip(client *http.Client, supported func() bool) *http.Client {
 
 type gzipTransport struct {
 	base      http.RoundTripper
-	supported func() bool
+	supported func() (batchEndpoint string, ok bool)
 }
 
 func (t *gzipTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var batchEndpoint string
+	var supported bool
+	if t.supported != nil {
+		batchEndpoint, supported = t.supported()
+	}
 	if req.Method != http.MethodPost || req.GetBody == nil ||
 		req.Header.Get("Content-Encoding") != "" ||
-		(req.URL.Path != ingestEndpoint() && req.URL.Path != "/v1/teams/ingest/batch") ||
-		t.supported == nil || !t.supported() {
+		(req.URL.Path != ingestEndpoint() && (batchEndpoint == "" || req.URL.Path != batchEndpoint)) ||
+		!supported {
 		return t.base.RoundTrip(req)
 	}
 	defer req.Body.Close()
@@ -54,7 +60,7 @@ func (t *gzipTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// A rollback can remove gzip support between policy refreshes. Retry the
 	// original bytes before an old parser's 400 can be mistaken for an invalid
 	// event and cause the outbox to discard it. Ingest is idempotent.
-	if err == nil && (resp.StatusCode == 400 || resp.StatusCode == 415) {
+	if err == nil && gzipUnsupported(resp) {
 		_ = resp.Body.Close()
 		plain := req.Clone(req.Context())
 		plain.Body, err = req.GetBody()
@@ -64,4 +70,33 @@ func (t *gzipTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return t.base.RoundTrip(plain)
 	}
 	return resp, err
+}
+
+// Only retry the old Fastify parser's transport errors, not real event-shape
+// rejections. Preserve the response body for the caller when it is not retried.
+func gzipUnsupported(resp *http.Response) bool {
+	if resp.StatusCode == http.StatusUnsupportedMediaType {
+		return true
+	}
+	if resp.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	original := resp.Body
+	prefix, err := io.ReadAll(io.LimitReader(original, 4096))
+	resp.Body = &prefixedResponseBody{Reader: io.MultiReader(bytes.NewReader(prefix), original), Closer: original}
+	if err != nil {
+		return false
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if json.Unmarshal(prefix, &body) != nil {
+		return false
+	}
+	return body.Code == "FST_ERR_CTP_INVALID_CONTENT_LENGTH" || body.Code == "FST_ERR_CTP_INVALID_JSON_BODY"
+}
+
+type prefixedResponseBody struct {
+	io.Reader
+	io.Closer
 }

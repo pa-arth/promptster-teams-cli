@@ -340,10 +340,13 @@ func (r *Resolver) BatchIngest() (endpoint string, maxSize int, ok bool) {
 }
 
 // GzipIngest enables compression only after the backend advertises support.
-func (r *Resolver) GzipIngest() bool {
+func (r *Resolver) GzipIngest() (batchEndpoint string, ok bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.ingest != nil && r.ingest.Gzip
+	if r.ingest == nil || !r.ingest.Gzip {
+		return "", false
+	}
+	return r.ingest.BatchEndpoint, true
 }
 
 // StartBackground runs policy refreshes OFF the caller's hot path: it fires an

@@ -4,6 +4,15 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.35.1] — 2026-09-28
+
+### Fixed
+
+- Queued capture uses gzip when the backend advertises support, preventing
+  legitimate shell-command telemetry from being blocked by Render's firewall.
+  Signed event contents stay unchanged, custom batch routes are supported, and
+  older backends continue to receive plain JSON.
+
 ## [0.35.0] — 2026-09-28
 
 ### Added
