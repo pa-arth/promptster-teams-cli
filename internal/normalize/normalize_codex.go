@@ -106,8 +106,8 @@ type CodexRolloutProcessor struct {
 	// value is always the model in force for the response it lands on.
 	model string
 	// effort is the reasoning-effort tier from the same turn_context, with the
-	// same lifetime as model. Main-thread ai_response only: subagent_usage has
-	// no `effort` on the server allowlist.
+	// same lifetime as model. Rides the main thread's ai_response and, on a
+	// delegated thread, its subagent_usage (the delegate's own tier).
 	effort string
 	// RepoRoot is the canonical per-session repository identity (a git remote slug
 	// owner/name, or a stable opaque hash for a no-remote/non-git dir). Unlike
