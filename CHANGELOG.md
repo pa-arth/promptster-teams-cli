@@ -4,6 +4,31 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [0.36.0] — 2026-09-28
+
+### Added
+
+- Codex subagent (delegate) turns now report their own reasoning effort on
+  `subagent_usage`, read from each delegate's own `turn_context`. Before this,
+  effort was recorded only for main-thread turns, so in multi-agent Codex
+  sessions (where the delegates carry most of the spend) the tier was unknown
+  exactly where the money went. A delegate left on the default records
+  `"default"`, as the main thread already does. Needs a backend that allowlists
+  the field (promptster-backend #1033, live).
+
+### Fixed
+
+- Cursor subagent tool calls no longer appear as separate phantom sessions. The
+  Cursor editor sends a subagent's hook events under the subagent's own
+  conversation id and with no `transcript_path`, so each delegated task became a
+  prompt-less orphan session holding a second copy of work the transcript watcher
+  already filed under the parent. The hook now finds the subagent's transcript
+  under the parent session it already claimed, files the events under the parent
+  with `agentId` set to the subagent, and claims the subagent's transcript so the
+  watcher doesn't capture it twice. On one team this accounted for 162 of 196
+  prompt-less Cursor sessions in a week. Headless `cursor-agent` subagents run as
+  separate top-level conversations and are unchanged.
+
 ## [0.35.1] — 2026-09-28
 
 ### Fixed
