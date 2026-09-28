@@ -19,7 +19,10 @@ import { fileURLToPath } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CT = path.resolve(HERE, "..", "..", "control-teams-cli.mjs");
-const ROOT = process.env.PROMPTSTER_VERIFY_ROOT || path.join(os.homedir(), ".promptster-verify", "teams-cli");
+// Its OWN root by default: this scenario runs `cleanup` on start and finish, and
+// on the shared root that would kill another run's daemon and delete its sandbox.
+process.env.PROMPTSTER_VERIFY_ROOT ||= path.join(os.homedir(), ".promptster-verify", "teams-cli-cursor-subagent-rollup");
+const ROOT = process.env.PROMPTSTER_VERIFY_ROOT;
 const HOME = path.join(ROOT, "sandbox", "home");
 const STATE = path.join(HOME, ".promptster-teams");
 const PARENT = "668e1dd6-6f4b-484c-91fa-5240841f3df6";

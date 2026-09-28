@@ -184,7 +184,6 @@ function cmdRun(args) {
   fs.writeFileSync(path.join(dir, "stderr.txt"), stderr);
   const started = harvestPids();
   const meta = { argv: args, exitCode: r.status, signal: r.signal, sandbox: SBX, startedPids: started, stdinFrom: process.env.PROMPTSTER_VERIFY_STDIN || null };
-  if (process.env.PROMPTSTER_VERIFY_STDIN) fs.copyFileSync(process.env.PROMPTSTER_VERIFY_STDIN, path.join(dir, "stdin.json"));
   fs.writeFileSync(path.join(dir, "cmd.json"), JSON.stringify(meta, null, 2));
 
   if (r.error && r.error.code === "ETIMEDOUT")
