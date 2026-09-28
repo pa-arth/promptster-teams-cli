@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -156,6 +158,18 @@ func runCursorHookInner() {
 		// no evidence on the device for a single one of them.
 		recordCursorHookDrop(res)
 		return
+	}
+
+	// A SUBAGENT'S HOOKS ARRIVE UNDER ITS OWN ID AND WITH NO TRANSCRIPT PATH.
+	// Cursor resolves transcript_path from the child id alone, but the child's
+	// file lives at <parent>/subagents/<child>.jsonl, so the lookup misses and
+	// the field is empty. Find the file ourselves: it names the parent, and
+	// claiming it hands the child to this rail exactly as the main chain is.
+	if res.TranscriptPath == "" {
+		if parent, path := cursorSubagentTranscript(res.SessionID); parent != "" {
+			normalize.RollUpCursorSubagent(&res, parent)
+			res.TranscriptPath = path
+		}
 	}
 
 	// Which Cursor login ran this turn (cursor-vendor-multi-account Phase A).
@@ -331,4 +345,20 @@ func EnsureCursorHooksBestEffort() {
 	if changed && verboseWatch() {
 		fmt.Fprintf(os.Stderr, "promptster-teams: enrolled Cursor hooks in %s\n", cursorUserHooksPath())
 	}
+}
+
+// cursorSubagentTranscript finds <projects>/*/agent-transcripts/<parent>/subagents/<id>.jsonl
+// and returns the parent id and the file, or "" when id is not a subagent.
+//
+// ponytail: globs every project's session dirs per subagent hook call; cache
+// child->parent in the state dir if this ever shows up in cursor_hook_overruns.
+func cursorSubagentTranscript(id string) (parent, path string) {
+	if id == "" || strings.ContainsAny(id, `/\*?[`) {
+		return "", ""
+	}
+	matches, _ := filepath.Glob(filepath.Join(CursorProjectsDir(), "*", "agent-transcripts", "*", "subagents", id+".jsonl"))
+	if len(matches) == 0 {
+		return "", ""
+	}
+	return filepath.Base(filepath.Dir(filepath.Dir(matches[0]))), matches[0]
 }

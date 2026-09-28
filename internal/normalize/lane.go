@@ -43,3 +43,18 @@ func stampLaneID(events []event.Event, laneID string) []event.Event {
 	}
 	return events
 }
+
+// RollUpCursorSubagent files a subagent's hook events under its PARENT session,
+// with the child's own id as the lane — exactly what the transcript rail does
+// for the same subagent (cursorSessionIDFromPath + LaneID). Cursor's hooks key a
+// subagent's tool events on the CHILD conversation id, so without this each
+// delegated task lands as a phantom session holding a second copy of work the
+// parent already carries.
+func RollUpCursorSubagent(res *CursorHookResult, parentID string) {
+	child := res.SessionID
+	for i := range res.Events {
+		res.Events[i].SessionID = parentID
+	}
+	res.Events = stampLaneID(res.Events, child)
+	res.SessionID = parentID
+}
