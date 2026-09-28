@@ -171,7 +171,10 @@ function cmdRun(args) {
     cwd: sbxHome(),          // never the repo: `status` prints cwd as the watch scope
     env: sandboxEnv(),
     encoding: "utf8",
-    input: "",               // no TTY, no stdin — interactive prompts must not hang
+    // No TTY and empty stdin, so interactive prompts cannot hang. The one
+    // exception is `cursor-hook`, whose whole input IS stdin (a real Cursor
+    // payload): PROMPTSTER_VERIFY_STDIN names the file to feed it.
+    input: process.env.PROMPTSTER_VERIFY_STDIN ? fs.readFileSync(process.env.PROMPTSTER_VERIFY_STDIN) : "",
     timeout: Number(process.env.PROMPTSTER_VERIFY_TIMEOUT_MS || 60000),
   });
 
@@ -180,7 +183,8 @@ function cmdRun(args) {
   fs.writeFileSync(path.join(dir, "stdout.txt"), stdout);
   fs.writeFileSync(path.join(dir, "stderr.txt"), stderr);
   const started = harvestPids();
-  const meta = { argv: args, exitCode: r.status, signal: r.signal, sandbox: SBX, startedPids: started };
+  const meta = { argv: args, exitCode: r.status, signal: r.signal, sandbox: SBX, startedPids: started, stdinFrom: process.env.PROMPTSTER_VERIFY_STDIN || null };
+  if (process.env.PROMPTSTER_VERIFY_STDIN) fs.copyFileSync(process.env.PROMPTSTER_VERIFY_STDIN, path.join(dir, "stdin.json"));
   fs.writeFileSync(path.join(dir, "cmd.json"), JSON.stringify(meta, null, 2));
 
   if (r.error && r.error.code === "ETIMEDOUT")

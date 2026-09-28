@@ -32,6 +32,12 @@ There are no hidden subcommands; anything not listed there exits 1 with
 `cursor-hook` (invoked by Cursor with a payload on stdin, and always exits 0 by
 design so it can never break the engineer's agent loop).
 
+`cursor-hook` CAN be driven with a recorded payload: `PROMPTSTER_VERIFY_STDIN=<file>
+node $CT run cursor-hook`. Its exit code and stdout are constant, so the verdict
+is the sandbox buffer and `cursor-hook-claims.json`. Recorded real-Cursor
+scenarios live under `scenarios/`; `node scenarios/<name>/run.mjs` drives one end
+to end and exits non-zero on failure.
+
 ## Before anything: exit codes are not verdicts
 
 `doctor`, `status`, `statusline status` and `autostart status` print `✗` and `!`
