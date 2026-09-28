@@ -161,6 +161,38 @@ func TestReadClaudeLastTurnFindsATurnFarFromTheEnd(t *testing.T) {
 
 // A stand-in `claude` records its argv, cwd and stdin, and answers like
 // `claude -p --output-format json`.
+func TestReadClaudeLastTurnStopsAtTheScanLimit(t *testing.T) {
+	proj := claudeProject(t)
+	t0 := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	old := keepaliveMaxScanBytes
+	keepaliveMaxScanBytes = 2 * keepaliveTailBytes
+	t.Cleanup(func() { keepaliveMaxScanBytes = old })
+	big := fmt.Sprintf(`{"type":"user","message":{"content":%q}}`, strings.Repeat("x", 3*keepaliveTailBytes))
+	p := writeSession(t, proj, "s1", t0, big+"\n")
+	if got, ok := readClaudeLastTurn(p); ok {
+		t.Fatalf("a turn beyond the scan limit must not be found (bounded work), got %+v", got)
+	}
+}
+
+func TestReadClaudeLastTurnAcrossChunkBoundaries(t *testing.T) {
+	// The tail after the assistant record is 50 bytes short of one chunk, so the
+	// first chunk boundary falls INSIDE that record: it only parses if the
+	// partial line is carried into the next (earlier) chunk.
+	proj := claudeProject(t)
+	t0 := time.Date(2026, 9, 26, 12, 0, 0, 0, time.UTC)
+	const shape = `{"type":"user","message":{"content":"%s"}}` + "\n"
+	pad := keepaliveTailBytes - 50 - (len(shape) - 2)
+	tail := fmt.Sprintf(shape, strings.Repeat("y", pad))
+	if len(tail) != keepaliveTailBytes-50 {
+		t.Fatalf("tail is %d bytes, want %d", len(tail), keepaliveTailBytes-50)
+	}
+	p := writeSession(t, proj, "s1", t0, tail)
+	got, ok := readClaudeLastTurn(p)
+	if !ok || !got.At.Equal(t0) || got.Context != 170_102 {
+		t.Fatalf("record split across a chunk boundary not recovered: %+v %v", got, ok)
+	}
+}
+
 func TestPingClaudeSessionArgsCwdAndClosedStdin(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell stand-in")

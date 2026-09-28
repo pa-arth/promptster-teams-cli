@@ -47,9 +47,13 @@ const (
 	keepaliveCap         = 4 * time.Hour    // stop keeping a session this long after its last real turn
 	keepaliveMinContext  = 30_000           // a small context is cheap to rebuild
 	keepalivePingTimeout = 3 * time.Minute
-	keepaliveTailBytes   = 1 << 20 // enough to hold the last assistant record
+	keepaliveTailBytes   = 1 << 20 // read the transcript backwards in chunks this size
 	keepalivePrompt      = `Cache keep-alive ping. Reply with exactly "ok" and nothing else. Do not use tools.`
 )
+
+// keepaliveMaxScanBytes bounds how far back a tick looks for a session's last
+// turn (a var so tests can shrink it).
+var keepaliveMaxScanBytes int64 = 32 << 20
 
 // keepalivePref is the engineer's opt-in, stored like the auto-update consent:
 // a small JSON file that outlives every cache. Missing or corrupt reads as off.
@@ -91,11 +95,12 @@ type claudeLastTurn struct {
 	Context   int // input + cache read + cache write of that turn = the cached prefix size
 }
 
-// readClaudeLastTurn scans the transcript's tail backwards for the newest
-// main-thread assistant record that carries usage from a claude-* model
-// (skipping "<synthetic>" rows, sidechains and a torn first line). The window
-// grows 4x at a time, up to the whole file, so a large tool result after the
-// last assistant turn can't hide it.
+// readClaudeLastTurn reads the transcript backwards in keepaliveTailBytes
+// chunks for the newest main-thread assistant record that carries usage from a
+// claude-* model (skipping "<synthetic>" rows and sidechains), so a large tool
+// result after the last assistant turn can't hide it. Each byte is read once
+// and the scan stops after keepaliveMaxScanBytes: a session whose last turn is
+// further back than that is simply not kept alive.
 func readClaudeLastTurn(path string) (claudeLastTurn, bool) {
 	f, err := os.Open(path) // #nosec G304 -- a transcript under the Claude projects dir we already watch
 	if err != nil {
@@ -107,28 +112,38 @@ func readClaudeLastTurn(path string) (claudeLastTurn, bool) {
 		return claudeLastTurn{}, false
 	}
 	size := info.Size()
-	for window := int64(keepaliveTailBytes); ; window *= 4 {
-		off := max(size-window, 0)
-		buf, err := io.ReadAll(io.NewSectionReader(f, off, size-off))
-		if err != nil {
+	var carry []byte // the (possibly partial) first line of the chunk read last
+	for end := size; end > 0 && size-end < keepaliveMaxScanBytes; {
+		start := max(end-keepaliveTailBytes, 0)
+		chunk := make([]byte, end-start, end-start+int64(len(carry)))
+		if _, err := f.ReadAt(chunk, start); err != nil && err != io.EOF {
 			return claudeLastTurn{}, false
 		}
-		if t, ok := lastTurnIn(buf, off > 0); ok {
+		buf := append(chunk, carry...)
+		carry = nil
+		if start > 0 {
+			// Everything up to the first newline may continue in the next (earlier) chunk.
+			i := bytes.IndexByte(buf, '\n')
+			if i < 0 {
+				carry, end = buf, start
+				continue
+			}
+			carry, buf = append([]byte(nil), buf[:i]...), buf[i+1:]
+		}
+		if t, ok := lastTurnIn(buf); ok {
 			return t, true
 		}
-		if off == 0 {
-			return claudeLastTurn{}, false
-		}
+		end = start
 	}
+	if len(carry) > 0 && int64(len(carry)) <= keepaliveMaxScanBytes {
+		return lastTurnIn(carry)
+	}
+	return claudeLastTurn{}, false
 }
 
-// lastTurnIn finds the newest qualifying assistant record in buf. torn drops the
-// first line, which may start mid-record.
-func lastTurnIn(buf []byte, torn bool) (claudeLastTurn, bool) {
+// lastTurnIn finds the newest qualifying assistant record among buf's lines.
+func lastTurnIn(buf []byte) (claudeLastTurn, bool) {
 	lines := bytes.Split(buf, []byte("\n"))
-	if torn && len(lines) > 0 {
-		lines = lines[1:]
-	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		var rec struct {
 			Type        string    `json:"type"`
