@@ -304,3 +304,31 @@ func TestCodexUserThreadUnaffected(t *testing.T) {
 		}
 	}
 }
+
+// TestCodexSubagentReportsItsOwnEffort: a delegate's turn_context names its own
+// tier, and before this only the main thread's ai_response carried one — so
+// effort was unknown exactly where multi-agent spend sits (ops.ai 2026-09-28:
+// 0 of ~2,400 daily subagent_usage rows). The null shape is a real local
+// gpt-6-astra delegate turn_context (2026-09-26), trimmed.
+func TestCodexSubagentReportsItsOwnEffort(t *testing.T) {
+	for _, tc := range []struct{ name, settings, want string }{
+		{"explicit tier", `"reasoning_effort":"low"`, "low"},
+		{"no tier picked", `"reasoning_effort":null`, "default"},
+	} {
+		lines := []string{
+			codexSubagentMeta,
+			`{"timestamp":"2026-09-26T15:21:57.000Z","type":"turn_context","payload":{"model":"gpt-6-astra","effort":null,"collaboration_mode":{"settings":{"model":"gpt-6-astra",` + tc.settings + `}}}}`,
+			`{"timestamp":"2026-09-26T15:21:58.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":5,"total_tokens":105}}}}`,
+			`{"timestamp":"2026-09-26T15:21:59.000Z","type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}`,
+		}
+		var got []interface{}
+		for _, e := range runCodexRollout(t, codexSubThreadID, lines) {
+			if e.Kind == "subagent_usage" {
+				got = append(got, codexData(e)["effort"])
+			}
+		}
+		if len(got) != 1 || got[0] != tc.want {
+			t.Errorf("%s: subagent_usage effort = %v, want [%s]", tc.name, got, tc.want)
+		}
+	}
+}
