@@ -1,0 +1,17 @@
+{
+ "conversation_id": "585adb63-4618-47a4-a145-3b2deb7d8adb",
+ "generation_id": "585adb63-4618-47a4-a145-3b2deb7d8adb",
+ "model": "default",
+ "command": "cat probe.txt",
+ "output": "subagent-probe\n",
+ "duration": 86.031,
+ "sandbox": false,
+ "session_id": "585adb63-4618-47a4-a145-3b2deb7d8adb",
+ "hook_event_name": "afterShellExecution",
+ "cursor_version": "2026.09.23-86fc751",
+ "workspace_roots": [
+  "__WORK__"
+ ],
+ "user_email": "engineer@example.com",
+ "transcript_path": null
+}
