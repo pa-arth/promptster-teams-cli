@@ -4,6 +4,21 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- `promptster-teams keepalive enable|disable|status`: opt-in cache keep-alive for
+  Claude Code. Claude's prompt cache expires an hour after its last use, and the
+  next turn re-writes the whole context (about $1.40 for a 170k-token Opus session).
+  With keep-alive on, the capture daemon sends each idle session a one-word ping
+  45–60 minutes after its last use, for up to 4 hours after its last real turn, so
+  a resume reads the cache instead. A ping costs one cache read of the context (a
+  few cents). It's a forked, unsaved, hook-free turn, so your session isn't
+  modified and the ping isn't captured. Off by default. The setting is re-read
+  every 10 minutes, so no restart is needed, and it shows on `status`. Claude Code
+  only: Codex and Cursor pings can't reuse their cache.
+
 ## [0.34.1] — 2026-09-24
 
 ### Changed

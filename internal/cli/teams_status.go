@@ -87,6 +87,7 @@ func printStatusStatic() {
 		"watch", root,
 		"daemon", daemon,
 		"autostart", autostart,
+		"keepalive", keepaliveStatusLine(),
 		"installation", capture.DeviceID(),
 		"identity", "anonymous — installation-scoped hash + team key, no email",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", humanInterval(capture.PresenceHeartbeatInterval)),
