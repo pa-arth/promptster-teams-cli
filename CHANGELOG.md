@@ -4,6 +4,16 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- The presence heartbeat now carries `cursorVendorLastPollOkAt`: when this
+  machine's Cursor usage collector last queued a complete snapshot (RFC3339 UTC,
+  `""` if it never has). It lets the dashboard tell a sleeping laptop from a
+  broken collector. It's a timestamp about the collector and carries no usage or
+  account data.
+
 ## [0.35.1] — 2026-09-28
 
 ### Fixed

@@ -202,6 +202,30 @@ type presenceData struct {
 	CursorStopEmpty     int `json:"cursorStopEmpty"`
 	CursorHookOverruns  int `json:"cursorHookOverruns"`
 	CursorHookUnparsed  int `json:"cursorHookUnparsed"`
+
+	// CURSOR VENDOR COLLECTOR FRESHNESS. When this machine's vendor usage
+	// collector last queued a complete current-period snapshot for any account,
+	// RFC3339 UTC.
+	//
+	// A missing Cursor snapshot has two causes that look identical from the
+	// server: the laptop is asleep, or the collector is broken. Only the second
+	// keeps sending heartbeats, so a beat that arrives with this stamp getting
+	// older is a collector problem, and no beats at all is a sleeping machine.
+	// Absences (not permitted, no credentials, vendor errors, budget skips) do not
+	// advance it: they are the collector reporting that it could NOT collect.
+	//
+	// NOT omitempty, for the reason PendingEvents spells out: "" is a measurement,
+	// "this machine's collector has never completed a successful poll", and a
+	// field that vanishes when empty cannot be told apart from a CLI too old to
+	// send it.
+	//
+	// A TIMESTAMP ABOUT OUR COLLECTOR, and nothing else: no account, no usage, no
+	// vendor response. It carries no content.
+	//
+	// GRAIN: per MACHINE, persisted across restarts. The server's row is per key,
+	// so two machines sharing a key alternate and last write wins, the same
+	// convention as every counter beside it.
+	CursorVendorLastPollOkAt string `json:"cursorVendorLastPollOkAt"`
 }
 
 // watchedTools reports which AI tools this device is set up to capture, keyed
@@ -274,6 +298,10 @@ func buildPresenceEvent(session Session) event.Event {
 	// combination that went unnoticed for weeks.
 	gen := loadCursorGenerations()
 	overruns := loadCursorHookOverruns()
+	vendorPollOkAt := ""
+	if t := loadCursorVendorPollOkAt(); !t.IsZero() {
+		vendorPollOkAt = t.UTC().Format(time.RFC3339)
+	}
 
 	e := event.NewEvent("presence", session.DeviceID)
 	e.Source = presenceSource
@@ -312,6 +340,8 @@ func buildPresenceEvent(session Session) event.Event {
 		CursorStopEmpty:     int(gen.StopEmpty),
 		CursorHookOverruns:  int(overruns.Overruns),
 		CursorHookUnparsed:  int(gen.Unparsed),
+
+		CursorVendorLastPollOkAt: vendorPollOkAt,
 	})
 	return e
 }

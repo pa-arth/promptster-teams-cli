@@ -158,6 +158,9 @@ func collectCursorVendorAccount(ctx context.Context, deviceID string, client *cu
 	queuedAll := queueCursorVendorSnapshotV2(snapshot, deviceID, capturedAt, shape.CursorVersion, queueCursorVendorEvent)
 	if queuedAll {
 		recordCursorVendorCostClaims(rows)
+		// Only here: every absence above returned before reaching it, so the
+		// heartbeat's cursorVendorLastPollOkAt moves on real snapshots alone.
+		recordCursorVendorPollOk(time.Now())
 	}
 	// A 31-day chart crosses the preceding billing cycle for most of each
 	// month. Its rows are staged under the prior cycle's own bounds and pool,
