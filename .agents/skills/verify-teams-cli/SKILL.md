@@ -185,6 +185,7 @@ the instance proved nothing.
 | `node $CT cleanup` | kill only what we started, drop the sandbox, keep evidence |
 | `PROMPTSTER_VERIFY_STDIN=<file> node $CT run cursor-hook` | feed one recorded Cursor hook payload |
 | `node scenarios/cursor-subagent-rollup/run.mjs` | real subagent capture replay; asserts roll-up, claim, no duplicate |
+| `node scenarios/codex-subagent-effort/run.mjs` | codex watcher over a parent + delegate rollout; asserts delegate effort survives projection |
 | `node evals/run-eval.mjs --agent claude` | score how well an agent catches planted defects |
 
 ## 7. Keeping this skill honest

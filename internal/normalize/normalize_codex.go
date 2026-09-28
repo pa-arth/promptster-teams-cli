@@ -1026,6 +1026,12 @@ func (p *CodexRolloutProcessor) subagentUsage(ts, raw string) []event.Event {
 	if p.model != "" {
 		data["model"] = p.model
 	}
+	// The delegate's OWN tier, from its own turn_context. Delegated threads carry
+	// most of a multi-agent session's spend, so leaving it off meant effort was
+	// known only for the few main-thread turns.
+	if p.effort != "" {
+		data["effort"] = p.effort
+	}
 	p.attachTokenUsage(data)
 	if p.threadID != "" {
 		data["agentId"] = p.threadID

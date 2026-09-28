@@ -173,7 +173,7 @@ var projectFieldAllowlist = map[string][]string{
 	// separates concurrent delegates of the same kind: 48% of measured lanes sit
 	// in such a cluster, with an 11.3x cost spread inside one. It goes LAST to
 	// match the server manifest's order, which freezes additions at the end.
-	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain", "cacheWriteInputTokens", "contextWindowTokens", "summary", "lastRequestInputTokens"),
+	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain", "cacheWriteInputTokens", "contextWindowTokens", "summary", "lastRequestInputTokens", "effort"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
