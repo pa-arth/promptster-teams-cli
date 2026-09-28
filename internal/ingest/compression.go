@@ -37,7 +37,7 @@ func (t *gzipTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	var encoded bytes.Buffer
 	writer := gzip.NewWriter(&encoded)
 	if _, err := io.Copy(writer, req.Body); err != nil {
-		writer.Close()
+		_ = writer.Close()
 		return nil, err
 	}
 	if err := writer.Close(); err != nil {
@@ -55,7 +55,7 @@ func (t *gzipTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// original bytes before an old parser's 400 can be mistaken for an invalid
 	// event and cause the outbox to discard it. Ingest is idempotent.
 	if err == nil && (resp.StatusCode == 400 || resp.StatusCode == 415) {
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		plain := req.Clone(req.Context())
 		plain.Body, err = req.GetBody()
 		if err != nil {
