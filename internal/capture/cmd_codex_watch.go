@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
@@ -341,7 +342,7 @@ func RunCodexWatcher() error {
 	// in the same supervisor process, so StartDrain is a process-wide singleton:
 	// whichever watcher gets there first starts the only drain, and it delivers
 	// both watchers' events.
-	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
+	outbox.StartDrain(ingest.WithGzip(client, policyResolver.GzipIngest), session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	policyResolver.StartBackground(policyCtx)
