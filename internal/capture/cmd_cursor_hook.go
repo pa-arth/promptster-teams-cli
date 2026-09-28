@@ -347,18 +347,35 @@ func EnsureCursorHooksBestEffort() {
 	}
 }
 
-// cursorSubagentTranscript finds <projects>/*/agent-transcripts/<parent>/subagents/<id>.jsonl
-// and returns the parent id and the file, or "" when id is not a subagent.
+// cursorSubagentTranscript finds the transcript of subagent `id` and returns its
+// parent session id and path, or "" when id is not a known subagent.
 //
-// ponytail: globs every project's session dirs per subagent hook call; cache
-// child->parent in the state dir if this ever shows up in cursor_hook_overruns.
+// It looks only under sessions this rail has already CLAIMED, newest claim
+// first: <claimed session dir>/subagents/<id>.jsonl. The parent's own hooks
+// (beforeSubmitPrompt, its tool calls) carry a transcript_path and claimed it
+// before the subagent could run, so the live parent is in the ledger. That makes
+// the lookup a handful of stats instead of a walk of every project, and it can
+// only pick the session that is actually running, never a stale copy of the
+// same uuid in another project dir. A parent this rail never claimed falls back
+// to today's behaviour: the events stay under the child id.
 func cursorSubagentTranscript(id string) (parent, path string) {
-	if id == "" || strings.ContainsAny(id, `/\*?[`) {
+	if id == "" || strings.ContainsAny(id, `/\`) {
 		return "", ""
 	}
-	matches, _ := filepath.Glob(filepath.Join(CursorProjectsDir(), "*", "agent-transcripts", "*", "subagents", id+".jsonl"))
-	if len(matches) == 0 {
-		return "", ""
+	claims := loadCursorHookClaims()
+	var bestTs int64
+	for key, c := range claims.Claims {
+		if c.TsMs <= bestTs || !isCursorHookClaimed(claims, key) {
+			continue
+		}
+		dir := filepath.Join(CursorProjectsDir(), filepath.FromSlash(filepath.Dir(key)))
+		if filepath.Base(dir) != c.SessionID {
+			continue // a subagent's own claim, not a parent's session dir
+		}
+		candidate := filepath.Join(dir, "subagents", id+".jsonl")
+		if _, err := os.Stat(candidate); err == nil {
+			parent, path, bestTs = c.SessionID, candidate, c.TsMs
+		}
 	}
-	return filepath.Base(filepath.Dir(filepath.Dir(matches[0]))), matches[0]
+	return parent, path
 }

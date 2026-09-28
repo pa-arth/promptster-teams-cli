@@ -15,13 +15,25 @@ import (
 func TestSubagentHookEventsRollUpToParent(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("PROMPTSTER_CURSOR_HOME", home)
-	child := filepath.Join(home, "projects", "ws", "agent-transcripts", "parent-1", "subagents", "child-1.jsonl")
-	if err := os.MkdirAll(filepath.Dir(child), 0o755); err != nil {
-		t.Fatal(err)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	touch := func(parts ...string) string {
+		p := filepath.Join(append([]string{home, "projects"}, parts...)...)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
-	if err := os.WriteFile(child, nil, 0o600); err != nil {
-		t.Fatal(err)
+	child := touch("ws", "agent-transcripts", "parent-1", "subagents", "child-1.jsonl")
+	// The same child uuid under an older, unclaimed project dir must not win.
+	touch("old-ws", "agent-transcripts", "stale-parent", "subagents", "child-1.jsonl")
+
+	if p, _ := cursorSubagentTranscript("child-1"); p != "" {
+		t.Fatalf("resolved %q before the parent was ever claimed", p)
 	}
+	recordCursorHookClaim(touch("ws", "agent-transcripts", "parent-1", "parent-1.jsonl"), "parent-1")
 
 	parent, path := cursorSubagentTranscript("child-1")
 	if parent != "parent-1" || path != child {
@@ -30,8 +42,8 @@ func TestSubagentHookEventsRollUpToParent(t *testing.T) {
 	if p, _ := cursorSubagentTranscript("parent-1"); p != "" {
 		t.Fatalf("main-chain session resolved as subagent of %q", p)
 	}
-	if p, _ := cursorSubagentTranscript("*"); p != "" {
-		t.Fatal("glob metacharacters in the id must not match")
+	if p, _ := cursorSubagentTranscript("../parent-1"); p != "" {
+		t.Fatal("path separators in the id must not match")
 	}
 
 	res, ok := normalize.NormalizeCursorHook([]byte(`{"hook_event_name":"afterShellExecution",

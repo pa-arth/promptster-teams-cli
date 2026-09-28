@@ -34,6 +34,14 @@ const ct = (args, env = {}) => {
 ct(["cleanup"]);
 const login = ct(["run", "login", "--key", "PSE-ABCD-EFGH-JKLM-NPQR-STUV-WXYZ"]);
 
+// Wait for the cursor watcher's first heartbeat. A transcript already on disk
+// when it starts is seeded to EOF as history, so writing fixtures before it is up
+// makes the control transcript invisible and the run a false failure.
+const hb = path.join(STATE, "cursor-watcher.json");
+for (const until = Date.now() + 60_000; Date.now() < until; spawnSync("sleep", ["1"])) {
+  try { if (JSON.parse(fs.readFileSync(hb, "utf8")).lastHeartbeat) break; } catch {}
+}
+
 const work = path.join(HOME, "probe");
 const tdir = path.join(HOME, ".cursor", "projects", "sbx-probe", "agent-transcripts", PARENT);
 fs.mkdirSync(path.join(tdir, "subagents"), { recursive: true });
@@ -44,13 +52,22 @@ const claimedPath = path.join(tdir, "subagents", `${CLAIMED}.jsonl`);
 fs.writeFileSync(claimedPath, ""); // Cursor creates the child file when the subagent starts
 
 const hookRuns = [];
+const hook = (payload, name) => {
+  const tmp = path.join(os.tmpdir(), `sub-hook-${process.pid}-${name}`);
+  fs.writeFileSync(tmp, JSON.stringify(payload));
+  hookRuns.push(ct(["run", "cursor-hook"], { PROMPTSTER_VERIFY_STDIN: tmp }).evidence);
+  fs.rmSync(tmp);
+};
+// The parent's own turn fires first and, like every main-chain hook in the
+// editor, names its transcript — which is what claims the parent session.
+const main = JSON.parse(fix(fs.readFileSync(path.join(HERE, "afterShellExecution-1.json"), "utf8")));
+Object.assign(main, { conversation_id: PARENT, session_id: PARENT, generation_id: PARENT,
+  transcript_path: path.join(tdir, `${PARENT}.jsonl`), command: "echo main-chain" });
+hook(main, "main");
 for (const f of ["afterShellExecution-1.json", "afterShellExecution-2.json"]) {
   const p = JSON.parse(fix(fs.readFileSync(path.join(HERE, f), "utf8")));
   Object.assign(p, { conversation_id: CLAIMED, session_id: CLAIMED, generation_id: CLAIMED, transcript_path: null });
-  const tmp = path.join(os.tmpdir(), `sub-hook-${process.pid}-${f}`);
-  fs.writeFileSync(tmp, JSON.stringify(p));
-  hookRuns.push(ct(["run", "cursor-hook"], { PROMPTSTER_VERIFY_STDIN: tmp }).evidence);
-  fs.rmSync(tmp);
+  hook(p, f);
 }
 
 const child = fix(fs.readFileSync(path.join(HERE, "child.jsonl"), "utf8"));
@@ -87,13 +104,14 @@ const claims = fs.existsSync(claimsFile) ? Object.keys(JSON.parse(fs.readFileSyn
 
 const checks = {
   watcherPolled: got.some((c) => c.agentId === CONTROL && c.session === PARENT),
-  subagentHookEventsUnderParent: got.filter((c) => c.rail === "cursor-hook").length === 2 &&
-    got.filter((c) => c.rail === "cursor-hook").every((c) => c.session === PARENT && c.agentId === CLAIMED),
+  mainChainUnchanged: got.some((c) => c.command === "echo main-chain" && c.session === PARENT && c.agentId === null),
+  subagentHookEventsUnderParent: got.filter((c) => c.rail === "cursor-hook" && c.command !== "echo main-chain").length === 2 &&
+    got.filter((c) => c.rail === "cursor-hook" && c.command !== "echo main-chain").every((c) => c.session === PARENT && c.agentId === CLAIMED),
   noOrphanSession: !got.some((c) => c.session === CLAIMED),
   subagentTranscriptClaimed: claims.some((k) => k.endsWith(`subagents/${CLAIMED}.jsonl`)),
   noDuplicateFromTranscript: !got.some((c) => c.agentId === CLAIMED && c.rail === "transcript-jsonl"),
 };
 const ok = Object.values(checks).every(Boolean);
 console.log(JSON.stringify({ ok, checks, commands: got, claims, evidence: [login.evidence, ...hookRuns] }, null, 1));
-ct(["cleanup"]);
+if (!process.env.PROMPTSTER_VERIFY_KEEP) ct(["cleanup"]); // KEEP=1 leaves the sandbox for `inspect`
 process.exit(ok ? 0 : 1);
