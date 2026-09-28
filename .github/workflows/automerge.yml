@@ -30,10 +30,17 @@ on:
     branches: [main]
   check_run:
     types: [completed]
+  # check_run never fires for check runs our own Actions workflows create
+  # (GITHUB_TOKEN events start no workflows), so CI finishing last used to be
+  # noticed only by luck, via a CodeQL/gosec SARIF check landing after it.
+  # workflow_run is the event GitHub does deliver when CI completes.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
   issue_comment:
     types: [created, edited]
-  pull_request_review:
-    types: [submitted]
+  # No pull_request_review trigger: the decision reads check runs and issue
+  # comments only, never reviews, so every review event was a billed no-op.
 
 # One decision at a time per PR — and never lose the run the PR can see.
 #
@@ -60,7 +67,7 @@ on:
 # already-merged PR, and a non-200 from the merge API logs "will retry on next
 # event" and exits 0.
 concurrency:
-  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha }}-${{ github.event_name }}
+  group: automerge-${{ github.event.pull_request.number || github.event.issue.number || github.event.check_run.head_sha || github.event.workflow_run.head_sha }}-${{ github.event_name }}
   cancel-in-progress: false
 
 permissions:
@@ -81,15 +88,22 @@ jobs:
     # marker it is waiting for would never be read. Letting any commenter
     # retrigger is safe: the job runs main's script, which re-derives every
     # signal from the API. A comment cannot fake a check run or a review.
+    # Every run bills at least a minute, so the filters below drop events that
+    # cannot change the decision: drafts never merge (ready_for_review re-fires),
+    # the only non-Actions required check is Greptile's (which also keeps our own
+    # check_run from retriggering this forever), and the only Greptile comment
+    # the script reads is the one carrying the greptile_summary marker.
     if: >
       (github.event_name == 'pull_request_target' &&
-       github.event.pull_request.head.repo.full_name == github.repository) ||
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       !github.event.pull_request.draft) ||
+      (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request') ||
       (github.event_name == 'check_run' &&
-       github.event.check_run.name != 'Automerge on green') ||
+       github.event.check_run.app.slug == 'greptile-apps') ||
       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
-       (github.event.comment.user.login == 'greptile-apps[bot]' ||
-        contains(github.event.comment.body, 'verified: verify-teams-cli'))) ||
-      github.event_name == 'pull_request_review'
+       ((github.event.comment.user.login == 'greptile-apps[bot]' &&
+         contains(github.event.comment.body, 'greptile_summary')) ||
+        contains(github.event.comment.body, 'verified: verify-teams-cli')))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
