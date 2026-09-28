@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
@@ -631,7 +632,7 @@ func RunClaudeWatcher() error {
 	// or (via the old send-derived count) masquerade as a broken parser.
 	// StartDrain is a process-wide singleton — the codex watcher shares this
 	// queue and calls it too (see its doc comment).
-	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
+	outbox.StartDrain(ingest.WithGzip(client, policyResolver.GzipIngest), session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	policyResolver.StartBackground(policyCtx)

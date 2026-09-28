@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/policy"
@@ -274,7 +275,7 @@ func RunCursorWatcher() error {
 
 	// Process-wide singleton shared with the Claude and Codex watchers — one
 	// device-wide queue, one drain. See outbox.StartDrain.
-	outbox.StartDrain(client, session.SessionToken, policyResolver.BatchIngest)
+	outbox.StartDrain(ingest.WithGzip(client, policyResolver.GzipIngest), session.SessionToken, policyResolver.BatchIngest)
 	policyCtx, cancelPolicy := context.WithCancel(context.Background())
 	defer cancelPolicy()
 	// The vendor collector's first decision must follow a completed policy

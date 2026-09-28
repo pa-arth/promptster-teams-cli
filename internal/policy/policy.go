@@ -79,6 +79,7 @@ func policyPath() string {
 // advertisement can go stale — a rollback between the fetch and the send — but
 // that fallback is the second line, not the first.
 type Ingest struct {
+	Gzip bool `json:"gzip"`
 	// Batch reports whether POST <BatchEndpoint> exists.
 	Batch bool `json:"batch"`
 	// BatchEndpoint is the route, sent by the backend rather than hardcoded here
@@ -336,6 +337,13 @@ func (r *Resolver) BatchIngest() (endpoint string, maxSize int, ok bool) {
 		return "", 0, false
 	}
 	return r.ingest.BatchEndpoint, r.ingest.MaxBatchSize, true
+}
+
+// GzipIngest enables compression only after the backend advertises support.
+func (r *Resolver) GzipIngest() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ingest != nil && r.ingest.Gzip
 }
 
 // StartBackground runs policy refreshes OFF the caller's hot path: it fires an
