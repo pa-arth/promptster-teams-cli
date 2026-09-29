@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -136,8 +135,8 @@ func TestCursorExtraProfileSkipsDefault(t *testing.T) {
 	if got := cursorExtraProfileStateDBs(); len(got) != 0 {
 		t.Fatalf("got %v, want the default store excluded", got)
 	}
-	if b, _ := os.ReadFile(cursorProfilesPath()); strings.Contains(string(b), dir) {
-		t.Fatalf("default dir remembered: %s", b)
+	if got := rememberCursorProfiles(nil); len(got) != 0 {
+		t.Fatalf("default dir remembered: %v", got)
 	}
 }
 
@@ -160,20 +159,21 @@ func TestRememberCursorProfilesConcurrentWritersKeepEveryDir(t *testing.T) {
 	}
 }
 
-// A lock that cannot be opened still reads the profiles, but writes nothing.
-func TestRememberCursorProfilesUnopenableLockStillReads(t *testing.T) {
+// Past the cap, the least recently seen profile is dropped.
+func TestRememberCursorProfilesEvictsOldest(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	t.Setenv(cursorStateDBEnv, filepath.Join(t.TempDir(), "default.vscdb"))
-	rememberCursorProfiles([]string{"/profiles/saved"})
-	lock := cursorProfilesPath() + ".lock"
-	_ = os.Remove(lock)
-	if err := os.Mkdir(lock, 0o700); err != nil { // a directory cannot be opened read-write
-		t.Fatal(err)
+	base := time.Now().Add(-time.Hour)
+	for i := 0; i <= cursorProfilesMax; i++ {
+		dir := fmt.Sprintf("/profiles/p%d", i)
+		rememberCursorProfiles([]string{dir})
+		at := base.Add(time.Duration(i) * time.Minute)
+		if err := os.Chtimes(filepath.Join(cursorProfilesDir(), cursorProfileFileName(dir)), at, at); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got := rememberCursorProfiles([]string{"/profiles/running"}); !slices.Equal(got, []string{"/profiles/running", "/profiles/saved"}) {
-		t.Fatalf("got %v, want the running and the saved profile", got)
-	}
-	if b, _ := os.ReadFile(cursorProfilesPath()); strings.Contains(string(b), "running") {
-		t.Fatalf("wrote the list without the lock: %s", b)
+	got := rememberCursorProfiles(nil)
+	if len(got) != cursorProfilesMax || got[0] != fmt.Sprintf("/profiles/p%d", cursorProfilesMax) || slices.Contains(got, "/profiles/p0") {
+		t.Fatalf("got %v, want the newest %d, p0 evicted", got, cursorProfilesMax)
 	}
 }

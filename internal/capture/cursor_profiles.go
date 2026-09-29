@@ -2,16 +2,17 @@ package capture
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -30,12 +31,17 @@ import (
 // a profile opened and closed between polls. Each profile dir found is
 // remembered, so it is still read in cycles where its window is closed. That
 // matters because an account's usage list covers the whole billing cycle (D1).
-// The file holds paths only, never a credential. A remembered dir is never
-// dropped for a failed read, because a store that is briefly unavailable would
-// then be forgotten until its Cursor runs again. It leaves only by the cap.
+// Paths only, never a credential. A remembered dir is never dropped for a failed
+// read, because a store that is briefly unavailable would then be forgotten
+// until its Cursor runs again. It leaves only by the cap.
+//
+// ONE FILE PER PROFILE. The hook and the daemon both remember profiles, at the
+// same moments. A shared list needs a read-merge-write, which loses an update
+// without a lock and needs a fallback when the lock fails. A file per profile,
+// named by a hash of its path, has no merge, so no writer can erase another's
+// profile.
 
 const (
-	cursorProfilesVersion = 1
 	// ponytail: 8 remembered profiles, the most recently seen kept. Raise it if
 	// anyone runs more.
 	cursorProfilesMax     = 8
@@ -43,11 +49,6 @@ const (
 	// The hook runs this scan inside its 2s budget. `ps` takes tens of ms.
 	cursorProcessScanWait = 500 * time.Millisecond
 )
-
-type cursorProfiles struct {
-	Version int      `json:"version"`
-	Dirs    []string `json:"dirs"`
-}
 
 // cursorProcessArgs lists every process's command line. A var for tests.
 var cursorProcessArgs = func() []string {
@@ -60,8 +61,8 @@ var cursorProcessArgs = func() []string {
 	return strings.Split(string(out), "\n")
 }
 
-func cursorProfilesPath() string {
-	return filepath.Join(state.StateDir(), "cursor-profiles.json")
+func cursorProfilesDir() string {
+	return filepath.Join(state.StateDir(), "cursor-profiles")
 }
 
 func cursorProfileStateDB(dir string) string {
@@ -106,11 +107,8 @@ func cursorUserDataDirs(lines []string) []string {
 	return dirs
 }
 
-// rememberRunningCursorProfiles adds every running non-default profile to the
-// file, running ones first, and returns the whole list. The hook and the daemon
-// both write the file, so the read-merge-write holds a file lock; otherwise
-// one could overwrite a profile the other just added. The process scan runs
-// before the lock, so the lock is held only for a small file read and write.
+// rememberRunningCursorProfiles remembers every running non-default profile and
+// returns every remembered one, most recently seen first.
 func rememberRunningCursorProfiles() []string {
 	if !CursorVendorPlatformSupported(runtime.GOOS) && os.Getenv(cursorStateDBEnv) == "" {
 		return nil
@@ -120,31 +118,43 @@ func rememberRunningCursorProfiles() []string {
 
 func rememberCursorProfiles(running []string) []string {
 	defaultDB, _ := cursorStateDBPath()
-	var dirs []string
-	merge := func(write bool) {
-		var f cursorProfiles
-		if b, err := os.ReadFile(cursorProfilesPath()); err == nil { // #nosec G304 -- state dir path.
-			if json.Unmarshal(b, &f) != nil || f.Version != cursorProfilesVersion {
-				f = cursorProfiles{}
-			}
-		}
-		for _, dir := range append(running, f.Dirs...) {
-			if !slices.Contains(dirs, dir) && cursorProfileStateDB(dir) != defaultDB && len(dirs) < cursorProfilesMax {
-				dirs = append(dirs, dir)
-			}
-		}
-		if write && !slices.Equal(dirs, f.Dirs) {
-			writeCursorProfiles(dirs)
+	root := cursorProfilesDir()
+	for _, dir := range running {
+		if cursorProfileStateDB(dir) != defaultDB {
+			writeCursorProfile(root, dir)
 		}
 	}
-	// An error means the lock was never taken, so merge never ran. Read without
-	// writing then: this cycle still reads every saved and running profile, and
-	// an unlocked write can't erase another writer's addition. A new running
-	// profile is saved on the next scan that gets the lock.
-	if sign.WithBufferLock(cursorProfilesPath()+".lock", func() error { merge(true); return nil }) != nil {
-		merge(false)
+	entries, _ := os.ReadDir(root)
+	type seen struct {
+		dir string
+		at  time.Time
+	}
+	var all []seen
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || strings.HasSuffix(e.Name(), ".tmp") {
+			continue
+		}
+		b, err := os.ReadFile(filepath.Join(root, e.Name())) // #nosec G304 -- state dir path.
+		if dir := string(b); err == nil && filepath.IsAbs(dir) && cursorProfileStateDB(dir) != defaultDB {
+			all = append(all, seen{dir, info.ModTime()})
+		}
+	}
+	sort.SliceStable(all, func(i, j int) bool { return all[i].at.After(all[j].at) })
+	var dirs []string
+	for i, p := range all {
+		if i >= cursorProfilesMax {
+			_ = os.Remove(filepath.Join(root, cursorProfileFileName(p.dir)))
+			continue
+		}
+		dirs = append(dirs, p.dir)
 	}
 	return dirs
+}
+
+func cursorProfileFileName(dir string) string {
+	sum := sha256.Sum256([]byte(dir))
+	return hex.EncodeToString(sum[:8])
 }
 
 // cursorExtraProfileStateDBs returns the stores of every remembered profile
@@ -159,18 +169,18 @@ func cursorExtraProfileStateDBs() []string {
 	return dbs
 }
 
-func writeCursorProfiles(dirs []string) {
-	b, err := json.Marshal(cursorProfiles{Version: cursorProfilesVersion, Dirs: dirs})
-	path := cursorProfilesPath()
-	if err != nil || os.MkdirAll(filepath.Dir(path), 0o700) != nil {
+// writeCursorProfile saves one profile path, or refreshes its mtime (the recency
+// the cap evicts by). The rename keeps a reader from seeing a torn file.
+func writeCursorProfile(root, dir string) {
+	if os.MkdirAll(root, 0o700) != nil {
 		return
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), "cursor-profiles-*.tmp")
+	tmp, err := os.CreateTemp(root, "profile-*.tmp")
 	if err != nil {
 		return
 	}
-	_, werr := tmp.Write(b)
-	if cerr := tmp.Close(); werr != nil || cerr != nil || os.Rename(tmp.Name(), path) != nil {
+	_, werr := tmp.WriteString(dir)
+	if cerr := tmp.Close(); werr != nil || cerr != nil || os.Rename(tmp.Name(), filepath.Join(root, cursorProfileFileName(dir))) != nil {
 		_ = os.Remove(tmp.Name())
 	}
 }

@@ -218,7 +218,7 @@ Each cycle the watcher lists running processes (`ps -axww -o args=`) and takes
 the `--user-data-dir` of any Cursor process. The Cursor hook runs the same scan on
 a turn whose login is unreadable, so a profile opened and closed between cycles
 is still found. Dirs are remembered by path (never a credential) in
-`cursor-profiles.json` in the state dir, up to 8, so a profile is still read
+`cursor-profiles/` in the state dir (one file per profile), up to 8, so a profile is still read
 while its window is closed. A dir whose store is missing is skipped that cycle,
 not forgotten.
 
