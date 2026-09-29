@@ -109,6 +109,18 @@ type CodexRolloutProcessor struct {
 	// same lifetime as model. Rides the main thread's ai_response and, on a
 	// delegated thread, its subagent_usage (the delegate's own tier).
 	effort string
+	// serviceTier is the routing tier from the latest thread_settings_applied
+	// ("default", "fast" or "flex"; "" when the value is one we don't know).
+	// Fast mode draws plan credits at 2-2.5x the standard rate, so usage run on
+	// it has to be told apart to convert a plan's window % into dollars.
+	// tierSeen is false until a snapshot arrives: older rollouts may carry none.
+	serviceTier string
+	tierSeen    bool
+	// prevUsage and fastUsage are {input, cacheRead, output}. prevUsage is the
+	// last cumulative total seen; fastUsage accumulates the deltas spent while
+	// serviceTier was "fast". Both are rebuilt by the prefix replay on restart.
+	prevUsage [3]int64
+	fastUsage [3]int64
 	// RepoRoot is the canonical per-session repository identity (a git remote slug
 	// owner/name, or a stable opaque hash for a no-remote/non-git dir). Unlike
 	// workdir — which normalize derives itself from the payload cwd via
@@ -215,14 +227,24 @@ func (p *CodexRolloutProcessor) stableEventID(sourceKey, kind string) string {
 // three counters must be non-negative integers (within float64's exact range)
 // and cached input cannot exceed input.
 func (p *CodexRolloutProcessor) codexSessionUsage(usage map[string]interface{}, ts string) []event.Event {
-	if p.threadID == "" {
-		return nil
-	}
 	input, hasInput := usage["input_tokens"].(float64)
 	output, hasOutput := usage["output_tokens"].(float64)
 	cacheRead, hasCacheRead := usage["cached_input_tokens"].(float64)
 	valid := func(v float64) bool { return v >= 0 && v <= 9_007_199_254_740_991 && math.Trunc(v) == v }
 	if !hasInput || !hasOutput || !hasCacheRead || !valid(input) || !valid(output) || !valid(cacheRead) || cacheRead > input {
+		return nil
+	}
+	// Attribute the growth since the last total to the tier in force. A
+	// repeated line adds nothing; a counter that went backwards restarts the
+	// baseline instead of adding a negative.
+	cur := [3]int64{int64(input), int64(cacheRead), int64(output)}
+	if p.serviceTier == "fast" && cur[0] >= p.prevUsage[0] && cur[1] >= p.prevUsage[1] && cur[2] >= p.prevUsage[2] {
+		for i := range cur {
+			p.fastUsage[i] += cur[i] - p.prevUsage[i]
+		}
+	}
+	p.prevUsage = cur
+	if p.threadID == "" {
 		return nil
 	}
 	// Counts disambiguate two token_count lines written in the same timestamp
@@ -233,11 +255,25 @@ func (p *CodexRolloutProcessor) codexSessionUsage(usage map[string]interface{}, 
 	if !p.subagentThread && p.model != "" {
 		sourceKey += "\x1fmain-model-v1:" + p.model
 	}
+	// Same reasoning for the tier fields: a replayed history must not be dropped
+	// as a duplicate of the counter that shipped before they existed.
+	if p.tierSeen {
+		sourceKey += "\x1ftier-v1"
+	}
 	e := p.newCodexEvent("codex_session_usage", ts, sourceKey)
 	e.Actor = event.SystemActor()
 	e.Data = map[string]interface{}{
 		"threadId": p.threadID, "inputTokens": int64(input),
 		"outputTokens": int64(output), "cacheReadTokens": int64(cacheRead),
+	}
+	if p.tierSeen {
+		data := e.Data.(map[string]interface{})
+		if p.serviceTier != "" {
+			data["serviceTier"] = p.serviceTier
+		}
+		data["fastInputTokens"] = p.fastUsage[0]
+		data["fastCacheReadTokens"] = p.fastUsage[1]
+		data["fastOutputTokens"] = p.fastUsage[2]
 	}
 	// Preserve the parent model even when no final answer is emitted. A delegate
 	// cannot nominate the main-loop model (its model may itself be a role alias).
@@ -854,6 +890,15 @@ func (p *CodexRolloutProcessor) newPromptEvent(text, ts, raw string) []event.Eve
 
 func (p *CodexRolloutProcessor) eventMsg(payload map[string]interface{}, ts, raw string) []event.Event {
 	switch stringField(payload, "type") {
+	case "thread_settings_applied":
+		// The only rollout record carrying the routing tier. Emits nothing.
+		settings, ok := payload["thread_settings"].(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		p.tierSeen = true
+		p.serviceTier = clampServiceTier(settings["service_tier"])
+		return nil
 	case "task_started":
 		// A new turn starting means the previous one will get no task_complete
 		// (interrupted). Its buffered final answer is still a real response.
@@ -1828,4 +1873,24 @@ func intField(m map[string]interface{}, key string) int64 {
 		return int64(f)
 	}
 	return 0
+}
+
+// clampServiceTier maps Codex's service_tier to "default", "fast" or "flex".
+// Codex omits the key when no tier was requested, which routes as standard.
+// It writes "priority" for fast mode ("fast" is accepted as an alias). Any
+// other value is "" rather than a guess.
+func clampServiceTier(v interface{}) string {
+	if v == nil {
+		return "default"
+	}
+	s, _ := v.(string)
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "default":
+		return "default"
+	case "priority", "fast":
+		return "fast"
+	case "flex":
+		return "flex"
+	}
+	return ""
 }

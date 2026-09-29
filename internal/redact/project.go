@@ -13,6 +13,10 @@ import (
 
 var mainLoopModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 
+var codexServiceTiers = map[string]bool{"default": true, "fast": true, "flex": true}
+
+var planTypePattern = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
+
 // Client-side source exclusion — the on-device twin of the backend's teams
 // write-boundary projection. projectEvent runs at the buffer/ingest choke point
 // (appendEventToLocalBuffer, before signing), so source-bearing fields are
@@ -357,12 +361,17 @@ var projectFieldAllowlist = map[string][]string{
 	// (§2 of usage-window-currency/contract.md): these eight keys must be
 	// allowlisted on BOTH sides in the same release — a field allowed here but not
 	// there is silently stripped at ingest and reads as an older CLI.
-	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState"},
+	// planType is the provider's own plan word from Codex rate_limits (e.g.
+	// "plus", "prolite", "pro"), a bounded lowercase token checked in
+	// ProjectEvent. It is what turns a window % into dollars per plan.
+	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState", "planType"},
 	// Cumulative Codex rollout counters, one reading per token_count line. No
 	// prompt, path, or prose. mainLoopModel is a bounded model identifier.
 	// threadId distinguishes delegated rollouts
 	// and is dropped unless it is an opaque id (see ProjectEvent).
-	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens", "mainLoopModel"},
+	// serviceTier is "default" | "fast" | "flex"; the fast* counters are the
+	// cumulative share of the three totals spent in fast mode.
+	"codex_session_usage": {"threadId", "inputTokens", "outputTokens", "cacheReadTokens", "mainLoopModel", "serviceTier", "fastInputTokens", "fastCacheReadTokens", "fastOutputTokens"},
 	// rework_verdict reports WHICH AI line ranges were rewritten on a feature
 	// branch BEFORE it merged (reworkedRanges) — the same content-free metadata as
 	// durability: integer line numbers, an age, and a `sha:path` lineage handle,
@@ -1027,6 +1036,14 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		}
 		if thread, ok := projected["threadId"].(string); !ok || !isOpaqueLaneID(thread) {
 			delete(projected, "threadId")
+		}
+		if tier, ok := projected["serviceTier"].(string); !ok || !codexServiceTiers[tier] {
+			delete(projected, "serviceTier")
+		}
+	}
+	if e.Kind == "windowUsage" {
+		if plan, ok := projected["planType"].(string); !ok || !planTypePattern.MatchString(plan) {
+			delete(projected, "planType")
 		}
 	}
 	if shellCommandKinds[e.Kind] {

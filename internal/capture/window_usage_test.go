@@ -423,3 +423,23 @@ func TestClaudeWindowEmitter_ThrottlesRepeatedAbsences(t *testing.T) {
 		t.Error("a throttled absence suppressed the reading that followed it")
 	}
 }
+
+func TestCodexPlanTypeRidesTheWindowUsageEvent(t *testing.T) {
+	rl := map[string]interface{}{
+		"plan_type": " ProLite ",
+		"primary":   map[string]interface{}{"used_percent": 49.0, "window_minutes": 10080.0, "resets_at": 2000000000.0},
+	}
+	r := mapCodexRateLimits(rl, 1500000000)
+	if r.PlanType != "prolite" {
+		t.Fatalf("planType = %q", r.PlanType)
+	}
+	data := buildWindowUsageEvent("codex", r, 1500000001, "s", "d").Data.(map[string]interface{})
+	if data["planType"] != "prolite" {
+		t.Fatalf("event data = %+v", data)
+	}
+	delete(rl, "plan_type")
+	data = buildWindowUsageEvent("codex", mapCodexRateLimits(rl, 1500000000), 1500000001, "s", "d").Data.(map[string]interface{})
+	if _, ok := data["planType"]; ok {
+		t.Fatal("absent plan must be omitted, not emitted empty")
+	}
+}

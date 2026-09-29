@@ -98,6 +98,9 @@ type windowReading struct {
 	// absence. An absence reading has every window pointer nil BY CONSTRUCTION —
 	// it is not a zero and must never acquire one. See the const block above.
 	SignalState string
+	// PlanType is Codex's rate_limits.plan_type ("plus", "prolite", "pro", …),
+	// "" when absent. Claude's statusline carries no plan.
+	PlanType string
 }
 
 // reported reports whether this reading carries a window the contract can render.
@@ -160,6 +163,8 @@ func codexResetsAbsolute(w map[string]interface{}, observedAt int64) (int64, boo
 // drops any window whose length matches neither 5h nor weekly.
 func mapCodexRateLimits(rl map[string]interface{}, observedAt int64) windowReading {
 	r := windowReading{ObservedAt: observedAt}
+	plan, _ := rl["plan_type"].(string)
+	r.PlanType = strings.ToLower(strings.TrimSpace(plan))
 	for _, key := range []string{"primary", "secondary"} {
 		w, ok := rl[key].(map[string]interface{})
 		if !ok {
@@ -373,6 +378,9 @@ func buildWindowUsageEvent(provider string, r windowReading, capturedAt int64, s
 	if !r.reported() {
 		data["signalState"] = r.SignalState
 	}
+	if r.PlanType != "" {
+		data["planType"] = r.PlanType
+	}
 	e.Data = data
 
 	// Deterministic id keyed on provider + device + observedAt + the four window
@@ -500,6 +508,9 @@ type claudeWindowSpool struct {
 	// Omitted for a reading, so a spool written by this build and one written by
 	// the previous build are byte-identical on the normal path.
 	SignalState string `json:"signalState,omitempty"`
+	// Mirrors windowReading.PlanType to keep the two types convertible; the
+	// Claude shim never sets it, so the spool bytes are unchanged.
+	PlanType string `json:"planType,omitempty"`
 }
 
 // writeClaudeWindowSpool atomically overwrites the spool with the latest reading
