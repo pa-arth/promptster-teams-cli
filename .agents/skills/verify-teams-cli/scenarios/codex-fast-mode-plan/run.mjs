@@ -75,7 +75,7 @@ const usage = got.filter((e) => e.kind === "codex_session_usage").map((e) => e.d
 const last = usage.at(-1) ?? {};
 const win = got.find((e) => e.kind === "windowUsage")?.data ?? {};
 const checks = {
-  standardTurnHasNoFastTokens: usage.some((d) => d.serviceTier === "default" && d.fastInputTokens === 0),
+  standardTurnHasNoFastTokens: usage.some((d) => d.serviceTier === "default" && d.fastInputTokens === 0 && d.fastCacheReadTokens === 0 && d.fastOutputTokens === 0),
   fastTierReported: last.serviceTier === "fast",
   // Only the growth after switching to priority counts: 3000-1000, 2000-500, 150-50.
   fastCountersAreTheFastDelta: last.fastInputTokens === 2000 && last.fastCacheReadTokens === 1500 && last.fastOutputTokens === 100,
