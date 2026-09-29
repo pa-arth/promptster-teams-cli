@@ -121,7 +121,7 @@ func rememberRunningCursorProfiles() []string {
 func rememberCursorProfiles(running []string) []string {
 	defaultDB, _ := cursorStateDBPath()
 	var dirs []string
-	_ = sign.WithBufferLock(cursorProfilesPath()+".lock", func() error {
+	merge := func() error {
 		var f cursorProfiles
 		if b, err := os.ReadFile(cursorProfilesPath()); err == nil { // #nosec G304 -- state dir path.
 			if json.Unmarshal(b, &f) != nil || f.Version != cursorProfilesVersion {
@@ -137,7 +137,13 @@ func rememberCursorProfiles(running []string) []string {
 			writeCursorProfiles(dirs)
 		}
 		return nil
-	})
+	}
+	// merge always returns nil, so an error means the lock was never taken and
+	// merge never ran. Merge unlocked then: a race can lose one dir, but a lock
+	// that cannot be opened would otherwise stop every extra profile being read.
+	if sign.WithBufferLock(cursorProfilesPath()+".lock", merge) != nil {
+		_ = merge()
+	}
 	return dirs
 }
 
