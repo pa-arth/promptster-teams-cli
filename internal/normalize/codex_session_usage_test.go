@@ -108,7 +108,7 @@ func TestCodexUsageAttributesFastModeTokensToTheTierInForce(t *testing.T) {
 	}
 
 	p.Process(settings(`"service_tier":"priority",`))
-	d = usage("2026-09-14T00:00:03Z", 500, 300, 50)
+	usage("2026-09-14T00:00:03Z", 500, 300, 50)
 	usage("2026-09-14T00:00:03Z", 500, 300, 50) // a repeated line adds nothing
 	d = usage("2026-09-14T00:00:04Z", 600, 350, 60)
 	if d["serviceTier"] != "fast" || d["fastInputTokens"] != int64(400) || d["fastCacheReadTokens"] != int64(250) || d["fastOutputTokens"] != int64(40) {
