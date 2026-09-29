@@ -212,6 +212,14 @@ back to a byte copy), reads only `cursorAuth/accessToken`,
 `cursorAuth/refreshToken` and `cursorAuth/cachedEmail` from that clone, then
 deletes it. It never opens the live database and never reads neighbouring keys.
 
+The same read covers extra Cursor profiles: a Cursor started with
+`--user-data-dir <dir>` keeps its login in `<dir>/User/globalStorage/state.vscdb`.
+Each cycle the watcher lists running processes (`ps -axww -o args=`), takes the
+`--user-data-dir` of any Cursor process, and remembers those dirs by path
+(never a credential) in `cursor-profiles.json` in the state dir, so a profile is
+still read while its window is closed. A remembered dir whose store is gone is
+dropped.
+
 It also reads the `cursor-agent` CLI's login when that login is in cursor-agent's
 file store: `~/.cursor/auth.json` on macOS (`$XDG_CONFIG_HOME/cursor/auth.json`
 elsewhere). Only `accessToken`/`refreshToken` are decoded from it.

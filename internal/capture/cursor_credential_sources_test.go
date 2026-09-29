@@ -20,13 +20,15 @@ import (
 )
 
 // TestMain keeps every test in this package off the developer's real
-// ~/.cursor/auth.json. A test that wants the source sets its own dir.
+// ~/.cursor/auth.json and running Cursor processes. A test that wants either
+// source sets its own.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "promptster-no-cursor-agent-")
 	if err != nil {
 		panic(err)
 	}
 	_ = os.Setenv(cursorAgentDirEnv, filepath.Join(dir, "absent"))
+	cursorProcessArgs = func() []string { return nil } // never the developer's running Cursor
 	code := m.Run()
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
