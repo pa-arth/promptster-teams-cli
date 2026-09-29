@@ -21,6 +21,7 @@ There are no hidden subcommands; anything not listed there exits 1 with
 | [Login & credentials](login.md) | `login` | `internal/cli/cmd_login.go`, `internal/ingest/credentials.go` |
 | [Doctor](doctor.md) | `doctor` | `internal/cli/teams_status.go`, `queue_health.go`, `capture_process_doctor.go` |
 | [Status](status.md) | `status` | `internal/cli/teams_status.go`, `status_tui.go` |
+| [Local incident origin](local-blame.md) | `blame-backfill` | `internal/cli/cmd_blame_backfill.go`, `internal/capture/line_origin.go` |
 | [Capture daemon](capture-daemon.md) | `start`, `stop`, `watch` | `internal/capture/daemon.go` |
 | [Autostart](autostart.md) | `autostart enable\|disable\|status\|repair` | `internal/cli/autostart.go`, `internal/service/*` |
 | [Statusline](statusline.md) | `statusline enable\|disable\|status\|run` | `internal/cli/cmd_statusline.go`, `internal/capture/statusline*.go` |

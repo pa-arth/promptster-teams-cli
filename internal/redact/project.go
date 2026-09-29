@@ -330,6 +330,7 @@ var projectFieldAllowlist = map[string][]string{
 	// added lines (the denominator for the backend's token-efficiency ratio),
 	// never the line text or bytes.
 	"commit_attribution": {"commitSha", "workspaceKey", "files", "aiTokens"},
+	"commit_line_origin": {"version", "commitSha", "workspaceKey", "state", "replacedLines", "tracedLines", "skippedFiles", "cappedFiles", "replacedFrom"},
 	// durability_verdict reports WHICH AI line ranges survived (durableRanges),
 	// were rewritten (churnedRanges), or are still tracked and undecided
 	// (livingRanges) on a path over time — content-free metadata: integer line
@@ -387,6 +388,7 @@ var projectFieldAllowlist = map[string][]string{
 // source nested inside. Every array-of-object field in projectFieldAllowlist
 // must have an entry here.
 var projectArrayElementAllowlist = map[string]map[string][]string{
+	"commit_line_origin": {"replacedFrom": {"sha", "lines"}},
 	// `tool` on every asset is WHICH agent owns it, from the closed
 	// "claude-code"|"codex"|"cursor" set — the same spellings event.Source uses,
 	// so a census asset joins to sessions.source_service with no mapping table.

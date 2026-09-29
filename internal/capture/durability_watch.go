@@ -192,6 +192,9 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 				// the SAME ledger transaction as that commit's range changes, so a
 				// crash cannot leave ranges applied with the cursor behind them.
 				for i := len(commits) - 1; i >= 0; i-- { // oldest-first
+					// The merged fix SHA may only exist on a locally fetched default ref.
+					// Separate receipt idempotence prevents duplicate HEAD observations.
+					queueLineOrigin(session, root, commits[i], nowMs)
 					pollDurabilityCommit(root, rootKey, session, commits[i], nowMs, lineage)
 				}
 			} else {
