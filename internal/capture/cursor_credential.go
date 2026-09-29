@@ -185,6 +185,12 @@ func readCursorCredential() (cursorCredential, error) {
 	if err != nil {
 		return cursorCredential{}, err
 	}
+	return readCursorCredentialAt(path)
+}
+
+// readCursorCredentialAt is readCursorCredential for one store path: the
+// default profile's, or an extra profile's (cursorExtraProfileStateDBs).
+func readCursorCredentialAt(path string) (cursorCredential, error) {
 	if _, statErr := os.Stat(path); statErr != nil {
 		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no state store on this device")
 	}
