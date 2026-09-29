@@ -1016,6 +1016,9 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		}
 		projected[key] = value
 	}
+	if e.Kind == "commit_line_origin" {
+		projected = projectLineOriginValues(projected)
+	}
 	if lane, present := projected[laneField]; present {
 		// Drop to ABSENT rather than to a placeholder. A lane id we refuse to
 		// carry is a lane we cannot identify, and the consumer contract already
