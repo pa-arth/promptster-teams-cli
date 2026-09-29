@@ -160,7 +160,7 @@ func TestRememberCursorProfilesConcurrentWritersKeepEveryDir(t *testing.T) {
 	}
 }
 
-// A lock that cannot be opened still reads the saved profiles.
+// A lock that cannot be opened still reads the profiles, but writes nothing.
 func TestRememberCursorProfilesUnopenableLockStillReads(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	t.Setenv(cursorStateDBEnv, filepath.Join(t.TempDir(), "default.vscdb"))
@@ -170,7 +170,10 @@ func TestRememberCursorProfilesUnopenableLockStillReads(t *testing.T) {
 	if err := os.Mkdir(lock, 0o700); err != nil { // a directory cannot be opened read-write
 		t.Fatal(err)
 	}
-	if got := rememberCursorProfiles(nil); !slices.Equal(got, []string{"/profiles/saved"}) {
-		t.Fatalf("got %v, want the saved profile", got)
+	if got := rememberCursorProfiles([]string{"/profiles/running"}); !slices.Equal(got, []string{"/profiles/running", "/profiles/saved"}) {
+		t.Fatalf("got %v, want the running and the saved profile", got)
+	}
+	if b, _ := os.ReadFile(cursorProfilesPath()); strings.Contains(string(b), "running") {
+		t.Fatalf("wrote the list without the lock: %s", b)
 	}
 }
