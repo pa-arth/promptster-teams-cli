@@ -16,7 +16,7 @@ func projectLineOriginValues(data map[string]interface{}) map[string]interface{}
 	count := func(value interface{}) (int, bool) {
 		switch n := value.(type) {
 		case int:
-			return n, n >= 0
+			return n, n >= 0 && float64(n) <= 9007199254740991
 		case float64:
 			if n >= 0 && n <= 9007199254740991 && n == math.Trunc(n) {
 				return int(n), true
