@@ -1,10 +1,12 @@
 package capture
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -136,5 +138,24 @@ func TestCursorExtraProfileSkipsDefault(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(cursorProfilesPath()); strings.Contains(string(b), dir) {
 		t.Fatalf("default dir remembered: %s", b)
+	}
+}
+
+// The hook and the daemon write the list at the same time without losing
+// each other's additions.
+func TestRememberCursorProfilesConcurrentWritersKeepEveryDir(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	t.Setenv(cursorStateDBEnv, filepath.Join(t.TempDir(), "default.vscdb"))
+	var wg sync.WaitGroup
+	for i := 0; i < cursorProfilesMax; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rememberCursorProfiles([]string{fmt.Sprintf("/profiles/p%d", i)})
+		}(i)
+	}
+	wg.Wait()
+	if got := rememberCursorProfiles(nil); len(got) != cursorProfilesMax {
+		t.Fatalf("remembered %d of %d: %v", len(got), cursorProfilesMax, got)
 	}
 }

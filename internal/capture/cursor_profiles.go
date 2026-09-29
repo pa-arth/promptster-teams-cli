@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
 )
 
@@ -106,30 +107,37 @@ func cursorUserDataDirs(lines []string) []string {
 }
 
 // rememberRunningCursorProfiles adds every running non-default profile to the
-// file, running ones first, and returns the whole list. Both the daemon and the
-// hook write it.
-// ponytail: last writer wins between the two, so a dir can be lost to a race and
-// is found again on its next scan. Lock the file if that is ever observed.
+// file, running ones first, and returns the whole list. The hook and the daemon
+// both write the file, so the read-merge-write holds a file lock; otherwise
+// one could overwrite a profile the other just added. The process scan runs
+// before the lock, so the lock is held only for a small file read and write.
 func rememberRunningCursorProfiles() []string {
 	if !CursorVendorPlatformSupported(runtime.GOOS) && os.Getenv(cursorStateDBEnv) == "" {
 		return nil
 	}
+	return rememberCursorProfiles(cursorUserDataDirs(cursorProcessArgs()))
+}
+
+func rememberCursorProfiles(running []string) []string {
 	defaultDB, _ := cursorStateDBPath()
-	var f cursorProfiles
-	if b, err := os.ReadFile(cursorProfilesPath()); err == nil { // #nosec G304 -- state dir path.
-		if json.Unmarshal(b, &f) != nil || f.Version != cursorProfilesVersion {
-			f = cursorProfiles{}
-		}
-	}
 	var dirs []string
-	for _, dir := range append(cursorUserDataDirs(cursorProcessArgs()), f.Dirs...) {
-		if !slices.Contains(dirs, dir) && cursorProfileStateDB(dir) != defaultDB && len(dirs) < cursorProfilesMax {
-			dirs = append(dirs, dir)
+	_ = sign.WithBufferLock(cursorProfilesPath()+".lock", func() error {
+		var f cursorProfiles
+		if b, err := os.ReadFile(cursorProfilesPath()); err == nil { // #nosec G304 -- state dir path.
+			if json.Unmarshal(b, &f) != nil || f.Version != cursorProfilesVersion {
+				f = cursorProfiles{}
+			}
 		}
-	}
-	if !slices.Equal(dirs, f.Dirs) {
-		writeCursorProfiles(dirs)
-	}
+		for _, dir := range append(running, f.Dirs...) {
+			if !slices.Contains(dirs, dir) && cursorProfileStateDB(dir) != defaultDB && len(dirs) < cursorProfilesMax {
+				dirs = append(dirs, dir)
+			}
+		}
+		if !slices.Equal(dirs, f.Dirs) {
+			writeCursorProfiles(dirs)
+		}
+		return nil
+	})
 	return dirs
 }
 
@@ -151,7 +159,6 @@ func writeCursorProfiles(dirs []string) {
 	if err != nil || os.MkdirAll(filepath.Dir(path), 0o700) != nil {
 		return
 	}
-	// A unique temp name: the hook and the daemon can write at the same moment.
 	tmp, err := os.CreateTemp(filepath.Dir(path), "cursor-profiles-*.tmp")
 	if err != nil {
 		return
