@@ -178,6 +178,11 @@ func runCursorHookInner() {
 	if res.Step == "stop" {
 		if ref, ok := cursorHookAccountRef(raw); ok {
 			stampCursorAccountRef(res.Events, ref)
+			if strings.HasPrefix(ref, cursorAccountRefUnreadablePrefix) {
+				// This turn's Cursor is running now, so an extra profile it runs
+				// in is visible even if it closes before the next vendor poll.
+				rememberRunningCursorProfiles()
+			}
 		}
 	}
 

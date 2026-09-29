@@ -10,15 +10,26 @@ import (
 )
 
 func TestCursorUserDataDirs(t *testing.T) {
+	client, _ := profileLogin(t, "auth0|a", "a@example.com")
+	spaced, _ := profileLogin(t, "auth0|b", "b@example.com")
+	dashed := filepath.Join(t.TempDir(), "Client -- Work")
+	if err := os.MkdirAll(filepath.Dir(cursorProfileStateDB(dashed)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cursorProfileStateDB(dashed), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	got := cursorUserDataDirs([]string{
-		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir=/Users/a/cursor-client",
-		"/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Renderer).app/Contents/MacOS/Cursor Helper (Renderer) --type=renderer --user-data-dir=/Users/a/cursor-client --lang=en",
-		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir /Users/a/Client Work/cursor --new-window",
+		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir=" + client,
+		"/Applications/Cursor.app/Contents/Frameworks/Cursor Helper (Renderer).app/Contents/MacOS/Cursor Helper (Renderer) --type=renderer --user-data-dir=" + client + " --lang=en",
+		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir " + spaced + " --new-window",
+		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir=" + dashed + " --lang=en",
 		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir=relative/dir",
-		"/Applications/Visual Studio Code.app/Contents/MacOS/Electron --user-data-dir=/Users/a/vscode",
+		"/Applications/Cursor.app/Contents/MacOS/Cursor --user-data-dir=/no/such/profile",
+		"/Applications/Visual Studio Code.app/Contents/MacOS/Electron --user-data-dir=" + client,
 		"/Applications/Cursor.app/Contents/MacOS/Cursor",
 	})
-	want := []string{"/Users/a/cursor-client", "/Users/a/Client Work/cursor"}
+	want := []string{client, spaced, dashed}
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -82,12 +93,35 @@ func TestCursorVendorExtraProfileLogin(t *testing.T) {
 		t.Fatalf("calls=%v, want the remembered profile read again", calls)
 	}
 
-	if err := os.RemoveAll(dir); err != nil {
+	// A store that is briefly gone is skipped, not forgotten.
+	if err := os.Rename(dir, dir+".away"); err != nil {
+		t.Fatal(err)
+	}
+	before := calls[profile]
+	pollCursorVendorUsage("dev", resolver, client, time.Now())
+	if calls[profile] != before {
+		t.Fatalf("calls=%v, want the missing store skipped", calls)
+	}
+	if err := os.Rename(dir+".away", dir); err != nil {
 		t.Fatal(err)
 	}
 	pollCursorVendorUsage("dev", resolver, client, time.Now())
-	if _, err := os.Stat(cursorProfilesPath()); !os.IsNotExist(err) {
-		t.Fatalf("profiles file still present after its only store was removed: %v", err)
+	if calls[profile] <= before {
+		t.Fatalf("calls=%v, want the profile read again once its store is back", calls)
+	}
+}
+
+// The hook's scan remembers a profile that is running during a turn, so the
+// next poll reads it after that Cursor has quit.
+func TestRememberRunningCursorProfilesForLaterPoll(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	ideLogin(t, "auth0|ide", "ide@example.com", 4102444800)
+	dir, _ := profileLogin(t, "auth0|short", "short@example.com")
+	runningCursor(t, dir)
+	rememberRunningCursorProfiles()
+	runningCursor(t)
+	if got := cursorExtraProfileStateDBs(); !slices.Equal(got, []string{cursorProfileStateDB(dir)}) {
+		t.Fatalf("got %v, want the profile seen by the hook", got)
 	}
 }
 

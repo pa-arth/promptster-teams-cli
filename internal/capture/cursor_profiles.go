@@ -23,12 +23,15 @@ import (
 // cursor-agent's login was already read.
 //
 // NO SETUP. A profile the engineer works in has a running Cursor process, and
-// Chromium passes `--user-data-dir=` to every helper process. So each cycle scans
-// the process list, and remembers each profile dir it finds. That way the
-// profile is still read in cycles where that Cursor window is closed, which
+// Chromium passes `--user-data-dir=` to every helper process. The process list
+// is scanned by each vendor cycle, and by the hook on any turn whose login is
+// unreadable, since that turn's Cursor is running at that moment. That catches
+// a profile opened and closed between polls. Each profile dir found is
+// remembered, so it is still read in cycles where its window is closed. That
 // matters because an account's usage list covers the whole billing cycle (D1).
-// The file holds paths only, never a credential. A remembered dir whose store is
-// gone is dropped.
+// The file holds paths only, never a credential. A remembered dir is never
+// dropped for a failed read, because a store that is briefly unavailable would
+// then be forgotten until its Cursor runs again. It leaves only by the cap.
 
 const (
 	cursorProfilesVersion = 1
@@ -36,7 +39,8 @@ const (
 	// anyone runs more.
 	cursorProfilesMax     = 8
 	cursorUserDataDirFlag = "--user-data-dir"
-	cursorProcessScanWait = 2 * time.Second
+	// The hook runs this scan inside its 2s budget. `ps` takes tens of ms.
+	cursorProcessScanWait = 500 * time.Millisecond
 )
 
 type cursorProfiles struct {
@@ -63,12 +67,18 @@ func cursorProfileStateDB(dir string) string {
 	return filepath.Join(dir, "User", "globalStorage", "state.vscdb")
 }
 
+func cursorStoreExists(db string) bool {
+	_, err := os.Stat(db)
+	return err == nil
+}
+
 // cursorUserDataDirs pulls `--user-data-dir` values out of Cursor command lines.
-// ps joins argv with spaces, so a value runs to the next ` --` flag. That keeps
-// a dir with a space in its name intact. Relative dirs are skipped.
+// ps joins argv with spaces, so a value's end is ambiguous: `/a/Client -- Work`
+// could be a dir, or `/a/Client` followed by a flag. Each ` --` is a possible
+// end, and the longest candidate with a Cursor store is taken. Relative dirs are
+// skipped.
 func cursorUserDataDirs(lines []string) []string {
 	var dirs []string
-	seen := map[string]bool{}
 	for _, line := range lines {
 		if !strings.Contains(line, "Cursor") {
 			continue
@@ -77,23 +87,30 @@ func cursorUserDataDirs(lines []string) []string {
 		if i < 0 {
 			continue
 		}
-		v := strings.TrimLeft(line[i+len(cursorUserDataDirFlag):], "= ")
-		if j := strings.Index(v, " --"); j >= 0 {
-			v = v[:j]
+		rest := strings.TrimLeft(line[i+len(cursorUserDataDirFlag):], "= ")
+		cands := []string{rest}
+		for j := strings.LastIndex(rest, " --"); j >= 0; j = strings.LastIndex(rest[:j], " --") {
+			cands = append(cands, rest[:j])
 		}
-		v = filepath.Clean(strings.Trim(strings.TrimSpace(v), `"'`))
-		if !filepath.IsAbs(v) || seen[v] {
-			continue
+		for _, c := range cands {
+			c = filepath.Clean(strings.Trim(strings.TrimSpace(c), `"'`))
+			if filepath.IsAbs(c) && cursorStoreExists(cursorProfileStateDB(c)) {
+				if !slices.Contains(dirs, c) {
+					dirs = append(dirs, c)
+				}
+				break
+			}
 		}
-		seen[v] = true
-		dirs = append(dirs, v)
 	}
 	return dirs
 }
 
-// cursorExtraProfileStateDBs returns the store paths of every non-default
-// profile found running now or remembered from before, and updates the file.
-func cursorExtraProfileStateDBs() []string {
+// rememberRunningCursorProfiles adds every running non-default profile to the
+// file, running ones first, and returns the whole list. Both the daemon and the
+// hook write it.
+// ponytail: last writer wins between the two, so a dir can be lost to a race and
+// is found again on its next scan. Lock the file if that is ever observed.
+func rememberRunningCursorProfiles() []string {
 	if !CursorVendorPlatformSupported(runtime.GOOS) && os.Getenv(cursorStateDBEnv) == "" {
 		return nil
 	}
@@ -104,39 +121,43 @@ func cursorExtraProfileStateDBs() []string {
 			f = cursorProfiles{}
 		}
 	}
-	var dirs, dbs []string
-	seen := map[string]bool{}
-	// Running dirs first, so the cap keeps the most recently seen.
+	var dirs []string
 	for _, dir := range append(cursorUserDataDirs(cursorProcessArgs()), f.Dirs...) {
-		db := cursorProfileStateDB(dir)
-		if seen[dir] || db == defaultDB || len(dirs) == cursorProfilesMax {
-			continue
+		if !slices.Contains(dirs, dir) && cursorProfileStateDB(dir) != defaultDB && len(dirs) < cursorProfilesMax {
+			dirs = append(dirs, dir)
 		}
-		seen[dir] = true
-		if _, err := os.Stat(db); err != nil {
-			continue
-		}
-		dirs = append(dirs, dir)
-		dbs = append(dbs, db)
 	}
 	if !slices.Equal(dirs, f.Dirs) {
 		writeCursorProfiles(dirs)
+	}
+	return dirs
+}
+
+// cursorExtraProfileStateDBs returns the stores of every remembered profile
+// that is present this cycle.
+func cursorExtraProfileStateDBs() []string {
+	var dbs []string
+	for _, dir := range rememberRunningCursorProfiles() {
+		if db := cursorProfileStateDB(dir); cursorStoreExists(db) {
+			dbs = append(dbs, db)
+		}
 	}
 	return dbs
 }
 
 func writeCursorProfiles(dirs []string) {
-	path := cursorProfilesPath()
-	if len(dirs) == 0 {
-		_ = os.Remove(path)
-		return
-	}
 	b, err := json.Marshal(cursorProfiles{Version: cursorProfilesVersion, Dirs: dirs})
+	path := cursorProfilesPath()
 	if err != nil || os.MkdirAll(filepath.Dir(path), 0o700) != nil {
 		return
 	}
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, path)
+	// A unique temp name: the hook and the daemon can write at the same moment.
+	tmp, err := os.CreateTemp(filepath.Dir(path), "cursor-profiles-*.tmp")
+	if err != nil {
+		return
+	}
+	_, werr := tmp.Write(b)
+	if cerr := tmp.Close(); werr != nil || cerr != nil || os.Rename(tmp.Name(), path) != nil {
+		_ = os.Remove(tmp.Name())
 	}
 }
