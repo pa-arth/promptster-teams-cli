@@ -443,3 +443,33 @@ func TestCodexPlanTypeRidesTheWindowUsageEvent(t *testing.T) {
 		t.Fatal("absent plan must be omitted, not emitted empty")
 	}
 }
+
+// A plan whose only window we cannot carry still names its plan.
+func TestLatestCodexWindowReading_UnsupportedKeepsPlanType(t *testing.T) {
+	sessions := filepath.Join(t.TempDir(), "sessions")
+	line := strings.Replace(rolloutTokenCount("2026-07-23T10:00:00.000Z", 17.0, 43800.0, 1950000000),
+		`"rate_limits":{`, `"rate_limits":{"plan_type":"team",`, 1)
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-07-23T10-00-00-aaaaaaaa-1111-2222-3333-444444444444.jsonl"), line)
+	r, _, ok := latestCodexWindowReading(sessions, time.Now().Add(-24*time.Hour))
+	if !ok || r.SignalState != signalPlanUnsupported || r.PlanType != "team" {
+		t.Fatalf("reading = %+v ok=%v, want plan_unsupported carrying plan team", r, ok)
+	}
+}
+
+// Learning the plan (or a plan change) is a new event id; no plan keeps the old id.
+func TestWindowUsageIDKeysOnPlanType(t *testing.T) {
+	pct := 49.0
+	r := windowReading{ObservedAt: 1500000000, WeeklyPct: &pct}
+	before := buildWindowUsageEvent("codex", r, 1, "s", "d").ID
+	r.PlanType = "plus"
+	plus := buildWindowUsageEvent("codex", r, 1, "s", "d").ID
+	r.PlanType = "pro"
+	pro := buildWindowUsageEvent("codex", r, 1, "s", "d").ID
+	if before == plus || plus == pro {
+		t.Fatalf("ids collide: none=%s plus=%s pro=%s", before, plus, pro)
+	}
+	r.PlanType = ""
+	if again := buildWindowUsageEvent("codex", r, 1, "s", "d").ID; again != before {
+		t.Fatal("a reading without a plan changed id")
+	}
+}

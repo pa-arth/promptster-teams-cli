@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -326,5 +327,87 @@ func TestModelReplayMigrationPreservesOldActiveRolloutCursor(t *testing.T) {
 	saved := loadCodexWatchProgress()
 	if saved.ModelReplayPending[path] {
 		t.Fatal("go-forward classification did not retire replay marker")
+	}
+}
+
+// codexUsageRows returns the codex_session_usage data queued so far.
+func codexUsageRows(t *testing.T, bufferPath string) []map[string]interface{} {
+	t.Helper()
+	b, err := os.ReadFile(bufferPath) // #nosec G304 -- test temp path.
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var rows []map[string]interface{}
+	for _, line := range strings.Split(string(b), "\n") {
+		var e struct {
+			Kind string                 `json:"kind"`
+			Data map[string]interface{} `json:"data"`
+		}
+		if json.Unmarshal([]byte(line), &e) == nil && e.Kind == "codex_session_usage" {
+			rows = append(rows, e.Data)
+		}
+	}
+	return rows
+}
+
+// The v4 backfill, end to end from saved v3 progress: history already sent
+// without tiers is replayed once with them, and the fast-mode counters rebuilt
+// by that replay carry on correctly across the saved offset.
+func TestTierReplayMigrationFromV3BackfillsOnceAndKeepsFastState(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	buffer := filepath.Join(stateDir, "buffer.jsonl")
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", buffer)
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	workspace := t.TempDir()
+	path := filepath.Join(root, "rollout-019eb780-3081-7ce0-9ba0-8a0bad13b532.jsonl")
+	now := time.Now().UTC()
+	ts := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339) }
+	settings := func(at, tier string) string {
+		return `{"timestamp":"` + at + `","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-astra","service_tier":"` + tier + `"}}}` + "\n"
+	}
+	usage := func(at string, in, cached, out int) string {
+		return fmt.Sprintf(`{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d}}}}`+"\n", at, in, cached, out)
+	}
+	history := codexSessionMetaLine(resolvePath(workspace), ts(-2*time.Hour)) +
+		settings(ts(-2*time.Hour), "default") + usage(ts(-110*time.Minute), 100, 50, 10) +
+		settings(ts(-100*time.Minute), "priority") + usage(ts(-90*time.Minute), 300, 150, 30)
+	if err := os.WriteFile(path, []byte(history), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A v3 watcher already sent this file (without tiers) and saved its cursor at EOF.
+	data, _ := json.Marshal(codexWatchProgress{V: 3, Offsets: map[string]int64{path: int64(len(history))}, Match: map[string]string{path: "yes"}})
+	if err := os.WriteFile(codexWatchProgressPath(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := Session{DeviceID: "tier-replay", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	procs := map[string]*normalize.CodexRolloutProcessor{}
+	poll := func() {
+		loadCodexWatchProgress()
+		pollCodexRollouts(session, resolvePath(workspace), transcriptHistoryCutoff(now), procs, false)
+	}
+	poll()
+	rows := codexUsageRows(t, buffer)
+	if len(rows) != 2 || rows[1]["serviceTier"] != "fast" || fmt.Sprint(rows[1]["fastInputTokens"]) != "200" {
+		t.Fatalf("replayed rows = %+v, want 2 with the second fast (200 fast input)", rows)
+	}
+	poll()
+	if n := len(codexUsageRows(t, buffer)); n != 2 {
+		t.Fatalf("replay ran again: %d rows, want 2", n)
+	}
+
+	// New fast-mode usage after the saved offset adds to the rebuilt counters.
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.WriteString(usage(ts(0), 400, 200, 40))
+	_ = f.Close()
+	poll()
+	rows = codexUsageRows(t, buffer)
+	if len(rows) != 3 || fmt.Sprint(rows[2]["fastInputTokens"]) != "300" || fmt.Sprint(rows[2]["fastOutputTokens"]) != "30" {
+		t.Fatalf("rows = %+v, want a third row with fast input 300 and fast output 30", rows)
 	}
 }

@@ -245,6 +245,7 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 	// subscription whose window we cannot yet express, which is OUR gap and not a
 	// fact about their billing. So remember that we SAW a rate_limits object.
 	var unsupportedTs time.Time
+	var unsupportedPlan string
 	sawUnsupported := false
 
 	_ = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
@@ -273,6 +274,7 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 			// we could not carry it.
 			if ts.After(unsupportedTs) {
 				unsupportedTs = ts
+				unsupportedPlan = reading.PlanType
 				sawUnsupported = true
 			}
 			return nil
@@ -287,7 +289,10 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 	// A real reading always wins: an account can run one project on a plan we
 	// carry and another on one we do not, and a gauge beats an explanation.
 	if !found && sawUnsupported {
-		return absenceReading(signalPlanUnsupported, unsupportedTs.Unix()), "", true
+		// The plan is still known when its window is not: keep it.
+		r := absenceReading(signalPlanUnsupported, unsupportedTs.Unix())
+		r.PlanType = unsupportedPlan
+		return r, "", true
 	}
 	return best, bestSession, found
 }
@@ -397,6 +402,16 @@ func buildWindowUsageEvent(provider string, r windowReading, capturedAt int64, s
 		ptrIntKey(r.FiveHourResetsAt), ptrIntKey(r.WeeklyResetsAt),
 		r.SignalState,
 	))
+	// planType joins the key only when present, so a reading without one keeps
+	// the id it shipped with. A reading re-read by a build that knows the plan
+	// (or whose plan changed) is then a new id and is not dropped as a duplicate.
+	if r.PlanType != "" {
+		e.ID = event.DeterministicUUID(fmt.Sprintf("windowUsage:%s:%s:%d:%s:%s:%s:%s:%s:plan=%s",
+			provider, deviceID, r.ObservedAt,
+			ptrFloatKey(r.FiveHourPct), ptrFloatKey(r.WeeklyPct),
+			ptrIntKey(r.FiveHourResetsAt), ptrIntKey(r.WeeklyResetsAt),
+			r.SignalState, r.PlanType))
+	}
 	return e
 }
 
