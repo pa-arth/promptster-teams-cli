@@ -56,6 +56,7 @@ function headShaFromEvent() {
   if (event.pull_request?.head?.sha) return event.pull_request.head.sha;
   if (event.check_run?.head_sha) return event.check_run.head_sha;
   if (event.check_suite?.head_sha) return event.check_suite.head_sha;
+  if (event.workflow_run?.head_sha) return event.workflow_run.head_sha;
   if (event.review?.commit_id) return event.review.commit_id;
   return null;
 }

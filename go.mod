@@ -9,9 +9,9 @@ require (
 	github.com/jedisct1/go-minisign v0.0.0-20260527172527-a09352b57a22
 	github.com/pkoukk/tiktoken-go v0.1.8
 	github.com/pkoukk/tiktoken-go-loader v0.0.2
-	github.com/praetorian-inc/titus v1.2.9
+	github.com/praetorian-inc/titus v1.2.10
 	golang.org/x/sys v0.48.0
-	modernc.org/sqlite v1.58.0
+	modernc.org/sqlite v1.59.0
 )
 
 require (
@@ -45,7 +45,7 @@ require (
 	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.75.6 // indirect
+	modernc.org/libc v1.75.7 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
 )

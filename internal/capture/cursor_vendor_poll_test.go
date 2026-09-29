@@ -1,6 +1,8 @@
 package capture
 
 import (
+	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"os"
 	"testing"
 	"time"
 
@@ -9,7 +11,9 @@ import (
 
 func beatVendorPollOkAt(t *testing.T) string {
 	t.Helper()
-	v, ok := buildPresenceEvent(Session{DeviceID: "dev"}).Data.(map[string]interface{})["cursorVendorLastPollOkAt"]
+	e := buildPresenceEvent(Session{DeviceID: "dev"})
+	redact.ProjectEvent(&e, false)
+	v, ok := e.Data.(map[string]interface{})["cursorVendorLastPollOkAt"]
 	if !ok {
 		t.Fatal("heartbeat omits cursorVendorLastPollOkAt; it must always be present")
 	}
@@ -60,5 +64,32 @@ func TestCursorVendorPollOkAtAdvancesOnlyOnSuccess(t *testing.T) {
 	pollCursorVendorUsage("dev", resolver, client, time.Now())
 	if again := beatVendorPollOkAt(t); again != got {
 		t.Fatalf("absence moved the stamp: %q -> %q", got, again)
+	}
+}
+
+func TestCursorVendorPollPersistenceErrors(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	if at, err := loadCursorVendorPollOkAt(); err != nil || !at.IsZero() {
+		t.Fatalf("missing: %v %v", at, err)
+	}
+	for _, data := range []string{"broken", `{"v":99,"lastOkAt":"2026-09-29T00:00:00Z"}`, `{"v":1}`} {
+		if err := os.WriteFile(cursorVendorPollPath(), []byte(data), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := loadCursorVendorPollOkAt(); err == nil {
+			t.Fatalf("invalid stamp accepted: %s", data)
+		}
+	}
+	if err := os.Remove(cursorVendorPollPath()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(cursorVendorPollPath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCursorVendorPollOkAt(); err == nil {
+		t.Fatal("read error hidden")
+	}
+	if err := recordCursorVendorPollOk(time.Now()); err == nil {
+		t.Fatal("rename error hidden")
 	}
 }

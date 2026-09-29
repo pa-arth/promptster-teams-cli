@@ -1183,3 +1183,27 @@ func TestProjectMainLoopModelIsBoundedScalar(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectKeepsBoundedTierAndPlanOnly(t *testing.T) {
+	e := eventWithData("codex_session_usage", map[string]interface{}{
+		"threadId": "parent", "inputTokens": int64(10), "serviceTier": "fast",
+		"fastInputTokens": int64(4), "fastCacheReadTokens": int64(2), "fastOutputTokens": int64(1),
+	})
+	ProjectEvent(&e, false)
+	d := e.Data.(map[string]interface{})
+	if d["serviceTier"] != "fast" || d["fastInputTokens"] != int64(4) || d["fastCacheReadTokens"] != int64(2) || d["fastOutputTokens"] != int64(1) {
+		t.Fatalf("projected = %+v", d)
+	}
+	e = eventWithData("codex_session_usage", map[string]interface{}{"threadId": "parent", "serviceTier": leakCanary})
+	ProjectEvent(&e, false)
+	if _, ok := e.Data.(map[string]interface{})["serviceTier"]; ok {
+		t.Fatal("free-text tier survived")
+	}
+	for plan, keep := range map[string]bool{"prolite": true, "pro": true, "business-standard": true, leakCanary: false, "": false} {
+		e = eventWithData("windowUsage", map[string]interface{}{"provider": "codex", "weeklyPct": 49.0, "planType": plan})
+		ProjectEvent(&e, false)
+		if _, ok := e.Data.(map[string]interface{})["planType"]; ok != keep {
+			t.Fatalf("planType %q kept=%v, want %v", plan, ok, keep)
+		}
+	}
+}

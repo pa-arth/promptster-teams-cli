@@ -530,8 +530,8 @@ test("the automerge workflow runs main's copy of the script, not the PR's", asyn
   assert.equal(wf.includes('github.event.pull_request.head.sha'), false);
   assert.match(
     wf,
-    /github\.event\.check_run\.name != 'Automerge on green'/,
-    'must ignore its own check_run or it retriggers forever',
+    /github\.event\.check_run\.app\.slug == 'greptile-apps'/,
+    'check_run must be limited to Greptile — its own (github-actions) check_run would retrigger it forever',
   );
   assert.match(wf, /issue_comment:/, 'must retry after Greptile posts its summary');
 

@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"fmt"
 	"os"
 	"runtime"
 	"time"
@@ -299,7 +300,9 @@ func buildPresenceEvent(session Session) event.Event {
 	gen := loadCursorGenerations()
 	overruns := loadCursorHookOverruns()
 	vendorPollOkAt := ""
-	if t := loadCursorVendorPollOkAt(); !t.IsZero() {
+	if t, err := loadCursorVendorPollOkAt(); err != nil {
+		fmt.Fprintf(os.Stderr, "cursor-vendor: cannot read successful poll timestamp: %v\n", err)
+	} else if !t.IsZero() {
 		vendorPollOkAt = t.UTC().Format(time.RFC3339)
 	}
 

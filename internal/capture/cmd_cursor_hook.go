@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -158,12 +160,29 @@ func runCursorHookInner() {
 		return
 	}
 
+	// A SUBAGENT'S HOOKS ARRIVE UNDER ITS OWN ID AND WITH NO TRANSCRIPT PATH.
+	// Cursor resolves transcript_path from the child id alone, but the child's
+	// file lives at <parent>/subagents/<child>.jsonl, so the lookup misses and
+	// the field is empty. Find the file ourselves: it names the parent, and
+	// claiming it hands the child to this rail exactly as the main chain is.
+	if res.TranscriptPath == "" {
+		if parent, path := cursorSubagentTranscript(res.SessionID); parent != "" {
+			normalize.RollUpCursorSubagent(&res, parent)
+			res.TranscriptPath = path
+		}
+	}
+
 	// Which Cursor login ran this turn (cursor-vendor-multi-account Phase A).
 	// Off the RAW payload: redaction has already rewritten the email in
 	// `redacted`. See cursorHookAccountRef for what is and is not kept.
 	if res.Step == "stop" {
 		if ref, ok := cursorHookAccountRef(raw); ok {
 			stampCursorAccountRef(res.Events, ref)
+			if strings.HasPrefix(ref, cursorAccountRefUnreadablePrefix) {
+				// This turn's Cursor is running now, so an extra profile it runs
+				// in is visible even if it closes before the next vendor poll.
+				rememberRunningCursorProfiles()
+			}
 		}
 	}
 
@@ -331,4 +350,37 @@ func EnsureCursorHooksBestEffort() {
 	if changed && verboseWatch() {
 		fmt.Fprintf(os.Stderr, "promptster-teams: enrolled Cursor hooks in %s\n", cursorUserHooksPath())
 	}
+}
+
+// cursorSubagentTranscript finds the transcript of subagent `id` and returns its
+// parent session id and path, or "" when id is not a known subagent.
+//
+// It looks only under sessions this rail has already CLAIMED, newest claim
+// first: <claimed session dir>/subagents/<id>.jsonl. The parent's own hooks
+// (beforeSubmitPrompt, its tool calls) carry a transcript_path and claimed it
+// before the subagent could run, so the live parent is in the ledger. That makes
+// the lookup a handful of stats instead of a walk of every project, and it can
+// only pick the session that is actually running, never a stale copy of the
+// same uuid in another project dir. A parent this rail never claimed falls back
+// to today's behaviour: the events stay under the child id.
+func cursorSubagentTranscript(id string) (parent, path string) {
+	if id == "" || strings.ContainsAny(id, `/\`) {
+		return "", ""
+	}
+	claims := loadCursorHookClaims()
+	var bestTs int64
+	for key, c := range claims.Claims {
+		if c.TsMs <= bestTs || !isCursorHookClaimed(claims, key) {
+			continue
+		}
+		dir := filepath.Join(CursorProjectsDir(), filepath.FromSlash(filepath.Dir(key)))
+		if filepath.Base(dir) != c.SessionID {
+			continue // a subagent's own claim, not a parent's session dir
+		}
+		candidate := filepath.Join(dir, "subagents", id+".jsonl")
+		if _, err := os.Stat(candidate); err == nil {
+			parent, path, bestTs = c.SessionID, candidate, c.TsMs
+		}
+	}
+	return parent, path
 }
