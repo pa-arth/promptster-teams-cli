@@ -149,6 +149,13 @@ func rememberCursorProfiles(running []string) []string {
 		}
 		dirs = append(dirs, p.dir)
 	}
+	// A running profile whose entry could not be written (a read-only state
+	// dir) is still read this cycle.
+	for i := len(running) - 1; i >= 0; i-- {
+		if dir := running[i]; cursorProfileStateDB(dir) != defaultDB && !slices.Contains(dirs, dir) {
+			dirs = append([]string{dir}, dirs...)
+		}
+	}
 	return dirs
 }
 

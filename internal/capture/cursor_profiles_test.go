@@ -177,3 +177,15 @@ func TestRememberCursorProfilesEvictsOldest(t *testing.T) {
 		t.Fatalf("got %v, want the newest %d, p0 evicted", got, cursorProfilesMax)
 	}
 }
+
+// A running profile is read even when its entry cannot be saved.
+func TestRememberCursorProfilesReturnsRunningWhenUnwritable(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	t.Setenv(cursorStateDBEnv, filepath.Join(t.TempDir(), "default.vscdb"))
+	if err := os.WriteFile(cursorProfilesDir(), nil, 0o600); err != nil { // a file where the dir should be
+		t.Fatal(err)
+	}
+	if got := rememberCursorProfiles([]string{"/profiles/running"}); !slices.Equal(got, []string{"/profiles/running"}) {
+		t.Fatalf("got %v, want the running profile", got)
+	}
+}
