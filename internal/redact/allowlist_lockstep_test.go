@@ -260,6 +260,11 @@ var deviceDeclinesToEmit = map[string]map[string]string{}
 // where the value IS consumed, not merely a note that it is dropped.
 var deviceOnlyFields = map[string]map[string]string{
 	"presence": {
+		"cursorVendorLastPollOkAt": "Consumed from the raw beat by teams-ingest.ts before timeline projection: " +
+			"sanitizeDevicePastTimestamp writes engineer_keys and devices.latest_cursor_vendor_poll_ok_at " +
+			"and latest_cursor_vendor_poll_reported_at (backend migrations 0071/0099). " +
+			"Like other fleet-health fields, intentionally absent from timeline rows; the current-state " +
+			"columns are its consumer. Empty retracts the stamp; absence preserves older readings.",
 		"pendingEvents": "Consumed at ingest BEFORE projection, then deliberately not persisted onto " +
 			"the timeline row. teams-ingest.ts reads event.data.pendingEvents off the raw beat and " +
 			"denormalizes it to engineer_keys.latest_pending_events / latest_pending_reported_at " +
