@@ -98,6 +98,9 @@ type windowReading struct {
 	// absence. An absence reading has every window pointer nil BY CONSTRUCTION —
 	// it is not a zero and must never acquire one. See the const block above.
 	SignalState string
+	// PlanType is Codex's rate_limits.plan_type ("plus", "prolite", "pro", …),
+	// "" when absent. Claude's statusline carries no plan.
+	PlanType string
 }
 
 // reported reports whether this reading carries a window the contract can render.
@@ -160,6 +163,8 @@ func codexResetsAbsolute(w map[string]interface{}, observedAt int64) (int64, boo
 // drops any window whose length matches neither 5h nor weekly.
 func mapCodexRateLimits(rl map[string]interface{}, observedAt int64) windowReading {
 	r := windowReading{ObservedAt: observedAt}
+	plan, _ := rl["plan_type"].(string)
+	r.PlanType = strings.ToLower(strings.TrimSpace(plan))
 	for _, key := range []string{"primary", "secondary"} {
 		w, ok := rl[key].(map[string]interface{})
 		if !ok {
@@ -240,6 +245,7 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 	// subscription whose window we cannot yet express, which is OUR gap and not a
 	// fact about their billing. So remember that we SAW a rate_limits object.
 	var unsupportedTs time.Time
+	var unsupportedPlan string
 	sawUnsupported := false
 
 	_ = filepath.Walk(sessionsDir, func(path string, info os.FileInfo, err error) error {
@@ -268,6 +274,7 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 			// we could not carry it.
 			if ts.After(unsupportedTs) {
 				unsupportedTs = ts
+				unsupportedPlan = reading.PlanType
 				sawUnsupported = true
 			}
 			return nil
@@ -282,7 +289,10 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 	// A real reading always wins: an account can run one project on a plan we
 	// carry and another on one we do not, and a gauge beats an explanation.
 	if !found && sawUnsupported {
-		return absenceReading(signalPlanUnsupported, unsupportedTs.Unix()), "", true
+		// The plan is still known when its window is not: keep it.
+		r := absenceReading(signalPlanUnsupported, unsupportedTs.Unix())
+		r.PlanType = unsupportedPlan
+		return r, "", true
 	}
 	return best, bestSession, found
 }
@@ -373,6 +383,9 @@ func buildWindowUsageEvent(provider string, r windowReading, capturedAt int64, s
 	if !r.reported() {
 		data["signalState"] = r.SignalState
 	}
+	if r.PlanType != "" {
+		data["planType"] = r.PlanType
+	}
 	e.Data = data
 
 	// Deterministic id keyed on provider + device + observedAt + the four window
@@ -389,6 +402,16 @@ func buildWindowUsageEvent(provider string, r windowReading, capturedAt int64, s
 		ptrIntKey(r.FiveHourResetsAt), ptrIntKey(r.WeeklyResetsAt),
 		r.SignalState,
 	))
+	// planType joins the key only when present, so a reading without one keeps
+	// the id it shipped with. A reading re-read by a build that knows the plan
+	// (or whose plan changed) is then a new id and is not dropped as a duplicate.
+	if r.PlanType != "" {
+		e.ID = event.DeterministicUUID(fmt.Sprintf("windowUsage:%s:%s:%d:%s:%s:%s:%s:%s:plan=%s",
+			provider, deviceID, r.ObservedAt,
+			ptrFloatKey(r.FiveHourPct), ptrFloatKey(r.WeeklyPct),
+			ptrIntKey(r.FiveHourResetsAt), ptrIntKey(r.WeeklyResetsAt),
+			r.SignalState, r.PlanType))
+	}
 	return e
 }
 
@@ -500,6 +523,9 @@ type claudeWindowSpool struct {
 	// Omitted for a reading, so a spool written by this build and one written by
 	// the previous build are byte-identical on the normal path.
 	SignalState string `json:"signalState,omitempty"`
+	// Mirrors windowReading.PlanType to keep the two types convertible; the
+	// Claude shim never sets it, so the spool bytes are unchanged.
+	PlanType string `json:"planType,omitempty"`
 }
 
 // writeClaudeWindowSpool atomically overwrites the spool with the latest reading

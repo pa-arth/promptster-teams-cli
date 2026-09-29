@@ -207,6 +207,23 @@ func loadCodexWatchProgress() codexWatchProgress {
 		}
 	}
 
+	// v4: the same reclassify-then-replay as v3, to backfill serviceTier and the
+	// fast-mode counters onto codex_session_usage for the history window.
+	if p.V < 4 {
+		if p.ModelReplayPending == nil {
+			p.ModelReplayPending = map[string]bool{}
+		}
+		p.ClassifyOffsets = map[string]int64{}
+		p.ClassifyDiscarding = map[string]bool{}
+		p.ClassifyScanned = map[string]int{}
+		for path := range p.Offsets {
+			p.ModelReplayPending[path] = true
+			if p.Match[path] == "yes" {
+				delete(p.Match, path)
+			}
+		}
+	}
+
 	p.V = codexProgressSchemaV
 	return p
 }

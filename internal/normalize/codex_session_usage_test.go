@@ -1,6 +1,9 @@
 package normalize
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestCodexCumulativeUsageEmitsWithoutFinalResponse(t *testing.T) {
 	p := NewCodexRolloutProcessor("thread-1")
@@ -76,5 +79,61 @@ func TestModelEnrichedCounterDoesNotCollideWithLegacyReplay(t *testing.T) {
 	replay := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
 	if enriched.ID != replay.ID {
 		t.Fatal("enriched replay not idempotent")
+	}
+}
+
+func TestCodexUsageAttributesFastModeTokensToTheTierInForce(t *testing.T) {
+	p := NewCodexRolloutProcessor("thread-1")
+	p.Process([]byte(`{"timestamp":"2026-09-14T00:00:00Z","type":"session_meta","payload":{"id":"thread-1","session_id":"thread-1"}}`))
+	settings := func(tier string) []byte {
+		return []byte(`{"timestamp":"2026-09-14T00:00:00Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-astra",` + tier + `"approval_policy":"never"}}}`)
+	}
+	usage := func(ts string, in, cached, out int) map[string]interface{} {
+		line := fmt.Sprintf(`{"timestamp":"%s","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":%d,"cached_input_tokens":%d,"output_tokens":%d}}}}`, ts, in, cached, out)
+		got := p.Process([]byte(line))
+		if len(got) != 1 {
+			t.Fatalf("events = %+v", got)
+		}
+		return got[0].Data.(map[string]interface{})
+	}
+	legacy := usage("2026-09-14T00:00:01Z", 100, 50, 10)
+	if _, ok := legacy["serviceTier"]; ok {
+		t.Fatal("tier reported before any thread_settings_applied")
+	}
+
+	p.Process(settings(`"service_tier":"default",`))
+	d := usage("2026-09-14T00:00:02Z", 200, 100, 20)
+	if d["serviceTier"] != "default" || d["fastInputTokens"] != int64(0) {
+		t.Fatalf("standard turn = %+v", d)
+	}
+
+	p.Process(settings(`"service_tier":"priority",`))
+	usage("2026-09-14T00:00:03Z", 500, 300, 50)
+	usage("2026-09-14T00:00:03Z", 500, 300, 50) // a repeated line adds nothing
+	d = usage("2026-09-14T00:00:04Z", 600, 350, 60)
+	if d["serviceTier"] != "fast" || d["fastInputTokens"] != int64(400) || d["fastCacheReadTokens"] != int64(250) || d["fastOutputTokens"] != int64(40) {
+		t.Fatalf("fast turn = %+v", d)
+	}
+
+	p.Process(settings(``)) // key absent: no tier requested, routes as standard
+	d = usage("2026-09-14T00:00:05Z", 700, 400, 70)
+	if d["serviceTier"] != "default" || d["fastInputTokens"] != int64(400) {
+		t.Fatalf("fast counter must stop growing after leaving fast mode: %+v", d)
+	}
+	p.Process(settings(`"service_tier":"turbo",`))
+	if d = usage("2026-09-14T00:00:06Z", 800, 400, 80); d["serviceTier"] != nil {
+		t.Fatalf("unknown tier guessed: %+v", d)
+	}
+}
+
+func TestTierEnrichedCounterDoesNotCollideWithLegacyReplay(t *testing.T) {
+	p := NewCodexRolloutProcessor("parent")
+	p.threadID = "parent"
+	usage := map[string]interface{}{"input_tokens": float64(100), "cached_input_tokens": float64(50), "output_tokens": float64(10)}
+	legacy := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
+	p.tierSeen, p.serviceTier = true, "default"
+	enriched := p.codexSessionUsage(usage, "2026-09-20T00:00:00Z")[0]
+	if legacy.ID == enriched.ID {
+		t.Fatal("tier evidence would be discarded as a duplicate of the counter that shipped without it")
 	}
 }
