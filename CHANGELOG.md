@@ -6,7 +6,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.38.0] — 2026-10-01
+
 ### Added
+
+- On-device incident origin tracing: local parent blame for replaced/deleted lines
+  emits signed SHA/count metadata without source or filenames. Renames, merges,
+  binary files, shallow history and bounded coverage have explicit states.
+- `blame-backfill --repo <checkout> --limit <1..500> [--dry-run]` replays local
+  committed history. Dry-run needs no credentials and queues nothing. Historical
+  replay never invents AI authorship from the current working-tree ledger.
 
 - The presence heartbeat now carries `cursorVendorLastPollOkAt`: when this
   machine's Cursor usage collector last queued a complete snapshot (RFC3339 UTC,
