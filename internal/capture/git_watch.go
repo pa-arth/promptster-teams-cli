@@ -1559,6 +1559,7 @@ func shortBranchName(ref string) string {
 // runGitWatch baselines immediately, then re-polls every gitWatchInterval until
 // stop is closed. Mirrors runConfigCensus's stop-channel loop.
 func runGitWatch(session Session, stop <-chan struct{}) {
+	go runLineOriginWorker(stop)
 	pollGitWatchWorkspace(session)
 	ticker := time.NewTicker(gitWatchInterval)
 	defer ticker.Stop()

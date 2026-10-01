@@ -492,7 +492,9 @@ func attributeCommit(session Session, root, sha string, nowMs int64, lin sibling
 // survives.
 func attributeAndReworkCommit(session Session, root, sha string, foldRework bool, nowMs int64, lin siblingLineage) (recordable bool) {
 	// Independent receipt also covers fixes that only delete lines.
-	queueLineOrigin(session, root, sha, nowMs)
+	if !requestLineOrigin(session, root, sha, nowMs) {
+		return false
+	}
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
 	if !ok {
 		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit

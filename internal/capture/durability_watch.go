@@ -194,7 +194,9 @@ func pollDurability(session Session, roots []string, nowMs int64) {
 				for i := len(commits) - 1; i >= 0; i-- { // oldest-first
 					// The merged fix SHA may only exist on a locally fetched default ref.
 					// Separate receipt idempotence prevents duplicate HEAD observations.
-					queueLineOrigin(session, root, commits[i], nowMs)
+					if !requestLineOrigin(session, root, commits[i], nowMs) {
+						break
+					}
 					pollDurabilityCommit(root, rootKey, session, commits[i], nowMs, lineage)
 				}
 			} else {

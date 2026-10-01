@@ -130,7 +130,7 @@ func TestOriginBinaryAndFileCapStayPartial(t *testing.T) {
 	originWrite(t, dir, "binary", string([]byte{0, 2, 3}))
 	sha := originCommit(t, dir)
 	r, err := AnalyzeLineOrigin(dir, sha)
-	if err != nil || r.State != "partial" || r.CappedFiles != 2 || r.SkippedFiles != 1 || r.TracedLines != 19 {
+	if err != nil || r.State != "partial" || r.CappedFiles != 1 || r.SkippedFiles != 1 || r.TracedLines != 20 {
 		t.Fatalf("bounded: %+v %v", r, err)
 	}
 }
@@ -141,5 +141,79 @@ func TestOriginReceiptProjectionRejectsNestedSource(t *testing.T) {
 	b, _ := json.Marshal(e)
 	if strings.Contains(string(b), "SOURCE_CANARY") {
 		t.Fatalf("leak: %s", b)
+	}
+}
+
+func TestOriginUnsupportedRemoteUsesOpaqueWorkspace(t *testing.T) {
+	dir := originRepo(t)
+	originTestGit(t, dir, "remote", "add", "origin", "https://example.invalid/team/repo+private.git")
+	originWrite(t, dir, "a", "old\n")
+	sha := originCommit(t, dir)
+	r, err := AnalyzeLineOrigin(dir, sha)
+	if err != nil || r.WorkspaceKey != workspaceHashKey(dir) {
+		t.Fatalf("workspace: %+v %v", r, err)
+	}
+	e := lineOriginEvent(Session{}, r)
+	redact.ProjectEvent(&e, false)
+	if e.Data.(map[string]interface{})["commitSha"] != sha {
+		t.Fatal("valid receipt dropped")
+	}
+}
+
+func TestOriginModeOnlyChangesDoNotConsumeTraceCap(t *testing.T) {
+	dir := originRepo(t)
+	for i := 0; i < 20; i++ {
+		originWrite(t, dir, fmt.Sprintf("a%02d", i), "same\n")
+	}
+	originWrite(t, dir, "z", "old\n")
+	intro := originCommit(t, dir)
+	for i := 0; i < 20; i++ {
+		if err := os.Chmod(filepath.Join(dir, fmt.Sprintf("a%02d", i)), 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	originWrite(t, dir, "z", "new\n")
+	sha := originCommit(t, dir)
+	r, err := AnalyzeLineOrigin(dir, sha)
+	if err != nil || r.CappedFiles != 0 || r.TracedLines != 1 || r.ReplacedFrom[0].Sha != intro {
+		t.Fatalf("mode cap: %+v %v", r, err)
+	}
+}
+
+func TestOriginPendingSurvivesFailureAndRestart(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PROMPTSTER_STATE_DIR", filepath.Join(home, "state"))
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(home, "buffer.jsonl"))
+	dir := originRepo(t)
+	originWrite(t, dir, "a", "old\n")
+	sha := originCommit(t, dir)
+	// Outbox failure must not consume the persisted job or mark it handled.
+	blocked := filepath.Join(home, "blocked")
+	if err := os.WriteFile(blocked, []byte("file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(blocked, "outbox.jsonl"))
+	if !requestLineOrigin(Session{DeviceID: "fixture"}, dir, sha, 1) {
+		t.Fatal("enqueue failed")
+	}
+	if _, err := os.Stat(filepath.Join(home, "buffer.jsonl")); !os.IsNotExist(err) {
+		t.Fatal("enqueue ran trace/signing on polling goroutine")
+	}
+	drainLineOriginPending()
+	jobs, err := os.ReadDir(lineOriginPendingDir())
+	if err != nil || len(jobs) != 1 {
+		t.Fatal("failed queue lost pending job", err)
+	}
+	// A new worker invocation uses only the persisted job after delivery recovers.
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(home, "outbox.jsonl"))
+	drainLineOriginPending()
+	jobs, err = os.ReadDir(lineOriginPendingDir())
+	if err != nil || len(jobs) != 0 {
+		t.Fatal("successful retry did not drain", err)
+	}
+	data, err := os.ReadFile(filepath.Join(home, "buffer.jsonl"))
+	if err != nil || !strings.Contains(string(data), sha) {
+		t.Fatal("retry did not sign receipt", err)
 	}
 }
