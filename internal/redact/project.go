@@ -288,6 +288,7 @@ var projectFieldAllowlist = map[string][]string{
 		"cursorHooks", "cursorHookRepairs", "cursorHookUnverifiable",
 		"cursorStopSeen", "cursorStopUsageRows", "cursorStopEmpty",
 		"cursorHookOverruns", "cursorHookUnparsed",
+		"cursorVendorLastPollOkAt",
 	},
 	// Config census: token-count inventory — counts and names only.
 	// workspaceKey is a git remote slug (owner/name) or an opaque sha256(path)

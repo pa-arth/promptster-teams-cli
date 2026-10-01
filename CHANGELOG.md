@@ -4,6 +4,44 @@ All notable changes to `promptster-teams` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/), and the project
 follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- The presence heartbeat now carries `cursorVendorLastPollOkAt`: when this
+  machine's Cursor usage collector last queued a complete snapshot (RFC3339 UTC,
+  `""` if it never has). It lets the dashboard tell a sleeping laptop from a
+  broken collector. It's a timestamp about the collector and carries no usage or
+  account data.
+
+## [0.37.0] — 2026-09-29
+
+### Added
+
+- A Cursor login kept in a separate profile (Cursor started with
+  `--user-data-dir`) is now read, with no setup. Before, only the default
+  profile's login was read, so a second account's turns showed as
+  `unreadable:` and its spend was never collected. The vendor cycle lists
+  running processes and takes each Cursor process's `--user-data-dir`. The
+  Cursor hook runs the same scan on a turn whose login is unreadable, so a
+  profile opened and closed between cycles is still found. Each profile dir is
+  remembered by path only (never a credential), one file per profile under
+  `cursor-profiles/` in the state dir, up to 8. That profile's store is then
+  read the same way as the default one, so its login is collected and its
+  turns are attributed.
+- Codex fast mode and plan type. `codex_session_usage` now carries the routing
+  tier (`serviceTier`: `default`, `fast` or `flex`) and cumulative
+  fast-mode token counters, and `windowUsage` carries Codex's `planType`. Fast
+  mode uses plan credits at a higher rate, so these are what turn a plan's
+  window % into dollars. Needs promptster-backend #1043, which is live.
+
+### Changed
+
+- The Codex watcher's progress schema moves to v4. On first start, it re-reads
+  up to 28 days of local Codex transcripts once to backfill the tier fields. The
+  replay goes on the backfill lane, so live capture is unaffected, but the
+  device uploads a backlog.
+
 ## [0.36.0] — 2026-09-28
 
 ### Added

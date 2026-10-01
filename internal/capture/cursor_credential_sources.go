@@ -49,6 +49,7 @@ type cursorCredentialSourceKind string
 
 const (
 	cursorSourceIDEStateDB       cursorCredentialSourceKind = "ide_state_vscdb"
+	cursorSourceIDEProfile       cursorCredentialSourceKind = "ide_profile_state_vscdb" // a --user-data-dir profile (cursor_profiles.go)
 	cursorSourceAgentAuthFile    cursorCredentialSourceKind = "cursor_agent_auth_json"
 	cursorAgentDirEnv                                       = "PROMPTSTER_CURSOR_AGENT_DIR" // TEST-ONLY: a dir holding auth.json and cli-config.json.
 	cursorAgentFileMaxBytes                                 = 1 << 20
@@ -78,6 +79,10 @@ func readCursorCredentialSources() []cursorCredentialSource {
 	idePath, _ := cursorStateDBPath()
 	cred, err := readCursorCredential()
 	sources := []cursorCredentialSource{{kind: cursorSourceIDEStateDB, path: idePath, cred: cred, err: err}}
+	for _, path := range cursorExtraProfileStateDBs() {
+		cred, err := readCursorCredentialAt(path)
+		sources = append(sources, cursorCredentialSource{kind: cursorSourceIDEProfile, path: path, cred: cred, err: err})
+	}
 	if agent, ok := readCursorAgentAuthFile(); ok {
 		sources = append(sources, agent)
 	}

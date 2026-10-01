@@ -72,6 +72,10 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	// measured against. Nothing about what was in them, and no reason string —
 	// a drop's context is the engineer's payload, a count of drops is a fact about
 	// us. Pinned on the emitted bytes by presence_drops_test.go.
+	//
+	// `cursorVendorLastPollOkAt` is one timestamp about OUR collector: when it
+	// last queued a complete snapshot. No account, no usage, no vendor response.
+	// Always present; "" means never. Pinned by cursor_vendor_poll_test.go.
 	allowed := map[string]bool{
 		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
@@ -81,6 +85,7 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 		"cursorHooks": true, "cursorHookRepairs": true, "cursorHookUnverifiable": true,
 		"cursorStopSeen": true, "cursorStopUsageRows": true, "cursorStopEmpty": true,
 		"cursorHookOverruns": true, "cursorHookUnparsed": true,
+		"cursorVendorLastPollOkAt": true,
 	}
 	for k := range data {
 		if !allowed[k] {
