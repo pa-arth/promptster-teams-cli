@@ -42,14 +42,6 @@ var originBlameHeader = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64}) \d+ (\d
 
 var originWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[a-f0-9]{16})$`)
 
-func originWorkspaceKey(root string) string {
-	key := workspaceKey(root)
-	if len(key) <= 300 && originWorkspace.MatchString(key) {
-		return key
-	}
-	return workspaceHashKey(root)
-}
-
 // Both subprocess time and stdout are bounded. No stderr or source reaches logs.
 type originOutput struct{ bytes.Buffer }
 
@@ -74,7 +66,7 @@ func originGit(ctx context.Context, root string, args ...string) ([]byte, error)
 // today's working tree. Rename pairs come from NUL-delimited raw metadata;
 // deleted files still exist at the parent. Merge commits compare with the first parent, matching the net PR fix. Shallow boundaries remain unknown.
 func AnalyzeLineOrigin(root, sha string) (LineOrigin, error) {
-	r := LineOrigin{Version: 1, CommitSha: sha, WorkspaceKey: originWorkspaceKey(root), State: "measured", ReplacedFrom: []OriginCount{}}
+	r := LineOrigin{Version: 1, CommitSha: sha, WorkspaceKey: workspaceKey(root), State: "measured", ReplacedFrom: []OriginCount{}}
 	if !originSHA.MatchString(sha) {
 		return r, errors.New("expected full commit SHA")
 	}

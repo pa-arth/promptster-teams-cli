@@ -150,7 +150,7 @@ func TestOriginUnsupportedRemoteUsesOpaqueWorkspace(t *testing.T) {
 	originWrite(t, dir, "a", "old\n")
 	sha := originCommit(t, dir)
 	r, err := AnalyzeLineOrigin(dir, sha)
-	if err != nil || r.WorkspaceKey != workspaceHashKey(dir) {
+	if err != nil || r.WorkspaceKey != workspaceHashKey(dir) || r.WorkspaceKey != workspaceKey(dir) {
 		t.Fatalf("workspace: %+v %v", r, err)
 	}
 	e := lineOriginEvent(Session{}, r)
@@ -215,5 +215,36 @@ func TestOriginPendingSurvivesFailureAndRestart(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(home, "buffer.jsonl"))
 	if err != nil || !strings.Contains(string(data), sha) {
 		t.Fatal("retry did not sign receipt", err)
+	}
+}
+
+func TestOriginPublishFailurePreservesWorkingCursor(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PROMPTSTER_STATE_DIR", filepath.Join(home, "state"))
+	dir := originRepo(t)
+	originWrite(t, dir, "a", "old\n")
+	intro := originCommit(t, dir)
+	pollGitWatch([]string{dir}, Session{DeviceID: "fixture"})
+	originWrite(t, dir, "a", "new\n")
+	fix := originCommit(t, dir)
+	pending := lineOriginPendingDir()
+	if err := os.WriteFile(pending, []byte("blocked"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	detected, _, _, _ := pollGitWatch([]string{dir}, Session{DeviceID: "fixture"})
+	if len(detected) != 0 || loadGitWatchCursors()[gitWatchRootKey(dir)] != intro {
+		t.Fatal("failed publish advanced cursor")
+	}
+	if err := os.Remove(pending); err != nil {
+		t.Fatal(err)
+	}
+	detected, _, _, _ = pollGitWatch([]string{dir}, Session{DeviceID: "fixture"})
+	if len(detected[gitWatchRootKey(dir)]) != 1 || loadGitWatchCursors()[gitWatchRootKey(dir)] != fix {
+		t.Fatal("recovered publication did not advance")
+	}
+	jobs, err := os.ReadDir(pending)
+	if err != nil || len(jobs) != 1 {
+		t.Fatal("advance has no durable pending work", err)
 	}
 }

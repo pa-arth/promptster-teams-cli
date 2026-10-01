@@ -1166,7 +1166,7 @@ func saveGitWatchCursors(heads map[string]string) {
 // cursor now claims. Re-reading `HEAD` there would let a commit made in between
 // be folded by the replay AND detected as new by the next poll, which folds its
 // hunks twice.
-func pollGitWatch(roots []string) (map[string][]string, map[string]map[string]struct{}, map[string]bool, map[string]string) {
+func pollGitWatch(roots []string, originSession ...Session) (map[string][]string, map[string]map[string]struct{}, map[string]bool, map[string]string) {
 	prior := loadGitWatchCursors()
 	newHeads := map[string]string{}
 	detected := map[string][]string{}
@@ -1230,6 +1230,20 @@ func pollGitWatch(roots []string) (map[string][]string, map[string]map[string]st
 			deferred += len(commits) - budget
 			commits = commits[len(commits)-budget:]
 		}
+		// Receipt requests must exist before THIS cursor write, which precedes
+		// attribution. Failed publication leaves the whole root cursor owed.
+		if len(originSession) > 0 {
+			published := true
+			for i := len(commits) - 1; i >= 0; i-- {
+				if !requestLineOrigin(originSession[0], root, commits[i], time.Now().UnixMilli()) {
+					published = false
+					break
+				}
+			}
+			if !published {
+				continue
+			}
+		}
 		detected[key] = commits
 		foldable[key] = onFirstParent
 		// Advance only to the newest commit we actually returned. commits[0] is
@@ -1273,7 +1287,7 @@ func pollGitWatchWorkspace(session Session) {
 		aiRoots,
 		loadDiscoveredRepos(nowMs),
 	))
-	detected, foldable, drained, coldStart := pollGitWatch(roots)
+	detected, foldable, drained, coldStart := pollGitWatch(roots, session)
 
 	// Persist the repos with a REASON to stay polled: fresh AI activity or a commit
 	// detected this poll. A merely-idle repo is left to age out after the horizon.

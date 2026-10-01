@@ -448,7 +448,7 @@ func workspaceKey(root string) string {
 	if root == "" {
 		return ""
 	}
-	if slug := gitRemoteSlug(root); slug != "" {
+	if slug := gitRemoteSlug(root); len(slug) <= 300 && originWorkspace.MatchString(slug) {
 		return slug
 	}
 	return workspaceHashKey(root)
