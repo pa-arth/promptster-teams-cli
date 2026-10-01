@@ -50,6 +50,7 @@ func (b *originOutput) Write(p []byte) (int, error) {
 	return b.Buffer.Write(p)
 }
 func originGit(ctx context.Context, root string, args ...string) ([]byte, error) {
+	// #nosec G204 -- fixed git executable, no shell; private callers supply read-only verbs/flags, validated object SHAs and literal paths from local Git metadata. -C names the engineer's selected checkout; no-ext-diff/no-textconv prevent diff drivers.
 	cmd := exec.CommandContext(ctx, "git", append([]string{"--no-pager", "--literal-pathspecs", "-C", root}, args...)...)
 	var out originOutput
 	cmd.Stdout = &out

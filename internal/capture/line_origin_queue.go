@@ -19,7 +19,7 @@ func queueLineOrigin(session Session, root, sha string, nowMs int64) bool {
 	key := workspaceKey(root) + ":" + sha
 	err := sign.WithBufferLock(path+".lock", func() error {
 		seen := map[string]int64{}
-		if data, err := os.ReadFile(path); err == nil {
+		if data, err := os.ReadFile(path); err == nil { // #nosec G304 -- fixed ledger filename under the CLI's own state directory; repo paths and event input never contribute to this path. Bytes are parsed locally as SHA/timestamp metadata, never emitted.
 			_ = json.Unmarshal(data, &seen)
 		}
 		if seen == nil {
