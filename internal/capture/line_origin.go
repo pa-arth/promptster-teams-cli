@@ -40,7 +40,7 @@ var originHunk = regexp.MustCompile(`(?m)^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@
 var originSHA = regexp.MustCompile(`^[0-9a-f]{40}$|^[0-9a-f]{64}$`)
 var originBlameHeader = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64}) \d+ (\d+) (\d+)$`)
 
-var originWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[a-f0-9]{16})$`)
+var originWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+|[a-f0-9]{16})$`)
 
 // Both subprocess time and stdout are bounded. No stderr or source reaches logs.
 type originOutput struct{ bytes.Buffer }

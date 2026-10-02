@@ -6,7 +6,7 @@ import (
 )
 
 var lineOriginSHA = regexp.MustCompile(`^(?:[a-f0-9]{40}|[a-f0-9]{64})$`)
-var lineOriginWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+|[a-f0-9]{16})$`)
+var lineOriginWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+|[a-f0-9]{16})$`)
 
 // Validate values as well as keys: source cannot hide inside an allowed SHA or
 // count field. This is the on-device mirror of CommitLineOriginSchema.

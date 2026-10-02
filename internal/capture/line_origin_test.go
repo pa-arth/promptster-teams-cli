@@ -144,19 +144,38 @@ func TestOriginReceiptProjectionRejectsNestedSource(t *testing.T) {
 	}
 }
 
-func TestOriginUnsupportedRemoteUsesOpaqueWorkspace(t *testing.T) {
+func TestOriginRemoteIdentityMatchesAcrossClonesAndEvents(t *testing.T) {
 	dir := originRepo(t)
 	originTestGit(t, dir, "remote", "add", "origin", "https://example.invalid/team/repo+private.git")
 	originWrite(t, dir, "a", "old\n")
 	sha := originCommit(t, dir)
 	r, err := AnalyzeLineOrigin(dir, sha)
-	if err != nil || r.WorkspaceKey != workspaceHashKey(dir) || r.WorkspaceKey != workspaceKey(dir) {
+	if err != nil || r.WorkspaceKey != "team/repo+private" || r.WorkspaceKey != workspaceKey(dir) {
 		t.Fatalf("workspace: %+v %v", r, err)
 	}
 	e := lineOriginEvent(Session{}, r)
 	redact.ProjectEvent(&e, false)
 	if e.Data.(map[string]interface{})["commitSha"] != sha {
 		t.Fatal("valid receipt dropped")
+	}
+	clone := filepath.Join(t.TempDir(), "clone")
+	originTestGit(t, dir, "clone", dir, clone)
+	for _, remote := range []string{"https://example.invalid/team/repo+private.git", "https://example.invalid/team/repo:private.git"} {
+		originTestGit(t, dir, "remote", "set-url", "origin", remote)
+		originTestGit(t, clone, "remote", "set-url", "origin", remote)
+		expected := workspaceKey(dir)
+		if workspaceKey(clone) != expected || sessionRepoRoot(dir) != expected || sessionRepoRoot(clone) != expected {
+			t.Fatal("identity fragmented across events or checkouts")
+		}
+		r, err := AnalyzeLineOrigin(clone, sha)
+		if err != nil || r.WorkspaceKey != expected {
+			t.Fatal("receipt identity fragmented", err)
+		}
+		e := lineOriginEvent(Session{}, r)
+		redact.ProjectEvent(&e, false)
+		if e.Data.(map[string]interface{})["workspaceKey"] != expected {
+			t.Fatal("fallback projection dropped identity")
+		}
 	}
 }
 

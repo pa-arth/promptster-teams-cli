@@ -99,7 +99,7 @@ func sessionRepoIdentity(cwd string) (root, host string, tracked bool) {
 		dir = r
 	}
 	if h, slug := gitRemote(dir); slug != "" {
-		return slug, h, ok
+		return remoteWorkspaceKey(slug), h, ok
 	}
 	return workspaceHashKey(dir), "", ok
 }
