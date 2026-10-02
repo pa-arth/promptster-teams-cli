@@ -160,7 +160,7 @@ func TestOriginRemoteIdentityMatchesAcrossClonesAndEvents(t *testing.T) {
 	}
 	clone := filepath.Join(t.TempDir(), "clone")
 	originTestGit(t, dir, "clone", dir, clone)
-	for _, remote := range []string{"https://example.invalid/team/repo+private.git", "https://example.invalid/team/repo:private.git"} {
+	for _, remote := range []string{"https://example.invalid/team/repo+private.git", "https://example.invalid/sandbox/repo:private.git"} {
 		originTestGit(t, dir, "remote", "set-url", "origin", remote)
 		originTestGit(t, clone, "remote", "set-url", "origin", remote)
 		expected := workspaceKey(dir)
@@ -168,12 +168,19 @@ func TestOriginRemoteIdentityMatchesAcrossClonesAndEvents(t *testing.T) {
 			t.Fatal("identity fragmented across events or checkouts")
 		}
 		r, err := AnalyzeLineOrigin(clone, sha)
-		if err != nil || r.WorkspaceKey != expected {
+		if expected != normalizeRemoteSlug(remote) {
+			t.Fatal("upgrade changed historical capture identity")
+		}
+		receiptKey := originWorkspaceKey(dir)
+		if expected == "sandbox/repo:private" && receiptKey != "9f96efb319d2a223" {
+			t.Fatal("receipt key differs from backend alias derivation")
+		}
+		if err != nil || r.WorkspaceKey != receiptKey {
 			t.Fatal("receipt identity fragmented", err)
 		}
 		e := lineOriginEvent(Session{}, r)
 		redact.ProjectEvent(&e, false)
-		if e.Data.(map[string]interface{})["workspaceKey"] != expected {
+		if e.Data.(map[string]interface{})["workspaceKey"] != receiptKey {
 			t.Fatal("fallback projection dropped identity")
 		}
 	}

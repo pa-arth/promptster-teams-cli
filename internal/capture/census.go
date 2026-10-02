@@ -449,19 +449,9 @@ func workspaceKey(root string) string {
 		return ""
 	}
 	if slug := gitRemoteSlug(root); slug != "" {
-		return remoteWorkspaceKey(slug)
-	}
-	return workspaceHashKey(root)
-}
-
-// A hosted remote's identity is shared across sessions, receipts, attribution,
-// and census. Safe historical slugs are preserved. Unsupported names use the
-// remote-derived hash, so separate clones still agree without uploading paths.
-func remoteWorkspaceKey(slug string) string {
-	if len(slug) <= 300 && originWorkspace.MatchString(slug) {
 		return slug
 	}
-	return ingest.Sha256Hex(slug)[:16]
+	return workspaceHashKey(root)
 }
 
 // workspaceHashKey is workspaceKey's opaque fallback, split out so a caller that

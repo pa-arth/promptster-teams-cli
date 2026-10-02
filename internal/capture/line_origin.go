@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 )
@@ -42,6 +43,17 @@ var originBlameHeader = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64}) \d+ (\d
 
 var originWorkspace = regexp.MustCompile(`^(?:[A-Za-z0-9_.+-]+/[A-Za-z0-9_.+-]+|[a-f0-9]{16})$`)
 
+// Preserve historical capture identities. Only the new privacy-closed receipt
+// normalizes unsafe names; the server derives this same key from a legacy repo
+// identity when looking up receipts, then joins attribution under its old key.
+func originWorkspaceKey(root string) string {
+	legacy := workspaceKey(root)
+	if len(legacy) <= 300 && originWorkspace.MatchString(legacy) {
+		return legacy
+	}
+	return ingest.Sha256Hex(legacy)[:16]
+}
+
 // Both subprocess time and stdout are bounded. No stderr or source reaches logs.
 type originOutput struct{ bytes.Buffer }
 
@@ -66,7 +78,7 @@ func originGit(ctx context.Context, root string, args ...string) ([]byte, error)
 // today's working tree. Rename pairs come from NUL-delimited raw metadata;
 // deleted files still exist at the parent. Merge commits compare with the first parent, matching the net PR fix. Shallow boundaries remain unknown.
 func AnalyzeLineOrigin(root, sha string) (LineOrigin, error) {
-	r := LineOrigin{Version: 1, CommitSha: sha, WorkspaceKey: workspaceKey(root), State: "measured", ReplacedFrom: []OriginCount{}}
+	r := LineOrigin{Version: 1, CommitSha: sha, WorkspaceKey: originWorkspaceKey(root), State: "measured", ReplacedFrom: []OriginCount{}}
 	if !originSHA.MatchString(sha) {
 		return r, errors.New("expected full commit SHA")
 	}
