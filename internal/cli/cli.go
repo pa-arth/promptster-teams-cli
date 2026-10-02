@@ -70,6 +70,8 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "cursor watcher error: %v\n", err)
 			return 1
 		}
+	case "blame-backfill":
+		return cmdBlameBackfill(argv[2:])
 	case "git-watch":
 		// Out-of-band git watcher: detect new commits per root on a ~60s timer
 		// and advance a persisted per-root HEAD cursor. Detection only — emits
@@ -135,6 +137,7 @@ Commands:
   stop         Stop background capture
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
+  blame-backfill  Trace replaced lines in local Git history (--repo, --limit, --dry-run)
   keepalive    Keep idle Claude sessions' prompt cache warm so resuming doesn't rebuild it (enable|disable|status)
   watch        Foreground capture — tail Claude Code + Codex + Cursor transcripts, redact on-device, ship to your team's backend (Ctrl-C to stop)
   update       Install a newer signed release, or set how this machine updates (--check|--ask-each|--enable-auto|--disable-auto)
