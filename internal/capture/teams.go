@@ -112,6 +112,7 @@ func watchDirFromEnv() string {
 // signs, and ships to the configured ingest endpoint. Returns when either
 // watcher exits (e.g. Ctrl-C).
 func RunTeamsWatch(args []string) error {
+	reapInheritedChildren()
 	// Single-instance guard: only one supervisor may capture at a time, whatever
 	// launched it (manual `start`, this foreground `watch`, or the autostart
 	// service). A second watcher would double-count presence + events and corrupt
