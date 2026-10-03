@@ -158,6 +158,17 @@ func TestCollectCursorVendorRowsBoundsCurrentPeriodAndPaginates(t *testing.T) {
 	}
 }
 
+func TestCollectCursorVendorRowsEmptyPageNamesNoMissingFields(t *testing.T) {
+	client := &cursorVendorClient{base: "https://api2.cursor.sh", http: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return response(`{"totalUsageEventsCount":0,"usageEventsDisplay":[]}`), nil
+	})}}
+	start := time.UnixMilli(1785542400000)
+	rows, shape, err := collectCursorVendorRows(client, cursorCredential{token: "s"}, start, start.Add(time.Hour))
+	if err != nil || len(rows) != 0 || shape.HTTPStatus != 200 || len(shape.MissingFields) != 0 {
+		t.Fatalf("rows=%#v shape=%#v err=%v", rows, shape, err)
+	}
+}
+
 func TestVendorCostClaimSuppressesOnlyHookCost(t *testing.T) {
 	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
 	recordCursorVendorCostClaims([]cursorVendorRow{{ConversationID: "conversation-1"}})
