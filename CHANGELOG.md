@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.38.1] — 2026-10-04
+
+### Fixed
+
+- The Cursor usage collector no longer reports every expected field as missing
+  when Cursor returns a page with no line items, as it does in the first minutes
+  of a new billing cycle. On 2026-10-02 that empty page named all 10 fields
+  absent and paged the backend's response-shape monitor (PD-38) while Cursor's
+  API was fine. Missing fields are now computed only when line items came back;
+  rows whose keys are all unrecognized still name every field.
+- `watch` now reaps git/agent child processes inherited across an in-place
+  self-update. They used to stay as zombies until the daemon restarted.
+
 ## [0.38.0] — 2026-10-01
 
 ### Added
