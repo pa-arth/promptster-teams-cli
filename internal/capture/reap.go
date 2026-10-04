@@ -1,12 +1,10 @@
-//go:build !windows
+//go:build linux || darwin
 
 package capture
 
 import (
+	"fmt"
 	"os"
-	"os/exec"
-	"strconv"
-	"strings"
 )
 
 // reapInheritedChildren waits on children this process did not spawn. A self-update
@@ -16,16 +14,12 @@ import (
 // spawns anything: at that point every child is inherited, so waiting by PID
 // cannot race an exec.Cmd's own Wait.
 func reapInheritedChildren() {
-	// #nosec G204 -- fixed argv; the only argument is our own PID.
-	out, err := exec.Command("pgrep", "-P", strconv.Itoa(os.Getpid())).Output()
+	pids, err := childPIDs(os.Getpid())
 	if err != nil {
-		return // exit 1 = no children, the normal case
+		fmt.Fprintf(os.Stderr, "promptster-teams: could not list inherited child processes (%v); any left by a self-update stay zombies until restart\n", err)
+		return
 	}
-	for _, f := range strings.Fields(string(out)) {
-		pid, err := strconv.Atoi(f)
-		if err != nil {
-			continue
-		}
+	for _, pid := range pids {
 		if p, err := os.FindProcess(pid); err == nil {
 			go func() { _, _ = p.Wait() }()
 		}
