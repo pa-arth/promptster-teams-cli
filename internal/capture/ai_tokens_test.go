@@ -1,6 +1,8 @@
 package capture
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -100,5 +102,27 @@ func TestCommitAiTokensNoAILines(t *testing.T) {
 	}
 	if got := commitAiTokens(diff, files); got != 0 {
 		t.Errorf("commitAiTokens with no likely_ai lines = %d, want 0", got)
+	}
+}
+
+// TestCommitAiTokensSkipsNotAuthoredCode: lockfiles, data files, dependency
+// writes and oversized files add nothing, while a code file beside them still
+// counts.
+func TestCommitAiTokensSkipsNotAuthoredCode(t *testing.T) {
+	ai := func(p string, end int) attrFile {
+		return attrFile{Path: p, LineRanges: []attrLineRange{{Start: 1, End: end, Attribution: attributionLikelyAI}}}
+	}
+	big := strings.Repeat("+x\n", maxAuthoredLinesPerFile+1)
+	diff := "diff --git a/ai.go b/ai.go\n--- /dev/null\n+++ b/ai.go\n@@ -0,0 +1,1 @@\n+package main\n" +
+		"diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n--- /dev/null\n+++ b/pnpm-lock.yaml\n@@ -0,0 +1,1 @@\n+lockfileVersion: 9\n" +
+		"diff --git a/d/rows.jsonl b/d/rows.jsonl\n--- /dev/null\n+++ b/d/rows.jsonl\n@@ -0,0 +1,1 @@\n+{\"a\":1}\n" +
+		"diff --git a/dep.json b/dep.json\n--- /dev/null\n+++ b/dep.json\n@@ -0,0 +1,1 @@\n+{}\n" +
+		fmt.Sprintf("diff --git a/tokenizer.json b/tokenizer.json\n--- /dev/null\n+++ b/tokenizer.json\n@@ -0,0 +1,%d @@\n", maxAuthoredLinesPerFile+1) + big
+	dep := ai("dep.json", 1)
+	dep.GenerationKind = "dependency"
+	files := []attrFile{ai("ai.go", 1), ai("pnpm-lock.yaml", 1), ai("d/rows.jsonl", 1), dep, ai("tokenizer.json", maxAuthoredLinesPerFile+1)}
+
+	if got, want := commitAiTokens(diff, files), countTiktokenTokens("package main"); got != want {
+		t.Errorf("commitAiTokens = %d, want %d (ai.go only)", got, want)
 	}
 }

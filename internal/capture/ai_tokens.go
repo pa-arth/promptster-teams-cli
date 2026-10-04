@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"path"
 	"strings"
 	"sync"
 
@@ -78,7 +79,7 @@ func commitAiTokens(diff string, files []attrFile) int {
 	n := 0
 	for _, f := range files {
 		lines := newLines[f.Path]
-		if len(lines) == 0 {
+		if len(lines) == 0 || notAuthoredCode(f) {
 			continue
 		}
 		for _, r := range f.LineRanges {
@@ -100,4 +101,45 @@ func commitAiTokens(diff string, files []attrFile) int {
 		return 0
 	}
 	return countTiktokenTokens(b.String())
+}
+
+// maxAuthoredLinesPerFile caps how many likely_ai lines one file may add to a
+// commit and still count as code the model wrote.
+// ponytail: a line cap, not a classifier — a genuine 5k-line agent-written file
+// is undercounted; replace with a generated/data detector if that ever shows up.
+const maxAuthoredLinesPerFile = 5000
+
+// notAuthoredCodeExts are files whose lines are data or tool output, never code
+// the model emitted token by token.
+var notAuthoredCodeExts = map[string]bool{
+	".jsonl": true, ".ndjson": true, ".csv": true, ".tsv": true,
+	".lock": true, ".sum": true, ".snap": true, ".map": true,
+}
+
+// notAuthoredCode reports whether a file's likely_ai lines must stay out of
+// aiTokens (and the fingerprint store): a lockfile an install rewrote, a data
+// dump, a vendored tokenizer. Path-level attribution marks every added line of
+// an AI-touched file likely_ai, so one such file swamps the count — on
+// 2026-10-04 three commits (a 757k-line tokenizer.json, scraped .jsonl) were
+// 53.2M of an org's 54.2M merged tokens and put generated:merged below 1:1.
+// The attribution event itself is unchanged; only the token count skips them.
+func notAuthoredCode(f attrFile) bool {
+	if f.GenerationKind == "dependency" {
+		return true
+	}
+	base := path.Base(f.Path)
+	switch base {
+	case "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml":
+		return true
+	}
+	if notAuthoredCodeExts[strings.ToLower(path.Ext(base))] || strings.HasSuffix(base, ".min.js") {
+		return true
+	}
+	n := 0
+	for _, r := range f.LineRanges {
+		if r.Attribution == attributionLikelyAI {
+			n += r.End - r.Start + 1
+		}
+	}
+	return n > maxAuthoredLinesPerFile
 }
