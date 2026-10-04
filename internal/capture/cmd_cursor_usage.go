@@ -211,8 +211,10 @@ func collectCursorVendorRows(client *cursorVendorClient, cred cursorCredential, 
 	shape := cursorVendorShapeRecord{ObservedFields: sortedSet(observedSet), HTTPStatus: 200}
 	// No line items means nothing to judge a field against: an empty page (a
 	// billing cycle minutes old) would otherwise name EVERY expected field
-	// missing and page the shape monitor (PD-38, 2026-10-02).
-	if len(shape.ObservedFields) > 0 {
+	// missing and page the shape monitor (PD-38, 2026-10-02). Gate on the line
+	// items themselves, not the observed names: rows whose every key fails
+	// isSafeShapeFieldName observe nothing, and that rename must still be named.
+	if len(all) > 0 {
 		shape.MissingFields = missingExpectedFields(shape.ObservedFields)
 	}
 	var rows []cursorVendorRow
