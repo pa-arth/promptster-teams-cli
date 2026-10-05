@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
@@ -361,5 +362,55 @@ func TestFailedEnqueueIsNotRecordedAsAttributed(t *testing.T) {
 
 	if got := attributedShas(t, state.OutboxPath()); countSha(got, sha) != 1 {
 		t.Fatalf("after the outbox recovered, %s appears %d times in %v, want exactly 1", sha, countSha(got, sha), got)
+	}
+}
+
+// TestBashEditedSiblingWorktreeIsPolled: an agent that edits a worktree only
+// through Bash records no ai-paths entry there, so discovery used to find the
+// repo's main checkout and never the worktree — its commits were never
+// attributed (prod 2026-10-05: 37 of 82 merged PRs in a week). The sibling must
+// be polled, and the bash-window recovery pass must credit the commit to the
+// session whose Bash command wrote the file.
+func TestBashEditedSiblingWorktreeIsPolled(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	wt := filepath.Join(home, "repos", "proj-feature")
+	git("worktree", "add", "-b", "feature", wt)
+
+	session := Session{DeviceID: "dev-sib", TaskRoot: home}
+	// AI evidence exists ONLY for the main checkout.
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session) // cold-start baseline
+
+	start := time.Now().UnixMilli()
+	writeCommitFile(t, wt, "bar.go", "package main\n\nfunc bar() {}\n")
+	recordBashWindow("bash-sess", gitWatchRootKey(home), start, time.Now().UnixMilli())
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "agent adds bar via bash")
+	sha := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+
+	pollGitWatchWorkspace(session)
+
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit %s in a Bash-edited sibling worktree was not attributed", sha)
+	}
+	out, err := os.ReadFile(state.OutboxPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"sessionId":"bash-sess"`) {
+		t.Fatalf("sibling-worktree commit not credited to the Bash session")
 	}
 }

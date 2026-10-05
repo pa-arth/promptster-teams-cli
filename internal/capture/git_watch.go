@@ -1281,10 +1281,22 @@ func pollGitWatchWorkspace(session Session) {
 	//   3. repos persisted from earlier polls — so a repo keeps being polled across
 	//      the 30-day durability horizon even after its AI edits age out of the
 	//      7-day ai-paths ledger (else its maturing verdicts would be silently lost).
+	//
+	// Each AI-discovered repo also brings its OTHER worktrees. An agent that edits
+	// through Bash (sed, heredocs, codex exec) records no ai-paths entry, so its
+	// worktree was never discovered and its commits never attributed — not even by
+	// the bash-window recovery pass, which only runs on polled roots. Prod
+	// 2026-10-05: 37 of one engineer's 82 merged PRs in a week had no captured
+	// commit, every one from a Bash-edited sibling worktree.
 	aiRoots := discoverAiRepoRoots(session.TaskRoot)
+	var siblings []string
+	for _, r := range aiRoots {
+		siblings = append(siblings, gitWorktrees(r)...)
+	}
 	roots := dedupRootsByKey(concatRoots(
 		workspaceMatchRoots(resolvePath(session.TaskRoot)),
 		aiRoots,
+		siblings,
 		loadDiscoveredRepos(nowMs),
 	))
 	detected, foldable, drained, coldStart := pollGitWatch(roots, session)
