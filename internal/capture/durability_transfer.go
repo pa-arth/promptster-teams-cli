@@ -199,6 +199,9 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 				}
 			}
 		}
+		if len(captured[f.Path]) > maxAuthoredLinesPerFile {
+			delete(captured, f.Path)
+		}
 	}
 	if len(captured) == 0 {
 		return

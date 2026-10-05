@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -596,5 +597,31 @@ func TestFingerprintsForPathInMatchesLoadingPerPath(t *testing.T) {
 	}
 	if fingerprintsForPathIn(store, "rk-eq", "a.go", t0+20*dayMs) != nil {
 		t.Error("a.go must be filtered out past the TTL")
+	}
+}
+
+// TestDurabilityFingerprintsSkipOversizedFile: a file adding more likely_ai lines
+// than maxAuthoredLinesPerFile records nothing, so one generated file cannot
+// evict every other file's evidence from the bounded store.
+func TestDurabilityFingerprintsSkipOversizedFile(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	const t0 int64 = 1_000_000_000_000
+	n := maxAuthoredLinesPerFile + 1
+	var b strings.Builder
+	fmt.Fprintf(&b, "diff --git a/merges.txt b/merges.txt\n--- /dev/null\n+++ b/merges.txt\n@@ -0,0 +1,%d @@\n", n)
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "+tok_%d\n", i)
+	}
+	b.WriteString("diff --git a/app.go b/app.go\n--- /dev/null\n+++ b/app.go\n@@ -0,0 +1,1 @@\n+ai_line\n")
+	files := []attrFile{
+		{Path: "merges.txt", LineRanges: []attrLineRange{{Start: 1, End: n, Attribution: attributionLikelyAI}}},
+		{Path: "app.go", LineRanges: []attrLineRange{{Start: 1, End: 1, Attribution: attributionLikelyAI}}},
+	}
+	recordAiFingerprints("rk-big", "sha", b.String(), files, t0)
+	if fps := fingerprintsForPath("rk-big", "merges.txt", t0); fps != nil {
+		t.Errorf("oversized file recorded %d fingerprints, want none", len(fps))
+	}
+	if fps := fingerprintsForPath("rk-big", "app.go", t0); fps == nil {
+		t.Error("normal file beside the oversized one must still record fingerprints")
 	}
 }

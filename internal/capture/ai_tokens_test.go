@@ -1,6 +1,7 @@
 package capture
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -120,7 +121,10 @@ func TestCommitAiTokensSkipsNotAuthoredCode(t *testing.T) {
 		"diff --git a/tokenizer.json b/tokenizer.json\n--- /dev/null\n+++ b/tokenizer.json\n@@ -0,0 +1,1 @@\n" + big
 	dep := ai("dep.json", 1)
 	dep.GenerationKind = "dependency"
-	files := []attrFile{ai("ai.go", 1), ai("pnpm-lock.yaml", 1), ai("d/rows.jsonl", 1), dep, ai("tokenizer.json", 1)}
+	// Short-line data: over the line cap, under the byte cap, as merges.txt is.
+	diff += fmt.Sprintf("diff --git a/merges.txt b/merges.txt\n--- /dev/null\n+++ b/merges.txt\n@@ -0,0 +1,%d @@\n", maxAuthoredLinesPerFile+1) +
+		strings.Repeat("+a b\n", maxAuthoredLinesPerFile+1)
+	files := []attrFile{ai("ai.go", 1), ai("pnpm-lock.yaml", 1), ai("d/rows.jsonl", 1), dep, ai("tokenizer.json", 1), ai("merges.txt", maxAuthoredLinesPerFile+1)}
 
 	if got, want := commitAiTokens(diff, files), countTiktokenTokens("package main"); got != want {
 		t.Errorf("commitAiTokens = %d, want %d (ai.go only)", got, want)

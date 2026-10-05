@@ -82,6 +82,7 @@ func commitAiTokens(diff string, files []attrFile) int {
 			continue
 		}
 		var fb strings.Builder
+		n := 0
 		for _, r := range f.LineRanges {
 			if r.Attribution != attributionLikelyAI {
 				continue
@@ -90,11 +91,12 @@ func commitAiTokens(diff string, files []attrFile) int {
 				if txt, ok := lines[ln]; ok {
 					fb.WriteString(txt)
 					fb.WriteByte('\n')
+					n++
 				}
 			}
 		}
-		// Bytes, not lines: a compact data file can be one enormous line.
-		if fb.Len() > maxAuthoredBytesPerFile {
+		// Lines AND bytes: a compact data file can be one enormous line.
+		if n > maxAuthoredLinesPerFile || fb.Len() > maxAuthoredBytesPerFile {
 			continue
 		}
 		b.WriteString(fb.String())
@@ -105,11 +107,15 @@ func commitAiTokens(diff string, files []attrFile) int {
 	return countTiktokenTokens(strings.TrimSuffix(b.String(), "\n"))
 }
 
-// maxAuthoredBytesPerFile caps how many likely_ai bytes one file may add to a
-// commit and still count toward aiTokens (~50k tokens). Token count only: the
-// fingerprint store keeps large files so a squash merge can still match them.
-// ponytail: a size cap, not a classifier — a genuine >200KB agent-written file
-// is undercounted; replace with a generated/data detector if that ever shows up.
+// maxAuthoredLinesPerFile / maxAuthoredBytesPerFile cap how much likely_ai
+// content one file may add to a commit and still count as code the model wrote.
+// Over either, it stays out of aiTokens; over the line cap it also stays out of
+// the fingerprint store, where one generated file would otherwise evict every
+// other file's entries from the bounded store.
+// ponytail: size caps, not a classifier — a genuine >5k-line agent-written file
+// is undercounted and loses squash-merge evidence; replace with a generated/data
+// detector if that ever shows up.
+const maxAuthoredLinesPerFile = 5000
 const maxAuthoredBytesPerFile = 200_000
 
 // notAuthoredCodeExts are files whose lines are data or tool output, never code
