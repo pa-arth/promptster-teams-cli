@@ -76,38 +76,41 @@ func commitAiTokens(diff string, files []attrFile) int {
 	}
 	newLines := mapUnifiedDiffNewLines(diff, func(s string) string { return s })
 	var b strings.Builder
-	n := 0
 	for _, f := range files {
 		lines := newLines[f.Path]
 		if len(lines) == 0 || notAuthoredCode(f) {
 			continue
 		}
+		var fb strings.Builder
 		for _, r := range f.LineRanges {
 			if r.Attribution != attributionLikelyAI {
 				continue
 			}
 			for ln := r.Start; ln <= r.End; ln++ {
 				if txt, ok := lines[ln]; ok {
-					if n > 0 {
-						b.WriteByte('\n')
-					}
-					b.WriteString(txt)
-					n++
+					fb.WriteString(txt)
+					fb.WriteByte('\n')
 				}
 			}
 		}
+		// Bytes, not lines: a compact data file can be one enormous line.
+		if fb.Len() > maxAuthoredBytesPerFile {
+			continue
+		}
+		b.WriteString(fb.String())
 	}
-	if n == 0 {
+	if b.Len() == 0 {
 		return 0
 	}
-	return countTiktokenTokens(b.String())
+	return countTiktokenTokens(strings.TrimSuffix(b.String(), "\n"))
 }
 
-// maxAuthoredLinesPerFile caps how many likely_ai lines one file may add to a
-// commit and still count as code the model wrote.
-// ponytail: a line cap, not a classifier — a genuine 5k-line agent-written file
+// maxAuthoredBytesPerFile caps how many likely_ai bytes one file may add to a
+// commit and still count toward aiTokens (~50k tokens). Token count only: the
+// fingerprint store keeps large files so a squash merge can still match them.
+// ponytail: a size cap, not a classifier — a genuine >200KB agent-written file
 // is undercounted; replace with a generated/data detector if that ever shows up.
-const maxAuthoredLinesPerFile = 5000
+const maxAuthoredBytesPerFile = 200_000
 
 // notAuthoredCodeExts are files whose lines are data or tool output, never code
 // the model emitted token by token.
@@ -117,8 +120,8 @@ var notAuthoredCodeExts = map[string]bool{
 }
 
 // notAuthoredCode reports whether a file's likely_ai lines must stay out of
-// aiTokens (and the fingerprint store): a lockfile an install rewrote, a data
-// dump, a vendored tokenizer. Path-level attribution marks every added line of
+// aiTokens and the fingerprint store by KIND: a lockfile an install rewrote, a
+// data dump. Size is judged separately (maxAuthoredBytesPerFile). Path-level attribution marks every added line of
 // an AI-touched file likely_ai, so one such file swamps the count — on
 // 2026-10-04 three commits (a 757k-line tokenizer.json, scraped .jsonl) were
 // 53.2M of an org's 54.2M merged tokens and put generated:merged below 1:1.
@@ -132,14 +135,5 @@ func notAuthoredCode(f attrFile) bool {
 	case "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml":
 		return true
 	}
-	if notAuthoredCodeExts[strings.ToLower(path.Ext(base))] || strings.HasSuffix(base, ".min.js") {
-		return true
-	}
-	n := 0
-	for _, r := range f.LineRanges {
-		if r.Attribution == attributionLikelyAI {
-			n += r.End - r.Start + 1
-		}
-	}
-	return n > maxAuthoredLinesPerFile
+	return notAuthoredCodeExts[strings.ToLower(path.Ext(base))] || strings.HasSuffix(base, ".min.js")
 }
