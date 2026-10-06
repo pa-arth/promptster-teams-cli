@@ -1060,31 +1060,39 @@ func gitBranchCommitsSinceDefault(root, head string) []string {
 	return shas
 }
 
-// recentBranchBase returns the first parent of the oldest first-parent commit
-// head holds past the default branch that was committed at or after sinceUnix —
-// the cursor from which those commits read as new — or "" when there are none.
-// Two read-only spawns.
-func recentBranchBase(root, head string, sinceUnix int64) string {
+// recentBranchCommits lists head's FIRST-PARENT commits past the default branch
+// committed at or after sinceUnix, newest-first — the branch's own recent work,
+// never the history a merge brought in. Over gitWatchMaxCommitsPerPoll it returns
+// the full list and the caller refuses it. One read-only spawn.
+func recentBranchCommits(root, head string, sinceUnix int64) []string {
 	defRef := durabilityDefaultRef(root)
 	if head == "" || defRef == "" {
-		return ""
+		return nil
 	}
 	// #nosec G204 -- constant argv; root is a discovered checkout, defRef a ref git resolved, head from git rev-parse. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent",
 		"--max-age="+strconv.FormatInt(sinceUnix, 10), defRef+".."+head).Output()
 	if err != nil {
-		return ""
+		return nil
 	}
 	shas := parseRevListShas(out)
-	if len(shas) == 0 {
-		return ""
+	if len(shas) > gitWatchMaxCommitsPerPoll {
+		state.HookDebugf("git-watch: new checkout %s holds %d recent commit(s), over the per-root cap %d; replaying none",
+			gitWatchRootKey(root), len(shas), gitWatchMaxCommitsPerPoll)
 	}
-	// #nosec G204 -- constant argv; the sha came from git rev-list. Read-only.
-	parent, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", shas[len(shas)-1]+"^1").Output()
-	if err != nil {
-		return ""
+	return shas
+}
+
+// requestLineOrigins queues line-origin work for commits (newest-first), oldest
+// first, and reports whether all of it was queued. The cursor may advance past
+// them only when it was.
+func requestLineOrigins(session Session, root string, commits []string) bool {
+	for i := len(commits) - 1; i >= 0; i-- {
+		if !requestLineOrigin(session, root, commits[i], time.Now().UnixMilli()) {
+			return false
+		}
 	}
-	return strings.TrimSpace(string(parent))
+	return true
 }
 
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
@@ -1218,33 +1226,41 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
-		replayOnly := false
 		if !hadCursor {
 			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
 			// and it is the whole reason this case is no longer folded in with
 			// "nothing moved" below — the two are indistinguishable from here and a
 			// root that has never been seen is precisely the one whose branch may hold
 			// AI history this device recorded through another copy of the repo.
-			coldStart[key] = head
-			// A root that appears while the daemon already holds cursors is a NEW
-			// checkout (a worktree cut and committed to between two polls), not a
-			// first install. Rather than baselining its recent branch commits away
-			// unreported, start its cursor just before the oldest of them (bounded by
-			// the ai-paths TTL) and let the normal path below report them: it clamps
-			// oldest-first, keeps the cursor behind anything unreported, and queues
-			// line-origin work before advancing. Rework never folds this range (see
-			// replayOnly). A first install (no cursors) keeps the cold-start discipline.
-			base := ""
+			//
+			// EXCEPT a root that appears while the daemon already holds cursors: that
+			// is a NEW checkout (a worktree cut and committed to between two polls),
+			// not a first install, and baselining would drop its commits unreported.
+			// Its recent first-parent branch commits are reported in ONE poll, whole
+			// or not at all — the same discipline as gitBranchCommitsSinceDefault, and
+			// for the same reason: they are never folded into rework, and a partial
+			// range would leave the rest to a later poll that WOULD fold them. Over
+			// the per-root cap, nothing is replayed (logged). Over this poll's budget,
+			// or if line-origin work can't be queued, the root is left WITHOUT a
+			// cursor, so the next poll retries the whole replay.
 			if len(prior) > 0 {
-				base = recentBranchBase(root, head, time.Now().Add(-aiPathsTTL).Unix())
+				recent := recentBranchCommits(root, head, time.Now().Add(-aiPathsTTL).Unix())
+				if len(recent) > 0 && len(recent) <= gitWatchMaxCommitsPerPoll {
+					if len(recent) > budget {
+						deferred += len(recent)
+						continue
+					}
+					if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, recent) {
+						continue
+					}
+					detected[key] = recent
+					budget -= len(recent)
+				}
 			}
-			if base == "" {
-				newHeads[key] = head
-				drained[key] = true
-				continue
-			}
-			lastSeen = base
-			replayOnly = true
+			newHeads[key] = head
+			drained[key] = true
+			coldStart[key] = head
+			continue
 		}
 		if lastSeen == head {
 			newHeads[key] = head // nothing moved
@@ -1276,22 +1292,11 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		}
 		// Receipt requests must exist before THIS cursor write, which precedes
 		// attribution. Failed publication leaves the whole root cursor owed.
-		if len(originSession) > 0 {
-			published := true
-			for i := len(commits) - 1; i >= 0; i-- {
-				if !requestLineOrigin(originSession[0], root, commits[i], time.Now().UnixMilli()) {
-					published = false
-					break
-				}
-			}
-			if !published {
-				continue
-			}
+		if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, commits) {
+			continue
 		}
 		detected[key] = commits
-		if !replayOnly {
-			foldable[key] = onFirstParent
-		}
+		foldable[key] = onFirstParent
 		// Advance only to the newest commit we actually returned. commits[0] is
 		// newest-first: it equals head on a normal or gc'd-recovery poll that fit the
 		// budget, but on a clamped burst (per-root OR global) it is the newest of the

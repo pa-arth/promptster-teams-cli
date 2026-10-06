@@ -411,7 +411,7 @@ const (
 // The window scoping below removes only the CROSS-repo case; the temporal
 // same-workspace overlap is a documented tradeoff of the opt-in heuristic.
 func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
-	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli())
+	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli(), false)
 }
 
 // recordBashWindowAt is recordBashWindow with the session-activity stamp
@@ -423,14 +423,15 @@ func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 // the genuinely live session's windows. Losing those costs a bash-mtime
 // recovery pass — an undercount, but exactly the one the ledger exists to
 // prevent.
-func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, roots ...string) {
+func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, cdAway bool, roots ...string) {
 	if endMs < startMs {
 		startMs, endMs = endMs, startMs
 	}
 	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
-		// The command's own working checkout counts alongside any it names:
-		// `git -C /B status && sed -i … foo.go` edits foo.go in the workdir.
-		if entry.Workdir != "" && !slices.Contains(roots, entry.Workdir) {
+		// The command's working checkout counts alongside any it names
+		// (`git -C /B status && sed -i … foo.go` edits foo.go in the workdir) —
+		// unless the command cd's away, in which case it works where it went.
+		if entry.Workdir != "" && !cdAway && !slices.Contains(roots, entry.Workdir) {
 			roots = append(roots, entry.Workdir)
 		}
 		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs, Roots: roots})
@@ -644,7 +645,20 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, eventRepoRoots(e, taskRoot)...)
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, commandChangesDir(e), eventRepoRoots(e, taskRoot)...)
+}
+
+// bashCdRe matches a `cd` that starts a command segment.
+var bashCdRe = regexp.MustCompile(`(?:^|&&|\|\||;|\()\s*cd\s+\S`)
+
+// commandChangesDir reports whether a Bash command cd's away from its workdir.
+func commandChangesDir(e *event.Event) bool {
+	d, ok := e.Data.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	c, _ := d["command"].(string)
+	return bashCdRe.MatchString(c)
 }
 
 // bashPathRe matches absolute or ~-prefixed path tokens in a shell command

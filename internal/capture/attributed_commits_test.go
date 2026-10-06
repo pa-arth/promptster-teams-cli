@@ -564,10 +564,10 @@ func TestEmptyDotGitIsNotARepo(t *testing.T) {
 	}
 }
 
-// TestLateWorktreeBurstOverTheCapDrainsAcrossPolls (Greptile, #270): a late
-// worktree holding more recent commits than one poll may report must keep its
-// cursor behind the unreported ones, so a later poll reports them.
-func TestLateWorktreeBurstOverTheCapDrainsAcrossPolls(t *testing.T) {
+// lateWorktreeFixture: a daemon already holding cursors, then a worktree cut and
+// given two commits before any poll sees it. Returns the session, the worktree
+// and its commits (oldest first).
+func lateWorktreeFixture(t *testing.T) (Session, string, []string, func(...string), func(...string) string) {
 	tmp := t.TempDir()
 	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
 	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
@@ -575,22 +575,18 @@ func TestLateWorktreeBurstOverTheCapDrainsAcrossPolls(t *testing.T) {
 	if _, err := sign.GenerateSessionKeypair(); err != nil {
 		t.Fatal(err)
 	}
-	prev := gitWatchMaxCommitsPerPoll
-	gitWatchMaxCommitsPerPoll = 1
-	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
-
 	home := t.TempDir()
 	repo := filepath.Join(home, "repos", "proj")
 	git, gitOut := gitRepoAt(t, repo)
 	writeCommitFile(t, repo, "foo.go", "package main\n")
 	git("add", "-A")
 	git("commit", "-m", "baseline")
-	session := Session{DeviceID: "dev-burst", TaskRoot: home}
+	session := Session{DeviceID: "dev-late", TaskRoot: home}
 	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
 	pollGitWatchWorkspace(session)
 
-	wt := filepath.Join(home, "repos", "proj-burst")
-	git("worktree", "add", "-b", "burst", wt)
+	wt := filepath.Join(home, "repos", "proj-late2")
+	git("worktree", "add", "-b", "late2", wt)
 	var shas []string
 	for _, f := range []string{"a.go", "b.go"} {
 		writeCommitFile(t, wt, f, "package main\n")
@@ -598,13 +594,59 @@ func TestLateWorktreeBurstOverTheCapDrainsAcrossPolls(t *testing.T) {
 		git("-C", wt, "commit", "-m", f)
 		shas = append(shas, strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD")))
 	}
+	return session, wt, shas, git, gitOut
+}
+
+// TestLateWorktreeReplayOverBudgetRetriesWhole (Greptile, #270): a replay that
+// does not fit this poll's budget is deferred whole — no cursor saved — and the
+// next poll with budget reports every commit exactly once.
+func TestLateWorktreeReplayOverBudgetRetriesWhole(t *testing.T) {
+	session, _, shas, _, _ := lateWorktreeFixture(t)
+	prev := gitWatchMaxCommitsPerPollTotal
+	gitWatchMaxCommitsPerPollTotal = 1
 	pollGitWatchWorkspace(session)
+	gitWatchMaxCommitsPerPollTotal = prev
+	if got := attributedShas(t, state.OutboxPath()); countSha(got, shas[0])+countSha(got, shas[1]) != 0 {
+		t.Fatalf("an over-budget replay reported part of its range: %v", got)
+	}
 	pollGitWatchWorkspace(session)
 	got := attributedShas(t, state.OutboxPath())
 	for _, sha := range shas {
 		if countSha(got, sha) != 1 {
-			t.Fatalf("late-worktree commit %s reported %d times across two capped polls, want 1", sha, countSha(got, sha))
+			t.Fatalf("deferred replay commit %s reported %d times, want 1", sha, countSha(got, sha))
 		}
+	}
+}
+
+// TestLateWorktreeReplayOverTheCapReplaysNone: whole or nothing, like the
+// cold-start rework replay — never a partial range a later poll would fold.
+func TestLateWorktreeReplayOverTheCapReplaysNone(t *testing.T) {
+	session, _, shas, _, _ := lateWorktreeFixture(t)
+	prev := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
+	pollGitWatchWorkspace(session)
+	pollGitWatchWorkspace(session)
+	if got := attributedShas(t, state.OutboxPath()); countSha(got, shas[0])+countSha(got, shas[1]) != 0 {
+		t.Fatalf("an over-cap replay reported a partial range: %v", got)
+	}
+}
+
+// TestLateWorktreeReplayIgnoresMergedInHistory (Greptile, #270): an older branch
+// merged into the new worktree is not its recent work.
+func TestLateWorktreeReplayIgnoresMergedInHistory(t *testing.T) {
+	session, wt, shas, git, gitOut := lateWorktreeFixture(t)
+	// An older side branch, merged into the worktree.
+	git("-C", wt, "checkout", "-q", "-b", "side", shas[0]+"~1")
+	writeCommitFile(t, wt, "side.go", "package main\n")
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "side")
+	side := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+	git("-C", wt, "checkout", "-q", "late2")
+	git("-C", wt, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+	pollGitWatchWorkspace(session)
+	if countSha(attributedShas(t, state.OutboxPath()), side) != 0 {
+		t.Fatalf("merged-in side-branch commit %s was replayed as new work", side)
 	}
 }
 
@@ -625,5 +667,25 @@ func TestBashWindowKeepsTheWorkdirAlongsideNamedPaths(t *testing.T) {
 	ws := readBashWindows(gitWatchRootKey(home))
 	if len(ws) != 1 || !slices.Contains(ws[0].Roots, resolvePath(a)) || !slices.Contains(ws[0].Roots, resolvePath(b)) {
 		t.Fatalf("window roots = %v, want both the workdir and the named checkout", ws)
+	}
+}
+
+// TestCdAwayCommandDoesNotClaimTheWorkdir (Greptile, #270): `cd /B && …` works
+// in B only.
+func TestCdAwayCommandDoesNotClaimTheWorkdir(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": a}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+b+" && sed -i x foo.go"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || len(ws[0].Roots) != 1 || ws[0].Roots[0] != resolvePath(b) {
+		t.Fatalf("window roots = %v, want only %s", ws, b)
 	}
 }
