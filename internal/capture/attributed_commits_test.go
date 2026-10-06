@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -560,5 +561,69 @@ func TestEmptyDotGitIsNotARepo(t *testing.T) {
 	}
 	if isGitRepoRoot(dir) {
 		t.Fatal("an empty .git dir was treated as a repository")
+	}
+}
+
+// TestLateWorktreeBurstOverTheCapDrainsAcrossPolls (Greptile, #270): a late
+// worktree holding more recent commits than one poll may report must keep its
+// cursor behind the unreported ones, so a later poll reports them.
+func TestLateWorktreeBurstOverTheCapDrainsAcrossPolls(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
+
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-burst", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session)
+
+	wt := filepath.Join(home, "repos", "proj-burst")
+	git("worktree", "add", "-b", "burst", wt)
+	var shas []string
+	for _, f := range []string{"a.go", "b.go"} {
+		writeCommitFile(t, wt, f, "package main\n")
+		git("-C", wt, "add", "-A")
+		git("-C", wt, "commit", "-m", f)
+		shas = append(shas, strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD")))
+	}
+	pollGitWatchWorkspace(session)
+	pollGitWatchWorkspace(session)
+	got := attributedShas(t, state.OutboxPath())
+	for _, sha := range shas {
+		if countSha(got, sha) != 1 {
+			t.Fatalf("late-worktree commit %s reported %d times across two capped polls, want 1", sha, countSha(got, sha))
+		}
+	}
+}
+
+// TestBashWindowKeepsTheWorkdirAlongsideNamedPaths (Greptile, #270):
+// `git -C /B status && sed -i … foo.go` edits foo.go in the workdir A.
+func TestBashWindowKeepsTheWorkdirAlongsideNamedPaths(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": a}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "git -C "+b+" status && sed -i x foo.go"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || !slices.Contains(ws[0].Roots, resolvePath(a)) || !slices.Contains(ws[0].Roots, resolvePath(b)) {
+		t.Fatalf("window roots = %v, want both the workdir and the named checkout", ws)
 	}
 }

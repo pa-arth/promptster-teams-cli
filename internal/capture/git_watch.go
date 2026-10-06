@@ -1060,25 +1060,31 @@ func gitBranchCommitsSinceDefault(root, head string) []string {
 	return shas
 }
 
-// recentBranchCommits lists head's first-parent commits past the default branch
-// committed at or after sinceUnix, newest-first, at most gitWatchMaxCommitsPerPoll.
-// One read-only spawn.
-func recentBranchCommits(root, head string, sinceUnix int64) []string {
+// recentBranchBase returns the first parent of the oldest first-parent commit
+// head holds past the default branch that was committed at or after sinceUnix —
+// the cursor from which those commits read as new — or "" when there are none.
+// Two read-only spawns.
+func recentBranchBase(root, head string, sinceUnix int64) string {
 	defRef := durabilityDefaultRef(root)
 	if head == "" || defRef == "" {
-		return nil
+		return ""
 	}
 	// #nosec G204 -- constant argv; root is a discovered checkout, defRef a ref git resolved, head from git rev-parse. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent",
 		"--max-age="+strconv.FormatInt(sinceUnix, 10), defRef+".."+head).Output()
 	if err != nil {
-		return nil
+		return ""
 	}
 	shas := parseRevListShas(out)
-	if len(shas) > gitWatchMaxCommitsPerPoll {
-		shas = shas[:gitWatchMaxCommitsPerPoll]
+	if len(shas) == 0 {
+		return ""
 	}
-	return shas
+	// #nosec G204 -- constant argv; the sha came from git rev-list. Read-only.
+	parent, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", shas[len(shas)-1]+"^1").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(parent))
 }
 
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
@@ -1212,32 +1218,33 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
+		replayOnly := false
 		if !hadCursor {
 			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
 			// and it is the whole reason this case is no longer folded in with
 			// "nothing moved" below — the two are indistinguishable from here and a
 			// root that has never been seen is precisely the one whose branch may hold
 			// AI history this device recorded through another copy of the repo.
-			newHeads[key] = head
-			drained[key] = true
 			coldStart[key] = head
 			// A root that appears while the daemon already holds cursors is a NEW
 			// checkout (a worktree cut and committed to between two polls), not a
-			// first install. Its recent branch commits would otherwise be baselined
-			// away unreported. Attributed only, never folded into rework (foldable
-			// stays empty), and bounded by the TTL and the shared budget. A first
-			// install (no cursors at all) keeps the cold-start discipline.
-			if len(prior) > 0 && budget > 0 {
-				recent := recentBranchCommits(root, head, time.Now().Add(-aiPathsTTL).Unix())
-				if len(recent) > budget {
-					recent = recent[:budget]
-				}
-				if len(recent) > 0 {
-					detected[key] = recent
-					budget -= len(recent)
-				}
+			// first install. Rather than baselining its recent branch commits away
+			// unreported, start its cursor just before the oldest of them (bounded by
+			// the ai-paths TTL) and let the normal path below report them: it clamps
+			// oldest-first, keeps the cursor behind anything unreported, and queues
+			// line-origin work before advancing. Rework never folds this range (see
+			// replayOnly). A first install (no cursors) keeps the cold-start discipline.
+			base := ""
+			if len(prior) > 0 {
+				base = recentBranchBase(root, head, time.Now().Add(-aiPathsTTL).Unix())
 			}
-			continue
+			if base == "" {
+				newHeads[key] = head
+				drained[key] = true
+				continue
+			}
+			lastSeen = base
+			replayOnly = true
 		}
 		if lastSeen == head {
 			newHeads[key] = head // nothing moved
@@ -1282,7 +1289,9 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 			}
 		}
 		detected[key] = commits
-		foldable[key] = onFirstParent
+		if !replayOnly {
+			foldable[key] = onFirstParent
+		}
 		// Advance only to the newest commit we actually returned. commits[0] is
 		// newest-first: it equals head on a normal or gc'd-recovery poll that fit the
 		// budget, but on a clamped burst (per-root OR global) it is the newest of the

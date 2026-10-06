@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -427,8 +428,10 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 		startMs, endMs = endMs, startMs
 	}
 	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
-		if len(roots) == 0 && entry.Workdir != "" {
-			roots = []string{entry.Workdir}
+		// The command's own working checkout counts alongside any it names:
+		// `git -C /B status && sed -i … foo.go` edits foo.go in the workdir.
+		if entry.Workdir != "" && !slices.Contains(roots, entry.Workdir) {
+			roots = append(roots, entry.Workdir)
 		}
 		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs, Roots: roots})
 		if len(entry.Windows) > bashWindowsMaxPerSession {
