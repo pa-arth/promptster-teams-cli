@@ -185,7 +185,7 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 	captured := map[string][]durAiFingerprint{} // path -> new entries
 	for _, f := range files {
 		lines := newLines[f.Path]
-		if len(lines) == 0 {
+		if len(lines) == 0 || notAuthoredCode(f) {
 			continue
 		}
 		lineage := durLineageID(sha, f.Path)
@@ -198,6 +198,9 @@ func recordAiFingerprints(rootKey, sha, diff string, files []attrFile, nowMs int
 					captured[f.Path] = append(captured[f.Path], durAiFingerprint{FP: fp, LineageID: lineage, BornTsMs: nowMs})
 				}
 			}
+		}
+		if len(captured[f.Path]) > maxAuthoredLinesPerFile {
+			delete(captured, f.Path)
 		}
 	}
 	if len(captured) == 0 {
