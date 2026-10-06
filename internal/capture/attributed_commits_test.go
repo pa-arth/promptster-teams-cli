@@ -479,3 +479,86 @@ func TestBashRecoveryCreditsTheSessionThatWorkedThere(t *testing.T) {
 		t.Fatalf("credited %q (ok=%v), want the session that worked in this checkout", got, ok)
 	}
 }
+
+// TestWorktreeCutAndCommittedBetweenPollsIsAttributed (Greptile, #270): a
+// worktree that appears and gets its first commit between two polls used to be
+// cold-started at that commit and never reported.
+func TestWorktreeCutAndCommittedBetweenPollsIsAttributed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-late", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session) // daemon now holds cursors
+
+	wt := filepath.Join(home, "repos", "proj-late")
+	git("worktree", "add", "-b", "late", wt)
+	writeCommitFile(t, wt, "bar.go", "package main\n\nfunc bar() {}\n")
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "first commit before any poll saw the worktree")
+	sha := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+
+	pollGitWatchWorkspace(session)
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit made before the worktree's first poll was skipped")
+	}
+}
+
+// TestBashCommandOutsideCaptureScopeAddsNoRoot (Greptile, #270): naming a repo
+// outside the workspace in a command must not widen capture.
+func TestBashCommandOutsideCaptureScopeAddsNoRoot(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	inside := filepath.Join(home, "repos", "in")
+	outside := filepath.Join(t.TempDir(), "elsewhere")
+	gitRepoAt(t, inside)
+	gitRepoAt(t, outside)
+	got := eventRepoRoots(aiCommandEvent("s", "cd "+outside+" && cd "+inside), home)
+	if len(got) != 1 || got[0] != resolvePath(inside) {
+		t.Fatalf("roots = %v, want only the in-scope %s", got, inside)
+	}
+}
+
+// TestBashWindowKeepsItsOwnCheckout (Greptile, #270): a session that later works
+// in checkout B must not make its earlier checkout-A command eligible for B.
+func TestBashWindowKeepsItsOwnCheckout(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+a+" && sed -i x f"), home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+b+" && sed -i x f"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 2 {
+		t.Fatalf("windows = %d, want 2", len(ws))
+	}
+	for _, w := range ws {
+		if len(w.Roots) != 1 {
+			t.Fatalf("window roots = %v, want exactly its own checkout", w.Roots)
+		}
+	}
+}
+
+// TestEmptyDotGitIsNotARepo: a stray empty `.git` dir (seen at /tmp) made every
+// path beneath it resolve to a fake repo root.
+func TestEmptyDotGitIsNotARepo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isGitRepoRoot(dir) {
+		t.Fatal("an empty .git dir was treated as a repository")
+	}
+}

@@ -365,21 +365,22 @@ type bashWindowsEntry struct {
 	Windows []bashWindowSpan `json:"windows"`
 	TsMs    int64            `json:"tsMs"`
 	RootKey string           `json:"rootKey"`
-	// Roots are the repo checkouts (resolved absolute paths) this session worked
-	// in: its prompts' workdir and every directory its Bash commands name. They
-	// make the session's repos discoverable to git-watch, and let recovery credit
-	// a commit only to a session that worked in that checkout. Local-only — this
+	// Workdir is the checkout the session's latest prompt ran in (resolved repo
+	// root). It is the checkout of every later command that names no path, and it
+	// makes a repo worked in purely through Bash discoverable. Local-only — this
 	// ledger never leaves the device.
-	Roots []string `json:"roots,omitempty"`
+	Workdir string `json:"workdir,omitempty"`
 }
-
-// bashRootsMaxPerSession bounds Roots; the newest are kept.
-const bashRootsMaxPerSession = 16
 
 // bashWindowSpan is one AI bash command's execution window, in Unix ms.
 type bashWindowSpan struct {
 	StartMs int64 `json:"startMs"`
 	EndMs   int64 `json:"endMs"`
+	// Roots are the checkouts THIS command worked in: the directories it names,
+	// else the session's workdir when it ran. Stored per window, so evidence a
+	// session gathers later in another checkout never reaches back to an earlier
+	// command. Empty on windows recorded before this field existed.
+	Roots []string `json:"roots,omitempty"`
 }
 
 // bashWindow is a span joined with the session that recorded it — the shape the
@@ -388,7 +389,7 @@ type bashWindow struct {
 	SessionID string
 	StartMs   int64
 	EndMs     int64
-	Roots     []string // the session's recorded checkouts; nil = unknown
+	Roots     []string // the checkouts this window's command worked in; nil = unknown
 }
 
 const (
@@ -426,41 +427,25 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 		startMs, endMs = endMs, startMs
 	}
 	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
-		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
+		if len(roots) == 0 && entry.Workdir != "" {
+			roots = []string{entry.Workdir}
+		}
+		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs, Roots: roots})
 		if len(entry.Windows) > bashWindowsMaxPerSession {
 			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
 		}
-		addBashRoots(entry, roots)
 	})
 }
 
-// recordBashRoots records the checkouts a session worked in without a window
-// (a prompt's workdir carries no edit time).
-func recordBashRoots(sessionID, rootKey string, activityMs int64, roots []string) {
-	if len(roots) == 0 {
+// recordBashWorkdir records the checkout a session's prompt ran in. No window: a
+// prompt edits nothing.
+func recordBashWorkdir(sessionID, rootKey string, activityMs int64, workdir string) {
+	if workdir == "" {
 		return
 	}
 	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
-		addBashRoots(entry, roots)
+		entry.Workdir = workdir
 	})
-}
-
-func addBashRoots(entry *bashWindowsEntry, roots []string) {
-	for _, r := range roots {
-		dup := false
-		for _, have := range entry.Roots {
-			if have == r {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			entry.Roots = append(entry.Roots, r)
-		}
-	}
-	if len(entry.Roots) > bashRootsMaxPerSession {
-		entry.Roots = entry.Roots[len(entry.Roots)-bashRootsMaxPerSession:]
-	}
 }
 
 func updateBashEntry(sessionID, rootKey string, activityMs int64, mutate func(*bashWindowsEntry)) {
@@ -514,7 +499,7 @@ func readBashWindows(rootKey string) []bashWindow {
 	var out []bashWindow
 	for sid, entry := range liveBashEntries(rootKey) {
 		for _, w := range entry.Windows {
-			out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs, Roots: entry.Roots})
+			out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs, Roots: w.Roots})
 		}
 	}
 	return out
@@ -555,11 +540,17 @@ func liveBashEntries(rootKey string) map[string]bashWindowsEntry {
 func readBashRoots(rootKey string) []string {
 	seen := map[string]bool{}
 	var out []string
+	add := func(r string) {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
 	for _, entry := range liveBashEntries(rootKey) {
-		for _, r := range entry.Roots {
-			if !seen[r] {
-				seen[r] = true
-				out = append(out, r)
+		add(entry.Workdir)
+		for _, w := range entry.Windows {
+			for _, r := range w.Roots {
+				add(r)
 			}
 		}
 	}
@@ -618,7 +609,9 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 		if taskRoot != "" {
 			rootKey = gitWatchRootKey(taskRoot)
 		}
-		recordBashRoots(e.SessionID, rootKey, now, eventRepoRoots(e))
+		if roots := eventRepoRoots(e, taskRoot); len(roots) > 0 {
+			recordBashWorkdir(e.SessionID, rootKey, now, roots[0])
+		}
 		return
 	}
 	if e.Provenance == nil || e.Provenance.Attribution != "likely_ai" {
@@ -648,7 +641,7 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, eventRepoRoots(e)...)
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, eventRepoRoots(e, taskRoot)...)
 }
 
 // bashPathRe matches absolute or ~-prefixed path tokens in a shell command
@@ -657,8 +650,10 @@ var bashPathRe = regexp.MustCompile(`(?:^|[\s'"=(])((?:~|/)[^\s'"` + "`" + `;|&(
 
 // eventRepoRoots returns the repo checkouts an event places its session in: a
 // prompt's workdir, or the directories a Bash command names. Stat-only (no git
-// spawn); a token that is not inside a repo contributes nothing.
-func eventRepoRoots(e *event.Event) []string {
+// spawn); a token that is not inside a repo contributes nothing, and neither does
+// a repo outside capture scope (see inCaptureScope) — naming a path in a command
+// must never widen what this install captures.
+func eventRepoRoots(e *event.Event, taskRoot string) []string {
 	var cands []string
 	switch d := e.Data.(type) {
 	case map[string]interface{}:
@@ -691,6 +686,9 @@ func eventRepoRoots(e *event.Event) []string {
 		}
 		if r, ok := gitRootOf(dir); ok {
 			r = resolvePath(r)
+			if !inCaptureScope(r, taskRoot) {
+				continue
+			}
 			if !seen[r] {
 				seen[r] = true
 				roots = append(roots, r)
@@ -870,4 +868,23 @@ func dedupeFileDiff(taskRoot string, e *event.Event, replay bool) bool {
 		recordAiTouchedPathAt(e.SessionID, rootKey, rel, writeMs, replay)
 	}
 	return won
+}
+
+// inCaptureScope reports whether a checkout is one this install already captures:
+// under the workspace or a registered capture root, or a linked worktree whose
+// repository is (an agent's scratch worktree under /tmp belongs to the repo it
+// was cut from).
+func inCaptureScope(root, taskRoot string) bool {
+	scope := []string{}
+	if taskRoot != "" {
+		scope = append(scope, resolvePath(taskRoot))
+	}
+	for _, r := range RegisteredCaptureRoots() {
+		scope = append(scope, resolvePath(r))
+	}
+	if pathWithinAny(root, scope) {
+		return true
+	}
+	gitdir, ok := worktreeGitdir(root)
+	return ok && pathWithinAny(resolvePath(gitdir), scope)
 }

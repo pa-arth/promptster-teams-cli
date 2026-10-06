@@ -325,8 +325,8 @@ func recoverBashSession(root, relPath string, windows []bashWindow) (string, boo
 	}
 	mtimeMs := info.ModTime().UnixMilli()
 
-	// Only a session that worked in THIS checkout (or recorded no checkouts at
-	// all — older ledgers) may claim the file. With several agents running at
+	// Only a window whose command worked in THIS checkout (or that recorded no
+	// checkout — older ledgers) may claim the file. With several agents running at
 	// once, a quarter of Bash calls land within 6s of another session's, and the
 	// nearest window alone credited whichever happened to be closest.
 	here := resolvePath(root)

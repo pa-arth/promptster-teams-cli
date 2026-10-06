@@ -579,6 +579,7 @@ func TestProjectClaudeMdTokensNested(t *testing.T) {
 	writeClaudeFixture(t, root, ".git/CLAUDE.md", 4000)
 	writeClaudeFixture(t, root, ".claude/worktrees/wt/CLAUDE.md", 4000)
 	writeClaudeFixture(t, root, "d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // dir d6 is 6 levels down → past bound
+	markGitRepo(t, root) // the .git/CLAUDE.md fixture alone is not a repo
 
 	const want = 50 // max(app=50, packages/x/y=10), NOT the 60 sum
 	got, pos := projectClaudeMdTokens(root)
@@ -615,6 +616,9 @@ func TestProjectClaudeMdTokensNested(t *testing.T) {
 func markGitRepo(t *testing.T, root string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

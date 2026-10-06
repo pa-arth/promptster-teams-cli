@@ -1060,6 +1060,27 @@ func gitBranchCommitsSinceDefault(root, head string) []string {
 	return shas
 }
 
+// recentBranchCommits lists head's first-parent commits past the default branch
+// committed at or after sinceUnix, newest-first, at most gitWatchMaxCommitsPerPoll.
+// One read-only spawn.
+func recentBranchCommits(root, head string, sinceUnix int64) []string {
+	defRef := durabilityDefaultRef(root)
+	if head == "" || defRef == "" {
+		return nil
+	}
+	// #nosec G204 -- constant argv; root is a discovered checkout, defRef a ref git resolved, head from git rev-parse. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent",
+		"--max-age="+strconv.FormatInt(sinceUnix, 10), defRef+".."+head).Output()
+	if err != nil {
+		return nil
+	}
+	shas := parseRevListShas(out)
+	if len(shas) > gitWatchMaxCommitsPerPoll {
+		shas = shas[:gitWatchMaxCommitsPerPoll]
+	}
+	return shas
+}
+
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
 // keeping the OLDEST cap commits (rev-list is newest-first, so the tail). The
 // caller advances the cursor only to the newest returned SHA, so the remainder
@@ -1200,6 +1221,22 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 			newHeads[key] = head
 			drained[key] = true
 			coldStart[key] = head
+			// A root that appears while the daemon already holds cursors is a NEW
+			// checkout (a worktree cut and committed to between two polls), not a
+			// first install. Its recent branch commits would otherwise be baselined
+			// away unreported. Attributed only, never folded into rework (foldable
+			// stays empty), and bounded by the TTL and the shared budget. A first
+			// install (no cursors at all) keeps the cold-start discipline.
+			if len(prior) > 0 && budget > 0 {
+				recent := recentBranchCommits(root, head, time.Now().Add(-aiPathsTTL).Unix())
+				if len(recent) > budget {
+					recent = recent[:budget]
+				}
+				if len(recent) > 0 {
+					detected[key] = recent
+					budget -= len(recent)
+				}
+			}
 			continue
 		}
 		if lastSeen == head {
@@ -1290,15 +1327,18 @@ func pollGitWatchWorkspace(session Session) {
 	// commit, every one from a Bash-edited sibling worktree.
 	aiRoots := discoverAiRepoRoots(session.TaskRoot)
 	aiRoots = append(aiRoots, readBashRoots(gitWatchRootKey(session.TaskRoot))...)
+	retained := loadDiscoveredRepos(nowMs)
+	// Siblings of RETAINED repos too: once a repo's AI paths age out it stays
+	// polled from the saved list, and a worktree cut from it later must be seen.
 	var siblings []string
-	for _, r := range aiRoots {
+	for _, r := range dedupRootsByKey(concatRoots(aiRoots, retained)) {
 		siblings = append(siblings, gitWorktrees(r)...)
 	}
 	roots := dedupRootsByKey(concatRoots(
 		workspaceMatchRoots(resolvePath(session.TaskRoot)),
 		aiRoots,
 		siblings,
-		loadDiscoveredRepos(nowMs),
+		retained,
 	))
 	detected, foldable, drained, coldStart := pollGitWatch(roots, session)
 

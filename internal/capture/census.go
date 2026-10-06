@@ -357,8 +357,34 @@ func isGitRepoRoot(root string) bool {
 	if root == "" {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(root, ".git"))
-	return err == nil
+	// A checkout's .git is either a directory holding HEAD or a worktree's
+	// "gitdir:" file. A bare/empty .git (a stray `/tmp/.git` dir) is not a repo:
+	// treating it as one made every path under /tmp resolve to a /tmp "repo".
+	dotGit := filepath.Join(root, ".git")
+	info, err := os.Stat(dotGit)
+	if err != nil {
+		return false
+	}
+	if info.IsDir() {
+		_, err = os.Stat(filepath.Join(dotGit, "HEAD"))
+		return err == nil
+	}
+	_, ok := worktreeGitdir(root)
+	return ok
+}
+
+// worktreeGitdir reads a linked worktree's `.git` file ("gitdir: <path>").
+func worktreeGitdir(root string) (string, bool) {
+	// #nosec G304 -- root is a local checkout path; reads only its .git pointer file.
+	data, err := os.ReadFile(filepath.Join(root, ".git"))
+	if err != nil {
+		return "", false
+	}
+	line := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(line, "gitdir:") {
+		return "", false
+	}
+	return strings.TrimSpace(strings.TrimPrefix(line, "gitdir:")), true
 }
 
 // maxNestedClaudeMdTokens returns the token cost of the LARGEST CLAUDE.md nested
