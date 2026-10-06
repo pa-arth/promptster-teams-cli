@@ -1060,27 +1060,66 @@ func gitBranchCommitsSinceDefault(root, head string) []string {
 	return shas
 }
 
-// recentBranchCommits lists head's FIRST-PARENT commits past the default branch
-// committed at or after sinceUnix, newest-first — the branch's own recent work,
-// never the history a merge brought in. Over gitWatchMaxCommitsPerPoll it returns
-// the full list and the caller refuses it. One read-only spawn.
-func recentBranchCommits(root, head string, sinceUnix int64) []string {
+// recentBranchBase returns the first parent of the oldest FIRST-PARENT commit
+// head holds past the default branch that was committed at or after sinceUnix —
+// the cursor from which that recent work reads as owed — or "" when there is
+// none. First-parent, so history a merge brought in is never replayed.
+func recentBranchBase(root, head string, sinceUnix int64) string {
 	defRef := durabilityDefaultRef(root)
 	if head == "" || defRef == "" {
-		return nil
+		return ""
 	}
 	// #nosec G204 -- constant argv; root is a discovered checkout, defRef a ref git resolved, head from git rev-parse. Read-only.
 	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent",
 		"--max-age="+strconv.FormatInt(sinceUnix, 10), defRef+".."+head).Output()
 	if err != nil {
-		return nil
+		return ""
 	}
 	shas := parseRevListShas(out)
-	if len(shas) > gitWatchMaxCommitsPerPoll {
-		state.HookDebugf("git-watch: new checkout %s holds %d recent commit(s), over the per-root cap %d; replaying none",
-			gitWatchRootKey(root), len(shas), gitWatchMaxCommitsPerPoll)
+	if len(shas) == 0 {
+		return ""
 	}
-	return shas
+	// #nosec G204 -- constant argv; the sha came from git rev-list. Read-only.
+	parent, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", shas[len(shas)-1]+"^1").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(parent))
+}
+
+// firstParentRange lists from..to along to's first-parent chain, newest-first.
+func firstParentRange(root, from, to string) ([]string, bool) {
+	// #nosec G204 -- constant argv; both shas came from git. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent", from+".."+to).Output()
+	if err != nil {
+		return nil, false
+	}
+	return parseRevListShas(out), true
+}
+
+// gitWatchReplaysPath holds the owed late-worktree replays: rootKey -> the head
+// the replay must reach. Local-only and tiny (one entry per replaying root).
+func gitWatchReplaysPath() string {
+	return filepath.Join(state.StateDir(), "git-watch-replays.json")
+}
+
+func loadGitWatchReplays() map[string]string {
+	out := map[string]string{}
+	if data, err := os.ReadFile(gitWatchReplaysPath()); err == nil {
+		_ = json.Unmarshal(data, &out)
+	}
+	return out
+}
+
+func saveGitWatchReplays(replays map[string]string) {
+	data, err := json.Marshal(replays)
+	if err != nil {
+		return
+	}
+	tmp := gitWatchReplaysPath() + ".tmp"
+	if os.WriteFile(tmp, data, 0o600) == nil {
+		_ = os.Rename(tmp, gitWatchReplaysPath())
+	}
 }
 
 // requestLineOrigins queues line-origin work for commits (newest-first), oldest
@@ -1208,6 +1247,7 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 	foldable := map[string]map[string]struct{}{}
 	drained := map[string]bool{}
 	coldStart := map[string]string{}
+	replays := loadGitWatchReplays()
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -1226,40 +1266,68 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
+		target, replaying := replays[key]
 		if !hadCursor {
 			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
 			// and it is the whole reason this case is no longer folded in with
 			// "nothing moved" below — the two are indistinguishable from here and a
 			// root that has never been seen is precisely the one whose branch may hold
 			// AI history this device recorded through another copy of the repo.
-			//
+			coldStart[key] = head
 			// EXCEPT a root that appears while the daemon already holds cursors: that
 			// is a NEW checkout (a worktree cut and committed to between two polls),
 			// not a first install, and baselining would drop its commits unreported.
-			// Its recent first-parent branch commits are reported in ONE poll, whole
-			// or not at all — the same discipline as gitBranchCommitsSinceDefault, and
-			// for the same reason: they are never folded into rework, and a partial
-			// range would leave the rest to a later poll that WOULD fold them. Over
-			// the per-root cap, nothing is replayed (logged). Over this poll's budget,
-			// or if line-origin work can't be queued, the root is left WITHOUT a
-			// cursor, so the next poll retries the whole replay.
+			// It is started just before its recent first-parent branch commits (within
+			// the ai-paths TTL) and those are OWED as a replay (gitWatchReplays) until
+			// reported — across as many polls as the caps need, oldest first, and
+			// never folded into rework.
+			base := ""
 			if len(prior) > 0 {
-				recent := recentBranchCommits(root, head, time.Now().Add(-aiPathsTTL).Unix())
-				if len(recent) > 0 && len(recent) <= gitWatchMaxCommitsPerPoll {
-					if len(recent) > budget {
-						deferred += len(recent)
-						continue
-					}
-					if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, recent) {
-						continue
-					}
-					detected[key] = recent
-					budget -= len(recent)
-				}
+				base = recentBranchBase(root, head, time.Now().Add(-aiPathsTTL).Unix())
 			}
-			newHeads[key] = head
-			drained[key] = true
-			coldStart[key] = head
+			if base == "" {
+				newHeads[key] = head
+				drained[key] = true
+				continue
+			}
+			lastSeen, target, replaying = base, head, true
+			replays[key] = head
+		}
+		if replaying {
+			commits, ok := firstParentRange(root, lastSeen, target)
+			if !ok {
+				// The owed range is gone (history rewritten, objects pruned): drop it.
+				delete(replays, key)
+				newHeads[key] = head
+				continue
+			}
+			if !hadCursor {
+				newHeads[key] = lastSeen // the replay stays owed even if nothing fits now
+			}
+			if len(commits) > gitWatchMaxCommitsPerPoll {
+				commits = commits[len(commits)-gitWatchMaxCommitsPerPoll:]
+			}
+			if budget <= 0 {
+				deferred += len(commits)
+				continue
+			}
+			if len(commits) > budget {
+				deferred += len(commits) - budget
+				commits = commits[len(commits)-budget:]
+			}
+			if len(commits) > 0 {
+				if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, commits) {
+					continue
+				}
+				detected[key] = commits // foldable deliberately unset: replays never fold
+				newHeads[key] = commits[0]
+				budget -= len(commits)
+			}
+			if len(commits) == 0 || commits[0] == target {
+				delete(replays, key)
+				newHeads[key] = target
+				drained[key] = target == head
+			}
 			continue
 		}
 		if lastSeen == head {
@@ -1313,6 +1381,7 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 	}
 
 	saveGitWatchCursors(newHeads)
+	saveGitWatchReplays(replays)
 	return detected, foldable, drained, coldStart
 }
 

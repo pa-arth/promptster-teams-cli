@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"slices"
 	"strings"
 	"time"
 
@@ -411,7 +410,7 @@ const (
 // The window scoping below removes only the CROSS-repo case; the temporal
 // same-workspace overlap is a documented tradeoff of the opt-in heuristic.
 func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
-	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli(), false)
+	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli(), nil)
 }
 
 // recordBashWindowAt is recordBashWindow with the session-activity stamp
@@ -423,16 +422,19 @@ func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 // the genuinely live session's windows. Losing those costs a bash-mtime
 // recovery pass — an undercount, but exactly the one the ledger exists to
 // prevent.
-func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, cdAway bool, roots ...string) {
+func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, checkouts func(workdir string) []string) {
 	if endMs < startMs {
 		startMs, endMs = endMs, startMs
 	}
 	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
-		// The command's working checkout counts alongside any it names
-		// (`git -C /B status && sed -i … foo.go` edits foo.go in the workdir) —
-		// unless the command cd's away, in which case it works where it went.
-		if entry.Workdir != "" && !cdAway && !slices.Contains(roots, entry.Workdir) {
-			roots = append(roots, entry.Workdir)
+		var roots []string
+		if checkouts != nil {
+			roots = checkouts(entry.Workdir)
+			if len(roots) == 0 {
+				// Known to have run in no captured checkout — distinct from a legacy
+				// window with no record, which stays eligible everywhere.
+				roots = []string{bashNoCheckout}
+			}
 		}
 		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs, Roots: roots})
 		if len(entry.Windows) > bashWindowsMaxPerSession {
@@ -440,6 +442,9 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 		}
 	})
 }
+
+// bashNoCheckout marks a window whose command ran in no captured checkout.
+const bashNoCheckout = "-"
 
 // recordBashWorkdir records the checkout a session's prompt ran in. No window: a
 // prompt edits nothing.
@@ -645,74 +650,100 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, commandChangesDir(e), eventRepoRoots(e, taskRoot)...)
+	command := ""
+	if d, ok := e.Data.(map[string]interface{}); ok {
+		command, _ = d["command"].(string)
+	}
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, func(workdir string) []string {
+		return commandCheckouts(command, workdir, taskRoot)
+	})
 }
 
-// bashCdRe matches a `cd` that starts a command segment.
-var bashCdRe = regexp.MustCompile(`(?:^|&&|\|\||;|\()\s*cd\s+\S`)
+// bashSegmentRe splits a command into the segments the shell runs in order.
+var bashSegmentRe = regexp.MustCompile(`&&|\|\||;|\|`)
 
-// commandChangesDir reports whether a Bash command cd's away from its workdir.
-func commandChangesDir(e *event.Event) bool {
-	d, ok := e.Data.(map[string]interface{})
-	if !ok {
-		return false
+// bashCdRe captures the target of a segment that is a `cd`.
+var bashCdRe = regexp.MustCompile(`^\(?\s*cd\s+(\S+)`)
+
+// commandCheckouts returns the captured checkouts a Bash command worked in,
+// walking its segments in order from the session's workdir: a `cd` moves the
+// working checkout for the segments AFTER it, every other segment works in the
+// current one, and any path a segment names counts too. So `sed … && cd /B`
+// edits the workdir, and `cd /B && sed …` edits B.
+func commandCheckouts(command, workdir, taskRoot string) []string {
+	cwd := workdir
+	seen := map[string]bool{}
+	var out []string
+	add := func(r string) {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
 	}
-	c, _ := d["command"].(string)
-	return bashCdRe.MatchString(c)
+	for _, seg := range bashSegmentRe.Split(command, -1) {
+		seg = strings.TrimSpace(seg)
+		if m := bashCdRe.FindStringSubmatch(seg); m != nil {
+			if strings.HasPrefix(m[1], "/") || strings.HasPrefix(m[1], "~") {
+				cwd = checkoutOf(m[1], taskRoot) // "" when outside capture
+			}
+			continue // a relative cd stays in the same checkout
+		}
+		add(cwd)
+		for _, m := range bashPathRe.FindAllStringSubmatch(seg, 16) {
+			add(checkoutOf(m[1], taskRoot))
+		}
+	}
+	return out
 }
 
 // bashPathRe matches absolute or ~-prefixed path tokens in a shell command
 // (`cd /x/wt && …`, `git -C ~/repos/y …`).
 var bashPathRe = regexp.MustCompile(`(?:^|[\s'"=(])((?:~|/)[^\s'"` + "`" + `;|&()<>]+)`)
 
-// eventRepoRoots returns the repo checkouts an event places its session in: a
-// prompt's workdir, or the directories a Bash command names. Stat-only (no git
-// spawn); a token that is not inside a repo contributes nothing, and neither does
-// a repo outside capture scope (see inCaptureScope) — naming a path in a command
-// must never widen what this install captures.
+// eventRepoRoots returns the checkout a prompt's workdir sits in, if captured.
 func eventRepoRoots(e *event.Event, taskRoot string) []string {
-	var cands []string
-	switch d := e.Data.(type) {
-	case map[string]interface{}:
-		if s, ok := d["workdir"].(string); ok && e.Kind == "prompt" {
-			cands = append(cands, s)
-		}
-		if s, ok := d["command"].(string); ok && e.Kind == "command" {
-			for _, m := range bashPathRe.FindAllStringSubmatch(s, 16) {
-				cands = append(cands, m[1])
-			}
-		}
+	d, ok := e.Data.(map[string]interface{})
+	if !ok || e.Kind != "prompt" {
+		return nil
 	}
-	home, _ := os.UserHomeDir()
-	seen := map[string]bool{}
-	var roots []string
-	for _, p := range cands {
-		if strings.HasPrefix(p, "~") {
-			if home == "" {
-				continue
-			}
-			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
-		}
-		info, err := os.Stat(p)
-		if err != nil {
-			continue
-		}
-		dir := p
-		if !info.IsDir() {
-			dir = filepath.Dir(p)
-		}
-		if r, ok := gitRootOf(dir); ok {
-			r = resolvePath(r)
-			if !inCaptureScope(r, taskRoot) {
-				continue
-			}
-			if !seen[r] {
-				seen[r] = true
-				roots = append(roots, r)
-			}
-		}
+	wd, _ := d["workdir"].(string)
+	if r := checkoutOf(wd, taskRoot); r != "" {
+		return []string{r}
 	}
-	return roots
+	return nil
+}
+
+// checkoutOf resolves an absolute or ~ path to the captured checkout holding it,
+// or "". Stat-only (no git spawn); a repo outside capture scope (see
+// inCaptureScope) resolves to "" — naming a path must never widen capture.
+func checkoutOf(p, taskRoot string) string {
+	if strings.HasPrefix(p, "~") {
+		home, _ := os.UserHomeDir()
+		if home == "" {
+			return ""
+		}
+		p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+	}
+	if !filepath.IsAbs(p) {
+		return ""
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	dir := p
+	if !info.IsDir() {
+		dir = filepath.Dir(p)
+	}
+	r, ok := gitRootOf(dir)
+	if !ok {
+		return ""
+	}
+	r = resolvePath(r)
+	if !inCaptureScope(r, taskRoot) {
+		return ""
+	}
+	return r
 }
 
 // eventTsMs parses an event's RFC3339Nano Ts into Unix ms.
