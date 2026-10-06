@@ -789,3 +789,29 @@ func TestLateWorktreeReplayFollowsBranchOrderUnderClockSkew(t *testing.T) {
 	pollGitWatchWorkspace(session)
 	assertBothReportedOnce(t, shas)
 }
+
+// TestRelativeCdResolvesFromThePromptSubdirectory (Greptile, #270): a session
+// started in a/src that runs `cd ../../sibling` lands in the sibling.
+func TestRelativeCdResolvesFromThePromptSubdirectory(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	sib := filepath.Join(home, "repos", "sibling")
+	gitRepoAt(t, a)
+	gitRepoAt(t, sib)
+	if err := os.MkdirAll(filepath.Join(a, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": filepath.Join(a, "src")}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd ../../sibling && sed -i x f"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || len(ws[0].Roots) != 1 || ws[0].Roots[0] != resolvePath(sib) {
+		t.Fatalf("window roots = %v, want only %s", ws, sib)
+	}
+	if roots := readBashRoots(gitWatchRootKey(home)); !slices.Contains(roots, resolvePath(a)) {
+		t.Fatalf("discovery roots %v lost the prompt's checkout", roots)
+	}
+}

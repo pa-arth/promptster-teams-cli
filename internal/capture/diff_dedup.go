@@ -365,7 +365,9 @@ type bashWindowsEntry struct {
 	Windows []bashWindowSpan `json:"windows"`
 	TsMs    int64            `json:"tsMs"`
 	RootKey string           `json:"rootKey"`
-	// Workdir is the checkout the session's latest prompt ran in (resolved repo
+	// Workdir is the DIRECTORY the session's latest prompt ran in (absolute, inside
+	// a captured checkout) — the directory, not just its repo root, so a relative
+	// `cd ../x` resolves from where the session actually is. Was a repo root
 	// root). It is the checkout of every later command that names no path, and it
 	// makes a repo worked in purely through Bash discoverable. Local-only — this
 	// ledger never leaves the device.
@@ -556,7 +558,9 @@ func readBashRoots(rootKey string) []string {
 		}
 	}
 	for _, entry := range liveBashEntries(rootKey) {
-		add(entry.Workdir)
+		if r, ok := gitRootOf(entry.Workdir); ok && entry.Workdir != "" { // scope-checked when recorded
+			add(resolvePath(r))
+		}
 		for _, w := range entry.Windows {
 			for _, r := range w.Roots {
 				add(r)
@@ -618,8 +622,8 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 		if taskRoot != "" {
 			rootKey = gitWatchRootKey(taskRoot)
 		}
-		if roots := eventRepoRoots(e, taskRoot); len(roots) > 0 {
-			recordBashWorkdir(e.SessionID, rootKey, now, roots[0])
+		if wd := promptWorkdir(e, taskRoot); wd != "" {
+			recordBashWorkdir(e.SessionID, rootKey, now, wd)
 		}
 		return
 	}
@@ -671,7 +675,8 @@ var bashCdRe = regexp.MustCompile(`^\(?\s*cd\s+(\S+)`)
 // current one, and any path a segment names counts too. So `sed … && cd /B`
 // edits the workdir, and `cd /B && sed …` edits B.
 func commandCheckouts(command, workdir, taskRoot string) []string {
-	dir, cwd := workdir, workdir // the directory segments run in, and its checkout
+	// The directory segments run in, and the captured checkout holding it.
+	dir, cwd := workdir, checkoutOf(workdir, taskRoot)
 	seen := map[string]bool{}
 	var out []string
 	add := func(r string) {
@@ -707,30 +712,37 @@ func commandCheckouts(command, workdir, taskRoot string) []string {
 // (`cd /x/wt && …`, `git -C ~/repos/y …`).
 var bashPathRe = regexp.MustCompile(`(?:^|[\s'"=(])((?:~|/)[^\s'"` + "`" + `;|&()<>]+)`)
 
-// eventRepoRoots returns the checkout a prompt's workdir sits in, if captured.
-func eventRepoRoots(e *event.Event, taskRoot string) []string {
+// promptWorkdir returns a prompt's workdir as an absolute directory, when it
+// sits inside a captured checkout; else "".
+func promptWorkdir(e *event.Event, taskRoot string) string {
 	d, ok := e.Data.(map[string]interface{})
 	if !ok || e.Kind != "prompt" {
-		return nil
+		return ""
 	}
 	wd, _ := d["workdir"].(string)
-	if r := checkoutOf(wd, taskRoot); r != "" {
-		return []string{r}
+	if checkoutOf(wd, taskRoot) == "" {
+		return ""
 	}
-	return nil
+	return expandHome(wd)
+}
+
+// expandHome turns a leading ~ into the home directory.
+func expandHome(p string) string {
+	if !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, strings.TrimPrefix(p, "~"))
 }
 
 // checkoutOf resolves an absolute or ~ path to the captured checkout holding it,
 // or "". Stat-only (no git spawn); a repo outside capture scope (see
 // inCaptureScope) resolves to "" — naming a path must never widen capture.
 func checkoutOf(p, taskRoot string) string {
-	if strings.HasPrefix(p, "~") {
-		home, _ := os.UserHomeDir()
-		if home == "" {
-			return ""
-		}
-		p = filepath.Join(home, strings.TrimPrefix(p, "~"))
-	}
+	p = expandHome(p)
 	if !filepath.IsAbs(p) {
 		return ""
 	}
