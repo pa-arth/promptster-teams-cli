@@ -81,6 +81,10 @@ func gitWatchCursorsPath() string {
 type gitWatchCursors struct {
 	V       int               `json:"v"`
 	Cursors map[string]string `json:"cursors"` // rootKey -> last-seen HEAD sha
+	// Replays are owed late-worktree replays: rootKey -> the head the replay must
+	// reach. Kept in the SAME file as the cursors and written in the same atomic
+	// rename, so a cursor can never advance past an owed range without its marker.
+	Replays map[string]string `json:"replays,omitempty"`
 }
 
 const gitWatchCursorsVersion = 1
@@ -1060,6 +1064,68 @@ func gitBranchCommitsSinceDefault(root, head string) []string {
 	return shas
 }
 
+// recentBranchBase returns the first parent of the oldest FIRST-PARENT commit
+// head holds past the default branch that was committed at or after sinceUnix —
+// the cursor from which that recent work reads as owed — or "" when there is
+// none. First-parent, so history a merge brought in is never replayed.
+func recentBranchBase(root, head string, sinceUnix int64) string {
+	defRef := durabilityDefaultRef(root)
+	if head == "" || defRef == "" {
+		return ""
+	}
+	// #nosec G204 -- constant argv; root is a discovered checkout, defRef a ref git resolved, head from git rev-parse. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent",
+		"--max-age="+strconv.FormatInt(sinceUnix, 10), defRef+".."+head).Output()
+	if err != nil {
+		return ""
+	}
+	shas := parseRevListShas(out)
+	if len(shas) == 0 {
+		return ""
+	}
+	// #nosec G204 -- constant argv; the sha came from git rev-list. Read-only.
+	parent, err := exec.Command("git", "-C", root, "rev-parse", "--verify", "-q", shas[len(shas)-1]+"^1").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(parent))
+}
+
+// firstParentRange lists from..to along to's first-parent chain, newest-first.
+func firstParentRange(root, from, to string) ([]string, bool) {
+	// #nosec G204 -- constant argv; both shas came from git. Read-only.
+	out, err := exec.Command("git", "-C", root, "rev-list", "--topo-order", "--first-parent", from+".."+to).Output()
+	if err != nil {
+		return nil, false
+	}
+	return parseRevListShas(out), true
+}
+
+// loadGitWatchReplays reads the owed late-worktree replays (see gitWatchCursors).
+func loadGitWatchReplays() map[string]string {
+	out := map[string]string{}
+	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
+		var onDisk gitWatchCursors
+		if data, err := os.ReadFile(gitWatchCursorsPath()); err == nil && json.Unmarshal(data, &onDisk) == nil && onDisk.Replays != nil {
+			out = onDisk.Replays
+		}
+		return nil
+	})
+	return out
+}
+
+// requestLineOrigins queues line-origin work for commits (newest-first), oldest
+// first, and reports whether all of it was queued. The cursor may advance past
+// them only when it was.
+func requestLineOrigins(session Session, root string, commits []string) bool {
+	for i := len(commits) - 1; i >= 0; i-- {
+		if !requestLineOrigin(session, root, commits[i], time.Now().UnixMilli()) {
+			return false
+		}
+	}
+	return true
+}
+
 // clampCommitBurst bounds a fast-forward range to gitWatchMaxCommitsPerPoll,
 // keeping the OLDEST cap commits (rev-list is newest-first, so the tail). The
 // caller advances the cursor only to the newest returned SHA, so the remainder
@@ -1106,8 +1172,10 @@ func loadGitWatchCursors() map[string]string {
 // saveGitWatchCursors merges the freshly observed heads into the on-disk cursor
 // set (re-read under the lock so a transiently-unreadable root keeps its old
 // cursor rather than re-baselining). Best-effort: I/O failure never blocks.
-func saveGitWatchCursors(heads map[string]string) {
-	if len(heads) == 0 {
+//
+// replays, when given, REPLACES the owed-replay set in the same write.
+func saveGitWatchCursors(heads map[string]string, replays ...map[string]string) {
+	if len(heads) == 0 && len(replays) == 0 {
 		return
 	}
 	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
@@ -1120,6 +1188,14 @@ func saveGitWatchCursors(heads map[string]string) {
 		}
 		for k, v := range heads {
 			merged.Cursors[k] = v
+		}
+		if len(replays) > 0 {
+			merged.Replays = replays[0]
+		} else {
+			var onDisk gitWatchCursors
+			if data, err := os.ReadFile(gitWatchCursorsPath()); err == nil && json.Unmarshal(data, &onDisk) == nil {
+				merged.Replays = onDisk.Replays
+			}
 		}
 		data, err := json.Marshal(merged)
 		if err != nil {
@@ -1173,6 +1249,7 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 	foldable := map[string]map[string]struct{}{}
 	drained := map[string]bool{}
 	coldStart := map[string]string{}
+	replays := loadGitWatchReplays()
 
 	// Global per-poll budget shared across ALL roots (§0.2c). gitNewCommits already
 	// clamps each root to gitWatchMaxCommitsPerPoll, but a poll walks every root, so
@@ -1191,15 +1268,68 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		key := gitWatchRootKey(root)
 
 		lastSeen, hadCursor := prior[key]
+		target, replaying := replays[key]
 		if !hadCursor {
 			// Cold start: baseline WITHOUT reporting, unchanged. Only the flag is new,
 			// and it is the whole reason this case is no longer folded in with
 			// "nothing moved" below — the two are indistinguishable from here and a
 			// root that has never been seen is precisely the one whose branch may hold
 			// AI history this device recorded through another copy of the repo.
-			newHeads[key] = head
-			drained[key] = true
 			coldStart[key] = head
+			// EXCEPT a root that appears while the daemon already holds cursors: that
+			// is a NEW checkout (a worktree cut and committed to between two polls),
+			// not a first install, and baselining would drop its commits unreported.
+			// It is started just before its recent first-parent branch commits (within
+			// the ai-paths TTL) and those are OWED as a replay (gitWatchReplays) until
+			// reported — across as many polls as the caps need, oldest first, and
+			// never folded into rework.
+			base := ""
+			if len(prior) > 0 {
+				base = recentBranchBase(root, head, time.Now().Add(-aiPathsTTL).Unix())
+			}
+			if base == "" {
+				newHeads[key] = head
+				drained[key] = true
+				continue
+			}
+			lastSeen, target, replaying = base, head, true
+			replays[key] = head
+		}
+		if replaying {
+			commits, ok := firstParentRange(root, lastSeen, target)
+			if !ok {
+				// The owed range is gone (history rewritten, objects pruned): drop it.
+				delete(replays, key)
+				newHeads[key] = head
+				continue
+			}
+			if !hadCursor {
+				newHeads[key] = lastSeen // the replay stays owed even if nothing fits now
+			}
+			if len(commits) > gitWatchMaxCommitsPerPoll {
+				commits = commits[len(commits)-gitWatchMaxCommitsPerPoll:]
+			}
+			if budget <= 0 {
+				deferred += len(commits)
+				continue
+			}
+			if len(commits) > budget {
+				deferred += len(commits) - budget
+				commits = commits[len(commits)-budget:]
+			}
+			if len(commits) > 0 {
+				if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, commits) {
+					continue
+				}
+				detected[key] = commits // foldable deliberately unset: replays never fold
+				newHeads[key] = commits[0]
+				budget -= len(commits)
+			}
+			if len(commits) == 0 || commits[0] == target {
+				delete(replays, key)
+				newHeads[key] = target
+				drained[key] = target == head
+			}
 			continue
 		}
 		if lastSeen == head {
@@ -1232,17 +1362,8 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 		}
 		// Receipt requests must exist before THIS cursor write, which precedes
 		// attribution. Failed publication leaves the whole root cursor owed.
-		if len(originSession) > 0 {
-			published := true
-			for i := len(commits) - 1; i >= 0; i-- {
-				if !requestLineOrigin(originSession[0], root, commits[i], time.Now().UnixMilli()) {
-					published = false
-					break
-				}
-			}
-			if !published {
-				continue
-			}
+		if len(originSession) > 0 && !requestLineOrigins(originSession[0], root, commits) {
+			continue
 		}
 		detected[key] = commits
 		foldable[key] = onFirstParent
@@ -1261,7 +1382,7 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 			gitWatchMaxCommitsPerPollTotal, deferred)
 	}
 
-	saveGitWatchCursors(newHeads)
+	saveGitWatchCursors(newHeads, replays)
 	return detected, foldable, drained, coldStart
 }
 
@@ -1281,11 +1402,27 @@ func pollGitWatchWorkspace(session Session) {
 	//   3. repos persisted from earlier polls — so a repo keeps being polled across
 	//      the 30-day durability horizon even after its AI edits age out of the
 	//      7-day ai-paths ledger (else its maturing verdicts would be silently lost).
+	//
+	// Each AI-discovered repo also brings its OTHER worktrees. An agent that edits
+	// through Bash (sed, heredocs, codex exec) records no ai-paths entry, so its
+	// worktree was never discovered and its commits never attributed — not even by
+	// the bash-window recovery pass, which only runs on polled roots. Prod
+	// 2026-10-05: 37 of one engineer's 82 merged PRs in a week had no captured
+	// commit, every one from a Bash-edited sibling worktree.
 	aiRoots := discoverAiRepoRoots(session.TaskRoot)
+	aiRoots = append(aiRoots, readBashRoots(gitWatchRootKey(session.TaskRoot))...)
+	retained := loadDiscoveredRepos(nowMs)
+	// Siblings of RETAINED repos too: once a repo's AI paths age out it stays
+	// polled from the saved list, and a worktree cut from it later must be seen.
+	var siblings []string
+	for _, r := range dedupRootsByKey(concatRoots(aiRoots, retained)) {
+		siblings = append(siblings, gitWorktrees(r)...)
+	}
 	roots := dedupRootsByKey(concatRoots(
 		workspaceMatchRoots(resolvePath(session.TaskRoot)),
 		aiRoots,
-		loadDiscoveredRepos(nowMs),
+		siblings,
+		retained,
 	))
 	detected, foldable, drained, coldStart := pollGitWatch(roots, session)
 

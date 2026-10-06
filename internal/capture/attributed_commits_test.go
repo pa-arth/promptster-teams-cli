@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
@@ -361,5 +363,455 @@ func TestFailedEnqueueIsNotRecordedAsAttributed(t *testing.T) {
 
 	if got := attributedShas(t, state.OutboxPath()); countSha(got, sha) != 1 {
 		t.Fatalf("after the outbox recovered, %s appears %d times in %v, want exactly 1", sha, countSha(got, sha), got)
+	}
+}
+
+// TestBashEditedSiblingWorktreeIsPolled: an agent that edits a worktree only
+// through Bash records no ai-paths entry there, so discovery used to find the
+// repo's main checkout and never the worktree — its commits were never
+// attributed (prod 2026-10-05: 37 of 82 merged PRs in a week). The sibling must
+// be polled, and the bash-window recovery pass must credit the commit to the
+// session whose Bash command wrote the file.
+func TestBashEditedSiblingWorktreeIsPolled(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	wt := filepath.Join(home, "repos", "proj-feature")
+	git("worktree", "add", "-b", "feature", wt)
+
+	session := Session{DeviceID: "dev-sib", TaskRoot: home}
+	// AI evidence exists ONLY for the main checkout.
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session) // cold-start baseline
+
+	start := time.Now().UnixMilli()
+	writeCommitFile(t, wt, "bar.go", "package main\n\nfunc bar() {}\n")
+	recordBashWindow("bash-sess", gitWatchRootKey(home), start, time.Now().UnixMilli())
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "agent adds bar via bash")
+	sha := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+
+	pollGitWatchWorkspace(session)
+
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit %s in a Bash-edited sibling worktree was not attributed", sha)
+	}
+	out, err := os.ReadFile(state.OutboxPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"sessionId":"bash-sess"`) {
+		t.Fatalf("sibling-worktree commit not credited to the Bash session")
+	}
+}
+
+func aiCommandEvent(sessionID, command string) *event.Event {
+	e := event.NewEvent("command", sessionID)
+	e.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	e.Data = map[string]interface{}{"command": command}
+	e.Provenance = &event.Provenance{Attribution: "likely_ai"}
+	return &e
+}
+
+// TestBashOnlyRepoIsDiscoveredFromPromptWorkdir: a repo that NO Edit/Write ever
+// touched (prod: the teams-cli checkout had zero ai-paths entries) is found
+// through the session's prompt workdir, and its commit is credited.
+func TestBashOnlyRepoIsDiscoveredFromPromptWorkdir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "cli")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+
+	session := Session{DeviceID: "dev-cwd", TaskRoot: home}
+	prompt := event.NewEvent("prompt", "bash-sess")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": repo}
+	recordAiBashWindow(&prompt, home, false)
+	pollGitWatchWorkspace(session) // cold-start baseline — only possible if discovered
+
+	writeCommitFile(t, repo, "bar.go", "package main\n\nfunc bar() {}\n")
+	recordAiBashWindow(aiCommandEvent("bash-sess", "sed -i s/a/b/ bar.go"), home, false)
+	git("add", "-A")
+	git("commit", "-m", "bash edit")
+	sha := strings.TrimSpace(gitOut("rev-parse", "HEAD"))
+	pollGitWatchWorkspace(session)
+
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit in a repo known only from the prompt workdir was not attributed")
+	}
+}
+
+// TestBashRecoveryCreditsTheSessionThatWorkedThere: two agents run Bash at the
+// same instant; only one of them worked in this checkout. The nearer window
+// belongs to the other — it must not win.
+func TestBashRecoveryCreditsTheSessionThatWorkedThere(t *testing.T) {
+	dir := t.TempDir()
+	writeCommitFile(t, dir, "x.go", "package x\n")
+	info, err := os.Stat(filepath.Join(dir, "x.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := info.ModTime().UnixMilli()
+	got, ok := recoverBashSession(dir, "x.go", []bashWindow{
+		{SessionID: "elsewhere", StartMs: m, EndMs: m, Roots: []string{"/some/other/checkout"}},
+		{SessionID: "here", StartMs: m + 2000, EndMs: m + 2000, Roots: []string{resolvePath(dir)}},
+	})
+	if !ok || got != "here" {
+		t.Fatalf("credited %q (ok=%v), want the session that worked in this checkout", got, ok)
+	}
+}
+
+// TestWorktreeCutAndCommittedBetweenPollsIsAttributed (Greptile, #270): a
+// worktree that appears and gets its first commit between two polls used to be
+// cold-started at that commit and never reported.
+func TestWorktreeCutAndCommittedBetweenPollsIsAttributed(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-late", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session) // daemon now holds cursors
+
+	wt := filepath.Join(home, "repos", "proj-late")
+	git("worktree", "add", "-b", "late", wt)
+	writeCommitFile(t, wt, "bar.go", "package main\n\nfunc bar() {}\n")
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "first commit before any poll saw the worktree")
+	sha := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+
+	pollGitWatchWorkspace(session)
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit made before the worktree's first poll was skipped")
+	}
+}
+
+// TestBashCommandOutsideCaptureScopeAddsNoRoot (Greptile, #270): naming a repo
+// outside the workspace in a command must not widen capture.
+func TestBashCommandOutsideCaptureScopeAddsNoRoot(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	inside := filepath.Join(home, "repos", "in")
+	outside := filepath.Join(t.TempDir(), "elsewhere")
+	gitRepoAt(t, inside)
+	gitRepoAt(t, outside)
+	got := commandCheckouts("ls "+outside+" "+inside, "", home)
+	if len(got) != 1 || got[0] != resolvePath(inside) {
+		t.Fatalf("roots = %v, want only the in-scope %s", got, inside)
+	}
+}
+
+// TestBashWindowKeepsItsOwnCheckout (Greptile, #270): a session that later works
+// in checkout B must not make its earlier checkout-A command eligible for B.
+func TestBashWindowKeepsItsOwnCheckout(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+a+" && sed -i x f"), home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+b+" && sed -i x f"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 2 {
+		t.Fatalf("windows = %d, want 2", len(ws))
+	}
+	for _, w := range ws {
+		if len(w.Roots) != 1 {
+			t.Fatalf("window roots = %v, want exactly its own checkout", w.Roots)
+		}
+	}
+}
+
+// TestEmptyDotGitIsNotARepo: a stray empty `.git` dir (seen at /tmp) made every
+// path beneath it resolve to a fake repo root.
+func TestEmptyDotGitIsNotARepo(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if isGitRepoRoot(dir) {
+		t.Fatal("an empty .git dir was treated as a repository")
+	}
+}
+
+// lateWorktreeFixture: a daemon already holding cursors, then a worktree cut and
+// given two commits before any poll sees it. Returns the session, the worktree
+// and its commits (oldest first).
+func lateWorktreeFixture(t *testing.T) (Session, string, []string, func(...string), func(...string) string) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-late", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session)
+
+	wt := filepath.Join(home, "repos", "proj-late2")
+	git("worktree", "add", "-b", "late2", wt)
+	var shas []string
+	for _, f := range []string{"a.go", "b.go"} {
+		writeCommitFile(t, wt, f, "package main\n")
+		git("-C", wt, "add", "-A")
+		git("-C", wt, "commit", "-m", f)
+		shas = append(shas, strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD")))
+	}
+	return session, wt, shas, git, gitOut
+}
+
+// TestLateWorktreeReplayIgnoresMergedInHistory (Greptile, #270): an older branch
+// merged into the new worktree is not its recent work.
+func TestLateWorktreeReplayIgnoresMergedInHistory(t *testing.T) {
+	session, wt, shas, git, gitOut := lateWorktreeFixture(t)
+	// An older side branch, merged into the worktree.
+	git("-C", wt, "checkout", "-q", "-b", "side", shas[0]+"~1")
+	writeCommitFile(t, wt, "side.go", "package main\n")
+	git("-C", wt, "add", "-A")
+	git("-C", wt, "commit", "-m", "side")
+	side := strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD"))
+	git("-C", wt, "checkout", "-q", "late2")
+	git("-C", wt, "merge", "-q", "--no-ff", "-m", "merge side", "side")
+	pollGitWatchWorkspace(session)
+	if countSha(attributedShas(t, state.OutboxPath()), side) != 0 {
+		t.Fatalf("merged-in side-branch commit %s was replayed as new work", side)
+	}
+}
+
+// TestBashWindowKeepsTheWorkdirAlongsideNamedPaths (Greptile, #270):
+// `git -C /B status && sed -i … foo.go` edits foo.go in the workdir A.
+func TestBashWindowKeepsTheWorkdirAlongsideNamedPaths(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": a}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "git -C "+b+" status && sed -i x foo.go"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || !slices.Contains(ws[0].Roots, resolvePath(a)) || !slices.Contains(ws[0].Roots, resolvePath(b)) {
+		t.Fatalf("window roots = %v, want both the workdir and the named checkout", ws)
+	}
+}
+
+// TestCdAwayCommandDoesNotClaimTheWorkdir (Greptile, #270): `cd /B && …` works
+// in B only.
+func TestCdAwayCommandDoesNotClaimTheWorkdir(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": a}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+b+" && sed -i x foo.go"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || len(ws[0].Roots) != 1 || ws[0].Roots[0] != resolvePath(b) {
+		t.Fatalf("window roots = %v, want only %s", ws, b)
+	}
+}
+
+func assertBothReportedOnce(t *testing.T, shas []string) {
+	t.Helper()
+	got := attributedShas(t, state.OutboxPath())
+	for _, sha := range shas {
+		if countSha(got, sha) != 1 {
+			t.Fatalf("late-worktree commit %s reported %d times, want 1 (%v)", sha, countSha(got, sha), got)
+		}
+	}
+}
+
+// TestLateWorktreeReplayOverTheCapStaysOwed (Greptile, #270): more owed commits
+// than one poll may report drain across polls, oldest first — never dropped.
+func TestLateWorktreeReplayOverTheCapStaysOwed(t *testing.T) {
+	session, _, shas, _, _ := lateWorktreeFixture(t)
+	prev := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
+	pollGitWatchWorkspace(session)
+	got := attributedShas(t, state.OutboxPath())
+	if countSha(got, shas[0]) != 1 || countSha(got, shas[1]) != 0 {
+		t.Fatalf("first capped poll must report only the OLDEST owed commit: %v", got)
+	}
+	pollGitWatchWorkspace(session)
+	assertBothReportedOnce(t, shas)
+}
+
+// TestLateWorktreeReplayOverBudgetStaysOwed: no budget this poll still saves the
+// replay as owed; the next poll reports it.
+func TestLateWorktreeReplayOverBudgetStaysOwed(t *testing.T) {
+	session, _, shas, _, _ := lateWorktreeFixture(t)
+	prev := gitWatchMaxCommitsPerPollTotal
+	gitWatchMaxCommitsPerPollTotal = 0
+	pollGitWatchWorkspace(session)
+	gitWatchMaxCommitsPerPollTotal = prev
+	pollGitWatchWorkspace(session)
+	assertBothReportedOnce(t, shas)
+}
+
+// TestEditThenCdKeepsTheWorkdir (Greptile, #270): `sed … foo.go && cd /B` edits
+// foo.go in the workdir; the cd only moves later segments.
+func TestEditThenCdKeepsTheWorkdir(t *testing.T) {
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	b := filepath.Join(home, "repos", "b")
+	gitRepoAt(t, a)
+	gitRepoAt(t, b)
+	got := commandCheckouts("sed -i x foo.go && cd "+b, resolvePath(a), home)
+	if len(got) != 1 || got[0] != resolvePath(a) {
+		t.Fatalf("checkouts = %v, want only the workdir %s", got, a)
+	}
+}
+
+// TestWindowInNoCapturedCheckoutClaimsNothing (Greptile, #270): a command that
+// ran only outside capture records that, rather than an empty list that
+// recovery would read as "unknown, eligible everywhere".
+func TestWindowInNoCapturedCheckoutClaimsNothing(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	gitRepoAt(t, a)
+	outside := filepath.Join(t.TempDir(), "x")
+	gitRepoAt(t, outside)
+	recordAiBashWindow(aiCommandEvent("s", "cd "+outside+" && sed -i x f"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 {
+		t.Fatalf("windows = %d", len(ws))
+	}
+	writeCommitFile(t, a, "y.go", "package y\n")
+	info, _ := os.Stat(filepath.Join(a, "y.go"))
+	m := info.ModTime().UnixMilli()
+	ws[0].StartMs, ws[0].EndMs = m, m
+	if got, ok := recoverBashSession(a, "y.go", ws); ok {
+		t.Fatalf("a window that ran outside capture claimed %q in a captured checkout", got)
+	}
+}
+
+// TestRelativeCdMovesTheCheckout (Greptile, #270): `cd ../sibling && sed …`
+// edits the sibling.
+func TestRelativeCdMovesTheCheckout(t *testing.T) {
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	sib := filepath.Join(home, "repos", "sibling")
+	gitRepoAt(t, a)
+	gitRepoAt(t, sib)
+	got := commandCheckouts("cd ../sibling && sed -i x f", resolvePath(a), home)
+	if len(got) != 1 || got[0] != resolvePath(sib) {
+		t.Fatalf("checkouts = %v, want only %s", got, sib)
+	}
+}
+
+// TestLateWorktreeReplayFollowsBranchOrderUnderClockSkew (Greptile, #270): a
+// parent committed with a LATER clock than its child must still be reported
+// first, or the capped batch skips it.
+func TestLateWorktreeReplayFollowsBranchOrderUnderClockSkew(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-skew", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session)
+
+	wt := filepath.Join(home, "repos", "proj-skew")
+	git("worktree", "add", "-b", "skew", wt)
+	now := time.Now()
+	var shas []string
+	for i, f := range []string{"a.go", "b.go"} {
+		// The parent's clock runs an hour AHEAD of its child's.
+		t.Setenv("GIT_COMMITTER_DATE", now.Add(time.Duration(1-i)*time.Hour).Format(time.RFC3339))
+		writeCommitFile(t, wt, f, "package main\n")
+		git("-C", wt, "add", "-A")
+		git("-C", wt, "commit", "-m", f)
+		shas = append(shas, strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD")))
+	}
+	pollGitWatchWorkspace(session)
+	got := attributedShas(t, state.OutboxPath())
+	if countSha(got, shas[0]) != 1 || countSha(got, shas[1]) != 0 {
+		t.Fatalf("first capped poll must report the PARENT despite its later clock: %v", got)
+	}
+	pollGitWatchWorkspace(session)
+	assertBothReportedOnce(t, shas)
+}
+
+// TestRelativeCdResolvesFromThePromptSubdirectory (Greptile, #270): a session
+// started in a/src that runs `cd ../../sibling` lands in the sibling.
+func TestRelativeCdResolvesFromThePromptSubdirectory(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	sib := filepath.Join(home, "repos", "sibling")
+	gitRepoAt(t, a)
+	gitRepoAt(t, sib)
+	if err := os.MkdirAll(filepath.Join(a, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prompt := event.NewEvent("prompt", "s")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": filepath.Join(a, "src")}
+	recordAiBashWindow(&prompt, home, false)
+	recordAiBashWindow(aiCommandEvent("s", "cd ../../sibling && sed -i x f"), home, false)
+	ws := readBashWindows(gitWatchRootKey(home))
+	if len(ws) != 1 || len(ws[0].Roots) != 1 || ws[0].Roots[0] != resolvePath(sib) {
+		t.Fatalf("window roots = %v, want only %s", ws, sib)
+	}
+	if roots := readBashRoots(gitWatchRootKey(home)); !slices.Contains(roots, resolvePath(a)) {
+		t.Fatalf("discovery roots %v lost the prompt's checkout", roots)
 	}
 }

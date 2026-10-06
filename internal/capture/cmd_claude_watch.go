@@ -1248,19 +1248,28 @@ func workspaceMatchRoots(workspace string) []string {
 	}
 	for _, seed := range seeds {
 		add(seed)
-		// #nosec G204 -- constant argv; seed is this install's own capture root, not attacker input. Reads only the local worktree list.
-		out, err := exec.Command("git", "-C", seed, "worktree", "list", "--porcelain").Output()
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(out), "\n") {
-			if !strings.HasPrefix(line, "worktree ") {
-				continue
-			}
-			add(resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))))
+		for _, wt := range gitWorktrees(seed) {
+			add(wt)
 		}
 	}
 	return roots
+}
+
+// gitWorktrees lists every checkout of the repository at root (resolved paths),
+// or nil when root is not a repo.
+func gitWorktrees(root string) []string {
+	// #nosec G204 -- constant argv; root is a local capture or discovered repo root, not attacker input. Reads only the local worktree list.
+	out, err := exec.Command("git", "-C", root, "worktree", "list", "--porcelain").Output()
+	if err != nil {
+		return nil
+	}
+	var wts []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "worktree ") {
+			wts = append(wts, resolvePath(strings.TrimSpace(strings.TrimPrefix(line, "worktree "))))
+		}
+	}
+	return wts
 }
 
 // claudeClassifyMaxScanLines bounds how many records either classifier examines

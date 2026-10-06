@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -363,12 +365,24 @@ type bashWindowsEntry struct {
 	Windows []bashWindowSpan `json:"windows"`
 	TsMs    int64            `json:"tsMs"`
 	RootKey string           `json:"rootKey"`
+	// Workdir is the DIRECTORY the session's latest prompt ran in (absolute, inside
+	// a captured checkout) — the directory, not just its repo root, so a relative
+	// `cd ../x` resolves from where the session actually is. Was a repo root
+	// root). It is the checkout of every later command that names no path, and it
+	// makes a repo worked in purely through Bash discoverable. Local-only — this
+	// ledger never leaves the device.
+	Workdir string `json:"workdir,omitempty"`
 }
 
 // bashWindowSpan is one AI bash command's execution window, in Unix ms.
 type bashWindowSpan struct {
 	StartMs int64 `json:"startMs"`
 	EndMs   int64 `json:"endMs"`
+	// Roots are the checkouts THIS command worked in: the directories it names,
+	// else the session's workdir when it ran. Stored per window, so evidence a
+	// session gathers later in another checkout never reaches back to an earlier
+	// command. Empty on windows recorded before this field existed.
+	Roots []string `json:"roots,omitempty"`
 }
 
 // bashWindow is a span joined with the session that recorded it — the shape the
@@ -377,6 +391,7 @@ type bashWindow struct {
 	SessionID string
 	StartMs   int64
 	EndMs     int64
+	Roots     []string // the checkouts this window's command worked in; nil = unknown
 }
 
 const (
@@ -397,7 +412,7 @@ const (
 // The window scoping below removes only the CROSS-repo case; the temporal
 // same-workspace overlap is a documented tradeoff of the opt-in heuristic.
 func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
-	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli())
+	recordBashWindowAt(sessionID, rootKey, startMs, endMs, time.Now().UnixMilli(), nil)
 }
 
 // recordBashWindowAt is recordBashWindow with the session-activity stamp
@@ -409,12 +424,44 @@ func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 // the genuinely live session's windows. Losing those costs a bash-mtime
 // recovery pass — an undercount, but exactly the one the ledger exists to
 // prevent.
-func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64) {
-	if sessionID == "" {
-		return
-	}
+func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, checkouts func(workdir string) []string) {
 	if endMs < startMs {
 		startMs, endMs = endMs, startMs
+	}
+	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
+		var roots []string
+		if checkouts != nil {
+			roots = checkouts(entry.Workdir)
+			if len(roots) == 0 {
+				// Known to have run in no captured checkout — distinct from a legacy
+				// window with no record, which stays eligible everywhere.
+				roots = []string{bashNoCheckout}
+			}
+		}
+		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs, Roots: roots})
+		if len(entry.Windows) > bashWindowsMaxPerSession {
+			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
+		}
+	})
+}
+
+// bashNoCheckout marks a window whose command ran in no captured checkout.
+const bashNoCheckout = "-"
+
+// recordBashWorkdir records the checkout a session's prompt ran in. No window: a
+// prompt edits nothing.
+func recordBashWorkdir(sessionID, rootKey string, activityMs int64, workdir string) {
+	if workdir == "" {
+		return
+	}
+	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
+		entry.Workdir = workdir
+	})
+}
+
+func updateBashEntry(sessionID, rootKey string, activityMs int64, mutate func(*bashWindowsEntry)) {
+	if sessionID == "" {
+		return
 	}
 	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
 		ledger := bashWindowsLedger{V: bashWindowsLedgerVersion, Sessions: map[string]bashWindowsEntry{}}
@@ -430,10 +477,7 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 			activityMs = nowMs
 		}
 		entry := ledger.Sessions[sessionID]
-		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
-		if len(entry.Windows) > bashWindowsMaxPerSession {
-			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
-		}
+		mutate(&entry)
 		if activityMs > entry.TsMs {
 			entry.TsMs = activityMs
 		}
@@ -464,6 +508,18 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 // AND differ (an unknown on either side falls through as a match).
 func readBashWindows(rootKey string) []bashWindow {
 	var out []bashWindow
+	for sid, entry := range liveBashEntries(rootKey) {
+		for _, w := range entry.Windows {
+			out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs, Roots: w.Roots})
+		}
+	}
+	return out
+}
+
+// liveBashEntries reads the ledger's sessions within aiPathsTTL whose rootKey
+// matches (see readBashWindows). Read-only.
+func liveBashEntries(rootKey string) map[string]bashWindowsEntry {
+	out := map[string]bashWindowsEntry{}
 	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(bashWindowsLedgerPath())
 		if err != nil {
@@ -482,12 +538,35 @@ func readBashWindows(rootKey string) []bashWindow {
 			if entry.RootKey != "" && rootKey != "" && entry.RootKey != rootKey {
 				continue
 			}
-			for _, w := range entry.Windows {
-				out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs})
-			}
+			out[sid] = entry
 		}
 		return nil
 	})
+	return out
+}
+
+// readBashRoots returns every checkout a live session recorded under rootKey,
+// for git-watch discovery: a repo an agent edits only through Bash has no
+// ai-paths entry, so this is the only way it gets polled at all.
+func readBashRoots(rootKey string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(r string) {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	for _, entry := range liveBashEntries(rootKey) {
+		if r, ok := gitRootOf(entry.Workdir); ok && entry.Workdir != "" { // scope-checked when recorded
+			add(resolvePath(r))
+		}
+		for _, w := range entry.Windows {
+			for _, r := range w.Roots {
+				add(r)
+			}
+		}
+	}
 	return out
 }
 
@@ -524,7 +603,28 @@ func pruneBashWindows(ledger *bashWindowsLedger, nowMs int64) {
 // window is the point [endMs, endMs]; recovery widens it by ± the δ/ε tolerance.
 // replay is declared by the caller, on the same terms as dedupeFileDiff's.
 func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
-	if e == nil || e.Kind != "command" {
+	if e == nil || (e.Kind != "command" && e.Kind != "prompt") {
+		return
+	}
+	if e.Kind == "prompt" {
+		// The workdir is where the session runs; recording it is what makes a repo
+		// worked in purely through Bash discoverable. No window: a prompt edits
+		// nothing.
+		endMs, ok := eventTsMs(e.Ts)
+		now := time.Now().UnixMilli()
+		if !ok || (replay && now-endMs > aiPathsTTL.Milliseconds()) {
+			return
+		}
+		if replay && endMs < now {
+			now = endMs
+		}
+		rootKey := ""
+		if taskRoot != "" {
+			rootKey = gitWatchRootKey(taskRoot)
+		}
+		if wd := promptWorkdir(e, taskRoot); wd != "" {
+			recordBashWorkdir(e.SessionID, rootKey, now, wd)
+		}
 		return
 	}
 	if e.Provenance == nil || e.Provenance.Attribution != "likely_ai" {
@@ -554,7 +654,115 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs)
+	command := ""
+	if d, ok := e.Data.(map[string]interface{}); ok {
+		command, _ = d["command"].(string)
+	}
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, func(workdir string) []string {
+		return commandCheckouts(command, workdir, taskRoot)
+	})
+}
+
+// bashSegmentRe splits a command into the segments the shell runs in order.
+var bashSegmentRe = regexp.MustCompile(`&&|\|\||;|\|`)
+
+// bashCdRe captures the target of a segment that is a `cd`.
+var bashCdRe = regexp.MustCompile(`^\(?\s*cd\s+(\S+)`)
+
+// commandCheckouts returns the captured checkouts a Bash command worked in,
+// walking its segments in order from the session's workdir: a `cd` moves the
+// working checkout for the segments AFTER it, every other segment works in the
+// current one, and any path a segment names counts too. So `sed … && cd /B`
+// edits the workdir, and `cd /B && sed …` edits B.
+func commandCheckouts(command, workdir, taskRoot string) []string {
+	// The directory segments run in, and the captured checkout holding it.
+	dir, cwd := workdir, checkoutOf(workdir, taskRoot)
+	seen := map[string]bool{}
+	var out []string
+	add := func(r string) {
+		if r != "" && !seen[r] {
+			seen[r] = true
+			out = append(out, r)
+		}
+	}
+	for _, seg := range bashSegmentRe.Split(command, -1) {
+		seg = strings.TrimSpace(seg)
+		if m := bashCdRe.FindStringSubmatch(seg); m != nil {
+			target := m[1]
+			if !strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "~") {
+				if dir == "" {
+					cwd = "" // relative to an unknown directory
+					continue
+				}
+				target = filepath.Join(dir, target) // `cd ../sibling`
+			}
+			dir = target
+			cwd = checkoutOf(target, taskRoot) // "" when outside capture
+			continue
+		}
+		add(cwd)
+		for _, m := range bashPathRe.FindAllStringSubmatch(seg, 16) {
+			add(checkoutOf(m[1], taskRoot))
+		}
+	}
+	return out
+}
+
+// bashPathRe matches absolute or ~-prefixed path tokens in a shell command
+// (`cd /x/wt && …`, `git -C ~/repos/y …`).
+var bashPathRe = regexp.MustCompile(`(?:^|[\s'"=(])((?:~|/)[^\s'"` + "`" + `;|&()<>]+)`)
+
+// promptWorkdir returns a prompt's workdir as an absolute directory, when it
+// sits inside a captured checkout; else "".
+func promptWorkdir(e *event.Event, taskRoot string) string {
+	d, ok := e.Data.(map[string]interface{})
+	if !ok || e.Kind != "prompt" {
+		return ""
+	}
+	wd, _ := d["workdir"].(string)
+	if checkoutOf(wd, taskRoot) == "" {
+		return ""
+	}
+	return expandHome(wd)
+}
+
+// expandHome turns a leading ~ into the home directory.
+func expandHome(p string) string {
+	if !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return ""
+	}
+	return filepath.Join(home, strings.TrimPrefix(p, "~"))
+}
+
+// checkoutOf resolves an absolute or ~ path to the captured checkout holding it,
+// or "". Stat-only (no git spawn); a repo outside capture scope (see
+// inCaptureScope) resolves to "" — naming a path must never widen capture.
+func checkoutOf(p, taskRoot string) string {
+	p = expandHome(p)
+	if !filepath.IsAbs(p) {
+		return ""
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		return ""
+	}
+	dir := p
+	if !info.IsDir() {
+		dir = filepath.Dir(p)
+	}
+	r, ok := gitRootOf(dir)
+	if !ok {
+		return ""
+	}
+	r = resolvePath(r)
+	if !inCaptureScope(r, taskRoot) {
+		return ""
+	}
+	return r
 }
 
 // eventTsMs parses an event's RFC3339Nano Ts into Unix ms.
@@ -727,4 +935,23 @@ func dedupeFileDiff(taskRoot string, e *event.Event, replay bool) bool {
 		recordAiTouchedPathAt(e.SessionID, rootKey, rel, writeMs, replay)
 	}
 	return won
+}
+
+// inCaptureScope reports whether a checkout is one this install already captures:
+// under the workspace or a registered capture root, or a linked worktree whose
+// repository is (an agent's scratch worktree under /tmp belongs to the repo it
+// was cut from).
+func inCaptureScope(root, taskRoot string) bool {
+	scope := []string{}
+	if taskRoot != "" {
+		scope = append(scope, resolvePath(taskRoot))
+	}
+	for _, r := range RegisteredCaptureRoots() {
+		scope = append(scope, resolvePath(r))
+	}
+	if pathWithinAny(root, scope) {
+		return true
+	}
+	gitdir, ok := worktreeGitdir(root)
+	return ok && pathWithinAny(resolvePath(gitdir), scope)
 }
