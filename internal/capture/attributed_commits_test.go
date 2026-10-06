@@ -414,3 +414,68 @@ func TestBashEditedSiblingWorktreeIsPolled(t *testing.T) {
 		t.Fatalf("sibling-worktree commit not credited to the Bash session")
 	}
 }
+
+func aiCommandEvent(sessionID, command string) *event.Event {
+	e := event.NewEvent("command", sessionID)
+	e.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	e.Data = map[string]interface{}{"command": command}
+	e.Provenance = &event.Provenance{Attribution: "likely_ai"}
+	return &e
+}
+
+// TestBashOnlyRepoIsDiscoveredFromPromptWorkdir: a repo that NO Edit/Write ever
+// touched (prod: the teams-cli checkout had zero ai-paths entries) is found
+// through the session's prompt workdir, and its commit is credited.
+func TestBashOnlyRepoIsDiscoveredFromPromptWorkdir(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "cli")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+
+	session := Session{DeviceID: "dev-cwd", TaskRoot: home}
+	prompt := event.NewEvent("prompt", "bash-sess")
+	prompt.Ts = time.Now().UTC().Format(time.RFC3339Nano)
+	prompt.Data = map[string]interface{}{"workdir": repo}
+	recordAiBashWindow(&prompt, home, false)
+	pollGitWatchWorkspace(session) // cold-start baseline — only possible if discovered
+
+	writeCommitFile(t, repo, "bar.go", "package main\n\nfunc bar() {}\n")
+	recordAiBashWindow(aiCommandEvent("bash-sess", "sed -i s/a/b/ bar.go"), home, false)
+	git("add", "-A")
+	git("commit", "-m", "bash edit")
+	sha := strings.TrimSpace(gitOut("rev-parse", "HEAD"))
+	pollGitWatchWorkspace(session)
+
+	if countSha(attributedShas(t, state.OutboxPath()), sha) != 1 {
+		t.Fatalf("commit in a repo known only from the prompt workdir was not attributed")
+	}
+}
+
+// TestBashRecoveryCreditsTheSessionThatWorkedThere: two agents run Bash at the
+// same instant; only one of them worked in this checkout. The nearer window
+// belongs to the other — it must not win.
+func TestBashRecoveryCreditsTheSessionThatWorkedThere(t *testing.T) {
+	dir := t.TempDir()
+	writeCommitFile(t, dir, "x.go", "package x\n")
+	info, err := os.Stat(filepath.Join(dir, "x.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := info.ModTime().UnixMilli()
+	got, ok := recoverBashSession(dir, "x.go", []bashWindow{
+		{SessionID: "elsewhere", StartMs: m, EndMs: m, Roots: []string{"/some/other/checkout"}},
+		{SessionID: "here", StartMs: m + 2000, EndMs: m + 2000, Roots: []string{resolvePath(dir)}},
+	})
+	if !ok || got != "here" {
+		t.Fatalf("credited %q (ok=%v), want the session that worked in this checkout", got, ok)
+	}
+}

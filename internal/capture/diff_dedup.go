@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -363,7 +365,16 @@ type bashWindowsEntry struct {
 	Windows []bashWindowSpan `json:"windows"`
 	TsMs    int64            `json:"tsMs"`
 	RootKey string           `json:"rootKey"`
+	// Roots are the repo checkouts (resolved absolute paths) this session worked
+	// in: its prompts' workdir and every directory its Bash commands name. They
+	// make the session's repos discoverable to git-watch, and let recovery credit
+	// a commit only to a session that worked in that checkout. Local-only — this
+	// ledger never leaves the device.
+	Roots []string `json:"roots,omitempty"`
 }
+
+// bashRootsMaxPerSession bounds Roots; the newest are kept.
+const bashRootsMaxPerSession = 16
 
 // bashWindowSpan is one AI bash command's execution window, in Unix ms.
 type bashWindowSpan struct {
@@ -377,6 +388,7 @@ type bashWindow struct {
 	SessionID string
 	StartMs   int64
 	EndMs     int64
+	Roots     []string // the session's recorded checkouts; nil = unknown
 }
 
 const (
@@ -409,12 +421,51 @@ func recordBashWindow(sessionID, rootKey string, startMs, endMs int64) {
 // the genuinely live session's windows. Losing those costs a bash-mtime
 // recovery pass — an undercount, but exactly the one the ledger exists to
 // prevent.
-func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64) {
-	if sessionID == "" {
-		return
-	}
+func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs int64, roots ...string) {
 	if endMs < startMs {
 		startMs, endMs = endMs, startMs
+	}
+	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
+		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
+		if len(entry.Windows) > bashWindowsMaxPerSession {
+			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
+		}
+		addBashRoots(entry, roots)
+	})
+}
+
+// recordBashRoots records the checkouts a session worked in without a window
+// (a prompt's workdir carries no edit time).
+func recordBashRoots(sessionID, rootKey string, activityMs int64, roots []string) {
+	if len(roots) == 0 {
+		return
+	}
+	updateBashEntry(sessionID, rootKey, activityMs, func(entry *bashWindowsEntry) {
+		addBashRoots(entry, roots)
+	})
+}
+
+func addBashRoots(entry *bashWindowsEntry, roots []string) {
+	for _, r := range roots {
+		dup := false
+		for _, have := range entry.Roots {
+			if have == r {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			entry.Roots = append(entry.Roots, r)
+		}
+	}
+	if len(entry.Roots) > bashRootsMaxPerSession {
+		entry.Roots = entry.Roots[len(entry.Roots)-bashRootsMaxPerSession:]
+	}
+}
+
+func updateBashEntry(sessionID, rootKey string, activityMs int64, mutate func(*bashWindowsEntry)) {
+	if sessionID == "" {
+		return
 	}
 	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
 		ledger := bashWindowsLedger{V: bashWindowsLedgerVersion, Sessions: map[string]bashWindowsEntry{}}
@@ -430,10 +481,7 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 			activityMs = nowMs
 		}
 		entry := ledger.Sessions[sessionID]
-		entry.Windows = append(entry.Windows, bashWindowSpan{StartMs: startMs, EndMs: endMs})
-		if len(entry.Windows) > bashWindowsMaxPerSession {
-			entry.Windows = entry.Windows[len(entry.Windows)-bashWindowsMaxPerSession:]
-		}
+		mutate(&entry)
 		if activityMs > entry.TsMs {
 			entry.TsMs = activityMs
 		}
@@ -464,6 +512,18 @@ func recordBashWindowAt(sessionID, rootKey string, startMs, endMs, activityMs in
 // AND differ (an unknown on either side falls through as a match).
 func readBashWindows(rootKey string) []bashWindow {
 	var out []bashWindow
+	for sid, entry := range liveBashEntries(rootKey) {
+		for _, w := range entry.Windows {
+			out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs, Roots: entry.Roots})
+		}
+	}
+	return out
+}
+
+// liveBashEntries reads the ledger's sessions within aiPathsTTL whose rootKey
+// matches (see readBashWindows). Read-only.
+func liveBashEntries(rootKey string) map[string]bashWindowsEntry {
+	out := map[string]bashWindowsEntry{}
 	_ = sign.WithBufferLock(bashWindowsLedgerPath()+".lock", func() error {
 		data, err := os.ReadFile(bashWindowsLedgerPath())
 		if err != nil {
@@ -482,12 +542,27 @@ func readBashWindows(rootKey string) []bashWindow {
 			if entry.RootKey != "" && rootKey != "" && entry.RootKey != rootKey {
 				continue
 			}
-			for _, w := range entry.Windows {
-				out = append(out, bashWindow{SessionID: sid, StartMs: w.StartMs, EndMs: w.EndMs})
-			}
+			out[sid] = entry
 		}
 		return nil
 	})
+	return out
+}
+
+// readBashRoots returns every checkout a live session recorded under rootKey,
+// for git-watch discovery: a repo an agent edits only through Bash has no
+// ai-paths entry, so this is the only way it gets polled at all.
+func readBashRoots(rootKey string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, entry := range liveBashEntries(rootKey) {
+		for _, r := range entry.Roots {
+			if !seen[r] {
+				seen[r] = true
+				out = append(out, r)
+			}
+		}
+	}
 	return out
 }
 
@@ -524,7 +599,26 @@ func pruneBashWindows(ledger *bashWindowsLedger, nowMs int64) {
 // window is the point [endMs, endMs]; recovery widens it by ± the δ/ε tolerance.
 // replay is declared by the caller, on the same terms as dedupeFileDiff's.
 func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
-	if e == nil || e.Kind != "command" {
+	if e == nil || (e.Kind != "command" && e.Kind != "prompt") {
+		return
+	}
+	if e.Kind == "prompt" {
+		// The workdir is where the session runs; recording it is what makes a repo
+		// worked in purely through Bash discoverable. No window: a prompt edits
+		// nothing.
+		endMs, ok := eventTsMs(e.Ts)
+		now := time.Now().UnixMilli()
+		if !ok || (replay && now-endMs > aiPathsTTL.Milliseconds()) {
+			return
+		}
+		if replay && endMs < now {
+			now = endMs
+		}
+		rootKey := ""
+		if taskRoot != "" {
+			rootKey = gitWatchRootKey(taskRoot)
+		}
+		recordBashRoots(e.SessionID, rootKey, now, eventRepoRoots(e))
 		return
 	}
 	if e.Provenance == nil || e.Provenance.Attribution != "likely_ai" {
@@ -554,7 +648,56 @@ func recordAiBashWindow(e *event.Event, taskRoot string, replay bool) {
 	if taskRoot != "" {
 		rootKey = gitWatchRootKey(taskRoot)
 	}
-	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs)
+	recordBashWindowAt(e.SessionID, rootKey, endMs, endMs, activityMs, eventRepoRoots(e)...)
+}
+
+// bashPathRe matches absolute or ~-prefixed path tokens in a shell command
+// (`cd /x/wt && …`, `git -C ~/repos/y …`).
+var bashPathRe = regexp.MustCompile(`(?:^|[\s'"=(])((?:~|/)[^\s'"` + "`" + `;|&()<>]+)`)
+
+// eventRepoRoots returns the repo checkouts an event places its session in: a
+// prompt's workdir, or the directories a Bash command names. Stat-only (no git
+// spawn); a token that is not inside a repo contributes nothing.
+func eventRepoRoots(e *event.Event) []string {
+	var cands []string
+	switch d := e.Data.(type) {
+	case map[string]interface{}:
+		if s, ok := d["workdir"].(string); ok && e.Kind == "prompt" {
+			cands = append(cands, s)
+		}
+		if s, ok := d["command"].(string); ok && e.Kind == "command" {
+			for _, m := range bashPathRe.FindAllStringSubmatch(s, 16) {
+				cands = append(cands, m[1])
+			}
+		}
+	}
+	home, _ := os.UserHomeDir()
+	seen := map[string]bool{}
+	var roots []string
+	for _, p := range cands {
+		if strings.HasPrefix(p, "~") {
+			if home == "" {
+				continue
+			}
+			p = filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+		info, err := os.Stat(p)
+		if err != nil {
+			continue
+		}
+		dir := p
+		if !info.IsDir() {
+			dir = filepath.Dir(p)
+		}
+		if r, ok := gitRootOf(dir); ok {
+			r = resolvePath(r)
+			if !seen[r] {
+				seen[r] = true
+				roots = append(roots, r)
+			}
+		}
+	}
+	return roots
 }
 
 // eventTsMs parses an event's RFC3339Nano Ts into Unix ms.

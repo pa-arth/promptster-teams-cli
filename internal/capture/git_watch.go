@@ -1289,6 +1289,7 @@ func pollGitWatchWorkspace(session Session) {
 	// 2026-10-05: 37 of one engineer's 82 merged PRs in a week had no captured
 	// commit, every one from a Bash-edited sibling worktree.
 	aiRoots := discoverAiRepoRoots(session.TaskRoot)
+	aiRoots = append(aiRoots, readBashRoots(gitWatchRootKey(session.TaskRoot))...)
 	var siblings []string
 	for _, r := range aiRoots {
 		siblings = append(siblings, gitWorktrees(r)...)
