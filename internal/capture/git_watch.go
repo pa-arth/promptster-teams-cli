@@ -81,6 +81,10 @@ func gitWatchCursorsPath() string {
 type gitWatchCursors struct {
 	V       int               `json:"v"`
 	Cursors map[string]string `json:"cursors"` // rootKey -> last-seen HEAD sha
+	// Replays are owed late-worktree replays: rootKey -> the head the replay must
+	// reach. Kept in the SAME file as the cursors and written in the same atomic
+	// rename, so a cursor can never advance past an owed range without its marker.
+	Replays map[string]string `json:"replays,omitempty"`
 }
 
 const gitWatchCursorsVersion = 1
@@ -1090,36 +1094,24 @@ func recentBranchBase(root, head string, sinceUnix int64) string {
 // firstParentRange lists from..to along to's first-parent chain, newest-first.
 func firstParentRange(root, from, to string) ([]string, bool) {
 	// #nosec G204 -- constant argv; both shas came from git. Read-only.
-	out, err := exec.Command("git", "-C", root, "rev-list", "--first-parent", from+".."+to).Output()
+	out, err := exec.Command("git", "-C", root, "rev-list", "--topo-order", "--first-parent", from+".."+to).Output()
 	if err != nil {
 		return nil, false
 	}
 	return parseRevListShas(out), true
 }
 
-// gitWatchReplaysPath holds the owed late-worktree replays: rootKey -> the head
-// the replay must reach. Local-only and tiny (one entry per replaying root).
-func gitWatchReplaysPath() string {
-	return filepath.Join(state.StateDir(), "git-watch-replays.json")
-}
-
+// loadGitWatchReplays reads the owed late-worktree replays (see gitWatchCursors).
 func loadGitWatchReplays() map[string]string {
 	out := map[string]string{}
-	if data, err := os.ReadFile(gitWatchReplaysPath()); err == nil {
-		_ = json.Unmarshal(data, &out)
-	}
+	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
+		var onDisk gitWatchCursors
+		if data, err := os.ReadFile(gitWatchCursorsPath()); err == nil && json.Unmarshal(data, &onDisk) == nil && onDisk.Replays != nil {
+			out = onDisk.Replays
+		}
+		return nil
+	})
 	return out
-}
-
-func saveGitWatchReplays(replays map[string]string) {
-	data, err := json.Marshal(replays)
-	if err != nil {
-		return
-	}
-	tmp := gitWatchReplaysPath() + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) == nil {
-		_ = os.Rename(tmp, gitWatchReplaysPath())
-	}
 }
 
 // requestLineOrigins queues line-origin work for commits (newest-first), oldest
@@ -1180,8 +1172,10 @@ func loadGitWatchCursors() map[string]string {
 // saveGitWatchCursors merges the freshly observed heads into the on-disk cursor
 // set (re-read under the lock so a transiently-unreadable root keeps its old
 // cursor rather than re-baselining). Best-effort: I/O failure never blocks.
-func saveGitWatchCursors(heads map[string]string) {
-	if len(heads) == 0 {
+//
+// replays, when given, REPLACES the owed-replay set in the same write.
+func saveGitWatchCursors(heads map[string]string, replays ...map[string]string) {
+	if len(heads) == 0 && len(replays) == 0 {
 		return
 	}
 	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
@@ -1194,6 +1188,14 @@ func saveGitWatchCursors(heads map[string]string) {
 		}
 		for k, v := range heads {
 			merged.Cursors[k] = v
+		}
+		if len(replays) > 0 {
+			merged.Replays = replays[0]
+		} else {
+			var onDisk gitWatchCursors
+			if data, err := os.ReadFile(gitWatchCursorsPath()); err == nil && json.Unmarshal(data, &onDisk) == nil {
+				merged.Replays = onDisk.Replays
+			}
 		}
 		data, err := json.Marshal(merged)
 		if err != nil {
@@ -1380,8 +1382,7 @@ func pollGitWatch(roots []string, originSession ...Session) (map[string][]string
 			gitWatchMaxCommitsPerPollTotal, deferred)
 	}
 
-	saveGitWatchCursors(newHeads)
-	saveGitWatchReplays(replays)
+	saveGitWatchCursors(newHeads, replays)
 	return detected, foldable, drained, coldStart
 }
 

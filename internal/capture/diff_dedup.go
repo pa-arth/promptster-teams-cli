@@ -671,7 +671,7 @@ var bashCdRe = regexp.MustCompile(`^\(?\s*cd\s+(\S+)`)
 // current one, and any path a segment names counts too. So `sed … && cd /B`
 // edits the workdir, and `cd /B && sed …` edits B.
 func commandCheckouts(command, workdir, taskRoot string) []string {
-	cwd := workdir
+	dir, cwd := workdir, workdir // the directory segments run in, and its checkout
 	seen := map[string]bool{}
 	var out []string
 	add := func(r string) {
@@ -683,10 +683,17 @@ func commandCheckouts(command, workdir, taskRoot string) []string {
 	for _, seg := range bashSegmentRe.Split(command, -1) {
 		seg = strings.TrimSpace(seg)
 		if m := bashCdRe.FindStringSubmatch(seg); m != nil {
-			if strings.HasPrefix(m[1], "/") || strings.HasPrefix(m[1], "~") {
-				cwd = checkoutOf(m[1], taskRoot) // "" when outside capture
+			target := m[1]
+			if !strings.HasPrefix(target, "/") && !strings.HasPrefix(target, "~") {
+				if dir == "" {
+					cwd = "" // relative to an unknown directory
+					continue
+				}
+				target = filepath.Join(dir, target) // `cd ../sibling`
 			}
-			continue // a relative cd stays in the same checkout
+			dir = target
+			cwd = checkoutOf(target, taskRoot) // "" when outside capture
+			continue
 		}
 		add(cwd)
 		for _, m := range bashPathRe.FindAllStringSubmatch(seg, 16) {

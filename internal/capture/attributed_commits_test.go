@@ -730,3 +730,62 @@ func TestWindowInNoCapturedCheckoutClaimsNothing(t *testing.T) {
 		t.Fatalf("a window that ran outside capture claimed %q in a captured checkout", got)
 	}
 }
+
+// TestRelativeCdMovesTheCheckout (Greptile, #270): `cd ../sibling && sed …`
+// edits the sibling.
+func TestRelativeCdMovesTheCheckout(t *testing.T) {
+	home := t.TempDir()
+	a := filepath.Join(home, "repos", "a")
+	sib := filepath.Join(home, "repos", "sibling")
+	gitRepoAt(t, a)
+	gitRepoAt(t, sib)
+	got := commandCheckouts("cd ../sibling && sed -i x f", resolvePath(a), home)
+	if len(got) != 1 || got[0] != resolvePath(sib) {
+		t.Fatalf("checkouts = %v, want only %s", got, sib)
+	}
+}
+
+// TestLateWorktreeReplayFollowsBranchOrderUnderClockSkew (Greptile, #270): a
+// parent committed with a LATER clock than its child must still be reported
+// first, or the capped batch skips it.
+func TestLateWorktreeReplayFollowsBranchOrderUnderClockSkew(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	prev := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prev })
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	writeCommitFile(t, repo, "foo.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "baseline")
+	session := Session{DeviceID: "dev-skew", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/foo.go")
+	pollGitWatchWorkspace(session)
+
+	wt := filepath.Join(home, "repos", "proj-skew")
+	git("worktree", "add", "-b", "skew", wt)
+	now := time.Now()
+	var shas []string
+	for i, f := range []string{"a.go", "b.go"} {
+		// The parent's clock runs an hour AHEAD of its child's.
+		t.Setenv("GIT_COMMITTER_DATE", now.Add(time.Duration(1-i)*time.Hour).Format(time.RFC3339))
+		writeCommitFile(t, wt, f, "package main\n")
+		git("-C", wt, "add", "-A")
+		git("-C", wt, "commit", "-m", f)
+		shas = append(shas, strings.TrimSpace(gitOut("-C", wt, "rev-parse", "HEAD")))
+	}
+	pollGitWatchWorkspace(session)
+	got := attributedShas(t, state.OutboxPath())
+	if countSha(got, shas[0]) != 1 || countSha(got, shas[1]) != 0 {
+		t.Fatalf("first capped poll must report the PARENT despite its later clock: %v", got)
+	}
+	pollGitWatchWorkspace(session)
+	assertBothReportedOnce(t, shas)
+}
