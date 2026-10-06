@@ -6,6 +6,20 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.38.2] — 2026-10-05
+
+### Fixed
+
+- `aiTokens` on `commit_attribution` no longer counts lockfiles, dependency
+  writes, data files (`.jsonl`, `.csv`, `.tsv`, `.lock`, `.sum`, `.snap`,
+  `.map`, `.min.js`) or any file adding more than 5000 lines or 200KB of AI
+  lines. Path-level attribution marks every added line of an AI-touched file
+  as AI, so a committed tokenizer or scraped dataset counted as merged AI code:
+  on 2026-10-04 three such commits were 53.2M of one org's 54.2M merged tokens
+  and showed generated:merged as 0.4 : 1. Those files also stay out of the
+  local fingerprint store, so one generated file can no longer evict other
+  files' squash-merge evidence. The attribution event itself is unchanged.
+
 ## [0.38.1] — 2026-10-04
 
 ### Fixed
