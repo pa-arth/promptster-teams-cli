@@ -579,7 +579,7 @@ func TestProjectClaudeMdTokensNested(t *testing.T) {
 	writeClaudeFixture(t, root, ".git/CLAUDE.md", 4000)
 	writeClaudeFixture(t, root, ".claude/worktrees/wt/CLAUDE.md", 4000)
 	writeClaudeFixture(t, root, "d1/d2/d3/d4/d5/d6/CLAUDE.md", 4000) // dir d6 is 6 levels down → past bound
-	markGitRepo(t, root) // the .git/CLAUDE.md fixture alone is not a repo
+	markGitRepo(t, root)                                             // the .git/CLAUDE.md fixture alone is not a repo
 
 	const want = 50 // max(app=50, packages/x/y=10), NOT the 60 sum
 	got, pos := projectClaudeMdTokens(root)
