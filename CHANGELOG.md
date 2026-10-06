@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.38.3] — 2026-10-06
+
+### Fixed
+
+- Commits made in a worktree an agent edits only through shell commands (sed,
+  heredocs, `codex exec`) are now attributed. git-watch discovered repos only
+  from Edit/Write-style evidence, so such worktrees were never polled: on
+  2026-10-05, 37 of one engineer's 82 merged PRs in a week had no captured
+  commit and no cost. git-watch now polls every worktree of a discovered repo,
+  learns repos from each session's prompt workdir and the paths its commands
+  `cd` into, and credits a Bash-edited file only to a session whose command
+  worked in that checkout. A worktree cut and committed to between two polls
+  has its recent first-parent commits replayed instead of baselined away. An
+  empty `.git` directory is no longer treated as a repository.
+
 ## [0.38.2] — 2026-10-05
 
 ### Fixed
