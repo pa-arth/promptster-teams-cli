@@ -1469,6 +1469,26 @@ func TestStreamedUsageMergesCacheCreationSplit(t *testing.T) {
 	}
 }
 
+func TestUsageForwardsSpeed(t *testing.T) {
+	// Fast mode bills 2x on the same model id; without speed the backend
+	// prices it at the standard rate.
+	main := processAll(t, NewClaudeTranscriptProcessor("sess-1"),
+		assistantLine("msg-f", 50, `,"speed":"fast"`))
+	if len(main) != 1 || dm(main[0])["speed"] != "fast" {
+		t.Fatalf("ai_response speed = %+v, want fast", main)
+	}
+	side := NewClaudeTranscriptProcessor("sess-1")
+	side.UsageOnly = true
+	sub := processAll(t, side, assistantLine("msg-g", 50, `,"speed":"fast"`))
+	if len(sub) != 1 || dm(sub[0])["speed"] != "fast" {
+		t.Fatalf("subagent_usage speed = %+v, want fast", sub)
+	}
+	plain := processAll(t, NewClaudeTranscriptProcessor("sess-1"), assistantLine("msg-h", 50, ""))
+	if _, ok := dm(plain[0])["speed"]; ok {
+		t.Error("speed invented on a row that carried none")
+	}
+}
+
 func TestSidechainUsageBillsFinalOutputTokens(t *testing.T) {
 	// The worst-hit path: it emitted on the FIRST line and marked the id done,
 	// so it could never observe a final count for ANY message.

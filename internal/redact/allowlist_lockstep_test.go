@@ -145,12 +145,9 @@ var serverOnlyFields = map[string]map[string]string{
 			"them. This is the provider's own per-request number off the OTel wire " +
 			"(claude_code.cost.usage), which no transcript carries. Kept out of USAGE_FIELDS " +
 			"server-side for exactly this reason.",
-		"speed": "No CLI rail sources it. `speed` is a Claude Code OTel `api_request` attribute; " +
-			"no transcript, rollout or hook payload this CLI reads carries it. Cursor's " +
-			"neighbouring `model_params` entry `{fast false}` is a DIFFERENT vocabulary — a " +
-			"boolean about Cursor's own fast-mode, not Claude's speed token — and mapping one " +
-			"onto the other would invent a fact. Unlike `effort` beside it, there is nothing " +
-			"here to decide: the value does not exist on this side.",
+		// speed was here until 2026-10-07, filed as "no transcript carries it". Claude
+		// Code transcripts do: message.usage.speed ("standard" | "fast"), 30,746 rows
+		// on one laptop. internal/normalize now forwards it; fast mode bills 2x.
 		"cachedInputTokens": "Codex OTel only (`cached_input`). No Codex rail on this device reports " +
 			"it: the rollout token_count this CLI parses carries no cached-input breakdown.",
 		// cacheWriteInputTokens was here until 2026-08-12, filed as "Codex OTel only,

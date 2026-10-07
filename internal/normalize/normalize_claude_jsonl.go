@@ -549,6 +549,10 @@ func (p *ClaudeTranscriptProcessor) flushSidechain(a *claudeMsgAccum) []event.Ev
 		data["cacheWrite5mTokens"] = intField(cc, "ephemeral_5m_input_tokens")
 		data["cacheWrite1hTokens"] = intField(cc, "ephemeral_1h_input_tokens")
 	}
+	// standard | fast. Fast mode bills 2x on the same model id.
+	if sp, ok := usage["speed"].(string); ok && sp != "" {
+		data["speed"] = sp
+	}
 	// Attribution: which skill/agent spawned this sidechain (names only) and
 	// the sidechain's agent id, so per-skill / per-agent spend can be rolled up.
 	if p.AgentID != "" {
@@ -722,6 +726,10 @@ func (p *ClaudeTranscriptProcessor) flushAccum() []event.Event {
 		if cc, ok := u["cache_creation"].(map[string]interface{}); ok {
 			data["cacheWrite5mTokens"] = intField(cc, "ephemeral_5m_input_tokens")
 			data["cacheWrite1hTokens"] = intField(cc, "ephemeral_1h_input_tokens")
+		}
+		// standard | fast. Fast mode bills 2x on the same model id.
+		if sp, ok := u["speed"].(string); ok && sp != "" {
+			data["speed"] = sp
 		}
 	}
 	// The window sits OUTSIDE the `u != nil` block on purpose, mirroring the
