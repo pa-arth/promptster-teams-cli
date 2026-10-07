@@ -552,3 +552,29 @@ func TestCursorLaneIDCarriesNoPath(t *testing.T) {
 		}
 	}
 }
+
+// A widened root set must reach a transcript already cached as "no" (e.g. a
+// /tmp agent run rejected before transcriptMatchRoots added the temp dir).
+func TestPollCursorTranscriptsRecheckAfterRootsChange(t *testing.T) {
+	root := cursorProjectsRoot(t)
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	oldWs := resolvePath(t.TempDir())
+	ws := resolvePath(t.TempDir())
+
+	path := writeCursorTranscript(t, root, "p/agent-transcripts/a/a.jsonl",
+		`{"role":"user","message":{"content":[{"type":"text","text":"<user_query>hi</user_query>"}]}}`,
+		cursorShellLine(ws),
+	)
+	key := cursorProgressKey(path)
+	saveCursorWatchProgress(cursorWatchProgress{
+		Offsets: map[string]int64{}, Match: map[string]string{key: "no"},
+		Roots: map[string]string{}, Sessions: map[string]string{},
+		V: cursorProgressSchemaV, RootsFP: captureRootsFingerprint(transcriptMatchRoots(oldWs)),
+	})
+
+	session := Session{TaskRoot: ws, DeviceID: "dev-test"}
+	pollCursorTranscripts(session, ws, time.Now().Add(-time.Hour), map[string]*normalize.CursorTranscriptProcessor{}, true, false)
+	if got := loadCursorWatchProgress().Match[key]; got != "yes" {
+		t.Fatalf("cached \"no\" survived a root-set change: match=%q", got)
+	}
+}
