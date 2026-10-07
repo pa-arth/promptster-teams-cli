@@ -258,6 +258,11 @@ func RunCursorWatcher() error {
 	// this watcher already provides. This is also the automatic migration for an
 	// already-installed fleet — the daemon self-updates, re-execs, and lands here.
 	EnsureCursorHooksBestEffort()
+	// Enrollment does nothing while ~/.cursor does not exist, and it used to run
+	// only here: Cursor installed after the daemon started got no hook until the
+	// next restart (2026-09-17: three days of sessions with billing rows only).
+	// Retry once, on the first poll that sees the directory.
+	hooksEnrolled := dirExists(filepath.Dir(cursorUserHooksPath()))
 
 	processors := map[string]*normalize.CursorTranscriptProcessor{}
 	eventsCaptured := 0
@@ -294,6 +299,10 @@ func RunCursorWatcher() error {
 	}
 
 	for {
+		if !hooksEnrolled && dirExists(filepath.Dir(cursorUserHooksPath())) {
+			EnsureCursorHooksBestEffort()
+			hooksEnrolled = true
+		}
 		captureProse := policyResolver.CaptureAssistantProse()
 		eventsCaptured += pollCursorTranscripts(session, workspace, startCutoff, processors, firstPoll, captureProse)
 		firstPoll = false
@@ -324,7 +333,7 @@ func pollCursorTranscripts(
 	captureProse bool,
 ) int {
 	progress := loadCursorWatchProgress()
-	roots := workspaceMatchRoots(workspace)
+	roots := transcriptMatchRoots(workspace)
 	// Sessions the hook rail already covers. Its events are strictly richer
 	// (model, real durations, session outcome), so where both rails can see a
 	// session the hook wins and this one stands down — otherwise one prompt and

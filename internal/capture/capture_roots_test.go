@@ -362,3 +362,25 @@ func TestRegisterCaptureRootConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestTranscriptMatchRootsAddsTempOnlyForHome: headless agent sessions run from
+// scratch dirs under the temp directory. A home-rooted install matches them; a
+// repo-rooted one does not, and git-watch's root set never gains the temp dir.
+func TestTranscriptMatchRootsAddsTempOnlyForHome(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	home := resolvePath(t.TempDir())
+	tmp := resolvePath(t.TempDir())
+	t.Setenv("HOME", home)
+	t.Setenv("TMPDIR", tmp)
+
+	if got := transcriptMatchRoots(home); !containsPath(got, tmp) {
+		t.Errorf("home-rooted install must match the temp dir %s; got %v", tmp, got)
+	}
+	if got := workspaceMatchRoots(home); containsPath(got, tmp) {
+		t.Errorf("the shared root set must not gain the temp dir; got %v", got)
+	}
+	repo := resolvePath(t.TempDir())
+	if got := transcriptMatchRoots(repo); containsPath(got, tmp) {
+		t.Errorf("a repo-rooted install must not match the temp dir; got %v", got)
+	}
+}
