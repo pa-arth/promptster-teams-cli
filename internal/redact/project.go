@@ -163,7 +163,7 @@ var projectFieldAllowlist = map[string][]string{
 	// cumulative inputTokens sums every request so far. A bare integer. Per-kind
 	// for the same lockstep reason as the four above; appended LAST on both usage
 	// kinds, matching the server manifest's freeze-additions-at-the-end order.
-	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId", "cursorAccountRef", "lastRequestInputTokens", "effort"),
+	"ai_response": append(append([]string{}, projectUsageFields...), "cacheWriteInputTokens", "contextWindowTokens", "generationId", "cursorAccountRef", "lastRequestInputTokens", "effort", "speed"),
 	// `sidechain` marks work done by a subagent. Its events roll up to the
 	// PARENT session's id (a subagent transcript records its parent's sessionId),
 	// so without this flag subagent work is indistinguishable from the main
@@ -177,7 +177,7 @@ var projectFieldAllowlist = map[string][]string{
 	// separates concurrent delegates of the same kind: 48% of measured lanes sit
 	// in such a cluster, with an 11.3x cost spread inside one. It goes LAST to
 	// match the server manifest's order, which freezes additions at the end.
-	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain", "cacheWriteInputTokens", "contextWindowTokens", "summary", "lastRequestInputTokens", "effort"),
+	"subagent_usage": append(append([]string{}, projectUsageFields...), "attributionSkill", "attributionAgent", "agentId", "sidechain", "cacheWriteInputTokens", "contextWindowTokens", "summary", "lastRequestInputTokens", "effort", "speed"),
 	// File events: PATH + line/byte counts only — never the diff or contents.
 	// lineRanges carries WHICH lines were AI as content-free {start,end,
 	// attribution} triples (ints + one enum); its element allowlist below is
