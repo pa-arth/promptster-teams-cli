@@ -1207,3 +1207,15 @@ func TestProjectKeepsBoundedTierAndPlanOnly(t *testing.T) {
 		}
 	}
 }
+
+func TestProjectKeepsOnlyKnownClaudeSpeeds(t *testing.T) {
+	for _, kind := range []string{"ai_response", "subagent_usage"} {
+		for speed, keep := range map[string]bool{"fast": true, "standard": true, leakCanary: false, "turbo": false} {
+			e := eventWithData(kind, map[string]interface{}{"inputTokens": int64(10), "speed": speed})
+			ProjectEvent(&e, false)
+			if got, ok := e.Data.(map[string]interface{})["speed"]; ok != keep || (keep && got != speed) {
+				t.Fatalf("%s speed=%q: kept=%v got=%v", kind, speed, ok, got)
+			}
+		}
+	}
+}

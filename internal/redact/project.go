@@ -15,6 +15,9 @@ var mainLoopModelPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127
 
 var codexServiceTiers = map[string]bool{"default": true, "fast": true, "flex": true}
 
+// claudeSpeeds is the closed set Claude transcripts write to usage.speed.
+var claudeSpeeds = map[string]bool{"standard": true, "fast": true}
+
 var planTypePattern = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 // Client-side source exclusion — the on-device twin of the backend's teams
@@ -1034,6 +1037,13 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 		if !isString || !isOpaqueLaneID(laneStr) {
 			delete(projected, laneField)
 			fmt.Fprintf(os.Stderr, "promptster-teams: redact: kind %q carried a %s that is not an opaque id — dropped\n", e.Kind, laneField)
+		}
+	}
+	if e.Kind == "ai_response" || e.Kind == "subagent_usage" {
+		if speed, present := projected["speed"]; present {
+			if v, ok := speed.(string); !ok || !claudeSpeeds[v] {
+				delete(projected, "speed")
+			}
 		}
 	}
 	if e.Kind == "codex_session_usage" {
