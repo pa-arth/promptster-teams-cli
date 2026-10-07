@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.39.0] — 2026-10-07
+
+### Added
+
+- Claude Code usage events now carry `speed` (`standard` or `fast`) from the
+  transcript, so fast-mode requests are priced at their 2x rate instead of the
+  standard one. Only those two values survive redaction.
+
+### Fixed
+
+- Cursor hooks are enrolled when `~/.cursor` appears after the daemon started.
+  Enrollment ran only at startup, so a Cursor first opened with the daemon
+  already running had no hook until the next restart: on 2026-09-17 that left
+  three days of one engineer's Cursor sessions as billing rows only, with no
+  prompts or commands.
+- Headless agent runs from the temp directory (Claude Code scratchpads under
+  `/tmp/claude-<uid>`, `codex exec` in `/tmp`) are captured when the engineer's
+  home is a capture root. git-watch and the config census still ignore `/tmp`.
+  Cursor's transcript cache now re-checks its decisions when the root set
+  changes, as Claude and Codex already did.
+
 ## [0.38.3] — 2026-10-06
 
 ### Fixed
