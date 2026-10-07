@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -783,7 +784,7 @@ func pollClaudeTranscripts(
 	// shared budget, so granting it once keeps the poll's total work bounded
 	// while making the escape independent of walk order.
 	oversizeProbe := true
-	roots := workspaceMatchRoots(workspace)
+	roots := transcriptMatchRoots(workspace)
 	// Any root-set change must revalidate cached decisions: widening can admit a
 	// prior mismatch, while narrowing must revoke a prior match. See RootsFP.
 	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
@@ -1255,6 +1256,27 @@ func workspaceMatchRoots(workspace string) []string {
 	return roots
 }
 
+// transcriptMatchRoots is workspaceMatchRoots plus the system temp directory
+// when the engineer's home is itself a root. Agents run headless sessions from
+// scratch directories there (Claude Code's /tmp/claude-<uid>/…, `codex exec`
+// in /tmp): that is the same engineer's spend, and a home-rooted install has
+// already opted in everything they run. Transcript matching only: git-watch
+// and the config census keep the narrower set, so throwaway repos in /tmp stay
+// out of commit attribution.
+func transcriptMatchRoots(workspace string) []string {
+	roots := workspaceMatchRoots(workspace)
+	home, err := os.UserHomeDir()
+	if err != nil || !slices.Contains(roots, resolvePath(home)) {
+		return roots
+	}
+	for _, t := range []string{os.TempDir(), "/tmp"} {
+		if r := resolvePath(t); !slices.Contains(roots, r) {
+			roots = append(roots, r)
+		}
+	}
+	return roots
+}
+
 // gitWorktrees lists every checkout of the repository at root (resolved paths),
 // or nil when root is not a repo.
 func gitWorktrees(root string) []string {
@@ -1425,7 +1447,7 @@ func classifyClaudeTranscriptBounded(
 // on. Used after a hook-takeover window.
 func fastForwardClaudeTranscripts(workspace string, historyCutoff time.Time) {
 	progress := loadClaudeWatchProgress()
-	roots := workspaceMatchRoots(workspace)
+	roots := transcriptMatchRoots(workspace)
 	for _, path := range candidateClaudeTranscripts(historyCutoff) {
 		key := claudeProgressKey(path)
 		if progress.Match[key] == "no" {

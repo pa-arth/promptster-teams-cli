@@ -108,6 +108,10 @@ type cursorWatchProgress struct {
 	// so an older progress file needs no migration and V does not move.
 	Sessions map[string]string `json:"sessions"`
 	V        int               `json:"v"`
+	// RootsFP fingerprints the match ROOT SET the cached decisions were made
+	// against; a change drops every cached decision. Mirrors
+	// claudeWatchProgress.RootsFP.
+	RootsFP string `json:"roots_fp"`
 }
 
 // cursorProgressSchemaV is the current progress-file schema version. Bump it
@@ -257,6 +261,13 @@ func RunCursorWatcher() error {
 	// a failure here leaves transcript-only capture, which is exactly the state
 	// this watcher already provides. This is also the automatic migration for an
 	// already-installed fleet — the daemon self-updates, re-execs, and lands here.
+	//
+	// Enrollment does nothing while ~/.cursor does not exist, and it used to run
+	// only here: Cursor installed after the daemon started got no hook until the
+	// next restart (2026-09-17: three days of sessions with billing rows only).
+	// Retry once, on the first poll that sees the directory. Sample before
+	// enrolling so a directory created mid-call is still retried.
+	hooksEnrolled := dirExists(filepath.Dir(cursorUserHooksPath()))
 	EnsureCursorHooksBestEffort()
 
 	processors := map[string]*normalize.CursorTranscriptProcessor{}
@@ -294,6 +305,10 @@ func RunCursorWatcher() error {
 	}
 
 	for {
+		if !hooksEnrolled && dirExists(filepath.Dir(cursorUserHooksPath())) {
+			EnsureCursorHooksBestEffort()
+			hooksEnrolled = true
+		}
 		captureProse := policyResolver.CaptureAssistantProse()
 		eventsCaptured += pollCursorTranscripts(session, workspace, startCutoff, processors, firstPoll, captureProse)
 		firstPoll = false
@@ -324,7 +339,14 @@ func pollCursorTranscripts(
 	captureProse bool,
 ) int {
 	progress := loadCursorWatchProgress()
-	roots := workspaceMatchRoots(workspace)
+	roots := transcriptMatchRoots(workspace)
+	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr, "cursor-watcher: capture roots changed — re-checking %d cached transcript(s)\n", dropped)
+		}
+		progress.RootsFP = fp
+		saveCursorWatchProgress(progress)
+	}
 	// Sessions the hook rail already covers. Its events are strictly richer
 	// (model, real durations, session outcome), so where both rails can see a
 	// session the hook wins and this one stands down — otherwise one prompt and

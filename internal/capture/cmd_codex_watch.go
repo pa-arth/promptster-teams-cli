@@ -507,7 +507,7 @@ func pollCodexRollouts(
 	// directory registered by a later `start`, and their git worktrees. Codex
 	// used to compare against the single workspace, so a registered second tree
 	// would have stayed invisible here even after the Claude side saw it.
-	roots := workspaceMatchRoots(workspace)
+	roots := transcriptMatchRoots(workspace)
 	if fp, dropped, changed := syncMatchCacheToRoots(progress.Match, progress.RootsFP, roots); changed {
 		if dropped > 0 {
 			fmt.Fprintf(os.Stderr, "codex-watcher: capture roots changed — re-checking %d cached rollout(s)\n", dropped)
