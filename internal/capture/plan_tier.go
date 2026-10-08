@@ -43,7 +43,7 @@ const providerCursor = "cursor"
 const (
 	tierSourceClaudeProfile = "claude_profile"
 	tierSourceCodexRollout  = "codex_rollout"
-	tierSourceCodexIDToken  = "codex_id_token"
+	tierSourceCodexIDToken  = "codex_id_token" // #nosec G101 -- a tier SOURCE label, not a credential.
 	tierSourceCursorStateDB = "cursor_state_db"
 
 	planSignalSourceAbsent = "source_absent"
