@@ -309,11 +309,13 @@ func (p *planLimitEmitter) maybe(session Session, now time.Time, captureProse bo
 			// Overlap a little: a file can be written during the previous scan.
 			after = time.Unix(st.HitScan, 0).Add(-10 * time.Minute)
 		}
+		queueFailed := false
 		for _, h := range p.scanHits(after) {
 			if _, seen := st.Hits[h.key()]; seen {
 				continue
 			}
 			if queuePlanEvent(buildUsageLimitHitEvent(h, p.tier.AccountRef, now.Unix(), session.DeviceID), captureProse) != nil {
+				queueFailed = true
 				continue
 			}
 			st.Hits[h.key()] = h.ResetsAt
@@ -326,7 +328,12 @@ func (p *planLimitEmitter) maybe(session Session, now time.Time, captureProse bo
 				delete(st.Hits, k)
 			}
 		}
-		st.HitScan, dirty = now.Unix(), true
+		// Hold the scan position while any hit failed to queue, so the next scan
+		// still reaches it; queued hits are deduped by st.Hits.
+		if !queueFailed {
+			st.HitScan = now.Unix()
+		}
+		dirty = true
 	}
 	if dirty {
 		savePlanLimitState(p.provider, st)

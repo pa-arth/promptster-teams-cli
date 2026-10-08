@@ -250,7 +250,9 @@ func readCodexPlanTier(sessionsDir, authPath string, now time.Time) planTierRead
 		forEachCodexTokenCount(path, func(ts time.Time, rl map[string]interface{}) {
 			plan, _ := rl["plan_type"].(string)
 			plan = vendorToken(plan, vendorTokenPattern)
-			if plan == "" || !ts.After(bestTs) {
+			// The file's mtime is not the row's age: a resumed old rollout keeps
+			// its old plan rows, which must not beat auth.json's current plan.
+			if plan == "" || ts.Before(now.Add(-codexPlanLookback)) || !ts.After(bestTs) {
 				return
 			}
 			bestTs = ts

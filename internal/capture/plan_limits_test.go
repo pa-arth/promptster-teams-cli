@@ -267,6 +267,14 @@ func TestReadCodexPlanTier(t *testing.T) {
 		len(r.AccountRef) != 16 || r.SourceObservedAt != now.Add(-time.Minute).Unix() {
 		t.Errorf("rollout reading = %+v", r)
 	}
+	// A resumed old rollout: fresh mtime, but its only plan row is 8 days old.
+	// That stale plan must not beat auth.json's current one.
+	stale := filepath.Join(dir, "stale-sessions")
+	writeLines(t, filepath.Join(stale, "rollout-old.jsonl"),
+		codexTokenCount(now.Add(-8*24*time.Hour).UTC().Format(time.RFC3339Nano), 12, 1791053686, "codex"))
+	if r := readCodexPlanTier(stale, auth, now); r.VendorPlan != "plus" || r.TierSource != tierSourceCodexIDToken {
+		t.Errorf("stale rollout row won: %+v", r)
+	}
 	// No rollout in 7 days: fall back to the id_token claim.
 	r = readCodexPlanTier(filepath.Join(dir, "none"), auth, now)
 	if r.VendorPlan != "plus" || r.TierSource != tierSourceCodexIDToken || r.SourceObservedAt != 1789689600 {
@@ -352,5 +360,38 @@ func TestPlanLimitEmitterDedup(t *testing.T) {
 	}
 	if n := strings.Count(string(b), `"kind":"planTier"`); n != 2 {
 		t.Errorf("planTier emitted %d times, want 2 (day 1 + day 2 heartbeat)", n)
+	}
+}
+
+// A hit that fails to queue must stay reachable: the scan position is held, so
+// the next scan still covers it and it is emitted once the queue recovers.
+func TestPlanLimitEmitterHoldsScanOnQueueFailure(t *testing.T) {
+	tmp := setupCaptureState(t)
+	good := filepath.Join(tmp, "outbox.jsonl")
+	blocker := filepath.Join(tmp, "not-a-dir")
+	writeLines(t, blocker, "x")
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(blocker, "outbox.jsonl"))
+
+	hits := []limitHit{{Provider: providerClaudeCode, Window: "five_hour", ResetsAt: 1790587800, FirstSeenAt: 1790580000, Evidence: evidenceRejectedRequest, SessionID: "s1"}}
+	e := &planLimitEmitter{
+		provider: providerClaudeCode,
+		readTier: func(time.Time) (planTierReading, bool) { return planTierReading{}, false },
+		scanHits: func(time.Time) []limitHit { return hits },
+	}
+	session := Session{DeviceID: "dev-1"}
+	day1 := time.Date(2026, 10, 7, 10, 0, 0, 0, time.UTC)
+	e.maybe(session, day1, false)
+	if st := loadPlanLimitState(providerClaudeCode); st.HitScan != 0 || len(st.Hits) != 0 {
+		t.Fatalf("failed queue advanced state: %+v", st)
+	}
+
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", good)
+	e.maybe(session, day1.Add(limitHitScanInterval), false)
+	if st := loadPlanLimitState(providerClaudeCode); st.HitScan == 0 || len(st.Hits) != 1 {
+		t.Errorf("recovered queue did not record the hit: %+v", st)
+	}
+	b, _ := os.ReadFile(good)
+	if n := strings.Count(string(b), `"kind":"usageLimitHit"`); n != 1 {
+		t.Errorf("usageLimitHit emitted %d times after recovery, want 1", n)
 	}
 }
