@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.0] — 2026-10-08
+
+### Added
+
+- Plan tier and usage-limit hits for Claude Code, Codex and Cursor, read
+  locally. `planTier` carries the vendor's own plan strings (Claude from
+  `~/.claude.json` `oauthAccount`, Codex from rollout `rate_limits.plan_type`,
+  Cursor from one read-only `state.vscdb` key). `usageLimitHit` is sent once per
+  exhausted window (Claude rate-limit rows in transcripts, Codex windows at
+  100%). Only lowercase tier strings, timestamps and a device-hashed account ref
+  leave the machine; tokens and emails in those files are never read out.
+  `cli login` discloses this.
+
 ## [0.39.0] — 2026-10-07
 
 ### Added
