@@ -607,6 +607,8 @@ func RunClaudeWatcher() error {
 	// writes (latest-wins) and emit the provider-agnostic windowUsage event. See
 	// window_usage.go and statusline_shim.go.
 	var windowEmitter claudeWindowEmitter
+	// Plan tier + usage-limit hits (plan_tier.go, limit_hits.go).
+	planLimits := newClaudePlanLimitEmitter()
 	// Claude CONTEXT-window spools: written per session by the same statusline
 	// shim, read (not drained) each poll by pollClaudeTranscripts, and aged out
 	// here because nothing tells the shim a session ended.
@@ -659,6 +661,7 @@ func RunClaudeWatcher() error {
 		parsed, consumed := pollClaudeTranscripts(session, workspace, historyCutoff, processors, degraded, captureProse)
 		bytesConsumed += consumed
 		windowEmitter.maybe(session, time.Now(), captureProse)
+		planLimits.maybe(session, time.Now(), captureProse)
 		contextPruner.maybe(time.Now())
 		statuslineHeal.maybe(time.Now())
 		wasDegraded := degraded

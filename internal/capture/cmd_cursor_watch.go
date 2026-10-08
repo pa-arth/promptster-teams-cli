@@ -275,6 +275,7 @@ func RunCursorWatcher() error {
 	// See pollCursorTranscripts: the first poll seeds pre-existing transcripts to
 	// EOF; every later poll tails a newly-appeared transcript from 0.
 	firstPoll := true
+	planLimits := newCursorPlanLimitEmitter()
 
 	// Org capture policy, fail-closed and refreshed off the hot path. It gates
 	// the one prose kind this rail mints: a text-only `ai_response` carrying the
@@ -312,6 +313,7 @@ func RunCursorWatcher() error {
 		captureProse := policyResolver.CaptureAssistantProse()
 		eventsCaptured += pollCursorTranscripts(session, workspace, startCutoff, processors, firstPoll, captureProse)
 		firstPoll = false
+		planLimits.maybe(session, time.Now(), captureProse)
 
 		_ = saveCursorWatcherState(cursorWatcherState{
 			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,
