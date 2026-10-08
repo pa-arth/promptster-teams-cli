@@ -344,6 +344,7 @@ func RunCodexWatcher() error {
 	// windowUsage event. Independent of the per-line capture above (window state
 	// is account-global, not workspace-scoped). See window_usage.go.
 	var windowEmitter codexWindowEmitter
+	planLimits := newCodexPlanLimitEmitter()
 
 	// Org capture policy (opt-in assistant prose), fail-closed. Refreshed in the
 	// background (immediate + every RefreshInterval) so the poll loop never
@@ -379,6 +380,7 @@ func RunCodexWatcher() error {
 		queued := pollCodexRollouts(session, workspace, historyCutoff, processors, captureProse)
 		eventsCaptured += queued
 		windowEmitter.maybe(session, time.Now(), captureProse)
+		planLimits.maybe(session, time.Now(), captureProse)
 
 		_ = saveCodexWatcherState(codexWatcherState{
 			PID: os.Getpid(), StartedAt: now, WatchDir: session.TaskRoot,

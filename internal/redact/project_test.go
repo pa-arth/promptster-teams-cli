@@ -1219,3 +1219,84 @@ func TestProjectKeepsOnlyKnownClaudeSpeeds(t *testing.T) {
 		}
 	}
 }
+
+// planTier / usageLimitHit (openspec plan-tier-and-limit-hits §2-§3): present
+// survives, absent stays absent (never 0 or ""), and a value failing its
+// pattern or type — an email planted in a tier string, a token, a smuggled
+// object — is dropped while the event still ships.
+func TestProjectEventPlanTierAndLimitHit(t *testing.T) {
+	e := eventWithData("planTier", map[string]interface{}{
+		"provider":            "claude_code",
+		"vendorPlan":          "claude_max",
+		"vendorRateLimitTier": "default_claude_max_5x",
+		"billingType":         "stripe_subscription",
+		"overageEnabled":      true,
+		"tierSource":          "claude_profile",
+		"sourceObservedAt":    int64(1791347467),
+		"capturedAt":          int64(1791350000),
+		"accountRef":          "0123456789abcdef",
+		"emailAddress":        "a@b.com",
+		"promptText":          leakCanary,
+	})
+	ProjectEvent(&e, false)
+	data := e.Data.(map[string]interface{})
+	want := map[string]interface{}{
+		"provider": "claude_code", "vendorPlan": "claude_max", "vendorRateLimitTier": "default_claude_max_5x",
+		"billingType": "stripe_subscription", "overageEnabled": true, "tierSource": "claude_profile",
+		"sourceObservedAt": int64(1791347467), "capturedAt": int64(1791350000), "accountRef": "0123456789abcdef",
+	}
+	if len(data) != len(want) {
+		t.Errorf("projected keys = %v, want %v", data, want)
+	}
+	for k, v := range want {
+		if data[k] != v {
+			t.Errorf("%s = %#v, want %#v", k, data[k], v)
+		}
+	}
+	for _, k := range []string{"seatTier", "signalState"} {
+		if _, present := data[k]; present {
+			t.Errorf("absent %s acquired a value: %#v", k, data[k])
+		}
+	}
+
+	planted := eventWithData("planTier", map[string]interface{}{
+		"provider":            "codex",
+		"vendorPlan":          "a@b.com",
+		"vendorRateLimitTier": "eyJhbGciOiJIUzI1NiJ9.e30.sig",
+		"seatTier":            "Planted Name",
+		"billingType":         map[string]interface{}{"email": "a@b.com"},
+		"overageEnabled":      "yes",
+		"tierSource":          "somewhere_else",
+		"signalState":         "reported",
+		"accountRef":          "5f0c1e2a-9b8d-4c3e-a1f2-0123456789ab",
+		"sourceObservedAt":    -1,
+		"capturedAt":          1.5,
+	})
+	ProjectEvent(&planted, false)
+	b, _ := json.Marshal(planted)
+	if strings.Contains(string(b), "@") || strings.Contains(string(b), "eyJ") || strings.Contains(string(b), "Planted") {
+		t.Fatalf("planted value survived planTier projection: %s", b)
+	}
+	got := planted.Data.(map[string]interface{})
+	if len(got) != 2 || got["provider"] != "codex" || got["signalState"] != "reported" {
+		t.Errorf("planted planTier projected to %v, want only provider + signalState", got)
+	}
+
+	hit := eventWithData("usageLimitHit", map[string]interface{}{
+		"provider": "claude_code", "window": "five_hour", "resetsAt": 1790587800.0, "firstSeenAt": 1790581171.0,
+		"evidence": "rejected_request", "overageStatus": "rejected", "capturedAt": 1791350000.0,
+		"upgradePaths": []interface{}{"upgrade_plan"}, "text": leakCanary,
+	})
+	ProjectEvent(&hit, false)
+	hd := hit.Data.(map[string]interface{})
+	if len(hd) != 7 || hd["window"] != "five_hour" || hd["resetsAt"] != 1790587800.0 {
+		t.Errorf("usageLimitHit projected to %v", hd)
+	}
+	bad := eventWithData("usageLimitHit", map[string]interface{}{
+		"provider": "claude_code", "window": "Five Hour!", "evidence": "guess", "overageStatus": "a@b.com", "resetsAt": "soon",
+	})
+	ProjectEvent(&bad, false)
+	if bd := bad.Data.(map[string]interface{}); len(bd) != 1 {
+		t.Errorf("bad usageLimitHit projected to %v, want provider only", bd)
+	}
+}

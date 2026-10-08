@@ -369,7 +369,15 @@ var projectFieldAllowlist = map[string][]string{
 	// planType is the provider's own plan word from Codex rate_limits (e.g.
 	// "plus", "prolite", "pro"), a bounded lowercase token checked in
 	// ProjectEvent. It is what turns a window % into dollars per plan.
-	"windowUsage": {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState", "planType"},
+	// planTier / usageLimitHit (openspec changes/plan-tier-and-limit-hits,
+	// design.md §2): vendor plan strings, booleans, epoch seconds and a hashed
+	// accountRef — nothing else. Every value is type- and pattern-checked by
+	// projectPlanScalars below, so an email or token planted in a source file
+	// cannot pass. LOCKSTEP with captureAllowlist.ts `stringScalars` and
+	// `nonNegativeIntegers` for the same kinds.
+	"planTier":      {"provider", "vendorPlan", "vendorRateLimitTier", "seatTier", "billingType", "overageEnabled", "tierSource", "sourceObservedAt", "capturedAt", "accountRef", "signalState"},
+	"usageLimitHit": {"provider", "window", "resetsAt", "firstSeenAt", "evidence", "overageStatus", "accountRef", "capturedAt"},
+	"windowUsage":   {"provider", "fiveHourPct", "weeklyPct", "fiveHourResetsAt", "weeklyResetsAt", "observedAt", "capturedAt", "signalState", "planType"},
 	// Cumulative Codex rollout counters, one reading per token_count line. No
 	// prompt, path, or prose. mainLoopModel is a bounded model identifier.
 	// threadId distinguishes delegated rollouts
@@ -1062,6 +1070,9 @@ func ProjectEvent(e *event.Event, captureAssistantProse bool) {
 			delete(projected, "planType")
 		}
 	}
+	if rules, ok := planScalarRules[e.Kind]; ok {
+		projectPlanScalars(projected, rules)
+	}
 	if shellCommandKinds[e.Kind] {
 		if cmd, isString := projected["command"].(string); isString {
 			projected["command"] = scrubInlineCommand(cmd)
@@ -1140,4 +1151,80 @@ func isScalar(v interface{}) bool {
 	default:
 		return false
 	}
+}
+
+// planScalarRules mirrors captureAllowlist.ts for planTier / usageLimitHit:
+// a string field must match its pattern, an integer field must be a
+// non-negative whole number, overageEnabled must be a bool. Anything else is
+// dropped to ABSENT, never coerced.
+var planScalarRules = map[string]map[string]string{
+	"planTier": {
+		"provider":            `^(claude_code|codex|cursor)$`,
+		"vendorPlan":          `^[a-z0-9_-]{1,32}$`,
+		"vendorRateLimitTier": `^[a-z0-9_-]{1,64}$`,
+		"seatTier":            `^[a-z0-9_-]{1,32}$`,
+		"billingType":         `^[a-z0-9_-]{1,32}$`,
+		"tierSource":          `^(claude_profile|codex_rollout|codex_id_token|cursor_state_db)$`,
+		"accountRef":          `^[0-9a-f]{16}$`,
+		"signalState":         `^(reported|source_absent|unreadable)$`,
+		"sourceObservedAt":    "int",
+		"capturedAt":          "int",
+		"overageEnabled":      "bool",
+	},
+	"usageLimitHit": {
+		"provider":      `^(claude_code|codex|cursor)$`,
+		"window":        `^[a-z0-9_]{1,32}$`,
+		"evidence":      `^(rejected_request|window_full|cycle_cap)$`,
+		"overageStatus": `^[a-z0-9_-]{1,32}$`,
+		"accountRef":    `^[0-9a-f]{16}$`,
+		"resetsAt":      "int",
+		"firstSeenAt":   "int",
+		"capturedAt":    "int",
+	},
+}
+
+var planScalarPatterns = map[string]*regexp.Regexp{}
+
+func init() {
+	for _, rules := range planScalarRules {
+		for _, rule := range rules {
+			if rule != "int" && rule != "bool" {
+				planScalarPatterns[rule] = regexp.MustCompile(rule)
+			}
+		}
+	}
+}
+
+func projectPlanScalars(projected map[string]interface{}, rules map[string]string) {
+	for key, value := range projected {
+		ok := false
+		switch rule := rules[key]; rule {
+		case "bool":
+			_, ok = value.(bool)
+		case "int":
+			ok = isNonNegativeInteger(value)
+		case "":
+		default:
+			s, isString := value.(string)
+			ok = isString && planScalarPatterns[rule].MatchString(s)
+		}
+		if !ok {
+			delete(projected, key)
+		}
+	}
+}
+
+func isNonNegativeInteger(v interface{}) bool {
+	switch n := v.(type) {
+	case int:
+		return n >= 0
+	case int64:
+		return n >= 0
+	case float64:
+		return n >= 0 && n == float64(int64(n))
+	case json.Number:
+		i, err := n.Int64()
+		return err == nil && i >= 0
+	}
+	return false
 }
