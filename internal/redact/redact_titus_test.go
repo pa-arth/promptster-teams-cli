@@ -167,6 +167,30 @@ func TestScrubEventPreservesUUIDRoutingIDs(t *testing.T) {
 	}
 }
 
+// A UUID whose first three groups are an all-digit, Luhn-valid Visa run
+// (4532015112835001) matched Titus's np.ccn.1 and came back as
+// `[REDACTED:np.ccn.1]-8929-…`; the backend 400'd the id and the outbox dropped
+// the event — forever, for deterministic ids. Envelope and data copies must
+// both survive.
+func TestScrubEventKeepsCardShapedUUIDs(t *testing.T) {
+	const id = "45320151-1283-5001-8929-24583e2df231"
+	ev := event.Event{
+		ID:        id,
+		SessionID: id,
+		Kind:      "cursorVendorUsage",
+		Source:    "cursor",
+		V:         1,
+		Data:      map[string]interface{}{"rowHash": id},
+	}
+	ScrubEvent(&ev)
+	if ev.ID != id || ev.SessionID != id {
+		t.Errorf("envelope id rewritten: id=%q sessionId=%q", ev.ID, ev.SessionID)
+	}
+	if got := ev.Data.(map[string]interface{})["rowHash"]; got != id {
+		t.Errorf("data id rewritten: %q", got)
+	}
+}
+
 // Multiple distinct secrets in one payload — all must go, ordering intact.
 func TestRedactMultipleSecretsOnePayload(t *testing.T) {
 	in := []byte(`{"output":"ANTHROPIC=sk-ant-` + `api03-jSq6OMjv1syXaEUE0bvOckLe_GtCKy8lvZdko3eOJgV8TH-f2iyzRekyZNSby5d9ScikGYuqQhsrxML3X3N3rQ-XwQaQAAA GITHUB=ghp_` + `wWPw5k4aXcaT4fNP0UcnZwJUVFk6LO0pINUx KEY=PST-A7K2-M9Q4 done"}`)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
@@ -297,6 +298,12 @@ func titusRedact(input []byte) []byte {
 
 	spans := make([]redactSpan, 0, len(res.Matches))
 	for _, m := range res.Matches {
+		// Card rules are the digit-run pass the header bans, back via Titus's
+		// builtin set (the library ignores its own `noisy` flag; Luhn only
+		// scores). They rewrite all-digit UUID groups, ids and hashes alike.
+		if strings.HasPrefix(m.RuleID, "np.ccn.") {
+			continue
+		}
 		s, e := int(m.Location.Offset.Start), int(m.Location.Offset.End)
 		if s < 0 || e > len(input) || s >= e {
 			continue
@@ -387,16 +394,14 @@ func ScrubEvent(ev *event.Event) {
 		// present or added later — can carry the secret-bearing payload
 		// through this branch.
 		state.HookDebugf("scrubEvent reparse failed, dropping event payload: %v", err)
-		*ev = event.Event{
-			ID:        ev.ID,
-			SessionID: ev.SessionID,
-			Ts:        ev.Ts,
-			Kind:      ev.Kind,
-			Source:    ev.Source,
-			V:         ev.V,
-			Data:      map[string]interface{}{"scrubbed": "payload dropped: redaction produced unparseable JSON"},
-		}
-		return
+		clean = event.Event{Data: map[string]interface{}{"scrubbed": "payload dropped: redaction produced unparseable JSON"}}
 	}
+	// Envelope fields are our own machine-generated identifiers, never user
+	// text, and the backend validates them strictly (id is z.uuid()). Restore
+	// them so no rule can mangle one into a permanent 400 — see the header.
+	clean.ID, clean.SessionID, clean.Ts = ev.ID, ev.SessionID, ev.Ts
+	clean.Kind, clean.Source, clean.V = ev.Kind, ev.Source, ev.V
+	clean.RelatedEventIDs, clean.DeviceID = ev.RelatedEventIDs, ev.DeviceID
+	clean.Sig, clean.PrevSig = ev.Sig, ev.PrevSig
 	*ev = clean
 }
