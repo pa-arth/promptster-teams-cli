@@ -167,6 +167,51 @@ func TestScrubEventPreservesUUIDRoutingIDs(t *testing.T) {
 	}
 }
 
+// A UUID whose first three groups are an all-digit, Luhn-valid Visa run
+// (4532015112835001) matched Titus's np.ccn.1 and came back as
+// `[REDACTED:np.ccn.1]-8929-…`; the backend 400'd the id and the outbox dropped
+// the event — forever, for deterministic ids. Envelope and data copies must
+// both survive.
+func TestScrubEventKeepsCardShapedUUIDs(t *testing.T) {
+	const id = "45320151-1283-5001-8929-24583e2df231"
+	ev := event.Event{
+		ID:        id,
+		SessionID: id,
+		Kind:      "cursorVendorUsage",
+		Source:    "cursor",
+		V:         1,
+		Data:      map[string]interface{}{"rowHash": id},
+	}
+	ScrubEvent(&ev)
+	if ev.ID != id || ev.SessionID != id {
+		t.Errorf("envelope id rewritten: id=%q sessionId=%q", ev.ID, ev.SessionID)
+	}
+	if got := ev.Data.(map[string]interface{})["rowHash"]; got != id {
+		t.Errorf("data id rewritten: %q", got)
+	}
+}
+
+// The restore path itself: Data carries a real secret so ScrubEvent does not
+// short-circuit, and every envelope field holds a value a rule WOULD rewrite
+// (email shape). Envelope survives byte-for-byte; the secret in Data does not.
+func TestScrubEventRestoresEnvelopeWhileRedactingData(t *testing.T) {
+	const tag = "dev@example.com"
+	ev := event.Event{
+		ID: tag, SessionID: tag, Ts: tag, Kind: tag, Source: tag, V: 1,
+		RelatedEventIDs: []string{tag}, DeviceID: tag, Sig: tag, PrevSig: tag,
+		Data: map[string]interface{}{"command": "export K=ghp_" + "wWPw5k4aXcaT4fNP0UcnZwJUVFk6LO0pINUx"},
+	}
+	ScrubEvent(&ev)
+	if ev.ID != tag || ev.SessionID != tag || ev.Ts != tag || ev.Kind != tag || ev.Source != tag ||
+		len(ev.RelatedEventIDs) != 1 || ev.RelatedEventIDs[0] != tag ||
+		ev.DeviceID != tag || ev.Sig != tag || ev.PrevSig != tag || ev.V != 1 {
+		t.Errorf("envelope rewritten: %+v", ev)
+	}
+	if cmd, _ := ev.Data.(map[string]interface{})["command"].(string); strings.Contains(cmd, "ghp_") {
+		t.Errorf("secret in data survived: %q", cmd)
+	}
+}
+
 // Multiple distinct secrets in one payload — all must go, ordering intact.
 func TestRedactMultipleSecretsOnePayload(t *testing.T) {
 	in := []byte(`{"output":"ANTHROPIC=sk-ant-` + `api03-jSq6OMjv1syXaEUE0bvOckLe_GtCKy8lvZdko3eOJgV8TH-f2iyzRekyZNSby5d9ScikGYuqQhsrxML3X3N3rQ-XwQaQAAA GITHUB=ghp_` + `wWPw5k4aXcaT4fNP0UcnZwJUVFk6LO0pINUx KEY=PST-A7K2-M9Q4 done"}`)
