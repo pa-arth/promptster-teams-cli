@@ -263,3 +263,23 @@ func TestTitusRedactsEveryCopyOfARepeatedSecret(t *testing.T) {
 		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
 	}
 }
+
+// Hidden helper rules capture the identifier half of a credential pair. On
+// opsAI they redacted the org name in every https://dev.azure.com/<org> URL
+// (1,141 markers) while protecting nothing. The org must survive; the PAT
+// still goes.
+func TestTitusKeepsHelperIdentifiersButRedactsTheirSecret(t *testing.T) {
+	if titusScanner() == nil {
+		t.Skip("titus scanner unavailable")
+	}
+	const pat = "FBdFol081crwkIHWJH2yiqDDyrFjVSi7HWl22hN2hTYfsB8NlGDpJQQJ77BAACAAAAAAAAAAAAASAZDOBucTj"
+	in := `{"command":"git clone https://dev.azure.com/contosoeng/app && export AZURE_DEVOPS_PAT=` + pat + `"}`
+	out := string(RedactBytes([]byte(in)))
+	if !strings.Contains(out, "dev.azure.com/contosoeng/app") {
+		t.Errorf("org name redacted: %s", out)
+	}
+	if strings.Contains(out, pat) {
+		t.Errorf("PAT survived: %s", out)
+	}
+	t.Logf("out: %s", out)
+}
