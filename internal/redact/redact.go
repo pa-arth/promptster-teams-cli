@@ -346,6 +346,21 @@ func titusRedact(input []byte) []byte {
 		return input
 	}
 
+	// Titus's cross-rule dedup clusters matches by captured VALUE, not offset,
+	// so a secret pasted N times comes back as ONE match. Cut every other copy
+	// too; the overlap handling below merges each with its original span.
+	for _, sp := range spans[:len(spans):len(spans)] {
+		secret := input[sp.start:sp.end]
+		for off := 0; ; {
+			i := bytes.Index(input[off:], secret)
+			if i < 0 {
+				break
+			}
+			spans = append(spans, redactSpan{start: off + i, end: off + i + len(secret), ruleID: sp.ruleID})
+			off += i + len(secret)
+		}
+	}
+
 	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
 
 	var out bytes.Buffer
