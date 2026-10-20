@@ -242,3 +242,24 @@ func BenchmarkRedactLargePayload(b *testing.B) {
 		RedactBytes(payload)
 	}
 }
+
+// Titus's CrossRuleDeduplicator (pkg/matcher/crossrule.go) clusters matches by
+// shared captured-group VALUE, ignoring offset, so N copies of one secret come
+// back as ONE match and only the first copy was spliced — the rest shipped in
+// plaintext. A GitLab PAT is caught by Titus only (no stage-1 vendor rule, and
+// `k`/`j`/`m` are not secret-ish names for stage 3), so this exercises stage 2.
+func TestTitusRedactsEveryCopyOfARepeatedSecret(t *testing.T) {
+	if titusScanner() == nil {
+		t.Skip("titus scanner unavailable")
+	}
+	const pat = "glpat-" + "Xk9fQ2vR7mT4pL8nW3yB"
+	in := `{"k":"` + pat + `","j":"` + pat + `","m":"echo ` + pat + ` done"}`
+	out := RedactBytes([]byte(in))
+	if n := bytes.Count(out, []byte(pat)); n != 0 {
+		t.Fatalf("%d copies of the secret survived: %s", n, out)
+	}
+	var v map[string]interface{}
+	if err := json.Unmarshal(out, &v); err != nil {
+		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
+	}
+}
