@@ -6,6 +6,21 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.1] — 2026-10-20
+
+### Fixed
+
+- Event ids are no longer rewritten by the secret scrubber. Titus's
+  credit-card rules matched UUIDs whose leading groups are all digits and
+  turned the id into a `[REDACTED:np.ccn.N]` marker; ingest rejected it and the
+  event was dropped for good. Deterministic ids (Cursor vendor usage rows) were
+  re-mangled on every resend, so one such row refused every later snapshot of
+  its Cursor login. Card rules are now skipped, and the event envelope (id,
+  session, timestamps, device, links) is never redacted.
+- A secret that appears more than once in one payload is now redacted
+  everywhere. Titus collapses repeated matches into one, so only the first
+  copy was masked and later copies were sent in plaintext.
+
 ## [0.40.0] — 2026-10-08
 
 ### Added
