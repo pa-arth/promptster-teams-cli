@@ -1153,6 +1153,51 @@ func parseRevListShas(out []byte) []string {
 	return shas
 }
 
+// gitRepoUserEmail is the identity this device commits as in root (`git config
+// user.email`, so global config and includeIf apply), or "" when none is set.
+func gitRepoUserEmail(root string) string {
+	// #nosec G204 -- constant argv; root is a discovered repo dir. Read-only.
+	out, _ := exec.Command("git", "-C", root, "config", "--get", "user.email").Output()
+	return strings.TrimSpace(string(out))
+}
+
+// gitOwnCommits returns the subset of shas whose AUTHOR email is root's
+// configured user.email — one spawn for the whole list.
+//
+// WHY: HEAD moves over commits this device did not write. A `git pull` that
+// fast-forwards over a colleague's work surfaces their commits exactly like our
+// own, and attributing them would match their files against THIS device's
+// ai-paths ledger, crediting a colleague's commit to a local AI session.
+//
+// nil means NO GATE: no user.email is configured, so nothing can be told apart
+// and the caller keeps attributing everything, as before this gate existed — a
+// misconfigured machine must not silently stop capturing. A probe that fails
+// returns an EMPTY set: nothing is proven ours, so nothing is attributed — an
+// undercount, never a misattribution.
+func gitOwnCommits(root string, shas []string) map[string]struct{} {
+	email := gitRepoUserEmail(root)
+	if email == "" {
+		return nil
+	}
+	own := map[string]struct{}{}
+	if len(shas) == 0 {
+		return own
+	}
+	// #nosec G204 -- constant argv plus the repo's own configured email as a fixed-string pattern; SHAs on stdin come from rev-list output. Read-only.
+	cmd := exec.Command("git", "-C", root, "rev-list", "--no-walk=unsorted", "--stdin",
+		"--fixed-strings", "--regexp-ignore-case", "--author=<"+email+">")
+	cmd.Stdin = strings.NewReader(strings.Join(shas, "\n") + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		state.HookDebugf("git-watch: author probe failed on %s; attributing none of %d commit(s)", gitWatchRootKey(root), len(shas))
+		return own
+	}
+	for _, sha := range parseRevListShas(out) {
+		own[sha] = struct{}{}
+	}
+	return own
+}
+
 func loadGitWatchCursors() map[string]string {
 	cursors := map[string]string{}
 	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
@@ -1600,10 +1645,15 @@ func pollGitWatchWorkspace(session Session) {
 		// keyed by path so worktree churn re-detects too. Skipping covers rework as
 		// well as attribution — re-running rework over a commit already accounted for
 		// would double-count its churn.
+		// Commits another author wrote (a pull fast-forwarding over a colleague's
+		// work) fold for rework STATE but are never emitted — see gitOwnCommits.
+		own := gitOwnCommits(root, commits)
 		for i := len(commits) - 1; i >= 0; i-- {
 			sha := commits[i]
 			_, foldRework := onFirstParent[sha]
 			foldRework = foldRework && preMerge
+			_, mine := own[sha]
+			foreign := own != nil && !mine
 			if _, done := attributed[sha]; done {
 				reattempted++
 				// Attribution stays skipped — this commit really was accounted for,
@@ -1616,7 +1666,7 @@ func pollGitWatchWorkspace(session Session) {
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs, lineage) {
+			if !attributeAndReworkCommit(session, root, sha, foldRework, foreign, nowMs, lineage) {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

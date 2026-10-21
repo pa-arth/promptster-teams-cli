@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- A `git pull` that fast-forwards over a colleague's commits no longer
+  attributes those commits to this device's AI sessions. The git watcher
+  matched every new HEAD commit against the local AI-edited-paths ledger, so a
+  colleague's commit touching a file your agent recently edited was credited to
+  your session. Commits whose author email is not the repo's `user.email` are
+  now not reported at all (they still shift tracked rework spans). With no
+  `user.email` configured, every commit is still reported as before.
+
 ## [0.40.2] — 2026-10-20
 
 ### Fixed

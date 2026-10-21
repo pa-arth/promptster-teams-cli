@@ -487,7 +487,7 @@ func emitCommitAttribution(ev event.Event) (queued bool) {
 // single source commit, so there is nothing to match against. Recovering it
 // would need an explicit merge/squash signal we do not collect out-of-band.
 func attributeCommit(session Session, root, sha string, nowMs int64, lin siblingLineage) {
-	attributeAndReworkCommit(session, root, sha, false, nowMs, lin)
+	attributeAndReworkCommit(session, root, sha, false, false, nowMs, lin)
 }
 
 // attributeAndReworkCommit does attribution for one detected working-HEAD commit
@@ -503,6 +503,15 @@ func attributeCommit(session Session, root, sha string, nowMs int64, lin sibling
 // reachable only through a merge's second parent. attributeCommit is the
 // foldRework=false entry point for callers (and tests) that only want attribution.
 //
+// EXCEPT A FOREIGN COMMIT — one another author wrote, which HEAD reached through
+// a pull (see gitOwnCommits). It is NOT emitted at all: not as attributed (its
+// files would be matched against this device's ai-paths ledger and credited to a
+// local session) and not as `unattributed:` either, because the backend counts
+// every SHA a device ships as a PR link. Its AI fingerprints are not recorded. It
+// still folds into rework exactly like the `!ok` shapes below — its hunks move
+// the spans this device tracks, and skipping them would leave those spans at
+// coordinates nobody wrote — with no files, so it can never SEED a span.
+//
 // Reports whether the commit may be RECORDED as attributed. That is true when
 // the event was durably queued, and ALSO when there was nothing attributable to
 // send (`!ok` — an empty diff, or a merge this parser intentionally skips):
@@ -510,10 +519,10 @@ func attributeCommit(session Session, root, sha string, nowMs int64, lin sibling
 // later poll would reach the same answer and only cost another `git show`.
 // It is false ONLY when an emit was attempted and failed to queue, so the retry
 // survives.
-func attributeAndReworkCommit(session Session, root, sha string, foldRework bool, nowMs int64, lin siblingLineage) (recordable bool) {
+func attributeAndReworkCommit(session Session, root, sha string, foldRework, foreign bool, nowMs int64, lin siblingLineage) (recordable bool) {
 	// Independent receipt also covers fixes that only delete lines.
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
-	if !ok {
+	if !ok || foreign {
 		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
 		// shapes land here that rework still has to see. A pure RENAME: its tracked
 		// spans must be carried to the new path or they strand at a dead one. A
