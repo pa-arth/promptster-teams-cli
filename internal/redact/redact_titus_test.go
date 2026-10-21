@@ -3,6 +3,10 @@ package redact
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -261,5 +265,64 @@ func TestTitusRedactsEveryCopyOfARepeatedSecret(t *testing.T) {
 	var v map[string]interface{}
 	if err := json.Unmarshal(out, &v); err != nil {
 		t.Fatalf("redacted JSON no longer parses: %v\n%s", err, out)
+	}
+}
+
+// Hidden helper rules capture the identifier half of a credential pair. On
+// opsAI they redacted the org name in every https://dev.azure.com/<org> URL
+// (1,141 markers) while protecting nothing. The org must survive; the PAT
+// still goes.
+func TestTitusKeepsHelperIdentifiersButRedactsTheirSecret(t *testing.T) {
+	if titusScanner() == nil {
+		t.Skip("titus scanner unavailable")
+	}
+	const pat = "FBdFol081crwkIHWJH2yiqDDyrFjVSi7HWl22hN2hTYfsB8NlGDpJQQJ77BAACAAAAAAAAAAAAASAZDOBucTj"
+	in := `{"command":"git clone https://dev.azure.com/contosoeng/app && export AZURE_DEVOPS_PAT=` + pat + `"}`
+	out := string(RedactBytes([]byte(in)))
+	if !strings.Contains(out, "dev.azure.com/contosoeng/app") {
+		t.Errorf("org name redacted: %s", out)
+	}
+	if strings.Contains(out, pat) {
+		t.Errorf("PAT survived: %s", out)
+	}
+	t.Logf("out: %s", out)
+}
+
+// Every exempted ID must still be a `visible: false` rule in the pinned titus.
+// A wrong entry, or a bump that makes a helper visible (it became a secret),
+// would otherwise silently stop redacting it. Fails, never skips, if the
+// module's rule files can't be read.
+func TestTitusHelperRulesAreHiddenUpstream(t *testing.T) {
+	dir, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/praetorian-inc/titus").Output()
+	if err != nil {
+		t.Fatalf("locate titus module: %v", err)
+	}
+	files, _ := filepath.Glob(filepath.Join(strings.TrimSpace(string(dir)), "pkg", "rule", "rules", "*.yml"))
+	if len(files) == 0 {
+		t.Fatal("no titus rule files found")
+	}
+	id := regexp.MustCompile(`(?m)^\s+id:\s*(\S+)`)
+	invisible := regexp.MustCompile(`(?m)^\s+visible:\s*false\s*$`)
+	hidden := map[string]bool{}
+	for _, f := range files {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, block := range strings.Split(string(b), "\n  - name:") {
+			if m := id.FindStringSubmatch(block); m != nil && invisible.MatchString(block) {
+				hidden[m[1]] = true
+			}
+		}
+	}
+	for r := range titusHelperRules {
+		if !hidden[r] {
+			t.Errorf("%s is exempted from redaction but is not a visible:false titus rule", r)
+		}
+	}
+	for r := range hidden {
+		if !titusHelperRules[r] {
+			t.Errorf("titus helper rule %s missing from titusHelperRules (identifier will be redacted)", r)
+		}
 	}
 }

@@ -218,6 +218,30 @@ var genericPatterns = []redactRule{
 	{regexp.MustCompile(`\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b`), "[REDACTED_PRIVATE_IP]"},
 }
 
+// titusHelperRules are Titus's `visible: false` rules (v1.2.10): the
+// identifier half of a key+secret pair, captured only so the visible sibling
+// rule can validate. They match org names, hosts, account names and client
+// IDs, not credentials; every paired secret has its own visible rule. The
+// loader drops the `visible` field, so the set is listed here — re-derive it
+// on a titus bump (grep -B5 'visible: false' pkg/rule/rules/*.yml).
+var titusHelperRules = map[string]bool{
+	"kingfisher.algolia.2": true, "kingfisher.alibabacloud.1": true,
+	"kingfisher.azure.devops.1": true, "kingfisher.azureopenai.host.1": true,
+	"kingfisher.azurestorage.1a": true, "kingfisher.azurestorage.1b": true,
+	"kingfisher.azurestorage.1c": true, "kingfisher.clickhouse.2": true,
+	"kingfisher.clojars.1": true, "kingfisher.confluent.1": true,
+	"kingfisher.coveralls.1": true, "kingfisher.datadog.1": true,
+	"kingfisher.discord.3": true, "kingfisher.endorlabs.1": true,
+	"kingfisher.foursquare.1": true, "kingfisher.freshdesk.1": true,
+	"kingfisher.intra42.1": true, "kingfisher.jira.1": true,
+	"kingfisher.looker.1": true, "kingfisher.mattermost.1": true,
+	"kingfisher.maxmind.2": true, "kingfisher.mongodb.2": true,
+	"kingfisher.nylas.api_uri.1": true, "kingfisher.paypal.1": true,
+	"kingfisher.plaid.1": true, "kingfisher.planetscale.2": true,
+	"kingfisher.riot.1": true, "kingfisher.sendbird.1": true,
+	"kingfisher.supabase.3": true,
+}
+
 var (
 	titusOnce sync.Once
 	titusCore *scanner.Core
@@ -301,7 +325,7 @@ func titusRedact(input []byte) []byte {
 		// Card rules are the digit-run pass the header bans, back via Titus's
 		// builtin set (the library ignores its own `noisy` flag; Luhn only
 		// scores). They rewrite all-digit UUID groups, ids and hashes alike.
-		if strings.HasPrefix(m.RuleID, "np.ccn.") {
+		if strings.HasPrefix(m.RuleID, "np.ccn.") || titusHelperRules[m.RuleID] {
 			continue
 		}
 		s, e := int(m.Location.Offset.Start), int(m.Location.Offset.End)
