@@ -1637,6 +1637,10 @@ func pollGitWatchWorkspace(session Session) {
 		}
 	}
 
+	// After the HEAD loop, so HEAD-reachable commits are the HEAD pass's (and
+	// fold into rework) before the ref pass can see them.
+	emitted = append(emitted, pollOffHeadCommits(session, roots, attributed, nowMs)...)
+
 	if reattempted > 0 {
 		state.HookDebugf("git-watch: skipped %d already-attributed commit(s) this poll", reattempted)
 	}
