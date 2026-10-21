@@ -6,6 +6,16 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.2] — 2026-10-20
+
+### Fixed
+
+- Identifiers that Titus matches only to locate a nearby secret (Azure DevOps
+  org names, storage account names, client/app IDs, service hostnames) are no
+  longer redacted. These hidden helper rules were masking non-secret values,
+  such as the org in every `dev.azure.com/<org>` URL. The credentials those
+  rules pair with are still redacted.
+
 ## [0.40.1] — 2026-10-20
 
 ### Fixed
