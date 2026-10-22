@@ -6,8 +6,17 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.3] — 2026-10-22
+
 ### Fixed
 
+- Commits an agent makes on a branch and pushes before the next 60-second poll
+  are now reported. The git watcher only read new commits on each checkout's
+  HEAD, so a branch → commit → push → switch-back (or a deleted worktree)
+  inside one poll left the PR with no linked session. It now also reads your
+  own commits newly reachable from local and remote-tracking branches,
+  author-matched to the repo's `user.email`. A repo seen for the first time is
+  baselined, not replayed.
 - A `git pull` that fast-forwards over a colleague's commits no longer
   attributes those commits to this device's AI sessions. The git watcher
   matched every new HEAD commit against the local AI-edited-paths ledger, so a
