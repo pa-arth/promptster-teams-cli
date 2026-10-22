@@ -128,3 +128,47 @@ func TestReworkColdStartReplayDoesNotSeedColleaguesCommit(t *testing.T) {
 		t.Fatalf("cold-start replay seeded a colleague's commits as AI work: %+v", got)
 	}
 }
+
+// The attributed-commits ledger is shared by a repo's worktrees, and a worktree
+// can carry its own user.email. A commit that is the SECOND checkout's own,
+// reached first by a checkout with a different email, must not be recorded as
+// foreign — that record makes the owning checkout skip it forever.
+func TestGitWatchSiblingWorktreeOwnCommitNotHiddenByForeignVerdict(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+
+	main := t.TempDir()
+	gitAs(t, main, "main@example.com", "init", "-q", "-b", "main")
+	gitAs(t, main, "main@example.com", "config", "user.email", "main@example.com")
+	gitAs(t, main, "main@example.com", "config", "extensions.worktreeConfig", "true")
+	writeCommitFile(t, main, "base.txt", "base\n")
+	gitAs(t, main, "main@example.com", "add", "-A")
+	gitAs(t, main, "main@example.com", "commit", "-m", "base")
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitAs(t, main, "main@example.com", "worktree", "add", "-q", "-b", "side", wt)
+	gitAs(t, wt, "wt@example.com", "config", "--worktree", "user.email", "wt@example.com")
+
+	session := Session{DeviceID: "dev-sib", TaskRoot: main}
+	pollGitWatchWorkspace(session) // cold-start baseline for both checkouts
+
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(main), "x.go")
+	writeCommitFile(t, wt, "x.go", "package main\n")
+	gitAs(t, wt, "wt@example.com", "add", "-A")
+	gitAs(t, wt, "wt@example.com", "commit", "-m", "wt's own commit")
+	own := gitAs(t, wt, "wt@example.com", "rev-parse", "HEAD")
+	// The main checkout reaches it first (its email differs from the author's).
+	gitAs(t, main, "main@example.com", "merge", "-q", "--ff-only", "side")
+
+	pollGitWatchWorkspace(session)
+	if n := countSha(attributedShas(t, state.OutboxPath()), own); n != 1 {
+		t.Fatalf("worktree's own commit %s attributed %d times, want 1: %v", own, n, attributedShas(t, state.OutboxPath()))
+	}
+}

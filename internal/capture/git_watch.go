@@ -1186,7 +1186,7 @@ func gitRepoUserEmail(root string) string {
 func gitOwnCommits(root string, shas []string) map[string]struct{} {
 	var emails []string
 	seen := map[string]bool{}
-	for _, checkout := range []string{root} {
+	for _, checkout := range append([]string{root}, gitSiblingWorktrees(root)...) {
 		e := gitRepoUserEmail(checkout)
 		if e == "" || seen[strings.ToLower(e)] {
 			continue
