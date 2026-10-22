@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -87,5 +88,43 @@ func TestGitOwnCommitsNoIdentityKeepsEverything(t *testing.T) {
 	git("commit", "--allow-empty", "-m", "A")
 	if own := gitOwnCommits(ws, []string{gitOut("rev-parse", "HEAD")}); own != nil {
 		t.Fatalf("no identity must disable the gate, got %v", own)
+	}
+}
+
+// A foreign commit is recorded in the attributed-commits ledger (so a cursor
+// recovery can't fold it twice), which routes it into the adoption replay on the
+// next branch switch. That replay rebuilds attributable files from this device's
+// ai-paths ledger, so without the author verdict it SEEDED rework spans for a
+// colleague's lines — a later rewrite of them then emitted a rework_verdict
+// against code no local agent wrote.
+func TestReworkAdoptionReplayDoesNotSeedColleaguesCommit(t *testing.T) {
+	ws, git, gitOut, key, sess := adoptionRepo(t)
+	git("config", "user.email", "me@example.com") // commits below are authored t@t: foreign
+
+	git("checkout", "-b", "feature")
+	recordAiTouchedPath("sess-foreign", key, "a.go")
+	writeCommitFile(t, ws, "a.go", "l1\nl2\nl3\n")
+	git("add", "-A")
+	git("commit", "-m", "colleague edits a.go")
+	recordAttributedCommits([]string{gitOut("rev-parse", "HEAD")}, time.Now().UnixMilli())
+
+	pollGitWatchWorkspace(sess) // adopts feature and replays the attributed commit
+	if c := reworkCovered(key, "a.go"); len(c) != 0 {
+		t.Fatalf("adoption replay seeded a colleague's commit as AI work: covered=%+v", c)
+	}
+}
+
+// Same hole through the cold-start replay (a brand-new worktree of a branch this
+// device already recorded).
+func TestReworkColdStartReplayDoesNotSeedColleaguesCommit(t *testing.T) {
+	ws, git, gitOut, key, sess := coldStartRepo(t)
+	git("config", "user.email", "me@example.com") // fixture commits are authored t@t: foreign
+	_, _, _, sha2 := coldStartBranch(t, ws, git, gitOut, key)
+
+	nowMs := time.Now().UnixMilli()
+	adoptReworkBranch(key, "feature")
+	replayReworkForColdStartBranch(sess, ws, sha2, loadAttributedCommits(nowMs), nowMs)
+	if got := loadReworkLedger().Roots[key]["a.go"]; len(got) != 0 {
+		t.Fatalf("cold-start replay seeded a colleague's commits as AI work: %+v", got)
 	}
 }

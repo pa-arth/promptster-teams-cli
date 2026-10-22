@@ -669,12 +669,16 @@ func foldReworkCommit(session Session, root, sha, diff string, files []attrFile,
 //
 // Costs one `git show` per replayed commit, on adoption polls only; a steady-state
 // poll on an unchanged branch replays nothing.
-func replayReworkForAdoptedCommit(session Session, root, sha string, nowMs int64, lin siblingLineage) {
+//
+// foreign is the HEAD pass's author verdict (see gitOwnCommits): a commit another
+// author wrote still shifts the spans this root tracks, but passes no files, so it
+// can never SEED one — the same shape as the rename/delete-only case below.
+func replayReworkForAdoptedCommit(session Session, root, sha string, foreign bool, nowMs int64, lin siblingLineage) {
 	diff, files, _, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
 	if diff == "" {
 		return // nothing this commit can contribute (merge commit, empty diff)
 	}
-	if !ok {
+	if !ok || foreign {
 		// Mirrors attributeAndReworkCommit's !ok branch: a pure rename and a
 		// delete-only commit both still move or churn tracked spans, and neither
 		// may seed — removing a file is not evidence that anyone wrote anything.
@@ -766,8 +770,9 @@ func replayReworkForColdStartBranch(session Session, root, head string, attribut
 	// This range is the caller's, not pollGitWatchWorkspace's, so it asks the
 	// siblings about its own commits — once for the whole replay, not per commit.
 	lin := newSiblingLineage(root, shas)
+	own := gitOwnCommits(root, shas)
 	for i := len(shas) - 1; i >= 0; i-- { // oldest-first: rework is stateful
-		replayReworkForAdoptedCommit(session, root, shas[i], nowMs, lin)
+		replayReworkForAdoptedCommit(session, root, shas[i], isForeignCommit(own, shas[i]), nowMs, lin)
 	}
 }
 

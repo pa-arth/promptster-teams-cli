@@ -1161,31 +1161,53 @@ func gitRepoUserEmail(root string) string {
 	return strings.TrimSpace(string(out))
 }
 
-// gitOwnCommits returns the subset of shas whose AUTHOR email is root's
-// configured user.email — one spawn for the whole list.
+// gitOwnCommits returns the subset of shas whose AUTHOR email is one of this
+// repository's checkouts' configured user.email — one spawn for the whole list
+// (plus one `git config` per checkout).
 //
 // WHY: HEAD moves over commits this device did not write. A `git pull` that
 // fast-forwards over a colleague's work surfaces their commits exactly like our
 // own, and attributing them would match their files against THIS device's
 // ai-paths ledger, crediting a colleague's commit to a local AI session.
 //
-// nil means NO GATE: no user.email is configured, so nothing can be told apart
+// EVERY CHECKOUT'S IDENTITY COUNTS, not just root's. The attributed-commits
+// ledger is keyed by SHA alone and shared by all of a repo's worktrees, and a
+// worktree may carry its own user.email (includeIf, `git config --worktree`). A
+// verdict of "foreign" is recorded there and makes every other checkout skip the
+// SHA, so a commit that is another checkout's OWN would be lost for good if the
+// first root to see it judged it by its own email alone. Foreign here therefore
+// means foreign to ALL of them.
+//
+// nil means NO GATE: no checkout has a user.email, so nothing can be told apart
 // and the caller keeps attributing everything, as before this gate existed — a
 // misconfigured machine must not silently stop capturing. A probe that fails
 // returns an EMPTY set: nothing is proven ours, so nothing is attributed — an
 // undercount, never a misattribution.
 func gitOwnCommits(root string, shas []string) map[string]struct{} {
-	email := gitRepoUserEmail(root)
-	if email == "" {
+	var emails []string
+	seen := map[string]bool{}
+	for _, checkout := range []string{root} {
+		e := gitRepoUserEmail(checkout)
+		if e == "" || seen[strings.ToLower(e)] {
+			continue
+		}
+		seen[strings.ToLower(e)] = true
+		emails = append(emails, e)
+	}
+	if len(emails) == 0 {
 		return nil
 	}
 	own := map[string]struct{}{}
 	if len(shas) == 0 {
 		return own
 	}
-	// #nosec G204 -- constant argv plus the repo's own configured email as a fixed-string pattern; SHAs on stdin come from rev-list output. Read-only.
-	cmd := exec.Command("git", "-C", root, "rev-list", "--no-walk=unsorted", "--stdin",
-		"--fixed-strings", "--regexp-ignore-case", "--author=<"+email+">")
+	// Repeated --author flags are ORed by rev-list.
+	args := []string{"-C", root, "rev-list", "--no-walk=unsorted", "--stdin", "--fixed-strings", "--regexp-ignore-case"}
+	for _, e := range emails {
+		args = append(args, "--author=<"+e+">")
+	}
+	// #nosec G204 -- constant argv plus the repo's own configured emails as fixed-string patterns; SHAs on stdin come from rev-list output. Read-only.
+	cmd := exec.Command("git", args...)
 	cmd.Stdin = strings.NewReader(strings.Join(shas, "\n") + "\n")
 	out, err := cmd.Output()
 	if err != nil {
@@ -1196,6 +1218,16 @@ func gitOwnCommits(root string, shas []string) map[string]struct{} {
 		own[sha] = struct{}{}
 	}
 	return own
+}
+
+// isForeignCommit applies a gitOwnCommits result to one SHA. A nil set is "no
+// gate", so nothing is foreign.
+func isForeignCommit(own map[string]struct{}, sha string) bool {
+	if own == nil {
+		return false
+	}
+	_, mine := own[sha]
+	return !mine
 }
 
 func loadGitWatchCursors() map[string]string {
@@ -1652,8 +1684,7 @@ func pollGitWatchWorkspace(session Session) {
 			sha := commits[i]
 			_, foldRework := onFirstParent[sha]
 			foldRework = foldRework && preMerge
-			_, mine := own[sha]
-			foreign := own != nil && !mine
+			foreign := isForeignCommit(own, sha)
 			if _, done := attributed[sha]; done {
 				reattempted++
 				// Attribution stays skipped — this commit really was accounted for,
@@ -1662,7 +1693,7 @@ func pollGitWatchWorkspace(session Session) {
 				// adoption emptied, and skipping it outright is what left an adopted
 				// branch looking like it held no AI work.
 				if foldRework && adopting {
-					replayReworkForAdoptedCommit(session, root, sha, nowMs, lineage)
+					replayReworkForAdoptedCommit(session, root, sha, foreign, nowMs, lineage)
 				}
 				continue
 			}
