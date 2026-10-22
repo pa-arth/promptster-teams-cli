@@ -1153,6 +1153,83 @@ func parseRevListShas(out []byte) []string {
 	return shas
 }
 
+// gitRepoUserEmail is the identity this device commits as in root (`git config
+// user.email`, so global config and includeIf apply), or "" when none is set.
+func gitRepoUserEmail(root string) string {
+	// #nosec G204 -- constant argv; root is a discovered repo dir. Read-only.
+	out, _ := exec.Command("git", "-C", root, "config", "--get", "user.email").Output()
+	return strings.TrimSpace(string(out))
+}
+
+// gitOwnCommits returns the subset of shas whose AUTHOR email is one of this
+// repository's checkouts' configured user.email — one spawn for the whole list
+// (plus one `git config` per checkout).
+//
+// WHY: HEAD moves over commits this device did not write. A `git pull` that
+// fast-forwards over a colleague's work surfaces their commits exactly like our
+// own, and attributing them would match their files against THIS device's
+// ai-paths ledger, crediting a colleague's commit to a local AI session.
+//
+// EVERY CHECKOUT'S IDENTITY COUNTS, not just root's. The attributed-commits
+// ledger is keyed by SHA alone and shared by all of a repo's worktrees, and a
+// worktree may carry its own user.email (includeIf, `git config --worktree`). A
+// verdict of "foreign" is recorded there and makes every other checkout skip the
+// SHA, so a commit that is another checkout's OWN would be lost for good if the
+// first root to see it judged it by its own email alone. Foreign here therefore
+// means foreign to ALL of them.
+//
+// nil means NO GATE: no checkout has a user.email, so nothing can be told apart
+// and the caller keeps attributing everything, as before this gate existed — a
+// misconfigured machine must not silently stop capturing. A probe that fails
+// returns an EMPTY set: nothing is proven ours, so nothing is attributed — an
+// undercount, never a misattribution.
+func gitOwnCommits(root string, shas []string) map[string]struct{} {
+	var emails []string
+	seen := map[string]bool{}
+	for _, checkout := range append([]string{root}, gitSiblingWorktrees(root)...) {
+		e := gitRepoUserEmail(checkout)
+		if e == "" || seen[strings.ToLower(e)] {
+			continue
+		}
+		seen[strings.ToLower(e)] = true
+		emails = append(emails, e)
+	}
+	if len(emails) == 0 {
+		return nil
+	}
+	own := map[string]struct{}{}
+	if len(shas) == 0 {
+		return own
+	}
+	// Repeated --author flags are ORed by rev-list.
+	args := []string{"-C", root, "rev-list", "--no-walk=unsorted", "--stdin", "--fixed-strings", "--regexp-ignore-case"}
+	for _, e := range emails {
+		args = append(args, "--author=<"+e+">")
+	}
+	// #nosec G204 -- constant argv plus the repo's own configured emails as fixed-string patterns; SHAs on stdin come from rev-list output. Read-only.
+	cmd := exec.Command("git", args...)
+	cmd.Stdin = strings.NewReader(strings.Join(shas, "\n") + "\n")
+	out, err := cmd.Output()
+	if err != nil {
+		state.HookDebugf("git-watch: author probe failed on %s; attributing none of %d commit(s)", gitWatchRootKey(root), len(shas))
+		return own
+	}
+	for _, sha := range parseRevListShas(out) {
+		own[sha] = struct{}{}
+	}
+	return own
+}
+
+// isForeignCommit applies a gitOwnCommits result to one SHA. A nil set is "no
+// gate", so nothing is foreign.
+func isForeignCommit(own map[string]struct{}, sha string) bool {
+	if own == nil {
+		return false
+	}
+	_, mine := own[sha]
+	return !mine
+}
+
 func loadGitWatchCursors() map[string]string {
 	cursors := map[string]string{}
 	_ = sign.WithBufferLock(gitWatchCursorsPath()+".lock", func() error {
@@ -1600,10 +1677,14 @@ func pollGitWatchWorkspace(session Session) {
 		// keyed by path so worktree churn re-detects too. Skipping covers rework as
 		// well as attribution — re-running rework over a commit already accounted for
 		// would double-count its churn.
+		// Commits another author wrote (a pull fast-forwarding over a colleague's
+		// work) fold for rework STATE but are never emitted — see gitOwnCommits.
+		own := gitOwnCommits(root, commits)
 		for i := len(commits) - 1; i >= 0; i-- {
 			sha := commits[i]
 			_, foldRework := onFirstParent[sha]
 			foldRework = foldRework && preMerge
+			foreign := isForeignCommit(own, sha)
 			if _, done := attributed[sha]; done {
 				reattempted++
 				// Attribution stays skipped — this commit really was accounted for,
@@ -1612,11 +1693,11 @@ func pollGitWatchWorkspace(session Session) {
 				// adoption emptied, and skipping it outright is what left an adopted
 				// branch looking like it held no AI work.
 				if foldRework && adopting {
-					replayReworkForAdoptedCommit(session, root, sha, nowMs, lineage)
+					replayReworkForAdoptedCommit(session, root, sha, foreign, nowMs, lineage)
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, foldRework, nowMs, lineage) {
+			if !attributeAndReworkCommit(session, root, sha, foldRework, foreign, nowMs, lineage) {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

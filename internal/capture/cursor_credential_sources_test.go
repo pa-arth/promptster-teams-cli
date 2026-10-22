@@ -20,7 +20,7 @@ import (
 )
 
 // TestMain keeps every test in this package off the developer's real
-// ~/.cursor/auth.json and running Cursor processes. A test that wants either
+// ~/.cursor/auth.json, running Cursor processes and git config. A test that wants either
 // source sets its own.
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "promptster-no-cursor-agent-")
@@ -28,6 +28,10 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	_ = os.Setenv(cursorAgentDirEnv, filepath.Join(dir, "absent"))
+	// Nor the developer's git identity: git-watch gates attribution on the repo's
+	// user.email, and a global one would make every fixture commit "foreign".
+	_ = os.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(dir, "absent-gitconfig"))
+	_ = os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	cursorProcessArgs = func() []string { return nil } // never the developer's running Cursor
 	code := m.Run()
 	_ = os.RemoveAll(dir)

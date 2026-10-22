@@ -196,7 +196,8 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 		budget -= len(fresh)
 		lin := newSiblingLineage(r.root, fresh)
 		for i := len(fresh) - 1; i >= 0; i-- {
-			if !attributeAndReworkCommit(session, r.root, fresh[i], false, nowMs, lin) {
+			// foreign=false: rev-list --author already kept only our own commits.
+			if !attributeAndReworkCommit(session, r.root, fresh[i], false, false, nowMs, lin) {
 				drained = false // enqueue failed: keep the tips so it is retried
 				continue
 			}
