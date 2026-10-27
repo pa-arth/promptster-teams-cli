@@ -1,0 +1,9 @@
+{
+  "customContext": {
+    "rules": [
+      {
+        "rule": "Do not ask for new or additional tests, and do not report missing test coverage as a finding. Comment on tests only when an existing test is wrong: it asserts the wrong behavior, cannot fail, or will break. Missing tests must not lower the confidence score."
+      }
+    ]
+  }
+}
