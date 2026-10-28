@@ -178,10 +178,10 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 			continue // keep the old tips; retry next poll
 		}
 		// A fetch also brings this engineer's OWN commits from their other
-		// devices — same author, so the --author filter passes them. Only commits
-		// this device wrote are claimed (git_watch_origin.go); the rest are not
-		// emitted and not recorded, so they cost a reflog read per tip change.
-		local := gitLocallyCreatedCommits(r.root, shas)
+		// devices — same author, so the --author filter passes them. Commits that
+		// provably arrived from a remote are not claimed (git_watch_origin.go);
+		// anything in doubt still is.
+		local := gitDeviceClaimableCommits(r.root, shas)
 		var fresh []string
 		for _, sha := range shas {
 			if _, done := attributed[sha]; done {

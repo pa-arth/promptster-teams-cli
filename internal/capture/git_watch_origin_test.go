@@ -117,10 +117,10 @@ func TestGitWatchOwnCommitFromOtherDeviceNotClaimed(t *testing.T) {
 	}
 }
 
-// The agent commits on a branch, pushes, and deletes the branch: its reflog goes
-// with it, and only the remote-tracking ref's "update by push" survives. Commits
-// under a pushed tip are this device's — but not the fetched base they sit on.
-func TestGitLocallyCreatedCommitsFollowsPushedTip(t *testing.T) {
+// The agent commits on a branch, pushes, and deletes the branch and HEAD's log
+// (as a deleted worktree would). Its commit is still claimed; the fetched base it
+// sits on, which provably arrived via origin/main, is not.
+func TestGitDeviceClaimableCommitsPushedBranchAndFetchedBase(t *testing.T) {
 	_, laptop, desktop, _ := twoDevices(t)
 	const me = "me@example.com"
 	writeCommitFile(t, laptop, "foo.go", "package main\n\nfunc laptop() {}\n")
@@ -137,24 +137,96 @@ func TestGitLocallyCreatedCommitsFollowsPushedTip(t *testing.T) {
 	gitAs(t, desktop, me, "push", "-q", "origin", "feat")
 	gitAs(t, desktop, me, "switch", "-q", "main")
 	gitAs(t, desktop, me, "branch", "-q", "-D", "feat")
-	// Drop HEAD's log too, as a deleted worktree would take it.
 	gitAs(t, desktop, me, "reflog", "expire", "--expire=now", "HEAD")
 
-	local := gitLocallyCreatedCommits(desktop, []string{a, base})
-	if _, ok := local[a]; !ok {
-		t.Errorf("pushed commit %s not recognised as this device's: %v", a, local)
+	claim := gitDeviceClaimableCommits(desktop, []string{a, base})
+	if _, ok := claim[a]; !ok {
+		t.Errorf("pushed local commit %s was refused: %v", a, claim)
 	}
-	if _, ok := local[base]; ok {
-		t.Errorf("fetched base %s claimed as this device's", base)
+	if _, ok := claim[base]; ok {
+		t.Errorf("fetched base %s was claimed", base)
 	}
 }
 
-// No reflog at all: nothing can be told apart, so the gate is off.
-func TestGitLocallyCreatedCommitsNoReflogIsNoGate(t *testing.T) {
+// localWorktreeCommit commits in a temporary linked worktree of desktop and
+// returns the worktree path and the commit.
+func localWorktreeCommit(t *testing.T, desktop string) (string, string) {
+	t.Helper()
+	const me = "me@example.com"
+	wt := filepath.Join(t.TempDir(), "wt")
+	gitAs(t, desktop, me, "worktree", "add", "-q", "-b", "agent", wt)
+	writeCommitFile(t, wt, "agent.go", "package main\n")
+	gitAs(t, wt, me, "add", "-A")
+	gitAs(t, wt, me, "commit", "-q", "-m", "agent work")
+	return wt, gitAs(t, wt, me, "rev-parse", "HEAD")
+}
+
+// Greptile #293: commit and push from a temporary worktree, create a second
+// branch at that commit, then remove the original branch and the worktree. Only
+// "update by push" and "branch: Created from" survive; neither shows the commit
+// arriving from elsewhere, so it must still be claimed.
+func TestGitDeviceClaimableCommitsDeletedWorktreeBranchCopy(t *testing.T) {
+	_, _, desktop, _ := twoDevices(t)
+	const me = "me@example.com"
+	wt, c := localWorktreeCommit(t, desktop)
+	gitAs(t, wt, me, "push", "-q", "origin", "agent")
+	gitAs(t, desktop, me, "branch", "keep", c)
+	gitAs(t, desktop, me, "worktree", "remove", "--force", wt)
+	gitAs(t, desktop, me, "branch", "-q", "-D", "agent")
+
+	if claim := gitDeviceClaimableCommits(desktop, []string{c}); claim != nil {
+		if _, ok := claim[c]; !ok {
+			t.Fatalf("locally written commit %s was refused after its worktree was deleted", c)
+		}
+	}
+}
+
+// Greptile #294: commit in a worktree, fast-forward the main checkout to it,
+// then delete branch and worktree before the poll. The surviving
+// "merge agent: Fast-forward" is local, not an arrival.
+func TestGitDeviceClaimableCommitsDeletedWorktreeFastForward(t *testing.T) {
+	_, _, desktop, _ := twoDevices(t)
+	const me = "me@example.com"
+	wt, c := localWorktreeCommit(t, desktop)
+	gitAs(t, desktop, me, "merge", "-q", "--ff-only", "agent")
+	gitAs(t, desktop, me, "worktree", "remove", "--force", wt)
+	gitAs(t, desktop, me, "branch", "-q", "-D", "agent")
+
+	if claim := gitDeviceClaimableCommits(desktop, []string{c}); claim != nil {
+		if _, ok := claim[c]; !ok {
+			t.Fatalf("locally written commit %s was refused after a local fast-forward", c)
+		}
+	}
+}
+
+func TestReflogArrived(t *testing.T) {
+	for _, tc := range []struct {
+		selector, subject string
+		want              bool
+	}{
+		{"refs/remotes/origin/main@{0}", "pull --ff-only: fast-forward", true},
+		{"refs/remotes/origin/feat@{0}", "fetch: storing head", true},
+		{"refs/remotes/origin/feat@{0}", "update by push", false},
+		{"refs/heads/main@{1}", "clone: from /x", true},
+		{"HEAD@{3}", "pull --rebase (start): checkout 6a1f057", true},
+		{"refs/heads/main@{0}", "pull https://x/y main: Fast-forward", true},
+		{"refs/heads/main@{0}", "merge agent: Fast-forward", false},
+		{"refs/heads/keep@{0}", "branch: Created from 6a1f057", false},
+		{"HEAD@{0}", "checkout: moving from agent to main", false},
+		{"HEAD@{0}", "reset: moving to HEAD~1", false},
+	} {
+		if got := reflogArrived(tc.selector, tc.subject); got != tc.want {
+			t.Errorf("reflogArrived(%q, %q) = %v, want %v", tc.selector, tc.subject, got, tc.want)
+		}
+	}
+}
+
+// No reflog at all: nothing can be shown to have arrived, so the gate is off.
+func TestGitDeviceClaimableCommitsNoReflogIsNoGate(t *testing.T) {
 	ws, git, gitOut := gitRepo(t)
 	git("config", "core.logAllRefUpdates", "false")
 	git("commit", "--allow-empty", "-m", "A")
-	if local := gitLocallyCreatedCommits(ws, []string{gitOut("rev-parse", "HEAD")}); local != nil {
-		t.Fatalf("no reflog must disable the gate, got %v", local)
+	if claim := gitDeviceClaimableCommits(ws, []string{gitOut("rev-parse", "HEAD")}); claim != nil {
+		t.Fatalf("no reflog must disable the gate, got %v", claim)
 	}
 }
