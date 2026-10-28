@@ -1678,8 +1678,9 @@ func pollGitWatchWorkspace(session Session) {
 		// well as attribution — re-running rework over a commit already accounted for
 		// would double-count its churn.
 		// Commits another author wrote (a pull fast-forwarding over a colleague's
-		// work) fold for rework STATE but are never emitted — see gitOwnCommits.
-		own := gitOwnCommits(root, commits)
+		// work), or that another of this engineer's devices wrote, fold for rework
+		// STATE but are never emitted — see gitOwnCommits and git_watch_origin.go.
+		own := gitClaimableCommits(root, commits)
 		for i := len(commits) - 1; i >= 0; i-- {
 			sha := commits[i]
 			_, foldRework := onFirstParent[sha]

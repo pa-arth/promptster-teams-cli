@@ -177,11 +177,22 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 		if !ok {
 			continue // keep the old tips; retry next poll
 		}
+		// A fetch also brings this engineer's OWN commits from their other
+		// devices — same author, so the --author filter passes them. Only commits
+		// this device wrote are claimed (git_watch_origin.go); the rest are not
+		// emitted and not recorded, so they cost a reflog read per tip change.
+		local := gitLocallyCreatedCommits(r.root, shas)
 		var fresh []string
 		for _, sha := range shas {
-			if _, done := attributed[sha]; !done {
-				fresh = append(fresh, sha)
+			if _, done := attributed[sha]; done {
+				continue
 			}
+			if local != nil {
+				if _, mine := local[sha]; !mine {
+					continue
+				}
+			}
+			fresh = append(fresh, sha)
 		}
 		// Oldest `limit` only; when anything is left over the tips stay put, and the
 		// next poll re-lists the range minus what the ledger now holds.
@@ -196,7 +207,7 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 		budget -= len(fresh)
 		lin := newSiblingLineage(r.root, fresh)
 		for i := len(fresh) - 1; i >= 0; i-- {
-			// foreign=false: rev-list --author already kept only our own commits.
+			// foreign=false: --author and the device-origin gate already kept only ours.
 			if !attributeAndReworkCommit(session, r.root, fresh[i], false, false, nowMs, lin) {
 				drained = false // enqueue failed: keep the tips so it is retried
 				continue

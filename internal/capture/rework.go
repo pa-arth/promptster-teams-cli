@@ -770,7 +770,7 @@ func replayReworkForColdStartBranch(session Session, root, head string, attribut
 	// This range is the caller's, not pollGitWatchWorkspace's, so it asks the
 	// siblings about its own commits — once for the whole replay, not per commit.
 	lin := newSiblingLineage(root, shas)
-	own := gitOwnCommits(root, shas)
+	own := gitClaimableCommits(root, shas)
 	for i := len(shas) - 1; i >= 0; i-- { // oldest-first: rework is stateful
 		replayReworkForAdoptedCommit(session, root, shas[i], isForeignCommit(own, shas[i]), nowMs, lin)
 	}

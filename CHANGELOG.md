@@ -14,6 +14,14 @@ follows [Semantic Versioning](https://semver.org/).
   lockfile and data-file filters and inflated `aiTokens` — on one org it was
   80% of the total. A file whose likely-AI lines average over 1,000 bytes is
   now left out of the count. The attribution event itself is unchanged.
+- A commit is now claimed only by the device that wrote it. 0.40.3 stopped
+  attributing colleagues' pulled commits by author email, but your own commits
+  from another machine carry your email too, so a commit made on your laptop
+  and pulled or fetched on your desktop was credited to the desktop's AI
+  session as well. The git watcher now also checks the repo's reflog: only
+  commits written here (commit, amend, cherry-pick, revert, rebase, merge) or
+  under a branch you pushed from here are reported. A repo with reflogs turned
+  off keeps the author check only.
 
 ## [0.40.3] — 2026-10-22
 
