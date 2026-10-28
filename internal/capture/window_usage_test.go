@@ -156,6 +156,32 @@ func TestLatestCodexWindowReading_PicksLatestByTimestamp(t *testing.T) {
 	}
 }
 
+// TestLatestCodexWindowReading_SubagentRollsUpToRoot: when the newest reading
+// is in a delegated thread's rollout, the event is keyed to the conversation
+// root, not to the subagent's own thread id from the filename — otherwise it
+// mints a session holding nothing but windowUsage.
+func TestLatestCodexWindowReading_SubagentRollsUpToRoot(t *testing.T) {
+	dir := t.TempDir()
+	sessions := filepath.Join(dir, "sessions")
+	if err := os.MkdirAll(sessions, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const root = "01a0c649-383f-7502-9b85-f811de80a766"
+	const thread = "01a117c9-39be-70c3-9be0-7b3b60955070"
+	writeRollout(t, filepath.Join(sessions, "rollout-2026-10-07T14-13-45-"+thread+".jsonl"),
+		`{"timestamp":"2026-10-07T14:13:45.000Z","type":"session_meta","payload":{"id":"`+thread+`","session_id":"`+root+`","parent_thread_id":"`+root+`","source":{"subagent":{"other":"guardian"}}}}`,
+		rolloutTokenCount("2026-10-07T14:14:00.000Z", 40.0, 300.0, 1950000000),
+	)
+
+	_, sid, ok := latestCodexWindowReading(sessions, time.Now().Add(-24*time.Hour))
+	if !ok {
+		t.Fatal("expected a reading")
+	}
+	if sid != root {
+		t.Errorf("session = %q, want the conversation root %q", sid, root)
+	}
+}
+
 // TestLatestCodexWindowReading_MultipleTokenCountsInOneFile: the LAST
 // token_count-with-rate_limits in a file wins.
 func TestLatestCodexWindowReading_MultipleTokenCountsInOneFile(t *testing.T) {

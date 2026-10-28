@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
 	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
 	"github.com/pa-arth/promptster-teams-cli/internal/sign"
 	"github.com/pa-arth/promptster-teams-cli/internal/state"
@@ -232,7 +233,7 @@ type codexTokenCountLine struct {
 // including on the error path (a parse failure is silently skipped).
 func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (windowReading, string, bool) {
 	var best windowReading
-	var bestSession string
+	var bestSession, bestPath string
 	var bestTs time.Time
 	found := false
 
@@ -280,11 +281,14 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 			return nil
 		}
 		best = reading
-		bestSession = codexSessionIDFromPath(path)
+		bestPath = path
 		bestTs = ts
 		found = true
 		return nil
 	})
+	if found {
+		bestSession = codexRolloutConversationID(bestPath)
+	}
 
 	// A real reading always wins: an account can run one project on a plan we
 	// carry and another on one we do not, and a gauge beats an explanation.
@@ -295,6 +299,49 @@ func latestCodexWindowReading(sessionsDir string, modifiedAfter time.Time) (wind
 		return r, "", true
 	}
 	return best, bestSession, found
+}
+
+// codexRolloutConversationID is the session a reading from this rollout belongs
+// to: the conversation ROOT from session_meta (normalize.CodexConversationID),
+// falling back to the filename's thread id when the header is unreadable.
+//
+// The filename alone is a subagent's own thread id whenever the newest
+// rate_limits line is in a delegated thread, and guardian reviewers write one
+// on nearly every turn. The watcher rolls every other event of that thread up
+// to the root, so the windowUsage row was the ONLY row under the subagent id
+// and minted a session of its own, sourced only by the transport name "cli".
+// Measured in teams prod 2026-10-28: 630 of 732 such sessions in 35 days were
+// codex subagent thread ids, and each received a full set of not_collectible
+// practice observations (backend incident #44).
+func codexRolloutConversationID(path string) string {
+	// #nosec G304 -- path is a Codex rollout discovered under the sessions dir, not user input; opened read-only and only session_meta's id fields are read.
+	f, err := os.Open(path)
+	if err != nil {
+		return codexSessionIDFromPath(path)
+	}
+	defer f.Close()
+	reader := newClassifyReader(f)
+	for skipped := 0; skipped <= codexClassifyMaxSkips; skipped++ {
+		line, ok := nextClassifyRecord(reader)
+		if !ok {
+			break
+		}
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Type    string                 `json:"type"`
+			Payload map[string]interface{} `json:"payload"`
+		}
+		if json.Unmarshal(line, &rec) != nil || rec.Type != "session_meta" {
+			continue
+		}
+		if id := normalize.CodexConversationID(rec.Payload); id != "" {
+			return id
+		}
+		break
+	}
+	return codexSessionIDFromPath(path)
 }
 
 // scanRolloutLatestRateLimits returns the timestamp + rate_limits map of the
