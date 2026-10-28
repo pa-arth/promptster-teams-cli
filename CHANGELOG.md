@@ -6,6 +6,15 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Committed build bundles no longer count as AI-written tokens. A minified
+  `dist/assets/index-<hash>.js` is a few enormous lines that sit under the
+  per-file size caps, and its name changes every build, so it got past the
+  lockfile and data-file filters and inflated `aiTokens` — on one org it was
+  80% of the total. A file whose likely-AI lines average over 1,000 bytes is
+  now left out of the count. The attribution event itself is unchanged.
+
 ## [0.40.3] — 2026-10-22
 
 ### Fixed
