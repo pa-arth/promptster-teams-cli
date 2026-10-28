@@ -330,6 +330,8 @@ var kindsAssertedUnconstructed = map[string]string{
 	"api_error":           "Sibling of api_request; the allowlist entry covers the backend proxy rail, not this binary.",
 	"tool_decision":       "serverOnlyFields[tool_decision] rests on this: approval decisions are an OTel-wire concept.",
 	"heartbeat":           "deviceOnlyFields[heartbeat] rests on this: the beat this CLI builds is `presence`.",
+	"session_counters":    "OTel-only: minted by the backend's OTLP receiver from Claude Code metrics.",
+	"tool_inventory":      "OTel-only: minted by the backend's OTLP receiver from plugin/MCP inventory events.",
 	// THE ONLY ENTRY HERE THAT IS A GAP RATHER THAN A BOUNDARY. The other five
 	// say "this kind belongs to another process". This one says "the producer
 	// this CLI is supposed to have does not exist yet" — the backend has shipped
