@@ -4,11 +4,11 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:36b5bebd2701339454229c31187439dc66da8f3907c700b66669ee3ab65c87b2",
+  "checksum": "sha256:b42d6cda1e80c367f5fe8919d0e62a014d22530e35f0fcb52b8d7ae8addec4bb",
   "counts": {
-    "kinds": 52,
-    "fields": 310,
-    "elementFields": 40
+    "kinds": 54,
+    "fields": 326,
+    "elementFields": 62
   },
   "kinds": {
     "ai_response": {
@@ -38,7 +38,11 @@
     "api_error": {
       "fields": [
         "status",
-        "error"
+        "error",
+        "statusCode",
+        "model",
+        "attempt",
+        "durationMs"
       ]
     },
     "api_request": {
@@ -485,6 +489,34 @@
         ]
       }
     },
+    "session_counters": {
+      "fields": [
+        "temporality",
+        "windowStart",
+        "linesAdded",
+        "linesRemoved",
+        "commits",
+        "pullRequests",
+        "activeUserSec",
+        "activeCliSec",
+        "linesByModel",
+        "editDecisions"
+      ],
+      "arrayElements": {
+        "editDecisions": [
+          "tool",
+          "decision",
+          "source",
+          "language",
+          "count"
+        ],
+        "linesByModel": [
+          "model",
+          "added",
+          "removed"
+        ]
+      }
+    },
     "session_end": {
       "fields": [
         "reason"
@@ -568,6 +600,32 @@
         "tool",
         "status"
       ]
+    },
+    "tool_inventory": {
+      "fields": [
+        "mcpServers",
+        "plugins"
+      ],
+      "arrayElements": {
+        "mcpServers": [
+          "name",
+          "scope",
+          "transport",
+          "status",
+          "isPlugin"
+        ],
+        "plugins": [
+          "name",
+          "version",
+          "scope",
+          "marketplace",
+          "skillCount",
+          "agentCount",
+          "commandCount",
+          "hasMcp",
+          "hasHooks"
+        ]
+      }
     },
     "tool_result": {
       "fields": [

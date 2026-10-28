@@ -89,6 +89,12 @@ the reverse.`
 // projectFieldAllowlist means every event of that kind projects to {} — so this
 // list doubles as the record of what must be added first.
 var kindsNotEmittedOnDevice = map[string]string{
+	"session_counters": "OTel-only. Minted by the backend's OTLP receiver from Claude Code's " +
+		"cumulative metrics (active time, lines, edit decisions); no transcript or hook in this " +
+		"CLI carries those counters.",
+	"tool_inventory": "OTel-only. Minted by the backend's OTLP receiver from Claude Code / " +
+		"Cowork plugin and MCP inventory events; this CLI's config census reports the same " +
+		"facts under its own kind.",
 	"instructions_loaded": "Not a watcher kind. It is minted SERVER-side by the tier-B hook route " +
 		"(apps/api/src/routes/team/teams-tier-b-hooks.ts), which classifies a memory-file load from " +
 		"the hook payload. No code path in this repo constructs it.",
@@ -134,6 +140,16 @@ var kindsNotEmittedOnDevice = map[string]string{
 // lack, so nobody ever revisits it, and the open question is retired by filing
 // rather than by deciding. The two tables are asserted disjoint.
 var serverOnlyFields = map[string]map[string]string{
+	// No code path in this CLI constructs api_error: the backend mints it from the
+	// tier-B hook payload (as `status`) and from OTel claude_code.api_error (these
+	// four). promptster-backend#1240 allowlisted them after OTel errors were landing
+	// with no status, so a 429 usage limit read the same as an outage.
+	"api_error": {
+		"statusCode": "OTel's name for the HTTP status; the hook route writes `status`.",
+		"model":      "OTel-only: the failing request's model, off claude_code.api_error.",
+		"attempt":    "OTel-only: the retry attempt number, off claude_code.api_error.",
+		"durationMs": "OTel-only: how long the failing request took, off claude_code.api_error.",
+	},
 	"cursorVendorUsage": {
 		"teamId": "This CLI vendor collector reads the personal billing scope and does not select a Cursor team id; the backend also accepts team-scoped reports from newer clients.",
 	},
