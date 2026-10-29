@@ -279,7 +279,26 @@ func promptIdDeclined() map[string]map[string]string {
 	} {
 		out[kind] = map[string]string{"promptId": reason}
 	}
+	// The transcript carries both of these too, and the normalizer reads neither yet.
+	out["context_compact"]["preTokens"] = "normalize_claude_jsonl.go reads compactMetadata.trigger but not compactMetadata.preTokens."
+	out["context_compact"]["postTokens"] = "Same as preTokens."
+	out["ai_response"]["isDelegated"] = "normalize_claude_jsonl.go marks delegated work as `sidechain`, not isDelegated."
 	return out
+}
+
+// `sequence` is OTel's event.sequence (promptster-backend #1271): the exporter's
+// own per-session counter. A device event has no exporter counter; its order is
+// the hash chain (prevSig) it is signed into.
+func init() {
+	for _, kind := range []string{
+		"ai_response", "prompt", "context_compact", "subagent_usage", "tool_result", "tool_decision", "api_error",
+		"command", "file_diff", "file_read", "file_search", "planning", "task_dispatch", "tool_use", "web_lookup",
+	} {
+		if serverOnlyFields[kind] == nil {
+			serverOnlyFields[kind] = map[string]string{}
+		}
+		serverOnlyFields[kind]["sequence"] = "OTel's event.sequence; device events are ordered by their prevSig chain."
+	}
 }
 
 // deviceOnlyFields — projected by this CLI and NOT allowlisted at the backend

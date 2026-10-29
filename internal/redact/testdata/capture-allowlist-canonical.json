@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:2d1734bfb362e5efa3502bf809a568f110f8ebf2ee55f86015433d1ba241815a",
+  "checksum": "sha256:0136f07dc299b6db7c9a53cf3db9b33f6dc89daf12e4f11ee6c62a0577090771",
   "counts": {
     "kinds": 54,
-    "fields": 341,
+    "fields": 359,
     "elementFields": 62
   },
   "kinds": {
@@ -33,7 +33,9 @@
         "generationId",
         "cursorAccountRef",
         "lastRequestInputTokens",
-        "promptId"
+        "promptId",
+        "sequence",
+        "isDelegated"
       ]
     },
     "api_error": {
@@ -44,7 +46,8 @@
         "model",
         "attempt",
         "durationMs",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "api_request": {
@@ -87,7 +90,8 @@
         "exitCode",
         "durationMs",
         "agentId",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "commit_attribution": {
@@ -181,7 +185,10 @@
       "fields": [
         "summary",
         "trigger",
-        "promptId"
+        "promptId",
+        "sequence",
+        "preTokens",
+        "postTokens"
       ]
     },
     "cursorVendorSnapshot": {
@@ -341,7 +348,8 @@
         "lineRanges",
         "agentId",
         "changeType",
-        "promptId"
+        "promptId",
+        "sequence"
       ],
       "arrayElements": {
         "lineRanges": [
@@ -355,7 +363,8 @@
       "fields": [
         "path",
         "credentialKeys",
-        "promptId"
+        "promptId",
+        "sequence"
       ],
       "stringArrays": {
         "credentialKeys": {
@@ -369,7 +378,8 @@
       "fields": [
         "path",
         "query",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "git_action": {
@@ -447,7 +457,8 @@
         "summary",
         "title",
         "status",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "planning_read": {
@@ -478,7 +489,8 @@
         "repoTracked",
         "promptLength",
         "agentId",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "rework_verdict": {
@@ -573,7 +585,8 @@
         "lastRequestInputTokens",
         "effort",
         "speed",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "task_dispatch": {
@@ -582,7 +595,8 @@
         "status",
         "summary",
         "agentId",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "test_run": {
@@ -603,7 +617,8 @@
         "callId",
         "decision",
         "decisionSource",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "tool_intent": {
@@ -650,7 +665,8 @@
         "mcpServer",
         "mcpServerName",
         "mcpToolName",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "tool_use": {
@@ -660,7 +676,8 @@
         "status",
         "skill",
         "agentId",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "usageLimitHit": {
@@ -679,7 +696,8 @@
       "fields": [
         "url",
         "query",
-        "promptId"
+        "promptId",
+        "sequence"
       ]
     },
     "windowUsage": {
