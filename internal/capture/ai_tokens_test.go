@@ -130,3 +130,23 @@ func TestCommitAiTokensSkipsNotAuthoredCode(t *testing.T) {
 		t.Errorf("commitAiTokens = %d, want %d (ai.go only)", got, want)
 	}
 }
+
+// TestCommitAiTokensSkipsMinifiedBundles: a committed build bundle is a few
+// enormous lines, each file under the byte cap, under a name that changes every
+// build. It adds nothing, while ordinary code with a long line still counts.
+func TestCommitAiTokensSkipsMinifiedBundles(t *testing.T) {
+	ai := func(p string, end int) attrFile {
+		return attrFile{Path: p, LineRanges: []attrLineRange{{Start: 1, End: end, Attribution: attributionLikelyAI}}}
+	}
+	bundleLine := strings.Repeat("a=1;", 2000) // 8,000 bytes: under maxAuthoredBytesPerFile
+	longCode := "const label = '" + strings.Repeat("x", 300) + "'"
+	diff := "diff --git a/dist/assets/index-Bx7aQ9.js b/dist/assets/index-Bx7aQ9.js\n--- /dev/null\n+++ b/dist/assets/index-Bx7aQ9.js\n@@ -0,0 +1,2 @@\n" +
+		"+" + bundleLine + "\n+" + bundleLine + "\n" +
+		"diff --git a/src/app.ts b/src/app.ts\n--- /dev/null\n+++ b/src/app.ts\n@@ -0,0 +1,2 @@\n" +
+		"+" + longCode + "\n+export {}\n"
+	files := []attrFile{ai("dist/assets/index-Bx7aQ9.js", 2), ai("src/app.ts", 2)}
+
+	if got, want := commitAiTokens(diff, files), countTiktokenTokens(longCode+"\nexport {}"); got != want {
+		t.Errorf("commitAiTokens = %d, want %d (src/app.ts only)", got, want)
+	}
+}

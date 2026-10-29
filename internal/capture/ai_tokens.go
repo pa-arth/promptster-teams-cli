@@ -99,6 +99,11 @@ func commitAiTokens(diff string, files []attrFile) int {
 		if n > maxAuthoredLinesPerFile || fb.Len() > maxAuthoredBytesPerFile {
 			continue
 		}
+		// And line LENGTH: a minified bundle sits under both caps and is still
+		// not code anyone typed. See maxAuthoredAvgLineBytes.
+		if n > 0 && fb.Len()/n > maxAuthoredAvgLineBytes {
+			continue
+		}
 		b.WriteString(fb.String())
 	}
 	if b.Len() == 0 {
@@ -117,6 +122,17 @@ func commitAiTokens(diff string, files []attrFile) int {
 // detector if that ever shows up.
 const maxAuthoredLinesPerFile = 5000
 const maxAuthoredBytesPerFile = 200_000
+
+// maxAuthoredAvgLineBytes keeps minified output out of aiTokens. Committed
+// build bundles (dist/assets/index-<hash>.js and the like) are a few enormous
+// lines, each file under maxAuthoredBytesPerFile, and their names change every
+// build, so no extension or path list catches them. Measured on prod
+// 2026-10-28: on one org, 100 of the 127 commits over 20k aiTokens carried such
+// files. Those commits averaged 312 tokens per likely_ai line against 12.6 for
+// every other commit, and made up 80% of the org's aiTokens. Hand-written code
+// averages well under 100 bytes a line; 1,000 leaves room for long JSX and
+// prose lines.
+const maxAuthoredAvgLineBytes = 1000
 
 // notAuthoredCodeExts are files whose lines are data or tool output, never code
 // the model emitted token by token.
