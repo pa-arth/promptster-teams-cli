@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.5] — 2026-10-29
+
 ### Fixed
 
 - Committed build bundles no longer count as AI-written tokens. A minified
