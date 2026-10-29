@@ -276,6 +276,7 @@ func promptIdDeclined() map[string]map[string]string {
 	for _, kind := range []string{
 		"ai_response", "prompt", "context_compact", "subagent_usage", "tool_result",
 		"command", "file_diff", "file_read", "file_search", "planning", "task_dispatch", "tool_use", "web_lookup",
+		"plan_decision", "dir_list", "planning_read",
 	} {
 		out[kind] = map[string]string{"promptId": reason}
 	}
@@ -293,6 +294,7 @@ func init() {
 	for _, kind := range []string{
 		"ai_response", "prompt", "context_compact", "subagent_usage", "tool_result", "tool_decision", "api_error",
 		"command", "file_diff", "file_read", "file_search", "planning", "task_dispatch", "tool_use", "web_lookup",
+		"plan_decision", "dir_list", "planning_read",
 	} {
 		if serverOnlyFields[kind] == nil {
 			serverOnlyFields[kind] = map[string]string{}
