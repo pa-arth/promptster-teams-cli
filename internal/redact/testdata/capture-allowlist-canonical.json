@@ -4,11 +4,11 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:36b5bebd2701339454229c31187439dc66da8f3907c700b66669ee3ab65c87b2",
+  "checksum": "sha256:2cd4c8ad8618aa04192f38f0928c1218c32e2fcfc550f0b847dd641dc85a60d6",
   "counts": {
-    "kinds": 52,
-    "fields": 310,
-    "elementFields": 40
+    "kinds": 54,
+    "fields": 365,
+    "elementFields": 62
   },
   "kinds": {
     "ai_response": {
@@ -32,13 +32,22 @@
         "contextWindowTokens",
         "generationId",
         "cursorAccountRef",
-        "lastRequestInputTokens"
+        "lastRequestInputTokens",
+        "isDelegated",
+        "promptId",
+        "sequence"
       ]
     },
     "api_error": {
       "fields": [
         "status",
-        "error"
+        "error",
+        "statusCode",
+        "model",
+        "attempt",
+        "durationMs",
+        "promptId",
+        "sequence"
       ]
     },
     "api_request": {
@@ -80,7 +89,9 @@
         "command",
         "exitCode",
         "durationMs",
-        "agentId"
+        "agentId",
+        "promptId",
+        "sequence"
       ]
     },
     "commit_attribution": {
@@ -173,7 +184,11 @@
     "context_compact": {
       "fields": [
         "summary",
-        "trigger"
+        "trigger",
+        "preTokens",
+        "postTokens",
+        "promptId",
+        "sequence"
       ]
     },
     "cursorVendorSnapshot": {
@@ -262,7 +277,9 @@
     },
     "dir_list": {
       "fields": [
-        "path"
+        "path",
+        "promptId",
+        "sequence"
       ]
     },
     "durability_verdict": {
@@ -332,7 +349,9 @@
         "linesRemoved",
         "lineRanges",
         "agentId",
-        "changeType"
+        "changeType",
+        "promptId",
+        "sequence"
       ],
       "arrayElements": {
         "lineRanges": [
@@ -345,7 +364,9 @@
     "file_read": {
       "fields": [
         "path",
-        "credentialKeys"
+        "credentialKeys",
+        "promptId",
+        "sequence"
       ],
       "stringArrays": {
         "credentialKeys": {
@@ -358,7 +379,9 @@
     "file_search": {
       "fields": [
         "path",
-        "query"
+        "query",
+        "promptId",
+        "sequence"
       ]
     },
     "git_action": {
@@ -428,20 +451,26 @@
         "title",
         "fromMode",
         "toMode",
-        "trigger"
+        "trigger",
+        "promptId",
+        "sequence"
       ]
     },
     "planning": {
       "fields": [
         "summary",
         "title",
-        "status"
+        "status",
+        "promptId",
+        "sequence"
       ]
     },
     "planning_read": {
       "fields": [
         "summary",
-        "title"
+        "title",
+        "promptId",
+        "sequence"
       ]
     },
     "presence": {
@@ -465,7 +494,9 @@
         "repoHost",
         "repoTracked",
         "promptLength",
-        "agentId"
+        "agentId",
+        "promptId",
+        "sequence"
       ]
     },
     "rework_verdict": {
@@ -482,6 +513,34 @@
           "end",
           "ageDays",
           "lineageId"
+        ]
+      }
+    },
+    "session_counters": {
+      "fields": [
+        "temporality",
+        "windowStart",
+        "linesAdded",
+        "linesRemoved",
+        "commits",
+        "pullRequests",
+        "activeUserSec",
+        "activeCliSec",
+        "linesByModel",
+        "editDecisions"
+      ],
+      "arrayElements": {
+        "editDecisions": [
+          "tool",
+          "decision",
+          "source",
+          "language",
+          "count"
+        ],
+        "linesByModel": [
+          "model",
+          "added",
+          "removed"
         ]
       }
     },
@@ -531,7 +590,9 @@
         "summary",
         "lastRequestInputTokens",
         "effort",
-        "speed"
+        "speed",
+        "promptId",
+        "sequence"
       ]
     },
     "task_dispatch": {
@@ -539,7 +600,9 @@
         "name",
         "status",
         "summary",
-        "agentId"
+        "agentId",
+        "promptId",
+        "sequence"
       ]
     },
     "test_run": {
@@ -559,7 +622,9 @@
         "status",
         "callId",
         "decision",
-        "decisionSource"
+        "decisionSource",
+        "promptId",
+        "sequence"
       ]
     },
     "tool_intent": {
@@ -568,6 +633,32 @@
         "tool",
         "status"
       ]
+    },
+    "tool_inventory": {
+      "fields": [
+        "mcpServers",
+        "plugins"
+      ],
+      "arrayElements": {
+        "mcpServers": [
+          "name",
+          "scope",
+          "transport",
+          "status",
+          "isPlugin"
+        ],
+        "plugins": [
+          "name",
+          "version",
+          "scope",
+          "marketplace",
+          "skillCount",
+          "agentCount",
+          "commandCount",
+          "hasMcp",
+          "hasHooks"
+        ]
+      }
     },
     "tool_result": {
       "fields": [
@@ -579,7 +670,9 @@
         "durationMs",
         "mcpServer",
         "mcpServerName",
-        "mcpToolName"
+        "mcpToolName",
+        "promptId",
+        "sequence"
       ]
     },
     "tool_use": {
@@ -588,7 +681,9 @@
         "tool",
         "status",
         "skill",
-        "agentId"
+        "agentId",
+        "promptId",
+        "sequence"
       ]
     },
     "usageLimitHit": {
@@ -606,7 +701,9 @@
     "web_lookup": {
       "fields": [
         "url",
-        "query"
+        "query",
+        "promptId",
+        "sequence"
       ]
     },
     "windowUsage": {

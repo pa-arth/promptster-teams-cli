@@ -119,6 +119,12 @@ var kindsNotEmittedOnDevice = map[string]string{
 		"docs/commit-rewrite-attribution.md, 'CLI producer contract'). Nothing in internal/capture " +
 		"constructs the kind, so rewrite-alias attribution is dark end to end. Remove this entry and " +
 		"add the kind to projectFieldAllowlist when the post-rewrite rail is built.",
+
+	"session_counters": "OTel rail only: the backend folds Claude Code's own metrics (lines, commits, " +
+		"PRs, active time, edit language) into one row per session per export " +
+		"(promptster-backend #1186). No device process sees those metrics.",
+	"tool_inventory": "OTel rail only: built server-side from the wire's mcp_server_connection and " +
+		"plugin_loaded events (promptster-backend #1180). No CLI emitter.",
 }
 
 // serverOnlyFields — allowlisted at the backend write boundary and deliberately
@@ -212,6 +218,7 @@ var serverOnlyFields = map[string]map[string]string{
 		"reasoningEffort": "Codex OTel only — same session_meta gap as approvalPolicy.",
 	},
 	"tool_decision": {
+		"promptId": "No device tool_decision emitter — see callId.",
 		"callId": "This CLI emits no tool_decision event at all. Approval decisions are an OTel-wire " +
 			"concept (Codex `approved`, Claude Code `accept`/`reject`); nothing in a transcript or " +
 			"hook payload on this device reports one.",
@@ -230,6 +237,16 @@ var serverOnlyFields = map[string]map[string]string{
 			"work (#148) lands on tool_use, not tool_result.",
 		"mcpToolName": "OTel only — see mcpServerName.",
 	},
+	// OTel's claude_code.api_error (promptster-backend #1240). This CLI has no
+	// api_error emitter at all: a usage limit reaches it as a transcript row
+	// (internal/capture/limit_hits.go) and leaves as usageLimitHit.
+	"api_error": {
+		"statusCode": "OTel only — no device api_error emitter.",
+		"model":      "OTel only — no device api_error emitter.",
+		"attempt":    "OTel only — no device api_error emitter.",
+		"durationMs": "OTel only — no device api_error emitter.",
+		"promptId":   "OTel only — no device api_error emitter.",
+	},
 }
 
 // deviceDeclinesToEmit — the server allowlists it, a device rail CAN source it,
@@ -246,7 +263,45 @@ var serverOnlyFields = map[string]map[string]string{
 // So an entry here is a QUESTION someone is expected to answer eventually, not a
 // closed fact. It must name the site that declines, so the next reader can go and
 // look rather than take this table's word for it.
-var deviceDeclinesToEmit = map[string]map[string]string{}
+var deviceDeclinesToEmit = promptIdDeclined()
+
+// promptIdDeclined — `promptId` groups one turn's records. The server keeps it
+// from OTel's prompt.id (promptster-backend #1271). Claude Code transcripts carry
+// it too (a top-level `promptId` on user rows), but
+// internal/normalize/normalize_claude_jsonl.go does not read it, so no device
+// event has one. Emitting it is a CLI change, not a policy question.
+func promptIdDeclined() map[string]map[string]string {
+	const reason = "normalize_claude_jsonl.go does not read the transcript's promptId yet."
+	out := map[string]map[string]string{}
+	for _, kind := range []string{
+		"ai_response", "prompt", "context_compact", "subagent_usage", "tool_result",
+		"command", "file_diff", "file_read", "file_search", "planning", "task_dispatch", "tool_use", "web_lookup",
+		"plan_decision", "dir_list", "planning_read",
+	} {
+		out[kind] = map[string]string{"promptId": reason}
+	}
+	// The transcript carries both of these too, and the normalizer reads neither yet.
+	out["context_compact"]["preTokens"] = "normalize_claude_jsonl.go reads compactMetadata.trigger but not compactMetadata.preTokens."
+	out["context_compact"]["postTokens"] = "Same as preTokens."
+	out["ai_response"]["isDelegated"] = "normalize_claude_jsonl.go marks delegated work as `sidechain`, not isDelegated."
+	return out
+}
+
+// `sequence` is OTel's event.sequence (promptster-backend #1271): the exporter's
+// own per-session counter. A device event has no exporter counter; its order is
+// the hash chain (prevSig) it is signed into.
+func init() {
+	for _, kind := range []string{
+		"ai_response", "prompt", "context_compact", "subagent_usage", "tool_result", "tool_decision", "api_error",
+		"command", "file_diff", "file_read", "file_search", "planning", "task_dispatch", "tool_use", "web_lookup",
+		"plan_decision", "dir_list", "planning_read",
+	} {
+		if serverOnlyFields[kind] == nil {
+			serverOnlyFields[kind] = map[string]string{}
+		}
+		serverOnlyFields[kind]["sequence"] = "OTel's event.sequence; device events are ordered by their prevSig chain."
+	}
+}
 
 // deviceOnlyFields — projected by this CLI and NOT allowlisted at the backend
 // write boundary, keyed kind → field → reason.
