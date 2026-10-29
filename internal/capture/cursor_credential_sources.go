@@ -174,11 +174,11 @@ func readCursorAgentAuthFile() (cursorCredentialSource, bool) {
 		return src, false
 	}
 	if errors.Is(err, errCursorAgentFileOversized) {
-		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, "cursor-agent auth file oversized")
+		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailAgentAuthOversized, "cursor-agent auth file oversized")
 		return src, true
 	}
 	if err != nil {
-		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, "cursor-agent auth file unreadable")
+		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailAgentAuthUnreadable, "cursor-agent auth file unreadable")
 		return src, true
 	}
 	var f struct {
@@ -186,7 +186,7 @@ func readCursorAgentAuthFile() (cursorCredentialSource, bool) {
 		RefreshToken string `json:"refreshToken"`
 	}
 	if json.Unmarshal(b, &f) != nil {
-		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, "cursor-agent auth file unparseable")
+		src.err = credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailAgentAuthUnparseable, "cursor-agent auth file unparseable")
 		return src, true
 	}
 	token := strings.TrimSpace(f.AccessToken)

@@ -94,9 +94,67 @@ func TestReadCursorCredentialRereadsStoreEveryCycle(t *testing.T) {
 	}
 }
 
+// PD-45: credential_absent alone could not say which step failed. Each failure
+// in the IDE store read carries its own fixed code, and that code (never a
+// path or a token) reaches the absence event as absenceDetail.
+func TestCredentialAbsenceNamesTheFailedStep(t *testing.T) {
+	t.Setenv("PROMPTSTER_STATE_DIR", t.TempDir())
+	live := jwtWithExpiry(t, time.Now().Add(time.Hour), "detail-canary-token")
+	noSub := "eyJhbGciOiJub25lIn0." + base64.RawURLEncoding.EncodeToString([]byte(`{"exp":4102444800}`)) + ".sig"
+	notSQLite := filepath.Join(t.TempDir(), "state.vscdb")
+	if err := os.WriteFile(notSQLite, []byte("not a database, at all, not even close to one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		path string
+		want cursorCredentialDetail
+	}{
+		{"missing store", filepath.Join(t.TempDir(), "absent", "state.vscdb"), cursorDetailStoreMissing},
+		{"not sqlite", notSQLite, cursorDetailStoreUnreadable},
+		// The key-rename / token-moved case: a healthy store with no cursorAuth rows.
+		{"no auth rows", makeCursorStateDB(t, map[string]string{"other/key": "v"}), cursorDetailStoreNoAuthRows},
+		{"empty token", makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: " "}), cursorDetailTokenMissing},
+		{"no sub", makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: noSub}), cursorDetailTokenNoSub},
+		{"expired", makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: jwtWithExpiry(t, time.Now().Add(-time.Hour), "x")}), cursorDetailTokenExpired},
+	}
+	codeShape := regexp.MustCompile(`^[a-z][a-z_]{0,47}$`)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := readCursorCredentialAt(tc.path)
+			if got := cursorCredentialAbsenceDetail(err); got != tc.want {
+				t.Fatalf("detail = %q, want %q (err %v)", got, tc.want, err)
+			}
+			ev := buildCursorCredentialAbsenceEvent("dev", cursorAccountRefUnknown, err, time.Now())
+			data := ev.Data.(map[string]interface{})
+			got, _ := data["absenceDetail"].(string)
+			if got != string(tc.want) || !codeShape.MatchString(got) {
+				t.Fatalf("absenceDetail on the wire = %q, want %q", got, tc.want)
+			}
+			if data["absenceReason"] != string(cursorCredentialAbsence(err)) {
+				t.Fatalf("absenceReason changed: %v", data["absenceReason"])
+			}
+			for _, v := range data {
+				if s, ok := v.(string); ok && (strings.Contains(s, tc.path) || strings.Contains(s, "/")) {
+					t.Fatalf("a path reached the absence: %q", s)
+				}
+			}
+		})
+	}
+	// A readable store with a live token is not an absence at all.
+	if _, err := readCursorCredentialAt(makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: live})); err != nil {
+		t.Fatalf("live token read as absent: %v", err)
+	}
+	// An error this file did not build carries no detail, and the field is omitted.
+	ev := buildCursorCredentialAbsenceEvent("dev", cursorAccountRefUnknown, fmt.Errorf("other"), time.Now())
+	if _, ok := ev.Data.(map[string]interface{})["absenceDetail"]; ok {
+		t.Fatal("absenceDetail emitted for an unclassified error")
+	}
+}
+
 func TestCredentialSecretMutationCannotReachErrorsOrPayload(t *testing.T) {
 	secret := "mutation-canary-cursor-bearer"
-	for _, text := range []string{credentialErr(CursorVendorAbsenceCredentialAbsent, "no token").Error(), buildCursorVendorAbsenceEvent("device", "unknown", CursorVendorAbsenceCredentialAbsent, time.Now(), time.Time{}, time.Time{}, cursorVendorShapeRecord{}).Data.(map[string]interface{})["absenceReason"].(string)} {
+	for _, text := range []string{credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailTokenMissing, "no token").Error(), buildCursorVendorAbsenceEvent("device", "unknown", CursorVendorAbsenceCredentialAbsent, time.Now(), time.Time{}, time.Time{}, cursorVendorShapeRecord{}).Data.(map[string]interface{})["absenceReason"].(string)} {
 		if err := assertNoCredentialInText(text, secret); err != nil {
 			t.Fatal(err)
 		}

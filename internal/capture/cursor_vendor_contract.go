@@ -306,6 +306,9 @@ var cursorVendorSnapshotCompletionFields = []string{
 	"shapeCursorVersion",
 	"shapeHttpStatus",
 	"absenceReason",
+	// absenceDetail — which credential step failed (cursorCredentialDetail), on
+	// credential absences only. A closed vocabulary, never text.
+	"absenceDetail",
 	// accountRef — see the row list. Present on complete AND absent records.
 	"accountRef",
 }

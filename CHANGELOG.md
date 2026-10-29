@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Cursor usage absences now say which step of reading the Cursor login
+  failed. `credential_absent` covered a dozen different failures (no store,
+  store not permitted, snapshot failed, store unreadable, store holds no login
+  keys, token with no account id, ...) and the backend could not tell them
+  apart, so a device that kept reporting it while Cursor was in use could not
+  be diagnosed. The absence now carries a short fixed code as `absenceDetail`
+  (never a path, error text or token) and the installed Cursor version. A store
+  that opens cleanly but holds no login keys was reported as unreadable; it now
+  has its own code, `store_no_auth_rows`.
+
 ## [0.40.5] — 2026-10-29
 
 ### Fixed

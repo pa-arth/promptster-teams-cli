@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -113,9 +114,53 @@ type cursorCredential struct {
 	emailHMAC string
 }
 
+// cursorCredentialDetail is WHICH credential failure produced an absence, on
+// the wire as `absenceDetail`.
+//
+// credential_absent alone covers a dozen different failures, and from the
+// backend they are indistinguishable: PD-45 (2026-10-28) was a device emitting
+// it every cycle for a login that was in active use, with nothing on the wire to
+// say whether the store was missing, locked away, unreadable or simply no longer
+// holding the keys. This names the step that failed.
+//
+// A CLOSED VOCABULARY, NEVER TEXT. Every value is a constant below — no path, no
+// error string, no key value — and the backend clamps the field to
+// `^[a-z][a-z_]{0,47}$`. The free-text `detail` beside it stays in this process
+// (verbose logs only), because an OS error string carries the home directory.
+type cursorCredentialDetail string
+
+const (
+	cursorDetailPlatformUnsupported   cursorCredentialDetail = "platform_unsupported"
+	cursorDetailNoHomeDir             cursorCredentialDetail = "no_home_dir"
+	cursorDetailStoreMissing          cursorCredentialDetail = "store_missing"
+	cursorDetailStorePermissionDenied cursorCredentialDetail = "store_permission_denied"
+	cursorDetailStoreStatFailed       cursorCredentialDetail = "store_stat_failed"
+	// snapshot_permission_denied is EPERM/EACCES while cloning or copying the
+	// store (a macOS privacy denial looks like this), apart from any other
+	// snapshot failure.
+	cursorDetailSnapshotPermissionDenied cursorCredentialDetail = "snapshot_permission_denied"
+	cursorDetailSnapshotFailed           cursorCredentialDetail = "snapshot_failed"
+	cursorDetailStoreReadTimeout         cursorCredentialDetail = "store_read_timeout"
+	cursorDetailStoreUnreadable          cursorCredentialDetail = "store_unreadable"
+	// store_no_auth_rows: the snapshot opened and queried cleanly and holds none
+	// of the cursorAuth keys. What a key rename or a move of the token out of
+	// ItemTable looks like. Reported as "unreadable" before it had a name.
+	cursorDetailStoreNoAuthRows      cursorCredentialDetail = "store_no_auth_rows"
+	cursorDetailTokenMissing         cursorCredentialDetail = "token_missing"
+	cursorDetailTokenNoSub           cursorCredentialDetail = "token_no_sub"
+	cursorDetailTokenExpired         cursorCredentialDetail = "token_expired"
+	cursorDetailAgentAuthOversized   cursorCredentialDetail = "agent_auth_oversized"
+	cursorDetailAgentAuthUnreadable  cursorCredentialDetail = "agent_auth_unreadable"
+	cursorDetailAgentAuthUnparseable cursorCredentialDetail = "agent_auth_unparseable"
+)
+
+// errNoCursorAuthRows is a store that was read and holds none of the keys.
+var errNoCursorAuthRows = errors.New("no cursorAuth rows")
+
 // cursorCredentialError names a failure without carrying a value.
 type cursorCredentialError struct {
 	reason CursorVendorAbsenceReason
+	code   cursorCredentialDetail
 	detail string
 }
 
@@ -126,8 +171,8 @@ func (e *cursorCredentialError) Error() string {
 // AbsenceReason lets the collector emit the right absence instead of silence.
 func (e *cursorCredentialError) AbsenceReason() CursorVendorAbsenceReason { return e.reason }
 
-func credentialErr(reason CursorVendorAbsenceReason, detail string) error {
-	return &cursorCredentialError{reason: reason, detail: detail}
+func credentialErr(reason CursorVendorAbsenceReason, code cursorCredentialDetail, detail string) error {
+	return &cursorCredentialError{reason: reason, code: code, detail: detail}
 }
 
 // cursorStateDBPath returns the platform path of Cursor's global state store.
@@ -142,11 +187,11 @@ func cursorStateDBPath() (string, error) {
 		return override, nil
 	}
 	if !CursorVendorPlatformSupported(runtime.GOOS) {
-		return "", credentialErr(CursorVendorAbsencePlatformUnsupported, runtime.GOOS)
+		return "", credentialErr(CursorVendorAbsencePlatformUnsupported, cursorDetailPlatformUnsupported, runtime.GOOS)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return "", credentialErr(CursorVendorAbsenceCredentialAbsent, "no home directory")
+		return "", credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailNoHomeDir, "no home directory")
 	}
 	return filepath.Join(home, "Library", "Application Support", "Cursor",
 		"User", "globalStorage", "state.vscdb"), nil
@@ -192,7 +237,14 @@ func readCursorCredential() (cursorCredential, error) {
 // default profile's, or an extra profile's (cursorExtraProfileStateDBs).
 func readCursorCredentialAt(path string) (cursorCredential, error) {
 	if _, statErr := os.Stat(path); statErr != nil {
-		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no state store on this device")
+		switch {
+		case errors.Is(statErr, fs.ErrNotExist):
+			return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStoreMissing, "no state store on this device")
+		case errors.Is(statErr, fs.ErrPermission):
+			return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStorePermissionDenied, "state store not permitted")
+		default:
+			return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStoreStatFailed, "state store could not be stat'd")
+		}
 	}
 
 	values, emailHMAC, _, err := readCursorAuthKeys(path)
@@ -213,7 +265,7 @@ func readCursorCredentialAt(path string) (cursorCredential, error) {
 // no token is absent, no parseable `sub` is absent, a past `exp` is expired.
 func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error) {
 	if token == "" {
-		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "no token in the store")
+		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailTokenMissing, "no token in the store")
 	}
 
 	cred := cursorCredential{token: token, expiresAt: cursorTokenExpiry(token),
@@ -223,14 +275,14 @@ func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error
 		// account to scope its snapshot to, and it would be collected and recorded
 		// under "unknown". It is treated as an absent credential: no vendor call,
 		// no login-map entry.
-		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, "token has no parseable sub")
+		return cursorCredential{}, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailTokenNoSub, "token has no parseable sub")
 	}
 	if !cred.expiresAt.IsZero() && time.Now().After(cred.expiresAt) {
 		// PRE-FLIGHT, not the authority. A 401 from the vendor is the other, and
 		// both resolve to the same emitted absence — the engineer must re-login
 		// in Cursor either way. The account ref survives (the token does not) so
 		// the absence names the account that expired.
-		return cursorCredential{accountRef: cred.accountRef}, credentialErr(CursorVendorAbsenceCredentialExpired, "the store's current token is past its exp claim")
+		return cursorCredential{accountRef: cred.accountRef}, credentialErr(CursorVendorAbsenceCredentialExpired, cursorDetailTokenExpired, "the store's current token is past its exp claim")
 	}
 	return cred, nil
 }
@@ -264,13 +316,22 @@ func cursorCredentialFromToken(token, emailHMAC string) (cursorCredential, error
 func readCursorAuthKeys(path string) (map[string]string, string, string, error) {
 	snapshot, cleanup, err := snapshotCursorStateDB(path)
 	if err != nil {
-		return nil, "", "", credentialErr(CursorVendorAbsenceCredentialAbsent, "state store could not be snapshotted")
+		if errors.Is(err, fs.ErrPermission) {
+			return nil, "", "", credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailSnapshotPermissionDenied, "state store snapshot not permitted")
+		}
+		return nil, "", "", credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailSnapshotFailed, "state store could not be snapshotted")
 	}
 	defer cleanup()
 
 	values, emailHMAC, queryErr := queryCursorAuthKeys("file:"+escapeSQLiteURI(snapshot)+"?mode=ro", state.CursorAttributionKey())
-	if queryErr != nil {
-		return nil, "", snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, "state store unreadable")
+	switch {
+	case queryErr == nil:
+	case errors.Is(queryErr, errNoCursorAuthRows):
+		return nil, "", snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStoreNoAuthRows, "state store holds no cursorAuth keys")
+	case errors.Is(queryErr, context.DeadlineExceeded):
+		return nil, "", snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStoreReadTimeout, "state store read timed out")
+	default:
+		return nil, "", snapshot, credentialErr(CursorVendorAbsenceCredentialAbsent, cursorDetailStoreUnreadable, "state store unreadable")
 	}
 	return values, emailHMAC, snapshot, nil
 }
@@ -316,7 +377,7 @@ func queryCursorAuthKeys(dsn string, installKey []byte) (map[string]string, stri
 		return nil, "", err
 	}
 	if len(out) == 0 {
-		return nil, "", errors.New("no cursorAuth rows")
+		return nil, "", errNoCursorAuthRows
 	}
 	return out, emailHMAC, nil
 }
@@ -480,6 +541,16 @@ func cursorCredentialAbsence(err error) CursorVendorAbsenceReason {
 		return ce.reason
 	}
 	return CursorVendorAbsenceCredentialAbsent
+}
+
+// cursorCredentialAbsenceDetail is err's cursorCredentialDetail, "" for an
+// error credentialErr did not build.
+func cursorCredentialAbsenceDetail(err error) cursorCredentialDetail {
+	var ce *cursorCredentialError
+	if errors.As(err, &ce) {
+		return ce.code
+	}
+	return ""
 }
 
 // assertNoCredentialInText is a belt-and-braces guard used by the leak test and

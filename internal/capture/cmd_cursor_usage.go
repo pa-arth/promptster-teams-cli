@@ -81,7 +81,7 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 	if len(accounts) == 0 {
 		// No source identified a login: one absence under "unknown", carrying the
 		// IDE store's reason (sources[0]).
-		queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, cursorAccountRefUnknown, cursorCredentialAbsence(sources[0].err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
+		queueCursorVendorEvent(buildCursorCredentialAbsenceEvent(deviceID, cursorAccountRefUnknown, sources[0].err, capturedAt))
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), cursorVendorPollBudget)
@@ -94,7 +94,7 @@ func pollCursorVendorUsage(deviceID string, resolver *policy.Resolver, client *c
 			continue
 		}
 		if a.err != nil {
-			queueCursorVendorEvent(buildCursorVendorAbsenceEvent(deviceID, a.cred.accountRef, cursorCredentialAbsence(a.err), capturedAt, time.Time{}, time.Time{}, cursorVendorShapeRecord{}))
+			queueCursorVendorEvent(buildCursorCredentialAbsenceEvent(deviceID, a.cred.accountRef, a.err, capturedAt))
 			continue
 		}
 		collectCursorVendorAccount(ctx, deviceID, client, a.cred, capturedAt)

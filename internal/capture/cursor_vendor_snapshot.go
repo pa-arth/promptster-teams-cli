@@ -503,6 +503,21 @@ func buildCursorVendorAbsenceEvent(deviceID, accountRef string, reason CursorVen
 	return e
 }
 
+// buildCursorCredentialAbsenceEvent is the absence for a credential that could
+// not be read, carrying WHICH step failed as `absenceDetail` (see
+// cursorCredentialDetail) and the installed Cursor version, so a store that
+// stopped yielding a login after a Cursor update reads as one. The detail is
+// not in the snapshot or event id: the same reason in the same cycle stays one
+// ongoing condition, whichever step failed.
+func buildCursorCredentialAbsenceEvent(deviceID, accountRef string, err error, capturedAt time.Time) event.Event {
+	e := buildCursorVendorAbsenceEvent(deviceID, accountRef, cursorCredentialAbsence(err), capturedAt,
+		time.Time{}, time.Time{}, cursorVendorShapeRecord{CursorVersion: cursorApplicationVersion()})
+	if detail := cursorCredentialAbsenceDetail(err); detail != "" {
+		e.Data.(map[string]interface{})["absenceDetail"] = string(detail)
+	}
+	return e
+}
+
 // cursorVendorAbsenceSnapshotID gives an absence a well-formed snapshot id.
 //
 // The completion schema requires a 64-hex digest in this field, and an absence
