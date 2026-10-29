@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.40.4] — 2026-10-28
+
+### Fixed
+
+- Codex rate-limit window readings now land on the conversation's own session.
+  When the newest reading came from a delegated subagent thread (guardian
+  reviewers report rate limits on almost every turn), it was filed under the
+  subagent's thread id. That created a separate session holding nothing but
+  the window reading, which showed up as an `unknown` tool family. The
+  reading now resolves to the root conversation, the same way the thread's
+  other events already did.
+
 ## [0.40.3] — 2026-10-22
 
 ### Fixed
