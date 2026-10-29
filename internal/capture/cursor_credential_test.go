@@ -141,6 +141,18 @@ func TestCredentialAbsenceNamesTheFailedStep(t *testing.T) {
 			}
 		})
 	}
+	// A store this process may not read: the snapshot step names the denial.
+	if os.Geteuid() != 0 {
+		locked := makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: live})
+		if err := os.Chmod(locked, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readCursorCredentialAt(locked)
+		_ = os.Chmod(locked, 0o600)
+		if got := cursorCredentialAbsenceDetail(err); got != cursorDetailSnapshotPermissionDenied {
+			t.Fatalf("unreadable store detail = %q, want %q (err %v)", got, cursorDetailSnapshotPermissionDenied, err)
+		}
+	}
 	// A readable store with a live token is not an absence at all.
 	if _, err := readCursorCredentialAt(makeCursorStateDB(t, map[string]string{cursorAuthAccessTokenKey: live})); err != nil {
 		t.Fatalf("live token read as absent: %v", err)
