@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:2cd4c8ad8618aa04192f38f0928c1218c32e2fcfc550f0b847dd641dc85a60d6",
+  "checksum": "sha256:3220b2be22c0141d2b58c685da239399db5056dfd5d1cc5a4cb2de339c2d8afd",
   "counts": {
     "kinds": 54,
-    "fields": 365,
+    "fields": 366,
     "elementFields": 62
   },
   "kinds": {
@@ -215,6 +215,7 @@
         "shapeCursorVersion",
         "shapeHttpStatus",
         "absenceReason",
+        "absenceDetail",
         "accountRef",
         "teamId"
       ],

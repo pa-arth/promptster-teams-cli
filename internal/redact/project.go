@@ -82,7 +82,10 @@ var projectFieldAllowlist = map[string][]string{
 	"cursorVendorUsage": {"snapshotId", "ordinal", "rowHash", "usageScope", "timestamp", "model", "kind", "conversationId", "isHeadless", "chargedCents", "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "totalCents", "isTokenBasedCall", "isChargeable", "owningUser", "subscriptionProductId", "cloudAgentId", "automationId", "serviceAccountId", "accountRef"},
 	// accountRef on both vendor kinds is hex(sha256(jwt.sub))[:16] of the Cursor
 	// login that was read, or "unknown" — a truncated digest, never the sub.
-	"cursorVendorSnapshot": {"protocolVersion", "poolId", "manifestSha256", "manifest", "snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason", "accountRef"},
+	// absenceDetail is a lower-snake code from capture's closed
+	// cursorCredentialDetail vocabulary (which credential step failed), never an
+	// error string or path; the backend clamps it to `^[a-z][a-z_]{0,47}$`.
+	"cursorVendorSnapshot": {"protocolVersion", "poolId", "manifestSha256", "manifest", "snapshotId", "status", "capturedAt", "billingCycleStartsAt", "billingCycleResetsAt", "rowCount", "contentSha256", "quotaProvider", "quotaCycleResetsAt", "quotaSpendCents", "quotaCapCents", "quotaVendorStatedPercentUsed", "quotaAbsenceReason", "shapeObservedFields", "shapeMissingFields", "shapeCursorVersion", "shapeHttpStatus", "absenceReason", "absenceDetail", "accountRef"},
 	// Human conversational text (secret-redacted upstream by redactBytes).
 	// prompt.command is the slash-command NAME, never the expanded body.
 	// followsInterrupt is a boolean flag marking a redirect prompt (the one
