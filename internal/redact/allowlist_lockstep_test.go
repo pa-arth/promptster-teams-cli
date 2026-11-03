@@ -125,6 +125,9 @@ var kindsNotEmittedOnDevice = map[string]string{
 		"(promptster-backend #1186). No device process sees those metrics.",
 	"tool_inventory": "OTel rail only: built server-side from the wire's mcp_server_connection and " +
 		"plugin_loaded events (promptster-backend #1180). No CLI emitter.",
+	"skill_activation": "OTel rail only: mapped from the Cowork/Claude Code wire's skill_activated " +
+		"event (promptster-backend #1317). No transcript line records a skill activation as its own " +
+		"event, so no CLI emitter.",
 }
 
 // serverOnlyFields — allowlisted at the backend write boundary and deliberately
@@ -140,6 +143,10 @@ var kindsNotEmittedOnDevice = map[string]string{
 // lack, so nobody ever revisits it, and the open question is retired by filing
 // rather than by deciding. The two tables are asserted disjoint.
 var serverOnlyFields = map[string]map[string]string{
+	"subagent_usage": {
+		"mcpServerName": "OTel wire attribution only (promptster-backend #1317), as ai_response.mcpServerName.",
+		"mcpToolName":   "OTel wire attribution only (promptster-backend #1317), as ai_response.mcpToolName.",
+	},
 	"cursorVendorUsage": {
 		"teamId": "This CLI vendor collector reads the personal billing scope and does not select a Cursor team id; the backend also accepts team-scoped reports from newer clients.",
 	},
@@ -147,6 +154,15 @@ var serverOnlyFields = map[string]map[string]string{
 		"teamId": "Same as cursorVendorUsage.teamId: this collector has no team-scope selection to report.",
 	},
 	"ai_response": {
+		"skillName": "OTel wire attribution only (promptster-backend #1317): Claude Code tags each api_request with the " +
+			"skill or MCP connector/tool it served (skill.name, mcp_server.name, mcp_tool.name). No transcript " +
+			"line carries that per-request attribution, so the device cannot source it.",
+		"mcpServerName": "OTel wire attribution only (promptster-backend #1317): Claude Code tags each api_request with the " +
+			"skill or MCP connector/tool it served (skill.name, mcp_server.name, mcp_tool.name). No transcript " +
+			"line carries that per-request attribution, so the device cannot source it.",
+		"mcpToolName": "OTel wire attribution only (promptster-backend #1317): Claude Code tags each api_request with the " +
+			"skill or MCP connector/tool it served (skill.name, mcp_server.name, mcp_tool.name). No transcript " +
+			"line carries that per-request attribution, so the device cannot source it.",
 		"costUsd": "The CLI has no cost figure to send — it emits tokens and the backend prices " +
 			"them. This is the provider's own per-request number off the OTel wire " +
 			"(claude_code.cost.usage), which no transcript carries. Kept out of USAGE_FIELDS " +
