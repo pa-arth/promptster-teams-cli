@@ -236,6 +236,11 @@ var serverOnlyFields = map[string]map[string]string{
 		"mcpServerName": "OTel only — the Claude Code spelling of the same fact. Cursor's MCP identity " +
 			"work (#148) lands on tool_use, not tool_result.",
 		"mcpToolName": "OTel only — see mcpServerName.",
+		// promptster-backend #1312: Cowork/Claude Code OTel tool_result attributes.
+		"resultSizeBytes": "OTel only (tool_result_size_bytes) — see callId. No device tool_result " +
+			"emitter carries the result body, so there is nothing to size.",
+		"mcpServerScope": "OTel only — see mcpServerName.",
+		"skillName":      "OTel only (skill_name, sent with toolDetails on) — see callId.",
 	},
 	// OTel's claude_code.api_error (promptster-backend #1240). This CLI has no
 	// api_error emitter at all: a usage limit reaches it as a transcript row
