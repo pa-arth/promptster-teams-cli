@@ -221,7 +221,7 @@ jobs:
           go-version-file: go.mod
       - run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
       - run: go tool cover -func=coverage.out | tail -1
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: coverage.out
@@ -332,7 +332,7 @@ jobs:
       - name: gosec (report all → SARIF)
         run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out gosec.sarif ./...
       - name: upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         continue-on-error: true
         with:
           sarif_file: gosec.sarif
@@ -359,7 +359,7 @@ jobs:
         continue-on-error: true
         run: go run golang.org/x/vuln/cmd/govulncheck@latest -format sarif ./... > govulncheck.sarif
       - name: upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         continue-on-error: true
         with:
           sarif_file: govulncheck.sarif
