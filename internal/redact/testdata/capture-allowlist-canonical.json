@@ -4,10 +4,10 @@
   "_resync": "promptster-teams-cli: make sync-capture-allowlist",
   "artifactVersion": 1,
   "manifestVersion": 1,
-  "checksum": "sha256:3220b2be22c0141d2b58c685da239399db5056dfd5d1cc5a4cb2de339c2d8afd",
+  "checksum": "sha256:77eaf2fe2ef438e8ea7df59682888b44fb1855c78a8f799ae95eb0e15c82c5be",
   "counts": {
     "kinds": 54,
-    "fields": 366,
+    "fields": 371,
     "elementFields": 62
   },
   "kinds": {
@@ -672,6 +672,9 @@
         "mcpServer",
         "mcpServerName",
         "mcpToolName",
+        "resultSizeBytes",
+        "mcpServerScope",
+        "skillName",
         "promptId",
         "sequence"
       ]
@@ -683,6 +686,8 @@
         "status",
         "skill",
         "agentId",
+        "resultSizeBytes",
+        "mcpServerScope",
         "promptId",
         "sequence"
       ]

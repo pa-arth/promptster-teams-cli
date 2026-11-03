@@ -236,6 +236,11 @@ var serverOnlyFields = map[string]map[string]string{
 		"mcpServerName": "OTel only — the Claude Code spelling of the same fact. Cursor's MCP identity " +
 			"work (#148) lands on tool_use, not tool_result.",
 		"mcpToolName": "OTel only — see mcpServerName.",
+		// promptster-backend #1312: Cowork/Claude Code OTel tool_result attributes.
+		"resultSizeBytes": "OTel only (tool_result_size_bytes) — see callId. No device tool_result " +
+			"emitter carries the result body, so there is nothing to size.",
+		"mcpServerScope": "OTel only — see mcpServerName.",
+		"skillName":      "OTel only (skill_name, sent with toolDetails on) — see callId.",
 	},
 	// OTel's claude_code.api_error (promptster-backend #1240). This CLI has no
 	// api_error emitter at all: a usage limit reaches it as a transcript row
@@ -284,6 +289,11 @@ func promptIdDeclined() map[string]map[string]string {
 	out["context_compact"]["preTokens"] = "normalize_claude_jsonl.go reads compactMetadata.trigger but not compactMetadata.preTokens."
 	out["context_compact"]["postTokens"] = "Same as preTokens."
 	out["ai_response"]["isDelegated"] = "normalize_claude_jsonl.go marks delegated work as `sidechain`, not isDelegated."
+	// promptster-backend #1312: a named MCP call off OTel lands as tool_use and keeps
+	// these. The transcript's tool_result block could be sized, and the MCP config
+	// scope read from Claude Code's settings, but the normalizer does neither yet.
+	out["tool_use"]["resultSizeBytes"] = "normalize_claude_jsonl.go does not size the transcript's tool_result block."
+	out["tool_use"]["mcpServerScope"] = "The CLI does not resolve which MCP config scope a server came from."
 	return out
 }
 
