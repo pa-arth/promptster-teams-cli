@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.41.0] — 2026-11-05
+
 ### Added
 
 - Cursor usage absences now say which step of reading the Cursor login
