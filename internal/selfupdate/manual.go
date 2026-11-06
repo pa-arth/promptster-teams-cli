@@ -112,7 +112,9 @@ func ApplyManual(pol PolicyView, target string) error {
 		return err
 	}
 	dir := filepath.Dir(self)
-	staged, err := u.downloadAndVerify(ensureVPrefix(target), asset, dir)
+	// Manual: the user named this version, so a rollback is intended, and
+	// releases signed before the tagged comment existed stay installable.
+	staged, err := u.downloadAndVerify(ensureVPrefix(target), asset, dir, false)
 	if err != nil {
 		return err
 	}

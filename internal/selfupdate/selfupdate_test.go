@@ -164,6 +164,7 @@ func TestUpToDate(t *testing.T) {
 }
 
 func TestHappyPathApplies(t *testing.T) {
+	allowUntaggedFixture(t)
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
 	wireHappyRelease(addRoute)
 	if got := u.checkAndApply(); got != outcomeApplied {
@@ -242,6 +243,7 @@ func TestStoredConsentIsReusedEveryCycleNotReAsked(t *testing.T) {
 // laptops is the org's decision, and an engineer's stored preference — in either
 // direction — must not be able to move it.
 func TestManagedFleetIgnoresLocalConsent(t *testing.T) {
+	allowUntaggedFixture(t)
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
 	wireHappyRelease(addRoute)
 	u.loadConsent = func() Consent {
@@ -283,6 +285,7 @@ func TestReleaseNotesURLNamesTheTag(t *testing.T) {
 }
 
 func TestPinnedTargetsThatTag(t *testing.T) {
+	allowUntaggedFixture(t)
 	// Pinned to v9.9.9; latest endpoint is NOT wired, proving the pin is used
 	// instead of "latest".
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, pinned: "9.9.9"})
@@ -673,6 +676,7 @@ func TestFetchLatestTagRequiresRedirect(t *testing.T) {
 // The whole point of the change: no check may touch api.github.com, whose
 // 60/hr per-IP limit is what forced the old 24h cadence.
 func TestChecksNeverHitTheGitHubAPI(t *testing.T) {
+	allowUntaggedFixture(t)
 	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
 	wireHappyRelease(addRoute)
 
@@ -718,6 +722,7 @@ func askUpdater(t *testing.T, answer guiPromptResult) (u *updater, applied *[]st
 }
 
 func TestAskModeInstallsWhenAccepted(t *testing.T) {
+	allowUntaggedFixture(t)
 	u, applied, prompts, _ := askUpdater(t, guiAccepted)
 
 	if got := u.checkAndApply(); got != outcomeApplied {
@@ -826,6 +831,7 @@ func TestAskModeUnavailableDialogFallsBackToNeedsConsent(t *testing.T) {
 // engineer clicking a popup is not a security review, and letting one appear
 // would make the org's pin look advisory.
 func TestAskModeNeverPromptsOnAManagedFleet(t *testing.T) {
+	allowUntaggedFixture(t)
 	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, managed: true})
 	wireHappyRelease(addRoute)
 	u.loadConsent = func() Consent { return ConsentAsk }
@@ -835,5 +841,23 @@ func TestAskModeNeverPromptsOnAManagedFleet(t *testing.T) {
 	}
 	if got := u.checkAndApply(); got != outcomeApplied {
 		t.Fatalf("managed outcome = %v, want applied", got)
+	}
+}
+
+// sampleSig is a real signature but carries no tag (it predates the tagged
+// trusted comment). Tests that only exercise the install flow allow it.
+func allowUntaggedFixture(t *testing.T) {
+	t.Helper()
+	enforceSignedTag = false
+	t.Cleanup(func() { enforceSignedTag = true })
+}
+
+// The rollback guard, end to end: a validly signed but UNTAGGED SHA256SUMS
+// published as "latest" v9.9.9 must not be applied.
+func TestAutoUpdateRefusesSignatureNotBoundToTheTag(t *testing.T) {
+	u, _, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true})
+	wireHappyRelease(addRoute)
+	if got := u.checkAndApply(); got == outcomeApplied {
+		t.Fatal("applied an update whose signature does not name the tag (rollback)")
 	}
 }
