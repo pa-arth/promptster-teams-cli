@@ -2,6 +2,7 @@ package selfupdate
 
 import (
 	"errors"
+	"fmt"
 
 	minisign "github.com/jedisct1/go-minisign"
 )
@@ -24,7 +25,12 @@ const minisignPublicKey = "RWSPnqFjEKp3+YGItrZaM+Ks6clhwDqFJBSDO/rMU1/KTm7xuijKx
 // id, failed verification) returns an error so the caller REJECTS the update.
 // An unsigned or absent signature never reaches here as "valid" — the caller
 // treats a missing .minisig as a hard failure before calling this.
-func verifyMinisign(sums, sig []byte) error {
+//
+// wantTag, when non-empty, must equal the version in the signature's TRUSTED
+// comment ("promptster-teams <tag>", authenticated by the global signature).
+// Without it an old release's validly signed SHA256SUMS could be re-published
+// under a new "latest" tag and every daemon would "upgrade" to the old build.
+func verifyMinisign(sums, sig []byte, wantTag string) error {
 	pk, err := minisign.NewPublicKey(minisignPublicKey)
 	if err != nil {
 		return err
@@ -39,6 +45,19 @@ func verifyMinisign(sums, sig []byte) error {
 	}
 	if !ok {
 		return errors.New("selfupdate: minisign signature did not verify")
+	}
+	return checkTrustedTag(signature.TrustedComment, wantTag)
+}
+
+// checkTrustedTag compares the signed trusted comment with the tag being
+// installed. Call only after the signature verified: that is what makes the
+// comment trustworthy.
+func checkTrustedTag(trustedComment, wantTag string) error {
+	if wantTag == "" {
+		return nil
+	}
+	if want := "trusted comment: promptster-teams " + wantTag; trustedComment != want {
+		return fmt.Errorf("selfupdate: signature is for %q, not %s (possible rollback)", trustedComment, wantTag)
 	}
 	return nil
 }

@@ -549,7 +549,7 @@ func (u *updater) checkAndApply() outcome {
 		u.logf("selfupdate: %v", err)
 		return outcomeError
 	}
-	staged, err := u.downloadAndVerify(tag, asset, dir)
+	staged, err := u.downloadAndVerify(tag, asset, dir, true)
 	if err != nil {
 		u.logf("selfupdate: rejected update to %s: %v", target, err)
 		return outcomeError
@@ -630,7 +630,12 @@ func ReleaseNotesURL(target string) string {
 // it removes partial temp files and returns an error (the whole update is
 // rejected). Order matters: the signature is checked BEFORE the checksums are
 // trusted.
-func (u *updater) downloadAndVerify(tag, asset, dir string) (string, error) {
+// enforceSignedTag is true in every build. Tests that publish the untagged
+// sampleSig fixture turn it off: making a tagged fixture needs the release
+// secret key. ponytail: drop this once verify_test.go carries a tagged fixture.
+var enforceSignedTag = true
+
+func (u *updater) downloadAndVerify(tag, asset, dir string, requireSignedTag bool) (string, error) {
 	base := strings.TrimRight(u.releaseBaseURL, "/") + "/" + repoSlug + "/releases/download/" + tag
 
 	sums, code, err := u.httpGet(base+"/SHA256SUMS", maxSumsBytes)
@@ -646,7 +651,11 @@ func (u *updater) downloadAndVerify(tag, asset, dir string) (string, error) {
 	if len(sig) == 0 {
 		return "", fmt.Errorf("SHA256SUMS.minisig is empty (unsigned release)")
 	}
-	if err := verifyMinisign(sums, sig); err != nil {
+	wantTag := ""
+	if requireSignedTag && enforceSignedTag {
+		wantTag = tag
+	}
+	if err := verifyMinisign(sums, sig, wantTag); err != nil {
 		return "", fmt.Errorf("minisign verify: %w", err)
 	}
 

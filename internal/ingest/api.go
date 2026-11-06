@@ -58,4 +58,8 @@ func (t *versionTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 var httpClient = &http.Client{
 	Timeout:   15 * time.Second,
 	Transport: &versionTransport{base: http.DefaultTransport},
+	// Never follow a redirect: Go re-sends custom headers like X-API-Key to the
+	// new host (it strips only Authorization/Cookie), so one 3xx would leak the
+	// engineer key. The API never redirects; a 3xx is an error to surface.
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }

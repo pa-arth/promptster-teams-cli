@@ -15,14 +15,14 @@ const sampleSig = "untrusted comment: signature from minisign secret key\n" +
 	"Z4N3VP3vG0cM2h85ByruU7uFPISybmjBWeG8QwnNxOm56esEy4v5jtbdI9JSbi0W68dr+FrjnqWlu0AUYBKCAw=="
 
 func TestVerifyMinisignAccept(t *testing.T) {
-	if err := verifyMinisign([]byte(sampleSums), []byte(sampleSig)); err != nil {
+	if err := verifyMinisign([]byte(sampleSums), []byte(sampleSig), ""); err != nil {
 		t.Fatalf("valid signature over sampleSums should verify: %v", err)
 	}
 }
 
 func TestVerifyMinisignRejectTamperedContent(t *testing.T) {
 	tampered := strings.Replace(sampleSums, "d3d9", "0000", 1)
-	if err := verifyMinisign([]byte(tampered), []byte(sampleSig)); err == nil {
+	if err := verifyMinisign([]byte(tampered), []byte(sampleSig), ""); err == nil {
 		t.Fatal("signature must NOT verify against tampered SHA256SUMS")
 	}
 }
@@ -34,13 +34,34 @@ func TestVerifyMinisignRejectTamperedSignature(t *testing.T) {
 		lines[1] = "X" + lines[1][1:]
 	}
 	bad := strings.Join(lines, "\n")
-	if err := verifyMinisign([]byte(sampleSums), []byte(bad)); err == nil {
+	if err := verifyMinisign([]byte(sampleSums), []byte(bad), ""); err == nil {
 		t.Fatal("corrupted signature must be rejected")
 	}
 }
 
 func TestVerifyMinisignRejectEmpty(t *testing.T) {
-	if err := verifyMinisign([]byte(sampleSums), []byte("")); err == nil {
+	if err := verifyMinisign([]byte(sampleSums), []byte(""), ""); err == nil {
 		t.Fatal("empty signature must be rejected")
+	}
+}
+
+// A validly signed SHA256SUMS from an OLD release must not install under a NEW
+// tag. The fixture's comment carries no version, so the automatic path refuses
+// it for any tag; only the matching signed tag passes.
+func TestVerifyMinisignRejectsUntaggedSignatureForAutoUpdate(t *testing.T) {
+	if err := verifyMinisign([]byte(sampleSums), []byte(sampleSig), "v9.9.9"); err == nil {
+		t.Fatal("old untagged signature accepted for a new tag: rollback possible")
+	}
+}
+
+func TestCheckTrustedTag(t *testing.T) {
+	if err := checkTrustedTag("trusted comment: promptster-teams v0.42.0", "v0.42.0"); err != nil {
+		t.Fatalf("matching tag refused: %v", err)
+	}
+	if err := checkTrustedTag("trusted comment: promptster-teams v0.41.0", "v0.42.0"); err == nil {
+		t.Fatal("older signed tag accepted for a newer one")
+	}
+	if err := checkTrustedTag("trusted comment: promptster-teams v0.42.0-evil", "v0.42.0"); err == nil {
+		t.Fatal("prefix match accepted")
 	}
 }
