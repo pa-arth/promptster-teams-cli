@@ -605,6 +605,15 @@ func pollCodexRollouts(
 
 		proc := processors[path]
 		if proc == nil {
+			// A cold processor replays the whole consumed prefix through secret
+			// redaction and shells out to git. After a restart that ran for every
+			// matched rollout in the history window (hundreds of MB, minutes of
+			// pegged CPU on every boot) even though most have nothing new to
+			// read. Build it only once the file has grown past the cursor; until
+			// then the tail below would read nothing anyway.
+			if info, err := os.Stat(path); err == nil && info.Size() <= progress.Offsets[path] {
+				return
+			}
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
 			// Progress offsets survive daemon restarts, while the processor's
 			// call/output correlation maps do not. Replay the consumed prefix only

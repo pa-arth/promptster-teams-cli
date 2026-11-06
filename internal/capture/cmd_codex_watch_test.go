@@ -411,3 +411,49 @@ func TestTierReplayMigrationFromV3BackfillsOnceAndKeepsFastState(t *testing.T) {
 		t.Fatalf("rows = %+v, want a third row with fast input 300 and fast output 30", rows)
 	}
 }
+
+// A restart must not rebuild (replay + redact) a processor for a rollout with
+// nothing past its cursor: that replay pegged the CPU for minutes on every boot.
+// Once the file grows, the processor is built and the new bytes are captured.
+func TestColdStartSkipsReplayForUnchangedRollout(t *testing.T) {
+	root := codexSessionsRoot(t)
+	stateDir := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", stateDir)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(stateDir, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(stateDir, "outbox.jsonl"))
+	workspace := t.TempDir()
+	path := filepath.Join(root, "rollout-019eb780-3081-7ce0-9ba0-8a0bad13b533.jsonl")
+	now := time.Now().UTC()
+	history := codexSessionMetaLine(resolvePath(workspace), now.Format(time.RFC3339))
+	if err := os.WriteFile(path, []byte(history), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := json.Marshal(codexWatchProgress{V: codexProgressSchemaV, Offsets: map[string]int64{path: int64(len(history))}, Match: map[string]string{path: "yes"}})
+	if err := os.WriteFile(codexWatchProgressPath(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	session := Session{DeviceID: "cold-start", SessionToken: "PSE-TEST", TaskRoot: workspace, StartedAt: now}
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+	if sent := pollCodexRollouts(session, resolvePath(workspace), transcriptHistoryCutoff(now), processors, false); sent != 0 {
+		t.Fatalf("unchanged rollout queued %d events", sent)
+	}
+	if processors[path] != nil {
+		t.Fatal("processor built (prefix replayed) for a rollout with no new bytes")
+	}
+
+	fresh := `{"timestamp":"` + now.Format(time.RFC3339) + `","type":"event_msg","payload":{"type":"user_message","message":"new activity","images":[]}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600) // #nosec G304 -- test temp path.
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(fresh); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if sent := pollCodexRollouts(session, resolvePath(workspace), transcriptHistoryCutoff(now), processors, false); sent != 1 {
+		t.Fatalf("new activity after restart: queued %d, want 1", sent)
+	}
+	if processors[path] == nil {
+		t.Fatal("processor not built once the rollout grew")
+	}
+}
