@@ -55,8 +55,23 @@ func TestOffHeadPushedBranchCommitSurfaced(t *testing.T) {
 	git("switch", "main")
 	git("branch", "-D", "feat")
 
+	// OUR commit, written elsewhere (a cloud agent, another machine) and only
+	// fetched here: same author, no ai-paths match on this device. Emitting it as
+	// `unattributed:` told the backend a human wrote it.
+	git("switch", "-c", "cloud")
+	writeCommitFile(t, repo, "cloud.go", "package main\n\nfunc cloud() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "cloud agent work")
+	fetched := gitOut("rev-parse", "HEAD")
+	git("update-ref", "refs/remotes/origin/cloud", fetched)
+	git("switch", "main")
+	git("branch", "-D", "cloud")
+
 	pollGitWatchWorkspace(session)
 	got := attributedShas(t, state.OutboxPath())
+	if countSha(got, fetched) != 0 {
+		t.Fatalf("fetched-only commit %s with no local AI evidence was emitted; outbox: %v", fetched, got)
+	}
 	if countSha(got, mine) != 1 {
 		t.Fatalf("pushed off-HEAD commit %s not surfaced exactly once; outbox: %v", mine, got)
 	}
