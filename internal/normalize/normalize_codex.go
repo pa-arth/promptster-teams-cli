@@ -516,6 +516,14 @@ func (p *CodexRolloutProcessor) HasBufferedState() bool {
 	return p.pendingUser.text != "" || p.pendingFinal.ts != "" || len(p.pending) > 0 || len(p.running) > 0
 }
 
+// HasFlushableState reports whether the processor holds a turn the stale
+// flushes (FlushStaleUserPrompt, FlushStaleFinal) would release with no further
+// bytes. Open tool calls are excluded: only a later output record can resolve
+// them, and a rollout that grows is replayed anyway.
+func (p *CodexRolloutProcessor) HasFlushableState() bool {
+	return p.pendingUser.text != "" || p.pendingFinal.ts != ""
+}
+
 // DiscardBufferedState throws away exactly what a re-read from RewindOffset
 // rebuilds, so a rewind's replay lands on an empty processor rather than on top
 // of a duplicate pending call or a turn it is about to re-derive.

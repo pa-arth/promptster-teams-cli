@@ -99,7 +99,14 @@ type codexWatchProgress struct {
 	ModelReplayPending map[string]bool  `json:"model_replay_pending,omitempty"`
 	// Discarding marks offsets that are inside an unsupported oversized record.
 	// Persisting it prevents a restart from parsing the malformed suffix.
-	Discarding         map[string]bool  `json:"discarding,omitempty"`
+	Discarding map[string]bool `json:"discarding,omitempty"`
+	// Settled marks rollouts whose processor held no turn for the stale flush
+	// to release (pending human turn or final answer) when its offset was last
+	// saved. A cold start may skip replaying such a rollout until it grows:
+	// nothing would be emitted without new bytes, and new bytes trigger the
+	// replay that rebuilds open tool calls. Absent means unknown (written by an
+	// older binary, or a turn still buffered) and keeps the replay + flush path.
+	Settled            map[string]bool  `json:"settled,omitempty"`
 	ClassifyOffsets    map[string]int64 `json:"classify_offsets,omitempty"`
 	ClassifyDiscarding map[string]bool  `json:"classify_discarding,omitempty"`
 	ClassifyScanned    map[string]int   `json:"classify_scanned,omitempty"`
@@ -134,7 +141,7 @@ func clearCodexClassifyState(p codexWatchProgress, key string) {
 
 func loadCodexWatchProgress() codexWatchProgress {
 	p := codexWatchProgress{
-		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{},
+		Offsets: map[string]int64{}, Discarding: map[string]bool{}, Match: map[string]string{}, Settled: map[string]bool{},
 		ClassifyOffsets: map[string]int64{}, ClassifyDiscarding: map[string]bool{}, ClassifyScanned: map[string]int{},
 	}
 	data, err := os.ReadFile(codexWatchProgressPath())
@@ -167,6 +174,9 @@ func loadCodexWatchProgress() codexWatchProgress {
 	}
 	if p.ClassifyScanned == nil {
 		p.ClassifyScanned = map[string]int{}
+	}
+	if p.Settled == nil {
+		p.Settled = map[string]bool{}
 	}
 	// Announce BEFORE migrating — same terms as the Claude loader.
 	announceProgressReplay("codex", codexProgressMigrations, p.V)
@@ -558,6 +568,7 @@ func pollCodexRollouts(
 				if progress.ModelReplayPending[path] {
 					delete(progress.Offsets, path)
 					delete(progress.Discarding, path)
+					delete(progress.Settled, path)
 					delete(progress.ModelReplayPending, path)
 				}
 				progress.Match[path] = "yes"
@@ -609,10 +620,15 @@ func pollCodexRollouts(
 			// redaction and shells out to git. After a restart that ran for every
 			// matched rollout in the history window (hundreds of MB, minutes of
 			// pegged CPU on every boot) even though most have nothing new to
-			// read. Build it only once the file has grown past the cursor; until
-			// then the tail below would read nothing anyway.
-			if info, err := os.Stat(path); err == nil && info.Size() <= progress.Offsets[path] {
-				return
+			// read. Skip it while the file hasn't grown past the cursor AND the
+			// last run left no trailing prompt/final answer for the stale flush
+			// to release. A rollout that ended mid-turn still replays, so the
+			// flush runs; an orphaned tool call only matters once the file grows,
+			// which brings back the replay.
+			if progress.Settled[path] {
+				if info, err := os.Stat(path); err == nil && info.Size() <= progress.Offsets[path] {
+					return
+				}
 			}
 			proc = normalize.NewCodexRolloutProcessor(codexSessionIDFromPath(path))
 			// Progress offsets survive daemon restarts, while the processor's
@@ -634,6 +650,11 @@ func pollCodexRollouts(
 		}
 		n, res := tailCodexRollout(path, progress, proc, session, captureProse, budget, oversizeProbe)
 		sent += n
+		if proc.HasFlushableState() {
+			delete(progress.Settled, path)
+		} else {
+			progress.Settled[path] = true
+		}
 		budget -= res.consumed
 		if res.probedOversize {
 			oversizeProbe = false

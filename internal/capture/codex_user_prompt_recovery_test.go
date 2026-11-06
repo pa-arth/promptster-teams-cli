@@ -181,3 +181,34 @@ func TestWatcherDoesNotDoubleCountWhenEventMsgIsPresent(t *testing.T) {
 			len(got), got)
 	}
 }
+
+// The cold-start replay skip must not strand a trailing human turn. The daemon
+// stops after the poll that consumed the turn to EOF (offset saved, turn only
+// in memory); the rollout never grows again. After restart the turn must still
+// be flushed, so a rollout left buffered is NOT settled and keeps the replay.
+func TestRestartMidTurnStillFlushesTrailingPrompt(t *testing.T) {
+	root, workspace, outbox, session, cutoff := codexRecoveryHarness(t)
+	const human = "ship the release before lunch"
+	path := codexRolloutWithoutEventMsg(t, root, workspace, human, false)
+
+	pollCodexRollouts(session, resolvePath(workspace), cutoff, map[string]*normalize.CodexRolloutProcessor{}, false)
+	if got := codexOutboxPromptTexts(t, outbox); len(got) != 0 {
+		t.Fatalf("first poll flushed early: %q", got)
+	}
+	if loadCodexWatchProgress().Settled[path] {
+		t.Fatal("rollout marked settled while its trailing turn was still buffered")
+	}
+
+	// Restart: fresh processor map, file unchanged.
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+	for i := 0; i < 2; i++ {
+		pollCodexRollouts(session, resolvePath(workspace), cutoff, processors, false)
+	}
+	got := codexOutboxPromptTexts(t, outbox)
+	if len(got) != 1 || got[0] != human {
+		t.Fatalf("after restart got prompts %q, want [%q]", got, human)
+	}
+	if !loadCodexWatchProgress().Settled[path] {
+		t.Fatal("rollout not settled once its buffered turn was released")
+	}
+}
