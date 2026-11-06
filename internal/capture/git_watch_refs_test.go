@@ -55,8 +55,23 @@ func TestOffHeadPushedBranchCommitSurfaced(t *testing.T) {
 	git("switch", "main")
 	git("branch", "-D", "feat")
 
+	// OUR commit, written elsewhere (a cloud agent, another machine) and only
+	// fetched here: same author, no ai-paths match on this device. Emitting it as
+	// `unattributed:` told the backend a human wrote it.
+	git("switch", "-c", "cloud")
+	writeCommitFile(t, repo, "cloud.go", "package main\n\nfunc cloud() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "cloud agent work")
+	fetched := gitOut("rev-parse", "HEAD")
+	git("update-ref", "refs/remotes/origin/cloud", fetched)
+	git("switch", "main")
+	git("branch", "-D", "cloud")
+
 	pollGitWatchWorkspace(session)
 	got := attributedShas(t, state.OutboxPath())
+	if countSha(got, fetched) != 0 {
+		t.Fatalf("fetched-only commit %s with no local AI evidence was emitted; outbox: %v", fetched, got)
+	}
 	if countSha(got, mine) != 1 {
 		t.Fatalf("pushed off-HEAD commit %s not surfaced exactly once; outbox: %v", mine, got)
 	}
@@ -69,6 +84,51 @@ func TestOffHeadPushedBranchCommitSurfaced(t *testing.T) {
 
 	pollGitWatchWorkspace(session) // steady state: nothing new, no repeats
 	assertNoRepeats(t, attributedShas(t, state.OutboxPath()))
+}
+
+// TestOffHeadSkipLeavesCommitToHeadPass: a human commits on a branch and switches
+// away before a poll. The off-HEAD pass sees it with no AI evidence and stays
+// silent — but must not RECORD it, or the HEAD pass skips it once the branch is
+// checked out again and the human commit is never sent at all.
+func TestOffHeadSkipLeavesCommitToHeadPass(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	git("config", "user.email", "t@t")
+	writeCommitFile(t, repo, "base.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	session := Session{DeviceID: "dev-offhead", TaskRoot: home}
+	// An agent touched SOME other file, so the repo is watched; human.go is not it.
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/other.go")
+	pollGitWatchWorkspace(session) // baseline
+
+	git("switch", "-c", "human")
+	writeCommitFile(t, repo, "human.go", "package main\n\nfunc human() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "human work")
+	human := gitOut("rev-parse", "HEAD")
+	git("switch", "main")
+
+	pollGitWatchWorkspace(session) // off-HEAD sees it, no AI evidence: silent
+	if n := countSha(attributedShas(t, state.OutboxPath()), human); n != 0 {
+		t.Fatalf("off-HEAD emitted human commit with no AI evidence (%d times)", n)
+	}
+
+	git("switch", "human")
+	pollGitWatchWorkspace(session) // HEAD pass must still send it
+	if n := countSha(attributedShas(t, state.OutboxPath()), human); n != 1 {
+		t.Fatalf("human commit %s emitted %d times after checkout, want 1", human, n)
+	}
 }
 
 func sessionForSha(t *testing.T, sha string) string {
@@ -87,4 +147,51 @@ func sessionForSha(t *testing.T, sha string) string {
 		}
 	}
 	return ""
+}
+
+// TestOffHeadDeferredDoesNotStallTheCap: with more off-HEAD commits than the
+// per-poll cap, a deferred (no-AI-evidence) commit must not be re-selected every
+// poll, or the newer AI commit behind it is never reached and the tips never move.
+func TestOffHeadDeferredDoesNotStallTheCap(t *testing.T) {
+	prevCap := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prevCap })
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	git("config", "user.email", "t@t")
+	writeCommitFile(t, repo, "base.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	session := Session{DeviceID: "dev-offhead", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/ai.go")
+	pollGitWatchWorkspace(session) // baseline
+
+	git("switch", "-c", "cloud")
+	writeCommitFile(t, repo, "cloud.go", "package main\n\nfunc cloud() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "older, written elsewhere")
+	writeCommitFile(t, repo, "ai.go", "package main\n\nfunc ai() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "newer, written here by the agent")
+	ai := gitOut("rev-parse", "HEAD")
+	git("update-ref", "refs/remotes/origin/cloud", ai)
+	git("switch", "main")
+	git("branch", "-D", "cloud")
+
+	for i := 0; i < 4; i++ {
+		pollGitWatchWorkspace(session)
+	}
+	if n := countSha(attributedShas(t, state.OutboxPath()), ai); n != 1 {
+		t.Fatalf("AI commit behind a deferred one emitted %d times, want 1", n)
+	}
 }
