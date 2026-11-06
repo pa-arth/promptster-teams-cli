@@ -6,6 +6,22 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.41.2] — 2026-11-06
+
+### Fixed
+
+- Commits you made somewhere else (a cloud agent, another machine) are no
+  longer reported as written without AI. The off-HEAD pass picks up your own
+  commits from fetched branch and remote-tracking refs by author email; when
+  this device had no record of an AI session editing those files, it reported
+  them as `unattributed:`, which the dashboard reads as "no AI session touched
+  this" and counts against the AI-assisted PR share. In one org that was 121
+  of 692 merged PRs in 30 days, nearly all carrying a Claude co-author trailer.
+  The off-HEAD pass now reports a commit only with local AI evidence and
+  otherwise leaves it unreported. A human's commit on a local branch is still
+  sent by the HEAD pass when that branch is checked out, and a large fetched
+  range no longer stalls the per-poll cap.
+
 ## [0.41.1] — 2026-11-06
 
 ### Fixed
