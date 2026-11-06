@@ -198,9 +198,13 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 		for i := len(fresh) - 1; i >= 0; i-- {
 			// foreign=false: rev-list --author already kept only our own commits.
 			// aiOnly=true: "ours" by email is not "written here" — see attributeAndReworkCommit.
-			if !attributeAndReworkCommit(session, r.root, fresh[i], false, false, true, nowMs, lin) {
+			ok, deferred := attributeAndReworkCommit(session, r.root, fresh[i], false, false, true, nowMs, lin)
+			if !ok {
 				drained = false // enqueue failed: keep the tips so it is retried
 				continue
+			}
+			if deferred {
+				continue // not sent and not recorded: the HEAD pass may still own it
 			}
 			attributed[fresh[i]] = struct{}{}
 			emitted = append(emitted, fresh[i])

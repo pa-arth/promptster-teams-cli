@@ -1697,7 +1697,7 @@ func pollGitWatchWorkspace(session Session) {
 				}
 				continue
 			}
-			if !attributeAndReworkCommit(session, root, sha, foldRework, foreign, false, nowMs, lineage) {
+			if ok, _ := attributeAndReworkCommit(session, root, sha, foldRework, foreign, false, nowMs, lineage); !ok {
 				// Enqueue failed — leave the SHA out of the ledger so the next poll
 				// retries it rather than suppressing it for the ledger's whole TTL.
 				continue

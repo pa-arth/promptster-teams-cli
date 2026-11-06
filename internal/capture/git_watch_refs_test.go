@@ -86,6 +86,51 @@ func TestOffHeadPushedBranchCommitSurfaced(t *testing.T) {
 	assertNoRepeats(t, attributedShas(t, state.OutboxPath()))
 }
 
+// TestOffHeadSkipLeavesCommitToHeadPass: a human commits on a branch and switches
+// away before a poll. The off-HEAD pass sees it with no AI evidence and stays
+// silent — but must not RECORD it, or the HEAD pass skips it once the branch is
+// checked out again and the human commit is never sent at all.
+func TestOffHeadSkipLeavesCommitToHeadPass(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	git("config", "user.email", "t@t")
+	writeCommitFile(t, repo, "base.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	session := Session{DeviceID: "dev-offhead", TaskRoot: home}
+	// An agent touched SOME other file, so the repo is watched; human.go is not it.
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/other.go")
+	pollGitWatchWorkspace(session) // baseline
+
+	git("switch", "-c", "human")
+	writeCommitFile(t, repo, "human.go", "package main\n\nfunc human() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "human work")
+	human := gitOut("rev-parse", "HEAD")
+	git("switch", "main")
+
+	pollGitWatchWorkspace(session) // off-HEAD sees it, no AI evidence: silent
+	if n := countSha(attributedShas(t, state.OutboxPath()), human); n != 0 {
+		t.Fatalf("off-HEAD emitted human commit with no AI evidence (%d times)", n)
+	}
+
+	git("switch", "human")
+	pollGitWatchWorkspace(session) // HEAD pass must still send it
+	if n := countSha(attributedShas(t, state.OutboxPath()), human); n != 1 {
+		t.Fatalf("human commit %s emitted %d times after checkout, want 1", human, n)
+	}
+}
+
 func sessionForSha(t *testing.T, sha string) string {
 	t.Helper()
 	data, err := os.ReadFile(state.OutboxPath())

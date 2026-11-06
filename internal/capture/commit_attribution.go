@@ -487,7 +487,7 @@ func emitCommitAttribution(ev event.Event) (queued bool) {
 // single source commit, so there is nothing to match against. Recovering it
 // would need an explicit merge/squash signal we do not collect out-of-band.
 func attributeCommit(session Session, root, sha string, nowMs int64, lin siblingLineage) {
-	attributeAndReworkCommit(session, root, sha, false, false, false, nowMs, lin)
+	_, _ = attributeAndReworkCommit(session, root, sha, false, false, false, nowMs, lin)
 }
 
 // attributeAndReworkCommit does attribution for one detected working-HEAD commit
@@ -519,7 +519,9 @@ func attributeCommit(session Session, root, sha string, nowMs int64, lin sibling
 // them as `unattributed:` told the backend a human wrote them. Prod 2026-11-06 (My
 // Org, 30d): 121 of 243 device-only PRs were fetched-only commits, nearly all with
 // a Claude co-author trailer. A human's local commit still lands at HEAD and is
-// emitted by the HEAD pass, so silence here loses no human evidence.
+// emitted by the HEAD pass — which is why this skip reports deferred=true: the
+// caller must NOT record the SHA, or a human commit made on a branch and switched
+// away from before a poll would be skipped by the HEAD pass when checked out again.
 //
 // Reports whether the commit may be RECORDED as attributed. That is true when
 // the event was durably queued, and ALSO when there was nothing attributable to
@@ -528,10 +530,13 @@ func attributeCommit(session Session, root, sha string, nowMs int64, lin sibling
 // later poll would reach the same answer and only cost another `git show`.
 // It is false ONLY when an emit was attempted and failed to queue, so the retry
 // survives.
-func attributeAndReworkCommit(session Session, root, sha string, foldRework, foreign, aiOnly bool, nowMs int64, lin siblingLineage) (recordable bool) {
+func attributeAndReworkCommit(session Session, root, sha string, foldRework, foreign, aiOnly bool, nowMs int64, lin siblingLineage) (recordable, deferred bool) {
 	// Independent receipt also covers fixes that only delete lines.
 	diff, files, primarySession, ok := commitAttributionFromDiff(root, session.TaskRoot, sha, lin)
-	if !ok || foreign || (aiOnly && primarySession == "") {
+	if ok && !foreign && aiOnly && primarySession == "" {
+		return true, true // off-HEAD, no local AI evidence: leave it to the HEAD pass
+	}
+	if !ok || foreign {
 		// Nothing to ATTRIBUTE, and nothing a retry would change — but two commit
 		// shapes land here that rework still has to see. A pure RENAME: its tracked
 		// spans must be carried to the new path or they strand at a dead one. A
@@ -545,12 +550,12 @@ func attributeAndReworkCommit(session Session, root, sha string, foldRework, for
 		if foldRework && diff != "" {
 			pollReworkCommit(session, root, sha, diff, nil, nowMs, lin)
 		}
-		return true
+		return true, false
 	}
 	if !emitCommitAttribution(assembleCommitAttributionEvent(session, root, sha, files, primarySession, commitAiTokens(diff, files))) {
 		// Never durably queued. Do NOT let the caller remember this SHA, or the
 		// ledger would suppress the retry for its whole TTL.
-		return false
+		return false, false
 	}
 	// From the SAME diff, capture on-device fingerprints of this commit's
 	// likely_ai lines so a later squash-merge onto the default branch can
@@ -560,5 +565,5 @@ func attributeAndReworkCommit(session Session, root, sha string, foldRework, for
 		// Reuse the same diff + files — no extra spawn — to track pre-merge rework.
 		pollReworkCommit(session, root, sha, diff, files, nowMs, lin)
 	}
-	return true
+	return true, false
 }
