@@ -212,3 +212,35 @@ func TestRestartMidTurnStillFlushesTrailingPrompt(t *testing.T) {
 		t.Fatal("rollout not settled once its buffered turn was released")
 	}
 }
+
+// A rollout older than the history window is captured go-forward from EOF. Its
+// history must not be replayed, and a trailing human turn in that history must
+// not be stale-flushed as if it were new.
+func TestPreexistingRolloutIsSettledAndNotReplayed(t *testing.T) {
+	root, workspace, outbox, session, cutoff := codexRecoveryHarness(t)
+	dir := filepath.Join(root, "2026", "07", "30")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-2026-07-30T16-38-12-019fb3e4-03e4-77f1-a022-c908046e4da5.jsonl")
+	old := time.Now().Add(-35 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	body := codexSessionMetaLine(resolvePath(workspace), old) +
+		fmt.Sprintf(`{"timestamp":"%s","type":"response_item","payload":{"type":"message","role":"user",`+
+			`"content":[{"type":"input_text","text":"old history turn"}]}}`+"\n", old)
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	processors := map[string]*normalize.CodexRolloutProcessor{}
+	for i := 0; i < 3; i++ {
+		pollCodexRollouts(session, resolvePath(workspace), cutoff, processors, false)
+	}
+	if processors[path] != nil {
+		t.Fatal("out-of-window history was replayed")
+	}
+	if got := codexOutboxPromptTexts(t, outbox); len(got) != 0 {
+		t.Fatalf("history turn emitted: %q", got)
+	}
+	if !loadCodexWatchProgress().Settled[path] {
+		t.Fatal("go-forward seed not settled")
+	}
+}

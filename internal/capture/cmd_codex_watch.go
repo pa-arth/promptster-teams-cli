@@ -590,6 +590,11 @@ func pollCodexRollouts(
 						return
 					}
 					progress.Offsets[path] = info.Size()
+					// Nothing before EOF is ours to capture, so nothing is
+					// buffered: settled. Without it the processor would replay
+					// the whole out-of-window history and could stale-flush a
+					// trailing turn from it.
+					progress.Settled[path] = true
 				}
 				progress.Match[path] = "yes"
 			case codexMatchNo:
