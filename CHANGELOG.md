@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.41.1] — 2026-11-06
+
+### Fixed
+
+- The daemon no longer pins the CPU for minutes on every start. Each restart
+  (boot, self-update, crash) replayed the whole consumed prefix of every Codex
+  rollout in the 28-day window through secret redaction, even rollouts with
+  nothing new to read. On a box with ~360 MB of Codex history that was ~1.5
+  cores for up to 10 minutes per boot. A rollout is now replayed only when it
+  has grown, or when the last run left a prompt or final answer buffered for
+  the stale flush to release.
+
 ## [0.41.0] — 2026-11-05
 
 ### Added
