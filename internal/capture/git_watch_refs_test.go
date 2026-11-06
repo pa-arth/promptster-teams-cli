@@ -148,3 +148,50 @@ func sessionForSha(t *testing.T, sha string) string {
 	}
 	return ""
 }
+
+// TestOffHeadDeferredDoesNotStallTheCap: with more off-HEAD commits than the
+// per-poll cap, a deferred (no-AI-evidence) commit must not be re-selected every
+// poll, or the newer AI commit behind it is never reached and the tips never move.
+func TestOffHeadDeferredDoesNotStallTheCap(t *testing.T) {
+	prevCap := gitWatchMaxCommitsPerPoll
+	gitWatchMaxCommitsPerPoll = 1
+	t.Cleanup(func() { gitWatchMaxCommitsPerPoll = prevCap })
+	tmp := t.TempDir()
+	t.Setenv("PROMPTSTER_STATE_DIR", tmp)
+	t.Setenv("PROMPTSTER_BUFFER_PATH", filepath.Join(tmp, "buffer.jsonl"))
+	t.Setenv("PROMPTSTER_OUTBOX_PATH", filepath.Join(tmp, "outbox.jsonl"))
+	if _, err := sign.GenerateSessionKeypair(); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	repo := filepath.Join(home, "repos", "proj")
+	git, gitOut := gitRepoAt(t, repo)
+	git("config", "user.email", "t@t")
+	writeCommitFile(t, repo, "base.go", "package main\n")
+	git("add", "-A")
+	git("commit", "-m", "base")
+	git("branch", "-M", "main")
+
+	session := Session{DeviceID: "dev-offhead", TaskRoot: home}
+	recordAiTouchedPath("ai-sess-1", gitWatchRootKey(home), "repos/proj/ai.go")
+	pollGitWatchWorkspace(session) // baseline
+
+	git("switch", "-c", "cloud")
+	writeCommitFile(t, repo, "cloud.go", "package main\n\nfunc cloud() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "older, written elsewhere")
+	writeCommitFile(t, repo, "ai.go", "package main\n\nfunc ai() {}\n")
+	git("add", "-A")
+	git("commit", "-m", "newer, written here by the agent")
+	ai := gitOut("rev-parse", "HEAD")
+	git("update-ref", "refs/remotes/origin/cloud", ai)
+	git("switch", "main")
+	git("branch", "-D", "cloud")
+
+	for i := 0; i < 4; i++ {
+		pollGitWatchWorkspace(session)
+	}
+	if n := countSha(attributedShas(t, state.OutboxPath()), ai); n != 1 {
+		t.Fatalf("AI commit behind a deferred one emitted %d times, want 1", n)
+	}
+}

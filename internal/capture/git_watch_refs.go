@@ -48,6 +48,14 @@ import (
 // First sight of a repo baselines its tips without emitting, matching the HEAD
 // pass's cold start.
 
+// offHeadDeferredPrefix keys, in the same ref-tips state, the SHAs this pass
+// declined for lack of local AI evidence (see attributeAndReworkCommit's aiOnly).
+// They stay OUT of the attributed ledger so the HEAD pass can still send them, so
+// without this set a range larger than the per-poll cap would re-select the same
+// deferred oldest batch forever and never reach the commits behind it. Cleared
+// when the repo drains and its tips advance.
+const offHeadDeferredPrefix = "deferred:"
+
 func gitWatchRefTipsPath() string {
 	return filepath.Join(state.StateDir(), "git-watch-ref-tips.json")
 }
@@ -177,9 +185,11 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 		if !ok {
 			continue // keep the old tips; retry next poll
 		}
+		deferredKey := offHeadDeferredPrefix + key
+		deferredSHAs := prev[deferredKey]
 		var fresh []string
 		for _, sha := range shas {
-			if _, done := attributed[sha]; !done {
+			if _, done := attributed[sha]; !done && !slices.Contains(deferredSHAs, sha) {
 				fresh = append(fresh, sha)
 			}
 		}
@@ -204,13 +214,18 @@ func pollOffHeadCommits(session Session, roots []string, attributed map[string]s
 				continue
 			}
 			if deferred {
-				continue // not sent and not recorded: the HEAD pass may still own it
+				// Not sent and not recorded: the HEAD pass may still own it.
+				deferredSHAs = append(deferredSHAs, fresh[i])
+				continue
 			}
 			attributed[fresh[i]] = struct{}{}
 			emitted = append(emitted, fresh[i])
 		}
 		if drained {
 			next[key] = r.tips
+			next[deferredKey] = []string{} // the range is behind us
+		} else {
+			next[deferredKey] = deferredSHAs
 		}
 	}
 	if len(emitted) > 0 {
