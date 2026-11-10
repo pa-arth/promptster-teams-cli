@@ -267,6 +267,7 @@ func readDurabilityLedgerUnlocked() durabilityLedger {
 	if cached, ok := durabilityCacheGet(path, info); ok {
 		return cached
 	}
+	// #nosec G304 -- path is the fixed durability.json under the state dir, not user input.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return led
