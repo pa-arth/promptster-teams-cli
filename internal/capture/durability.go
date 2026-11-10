@@ -259,7 +259,16 @@ func durabilityLedgerPath() string {
 // an empty ledger (never an error).
 func readDurabilityLedgerUnlocked() durabilityLedger {
 	led := durabilityLedger{V: durabilityLedgerVersion, Roots: map[string]map[string][]durTrackedRange{}}
-	data, err := os.ReadFile(durabilityLedgerPath())
+	path := durabilityLedgerPath()
+	info, err := os.Stat(path)
+	if err != nil {
+		return led
+	}
+	if cached, ok := durabilityLedgerCache.get(path, info); ok {
+		return cached
+	}
+	// #nosec G304 -- path is the fixed durability.json under the state dir, not user input.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return led
 	}
@@ -267,6 +276,9 @@ func readDurabilityLedgerUnlocked() durabilityLedger {
 	if json.Unmarshal(data, &onDisk) == nil && onDisk.V == durabilityLedgerVersion && onDisk.Roots != nil {
 		led = onDisk
 	}
+	// Cache against the stat taken BEFORE the read: if the file was replaced in
+	// between, this entry's inode no longer matches and the next read re-parses.
+	durabilityLedgerCache.put(path, info, led)
 	return led
 }
 
@@ -279,11 +291,15 @@ func writeDurabilityLedgerUnlocked(led durabilityLedger) {
 	if err != nil {
 		return
 	}
-	tmp := durabilityLedgerPath() + ".tmp"
+	path := durabilityLedgerPath()
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, durabilityLedgerPath())
+	if err := os.Rename(tmp, path); err != nil {
+		return
+	}
+	durabilityLedgerCache.putAfterWrite(path, led)
 }
 
 // loadDurabilityLedger reads the ledger under the buffer lock. For read-only
@@ -308,6 +324,12 @@ func mutateDurabilityLedger(fn func(led *durabilityLedger)) {
 	_ = sign.WithBufferLock(durabilityLedgerPath()+".lock", func() error {
 		led := readDurabilityLedgerUnlocked()
 		fn(&led)
+		// Most polls change nothing (harvest and inventory run for every root on
+		// every poll). Skipping the rewrite saves the encode and the disk write,
+		// and keeps the cached parse valid.
+		if durabilityLedgerCache.matches(durabilityLedgerPath(), led) {
+			return nil
+		}
 		writeDurabilityLedgerUnlocked(led)
 		return nil
 	})
