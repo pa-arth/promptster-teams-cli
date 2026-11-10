@@ -8,8 +8,20 @@ import "time"
 // Cursor has no trustworthy transcript timestamp and stays go-forward only.
 const transcriptHistoryWindow = 28 * 24 * time.Hour
 
+// backfillFloor, when set, is the earliest a session may have started and still
+// be replayed from byte zero. RunTeamsWatch sets it to its own start time when
+// the engineer has not acknowledged the employee notice, so an install that
+// never showed the notice (an env-var key, a provisioning script, an autostart
+// on an upgraded machine) captures go-forward only and never uploads the prior
+// 28 days. Zero means the full window.
+var backfillFloor time.Time
+
 func transcriptHistoryCutoff(now time.Time) time.Time {
-	return now.Add(-transcriptHistoryWindow)
+	cutoff := now.Add(-transcriptHistoryWindow)
+	if cutoff.Before(backfillFloor) {
+		return backfillFloor
+	}
+	return cutoff
 }
 
 // Session is the teams capture context. Unlike the hiring CLI, it is NOT a

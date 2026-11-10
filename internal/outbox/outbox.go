@@ -277,7 +277,15 @@ func laneFor(ev event.Event) Lane {
 
 // AppendTo enqueues onto a named lane. Exported so a caller that has already
 // decided (a migration replay, which knows its own horizon) can say so directly.
+//
+// While the engineer has paused capture (`promptster-teams pause`) the event is
+// discarded and nil returned, so transcript tails advance past it and it is
+// never sent later. This is the one funnel every queued producer shares; the
+// presence beat bypasses the queue and so keeps flowing while paused.
 func AppendTo(lane Lane, ev event.Event) error {
+	if paused, _ := state.CapturePaused(time.Now()); paused {
+		return nil
+	}
 	b, err := json.Marshal(ev)
 	if err != nil {
 		return fmt.Errorf("marshal event: %w", err)

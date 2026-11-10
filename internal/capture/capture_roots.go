@@ -161,7 +161,14 @@ func captureRootsFingerprint(roots []string) string {
 		uniq = append(uniq, r)
 	}
 	sort.Strings(uniq)
-	sum := sha256.Sum256([]byte(strings.Join(uniq, "\x00")))
+	key := strings.Join(uniq, "\x00")
+	// The exclude list narrows scope just like a root does, so an edit to it
+	// must re-check cached decisions too. Appended only when non-empty, so a
+	// machine with no excludes keeps the fingerprint it already stored.
+	if ex := excludePaths(); len(ex) > 0 {
+		key += "\x01" + strings.Join(ex, "\x00")
+	}
+	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:8])
 }
 

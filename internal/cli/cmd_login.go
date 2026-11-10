@@ -27,6 +27,7 @@ func cmdLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ContinueOnError)
 	keyFlag := fs.String("key", "", "Developer key ("+ingest.KeyFormatHint+"); paste interactively if omitted")
 	urlFlag := fs.String("api-url", "", "Override ingest base URL (default: hosted)")
+	acceptNotice := fs.Bool("accept-notice", false, "Acknowledge the employee notice non-interactively")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
@@ -35,7 +36,7 @@ func cmdLogin(args []string) {
 	fmt.Println(brandBar("setup"))
 	fmt.Println()
 	printlnIndent(bodyStyle.Render("Capture your AI-coding sessions for your team. Paste the developer"))
-	printlnIndent(bodyStyle.Render("key your manager gave you — it identifies your sessions, nothing else."))
+	printlnIndent(bodyStyle.Render("key your manager gave you — it links your sessions to you in your team's org."))
 	fmt.Println()
 
 	key := strings.TrimSpace(*keyFlag)
@@ -59,6 +60,12 @@ func cmdLogin(args []string) {
 	}
 
 	apiURL := ingest.ResolveAPIURL(*urlFlag)
+
+	// Notice before anything is saved or started: a declined notice leaves no
+	// key on disk, so no later autostart can capture without it.
+	if !ensureNoticeAcknowledged(*acceptNotice) {
+		os.Exit(1)
+	}
 
 	// Best-effort reachability check — never blocks saving the key.
 	if pingIngestHost(apiURL) {
@@ -90,6 +97,7 @@ func cmdLogin(args []string) {
 	// act on it. Asking afterwards would leave the first check — the one that
 	// runs within a second of start — reading an unknown consent and declining.
 	PromptForUpdateConsent()
+	proseCapture()
 
 	// Auto-start background capture so login is the only command a new engineer
 	// has to run — capture "just works" afterward instead of waiting for a manual

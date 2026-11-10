@@ -47,12 +47,45 @@ Read straight from the AI tool's own transcript `.jsonl`:
   command output
 - Per-request token usage and the exact model, for cost estimation
 - Timestamps, so the timeline reflects when work happened
-- On first run, the **previous 28 days** of Claude Code and Codex sessions that
+- On first run, and only once you have acknowledged the employee notice (below),
+  the **previous 28 days** of Claude Code and Codex sessions that
   ran in the watched directory — those transcripts are already on your disk and
   each record carries its own timestamp, so your team's 28-day views are
   accurate from day one instead of starting empty. Older sessions are captured
   only from that point forward. The backfill goes through the same allowlist and
   redaction as live capture, so it egresses nothing live capture would not.
+
+## Who can see it (employee notice)
+
+`login` and `start` show a short notice before anything is captured, and
+capture does not start until you acknowledge it (interactively with `y`, or
+non-interactively with `--accept-notice`). The acknowledgement and the notice
+version are stored locally in `~/.promptster-teams/employee-notice.json`; until
+it exists, a capture started any other way (env-var key, autostart) runs
+go-forward only and backfills no history. In short:
+
+- Your key links every captured session to **you by name** in your employer's
+  Promptster Teams org, and **your org's admins can open any of your sessions,
+  including your prompt text**.
+- Teams session data is deleted after **90 days**.
+- Your employer is the data **controller**; Promptster is its **processor**.
+- For a copy of your data or any privacy question, ask your admin or email
+  privacy@promptster.ai.
+- `promptster-teams status` always says whether you are being captured
+  (`capturing — your org admins can view these sessions`) or paused.
+
+### Pause, stop, and keeping repos out
+
+- `promptster-teams pause [--for 2h]` pauses capture (until `resume` if no
+  `--for`). It survives restarts until it expires. While paused nothing from
+  your AI sessions is captured or sent — not then and not later; the presence
+  heartbeat keeps running and reports `state: "paused"`. `promptster-teams
+  resume` ends it early.
+- `promptster-teams stop` stops capture entirely; `uninstall` removes it.
+- An empty `.promptsterignore` file in a directory keeps every session working
+  at or under it out of capture — put one at a repo root. Or list directories
+  (one per line, `~/` allowed, `#` comments) in `~/.promptster-teams/exclude`.
+  The CLI reads only an excluded session's working directory, to skip it.
 
 ## What it does NOT capture
 
@@ -62,28 +95,33 @@ Read straight from the AI tool's own transcript `.jsonl`:
   The backend applies the same projection again at its write boundary and its
   database rejects source-bearing rows outright (CHECK constraints) — but with
   this CLI the source content is never even transmitted.
-- Assistant response *text* (only its token usage + model are kept)
+- Assistant response *text* (only its token usage + model are kept) — **unless
+  your org turns on assistant-reply capture** in its policy, in which case the
+  reply prose is kept with code scrubbed out on-device. `status` shows whether
+  it is on, and `login`/`start`/`status` print a one-time notice when it turns on.
 - Keystrokes, clipboard, screen, webcam/microphone
 - Any file you didn't open through the AI tool
 - Secrets and credentials — these are **redacted on-device before anything is
   sent** (see below)
 - Behavioral signals: no typing-cadence, no paste detection, no authorship
   scoring. Capture is *content*, not surveillance of the developer.
-- Your email or any personal identity. Events are stamped only with an
-  **anonymous per-installation hash** and your team key; the CLI never collects or
-  sends your email. Mapping a device to a person is done on the backend, from
-  the key — so nothing in this on-device path needs to know who you are.
+- Your email. Events are stamped with a per-installation hash and your
+  developer key; the CLI never collects or sends your email. This is **not
+  anonymous**: your key was minted for you, and the backend uses it to attribute
+  every session to you by name.
 
 ## Presence heartbeat
 
 While `watch` is running it emits a small **presence** event on start and every
 few minutes — *even when you are idle and nothing is being captured*. It carries
-only device + environment metadata (the anonymous installation hash, the CLI version,
-OS/arch, and which tools are being watched) and **zero transcript content**.
+only device + environment metadata (the installation hash, the CLI version,
+OS/arch, which tools are being watched, and whether capture is paused) and
+**zero transcript content**.
 
 Its only purpose is to let your team tell an *installed-but-idle* seat apart
 from one where the CLI was *never installed* — e.g. for seat-utilization
-reporting. It is not a tracker: it identifies an installation, never a person, and a
+reporting. It carries no content: it identifies an installation (which your key
+links to you, like every other event), and a
 CI test (`presence_test.go`) fails the build if a presence event ever grows a
 field that could carry captured content.
 
@@ -131,12 +169,12 @@ guarantee "source never leaves the machine" does not depend on trusting the
 network or the backend.
 
 - **A malicious or compromised backend** can see the metadata this CLI chooses
-  to send (redacted prompts, tool-call metadata, token counts, the anonymous
-  installation hash, the team key). It **cannot** obtain source code, diffs, file
+  to send (redacted prompts, tool-call metadata, token counts, the
+  installation hash, the developer key). It **cannot** obtain source code, diffs, file
   contents, command output, or assistant response text, because those are
   dropped locally before transmission — there is nothing on the wire to steal.
-  It cannot deanonymize a device to a person from the CLI's payload alone (the
-  CLI never sends an email or identity).
+  The backend maps the developer key to the named engineer it was minted for;
+  the CLI itself never sends an email.
 - **A network attacker (MITM)** sees only TLS traffic. Tampering is detectable:
   each event is Ed25519-signed and chained (`prevSig`), and the backend pins the
   first device pubkey it sees.
@@ -190,8 +228,8 @@ promptster-teams autostart enable  # keep capturing across reboots (starts at lo
 promptster-teams status            # confirm it's running
 ```
 
-The key identifies your sessions to your team and nothing else; it is the only
-identity stamped on captured events. `login` stores it at
+The key links your sessions to you in your team's org; it is the only identity
+stamped on captured events. `login` stores it at
 `~/.promptster-teams/credentials` (mode `0600`).
 
 `login` and `start` run capture as a detached background process — but a plain
