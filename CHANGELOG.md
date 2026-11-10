@@ -6,6 +6,18 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.41.3] — 2026-11-09
+
+### Fixed
+
+- The background daemon uses about half the CPU it did while idle. git-watch
+  re-read the whole durability ledger about three times per repo on every poll,
+  rewrote it about twice, and re-read the rework ledger on every branch check.
+  On a machine with a few hundred worktrees that kept ~13% of a core busy at
+  all times. The parsed ledgers are now cached until the file changes, and
+  writes that change nothing are skipped. On that machine: 22.9s to about 11s
+  of CPU per 3 minutes, and the durability pass from 10.7s to 2.2s.
+
 ## [0.41.2] — 2026-11-06
 
 ### Fixed
