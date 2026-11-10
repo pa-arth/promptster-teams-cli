@@ -775,7 +775,7 @@ func classifyCodexRollout(path string, roots []string, historyCutoff time.Time) 
 	if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
 		return codexMatchUndecided
 	}
-	if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
+	if cwd := resolvePath(rec.Payload.Cwd); !pathWithinAny(cwd, roots) || captureExcluded(cwd) {
 		return codexMatchNo
 	}
 	// Replay in-window history from the start. Anything older — INCLUDING a
@@ -847,7 +847,7 @@ func classifyCodexRolloutBounded(
 		if rec.Type != "session_meta" || rec.Payload.Cwd == "" {
 			return true
 		}
-		if !pathWithinAny(resolvePath(rec.Payload.Cwd), roots) {
+		if cwd := resolvePath(rec.Payload.Cwd); !pathWithinAny(cwd, roots) || captureExcluded(cwd) {
 			result = codexMatchNo
 			return false
 		}

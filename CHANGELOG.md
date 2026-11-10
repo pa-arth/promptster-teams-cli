@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Employee notice. `login` and `start` now say what is captured, that your
+  org's admins can open any of your sessions including prompt text, that Teams
+  data is deleted after 90 days, that your employer is the controller and
+  Promptster its processor, and how to get a copy of your data. Capture does not
+  start until you acknowledge it (`y`, or `--accept-notice` without a terminal).
+  Until it is acknowledged, capture started any other way backfills no history.
+- `pause [--for <duration>]` and `resume`. While paused nothing is captured or
+  sent, ever; the presence heartbeat continues and reports `state: "paused"`.
+- `status` leads with `capturing — your org admins can view these sessions` or
+  `paused until …`, and shows whether your org captures assistant replies (with
+  a one-time notice when that turns on).
+- Keep a tree out of capture with an empty `.promptsterignore` at its root, or
+  list directories in `~/.promptster-teams/exclude`.
+
+### Fixed
+
+- The README, `login` and `status` called your identity anonymous. It is not:
+  your developer key links every session to you by name.
+
 ## [0.41.3] — 2026-11-09
 
 ### Fixed

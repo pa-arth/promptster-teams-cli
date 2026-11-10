@@ -53,9 +53,12 @@ type statusModel struct {
 	// Probed on the same schedule as recon: it touches the disk, so it is not a
 	// per-render question.
 	writeFault error
-	now        time.Time
-	tick       int
-	quitting   bool
+	// prose is the assistant-reply capture row, resolved once at start (it is a
+	// network fetch, not a per-render question).
+	prose    string
+	now      time.Time
+	tick     int
+	quitting bool
 }
 
 // reconEveryTicks is how many one-second ticks pass between reconstruction
@@ -86,6 +89,7 @@ func newStatusModel() statusModel {
 	m.recon = reconNow()
 	m.writeFault = persistFaultNow()
 	m.autostart = autostartLine()
+	m.prose = proseCapture()
 	return m
 }
 
@@ -182,6 +186,8 @@ func (m statusModel) capturePanel() string {
 	// the model — surface it live so an installed-but-idle seat is visible.
 	return kvPanel("capture",
 		"state", state,
+		"privacy", captureVisibilityLine(m.now),
+		"assistant", m.prose,
 		"watch", m.watch,
 		"autostart", m.autostart,
 		"keepalive", keepaliveStatusLine(),

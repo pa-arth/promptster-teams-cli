@@ -37,8 +37,17 @@ func Main(argv []string) int {
 		// Ask the one-time update question first: this and `login` are the only
 		// commands where an engineer is reliably at a keyboard, and the daemon
 		// about to be spawned has no terminal of its own to ask on.
+		//
+		// The employee notice comes first of all: nothing may start, and no
+		// history may be backfilled, until the engineer has seen who can read
+		// what this captures.
+		args, accept := takeFlag(argv[2:], "--accept-notice")
+		if !ensureNoticeAcknowledged(accept) {
+			return 1
+		}
 		PromptForUpdateConsent()
-		if err := capture.StartTeamsDaemon(argv[2:]); err != nil {
+		proseCapture()
+		if err := capture.StartTeamsDaemon(args); err != nil {
 			fmt.Fprintf(os.Stderr, "start error: %v\n", err)
 			return 1
 		}
@@ -47,6 +56,12 @@ func Main(argv []string) int {
 			fmt.Fprintf(os.Stderr, "stop error: %v\n", err)
 			return 1
 		}
+	case "pause":
+		// Stop capturing without stopping the daemon: events are dropped (never
+		// sent later) while the presence heartbeat keeps reporting "paused".
+		return cmdPause(argv[2:])
+	case "resume":
+		return cmdResume()
 	case "claude-watch":
 		if err := capture.RunClaudeWatcher(); err != nil {
 			fmt.Fprintf(os.Stderr, "claude watcher error: %v\n", err)
@@ -132,9 +147,11 @@ func printUsage() {
 Usage: promptster-teams <command>
 
 Commands:
-  login        Save your developer key (PSE-XXXX-…) — paste it or pass --key
-  start        Capture in the background (detaches and returns your shell)
+  login        Save your developer key (PSE-XXXX-…) — paste it or pass --key; shows the employee notice (--accept-notice to acknowledge non-interactively)
+  start        Capture in the background (detaches and returns your shell; --accept-notice as for login)
   stop         Stop background capture
+  pause        Pause capture (--for 30m|2h; default until resume) — nothing is captured or sent while paused
+  resume       Resume capture after pause
   autostart    Keep capture alive across reboots (enable|disable|status|repair) — starts at login
   statusline   Track your Claude 5h/weekly usage via the statusline (enable|disable|status)
   blame-backfill  Trace replaced lines in local Git history (--repo, --limit, --dry-run)
@@ -183,7 +200,13 @@ Your developer key is resolved from, in order: --key flag,
 PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by
 login). PROMPTSTER_TEAMS_API_URL overrides the ingest URL (default: hosted).
 
-Everything is captured locally and redacted on-device before anything is sent.
+Secrets are redacted and source code stripped on-device before anything is
+sent. Your prompts are sent, linked to you, and your org's admins can open any
+of your sessions, including prompt text. Teams data is deleted after 90 days.
+Your employer is the controller and Promptster its processor; for a copy of
+your data ask your admin or email privacy@promptster.ai. Keep a repo out with
+an empty .promptsterignore at its root, or list paths in
+~/.promptster-teams/exclude.
 Source: https://github.com/pa-arth/promptster-teams-cli
 `)
 }

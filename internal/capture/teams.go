@@ -195,8 +195,13 @@ func RunTeamsWatch(args []string) error {
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "promptster-teams: capturing transcripts under %s → %s\n", cfg.TaskRoot, ingest.APIHost())
-	fmt.Fprintf(os.Stderr, "promptster-teams: everything is redacted on-device before it leaves this machine. Ctrl-C to stop.\n")
+	fmt.Fprintf(os.Stderr, "promptster-teams: capturing AI sessions under %s → %s\n", cfg.TaskRoot, ingest.APIHost())
+	fmt.Fprintf(os.Stderr, "promptster-teams: secrets are redacted and source code is stripped on-device; your prompts are sent, and your org's admins can open any of your sessions, including prompt text.\n")
+	fmt.Fprintf(os.Stderr, "promptster-teams: pause with `promptster-teams pause`, stop with Ctrl-C or `promptster-teams stop`.\n")
+	if !state.NoticeAcknowledged() {
+		backfillFloor = time.Now().UTC()
+		fmt.Fprintf(os.Stderr, "promptster-teams: the employee notice has not been acknowledged on this machine, so earlier sessions are NOT backfilled — run `promptster-teams start` to read it.\n")
+	}
 
 	// Announce presence on start and periodically while running, so the backend
 	// can tell "installed but idle" from "never installed" even when no

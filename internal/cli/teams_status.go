@@ -78,10 +78,14 @@ func printStatusStatic() {
 		autostart = st.Detail
 	}
 
+	prose := proseCapture()
+
 	fmt.Println()
 	fmt.Println(brandBar("status"))
 	fmt.Println()
 	pairs := []string{
+		"capture", captureVisibilityLine(time.Now()),
+		"assistant", prose,
 		"key", keyDisplay(token, source),
 		"ingest", hostOf(apiURL),
 		"watch", root,
@@ -89,7 +93,7 @@ func printStatusStatic() {
 		"autostart", autostart,
 		"keepalive", keepaliveStatusLine(),
 		"installation", capture.DeviceID(),
-		"identity", "anonymous — installation-scoped hash + team key, no email",
+		"identity", "linked to you by name via your key — no email collected on this device",
 		"presence", fmt.Sprintf("heartbeat every %s during watch", humanInterval(capture.PresenceHeartbeatInterval)),
 		"buffered", fmt.Sprintf("%d events", countBufferedEvents()),
 	}

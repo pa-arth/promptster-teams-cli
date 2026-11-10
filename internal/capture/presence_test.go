@@ -76,8 +76,11 @@ func TestPresenceEventCarriesNoTranscriptContent(t *testing.T) {
 	// `cursorVendorLastPollOkAt` is one timestamp about OUR collector: when it
 	// last queued a complete snapshot. No account, no usage, no vendor response.
 	// Always present; "" means never. Pinned by cursor_vendor_poll_test.go.
+	//
+	// `state` is the closed enum "capturing" | "paused" — whether the engineer
+	// has paused capture. A fact about this installation, never content.
 	allowed := map[string]bool{
-		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true,
+		"device": true, "cliVersion": true, "os": true, "arch": true, "watching": true, "state": true,
 		"pendingEvents": true, "pendingOldestEventAt": true,
 		"deliveryState": true, "deliveryLane": true, "deliveryFailureClass": true,
 		"deliveryHTTPStatus": true, "deliveryMemberStatus": true, "deliveryFailureAt": true,

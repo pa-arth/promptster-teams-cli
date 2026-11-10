@@ -676,7 +676,8 @@ func cursorClassify(path string, roots []string) (cursorMatchResult, string) {
 		}
 		resolved := resolvePath(observed)
 		for _, root := range roots {
-			if pathWithin(resolved, root) {
+			// An excluded path counts as outside: it never makes a session ours.
+			if pathWithin(resolved, root) && !captureExcluded(resolved) {
 				return cursorMatchYes, root
 			}
 		}

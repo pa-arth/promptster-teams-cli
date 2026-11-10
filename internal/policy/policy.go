@@ -266,6 +266,16 @@ func (r *Resolver) CaptureAssistantProse() bool {
 	return false
 }
 
+// CaptureAssistantProseDecision is CaptureAssistantProse plus whether the answer
+// comes from a fresh org decision (known) rather than fail-closed silence, so a
+// caller can tell "the org turned it off" from "we could not ask".
+func (r *Resolver) CaptureAssistantProseDecision() (on, known bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	known = !r.fetchedAt.IsZero() && time.Since(r.fetchedAt) < cacheTTL
+	return known && r.value, known
+}
+
 // AutoUpdateEnabled reports whether the org allows CLI self-update. It is
 // fail-OPEN: true unless a successful fetch (or adopted disk cache) explicitly
 // set autoUpdate:false. A never-fetched or failing resolver therefore leaves

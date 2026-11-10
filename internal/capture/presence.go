@@ -59,6 +59,10 @@ type presenceData struct {
 	OS         string   `json:"os"`         // runtime.GOOS
 	Arch       string   `json:"arch"`       // runtime.GOARCH
 	Watching   []string `json:"watching"`   // tool sources this device is watching
+	// State is "paused" while the engineer has paused capture (`promptster-teams
+	// pause`), else "capturing". A closed enum word, already on both the CLI and
+	// backend presence allowlists, so it needs no backend change to be stored.
+	State string `json:"state"`
 
 	// DELIVERY BACKLOG. This device is the only party that knows how far behind
 	// its own outbox is, and until now it had no way to say so. On 2026-08-04 a
@@ -315,6 +319,7 @@ func buildPresenceEvent(session Session) event.Event {
 		OS:                   runtime.GOOS,
 		Arch:                 runtime.GOARCH,
 		Watching:             watchedTools(),
+		State:                presenceState(time.Now()),
 		PendingEvents:        pending.Count,
 		PendingOldestEventAt: oldest,
 		DeliveryState:        delivery.State,
@@ -405,4 +410,12 @@ func StartPresenceHeartbeat(session Session) (stop func()) {
 	done := make(chan struct{})
 	go runPresenceHeartbeat(session, done)
 	return func() { close(done) }
+}
+
+// presenceState is the closed enum carried in presenceData.State.
+func presenceState(now time.Time) string {
+	if paused, _ := state.CapturePaused(now); paused {
+		return "paused"
+	}
+	return "capturing"
 }

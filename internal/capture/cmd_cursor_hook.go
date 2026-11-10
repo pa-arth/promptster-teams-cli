@@ -159,6 +159,11 @@ func runCursorHookInner() {
 		recordCursorHookDrop(res)
 		return
 	}
+	// Honour the exclude list / .promptsterignore exactly as the transcript
+	// rails do (exclude.go): a turn in an excluded tree emits nothing.
+	if res.Workdir != "" && captureExcluded(resolvePath(res.Workdir)) {
+		return
+	}
 
 	// A SUBAGENT'S HOOKS ARRIVE UNDER ITS OWN ID AND WITH NO TRANSCRIPT PATH.
 	// Cursor resolves transcript_path from the child id alone, but the child's

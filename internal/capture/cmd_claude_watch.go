@@ -1356,7 +1356,7 @@ func classifyClaudeTranscript(path string, roots []string, historyCutoff time.Ti
 		matched := false
 		for _, root := range roots {
 			if pathWithin(resolved, root) {
-				matched = true
+				matched = !captureExcluded(resolved)
 				break
 			}
 		}
@@ -1426,7 +1426,7 @@ func classifyClaudeTranscriptBounded(
 		matched := false
 		for _, root := range roots {
 			if pathWithin(resolved, root) {
-				matched = true
+				matched = !captureExcluded(resolved)
 				break
 			}
 		}
