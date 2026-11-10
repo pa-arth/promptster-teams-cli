@@ -230,7 +230,16 @@ func reworkLedgerPath() string {
 // must hold it. A missing/version-mismatched file yields an empty ledger.
 func readReworkLedgerUnlocked() reworkLedger {
 	led := reworkLedger{V: reworkLedgerVersion, Roots: map[string]map[string][]durTrackedRange{}}
-	data, err := os.ReadFile(reworkLedgerPath())
+	path := reworkLedgerPath()
+	info, err := os.Stat(path)
+	if err != nil {
+		return led
+	}
+	if cached, ok := reworkLedgerCache.get(path, info); ok {
+		return cached
+	}
+	// #nosec G304 -- path is the fixed rework.json under the state dir, not user input.
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return led
 	}
@@ -238,6 +247,9 @@ func readReworkLedgerUnlocked() reworkLedger {
 	if json.Unmarshal(data, &onDisk) == nil && onDisk.V == reworkLedgerVersion && onDisk.Roots != nil {
 		led = onDisk
 	}
+	// Stat taken BEFORE the read: a replace in between leaves a stale inode here,
+	// so the next read re-parses. See ledgerCache.
+	reworkLedgerCache.put(path, info, led)
 	return led
 }
 
@@ -249,11 +261,15 @@ func writeReworkLedgerUnlocked(led reworkLedger) {
 	if err != nil {
 		return
 	}
-	tmp := reworkLedgerPath() + ".tmp"
+	path := reworkLedgerPath()
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, data, 0o600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, reworkLedgerPath())
+	if err := os.Rename(tmp, path); err != nil {
+		return
+	}
+	reworkLedgerCache.putAfterWrite(path, led)
 }
 
 // loadReworkLedger reads the ledger under the buffer lock. For read-only callers;
@@ -274,6 +290,9 @@ func mutateReworkLedger(fn func(led *reworkLedger)) {
 	_ = sign.WithBufferLock(reworkLedgerPath()+".lock", func() error {
 		led := readReworkLedgerUnlocked()
 		fn(&led)
+		if reworkLedgerCache.matches(reworkLedgerPath(), led) {
+			return nil // nothing changed: skip the encode + rewrite, keep the cache valid
+		}
 		writeReworkLedgerUnlocked(led)
 		return nil
 	})

@@ -264,7 +264,7 @@ func readDurabilityLedgerUnlocked() durabilityLedger {
 	if err != nil {
 		return led
 	}
-	if cached, ok := durabilityCacheGet(path, info); ok {
+	if cached, ok := durabilityLedgerCache.get(path, info); ok {
 		return cached
 	}
 	// #nosec G304 -- path is the fixed durability.json under the state dir, not user input.
@@ -278,7 +278,7 @@ func readDurabilityLedgerUnlocked() durabilityLedger {
 	}
 	// Cache against the stat taken BEFORE the read: if the file was replaced in
 	// between, this entry's inode no longer matches and the next read re-parses.
-	durabilityCachePut(path, info, led)
+	durabilityLedgerCache.put(path, info, led)
 	return led
 }
 
@@ -299,9 +299,7 @@ func writeDurabilityLedgerUnlocked(led durabilityLedger) {
 	if err := os.Rename(tmp, path); err != nil {
 		return
 	}
-	if info, err := os.Stat(path); err == nil {
-		durabilityCachePut(path, info, led)
-	}
+	durabilityLedgerCache.putAfterWrite(path, led)
 }
 
 // loadDurabilityLedger reads the ledger under the buffer lock. For read-only
@@ -325,12 +323,11 @@ func loadDurabilityLedger() durabilityLedger {
 func mutateDurabilityLedger(fn func(led *durabilityLedger)) {
 	_ = sign.WithBufferLock(durabilityLedgerPath()+".lock", func() error {
 		led := readDurabilityLedgerUnlocked()
-		before := cloneDurabilityLedger(led)
 		fn(&led)
 		// Most polls change nothing (harvest and inventory run for every root on
 		// every poll). Skipping the rewrite saves the encode and the disk write,
 		// and keeps the cached parse valid.
-		if durabilityLedgersEqual(before, led) {
+		if durabilityLedgerCache.matches(durabilityLedgerPath(), led) {
 			return nil
 		}
 		writeDurabilityLedgerUnlocked(led)
