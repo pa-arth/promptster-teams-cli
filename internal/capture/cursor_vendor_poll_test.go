@@ -1,12 +1,12 @@
 package capture
 
 import (
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 	"os"
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 func beatVendorPollOkAt(t *testing.T) string {

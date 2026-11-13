@@ -92,10 +92,10 @@ func buildUpdater(t *testing.T, current string, pol PolicyView) (u *updater, app
 
 // latestRoute is the releases/latest redirect route: the substring the stub
 // matches, and the Location it answers with.
-const latestRoute = "rel.test/pa-arth/promptster-teams-cli/releases/latest"
+const latestRoute = "rel.test/promptster-ai/promptster-teams-cli/releases/latest"
 
 func locationForTag(tag string) string {
-	return "https://rel.test/pa-arth/promptster-teams-cli/releases/tag/" + tag
+	return "https://rel.test/promptster-ai/promptster-teams-cli/releases/tag/" + tag
 }
 
 // wireHappyRelease registers a full valid release at tag v9.9.9.
@@ -271,7 +271,7 @@ func TestManagedDisabledBeatsGrantedConsent(t *testing.T) {
 }
 
 func TestReleaseNotesURLNamesTheTag(t *testing.T) {
-	const want = "https://github.com/pa-arth/promptster-teams-cli/releases/tag/v9.9.9"
+	const want = "https://github.com/promptster-ai/promptster-teams-cli/releases/tag/v9.9.9"
 	// Both forms resolve to the same page: callers hold a bare version, the URL
 	// needs the v-prefixed tag.
 	if got := ReleaseNotesURL("9.9.9"); got != want {
@@ -541,7 +541,7 @@ func TestMinCliVersionDoesNotOverrideDisabledOrg(t *testing.T) {
 func TestMinCliVersionDoesNotOverridePin(t *testing.T) {
 	u, applied, addRoute := buildUpdater(t, "0.5.2", stubPolicy{enabled: true, pinned: "0.5.4", min: "9.9.9"})
 	wireHappyRelease(addRoute)
-	addRoute("github.test/pa-arth/promptster-teams-cli/releases/download/v0.5.4/SHA256SUMS", "", 404)
+	addRoute("github.test/promptster-ai/promptster-teams-cli/releases/download/v0.5.4/SHA256SUMS", "", 404)
 	if got := u.checkAndApply(); got == outcomeApplied {
 		t.Fatal("a min-version floor must not override an org pin")
 	}
@@ -595,8 +595,8 @@ func TestFetchLatestError(t *testing.T) {
 // parse is the new failure surface.
 func TestTagFromReleaseLocation(t *testing.T) {
 	ok := []struct{ name, loc, want string }{
-		{"absolute", "https://github.com/pa-arth/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
-		{"relative", "/pa-arth/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
+		{"absolute", "https://github.com/promptster-ai/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
+		{"relative", "/promptster-ai/promptster-teams-cli/releases/tag/v0.6.1", "v0.6.1"},
 		{"trailing slash", "https://github.com/x/y/releases/tag/v1.2.3/", "v1.2.3"},
 		{"percent-escaped", "https://github.com/x/y/releases/tag/v1.2.3%2Brc1", "v1.2.3+rc1"},
 		{"no v prefix", "https://github.com/x/y/releases/tag/1.2.3", "1.2.3"},
@@ -615,7 +615,7 @@ func TestTagFromReleaseLocation(t *testing.T) {
 
 	bad := []struct{ name, loc string }{
 		{"empty", ""},
-		{"no marker", "https://github.com/pa-arth/promptster-teams-cli/releases"},
+		{"no marker", "https://github.com/promptster-ai/promptster-teams-cli/releases"},
 		{"empty tag", "https://github.com/x/y/releases/tag/"},
 		{"login redirect", "https://github.com/login?return_to=%2Fx%2Fy"},
 		// The tag is interpolated into the download URL, so a separator that

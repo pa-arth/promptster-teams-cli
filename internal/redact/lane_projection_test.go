@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // laneBearingKinds is every kind the sidechain path can emit. Written out rather

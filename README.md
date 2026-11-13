@@ -1,7 +1,7 @@
 # promptster-teams-cli
 
-[![ci](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/ci.yml)
-[![codeql](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/pa-arth/promptster-teams-cli/actions/workflows/codeql.yml)
+[![ci](https://github.com/promptster-ai/promptster-teams-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/promptster-ai/promptster-teams-cli/actions/workflows/ci.yml)
+[![codeql](https://github.com/promptster-ai/promptster-teams-cli/actions/workflows/codeql.yml/badge.svg)](https://github.com/promptster-ai/promptster-teams-cli/actions/workflows/codeql.yml)
 [![npm](https://img.shields.io/npm/v/@promptster/teams-cli.svg)](https://www.npmjs.com/package/@promptster/teams-cli)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -171,7 +171,7 @@ verify it with `npm audit signatures`.
 Or install the raw binary:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/promptster-ai/promptster-teams-cli/main/install.sh | sh
 ```
 
 The installer downloads `SHA256SUMS` from the release and **verifies the binary

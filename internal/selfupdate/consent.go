@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // Consent is the engineer's DURABLE answer to "may this binary keep itself up to

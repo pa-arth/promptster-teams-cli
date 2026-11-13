@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // openspec cursor-vendor-multi-account §2.1 — EXTRA CURSOR PROFILES.

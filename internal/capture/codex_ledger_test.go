@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // TestCodexFileDiffReachesAiPathsLedger (§10.3) is the end-to-end confirmation

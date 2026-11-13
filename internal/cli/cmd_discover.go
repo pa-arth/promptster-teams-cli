@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/discovery"
+	"github.com/promptster-ai/promptster-teams-cli/internal/discovery"
 )
 
 // cmdDiscover performs metadata-only discovery. Setup remains user-scoped:

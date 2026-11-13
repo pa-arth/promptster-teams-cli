@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 )
 
 // cursorHookMaxPayload bounds what we read from stdin. An afterFileEdit payload

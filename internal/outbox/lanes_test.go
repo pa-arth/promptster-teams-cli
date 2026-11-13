@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // The lane split exists for ONE observed failure: a schema bump queued 62,302

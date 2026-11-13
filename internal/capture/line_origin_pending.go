@@ -7,9 +7,9 @@ import (
 	"sort"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // Only local job metadata is persisted here. Root paths never enter a receipt,

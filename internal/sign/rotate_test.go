@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // fillLedgerPastRotation pads the live ledger past the rotation threshold with

@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 func TestReplayCodexRolloutPrefixRestoresDetachedCommand(t *testing.T) {

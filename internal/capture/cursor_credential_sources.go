@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // openspec cursor-vendor-multi-account §2.1 — EVERY CURSOR LOGIN ON THE DEVICE.

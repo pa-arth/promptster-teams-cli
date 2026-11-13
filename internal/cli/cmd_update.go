@@ -7,10 +7,10 @@ import (
 	"os"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/policy"
-	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/policy"
+	"github.com/promptster-ai/promptster-teams-cli/internal/selfupdate"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // cmdUpdate is the manual update path, and the escape hatch that makes the rest

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # promptster-teams installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/promptster-ai/promptster-teams-cli/main/install.sh | sh
 # Or:    PROMPTSTER_TEAMS_VERSION=0.1.0 curl -fsSL <url> | sh
 #
 # Before installing, this verifies the minisign SIGNATURE over SHA256SUMS using
@@ -11,7 +11,7 @@
 # back to checksum-only verification (not recommended).
 set -euo pipefail
 
-REPO="pa-arth/promptster-teams-cli"
+REPO="promptster-ai/promptster-teams-cli"
 VERSION="${PROMPTSTER_TEAMS_VERSION:-latest}"
 BINARY="promptster-teams"
 

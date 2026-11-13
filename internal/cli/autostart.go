@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // cmdAutostart manages the per-user OS service that relaunches capture at login

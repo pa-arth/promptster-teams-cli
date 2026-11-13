@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // TestDegradationCountsParsesNotSends is the regression for bug 4.

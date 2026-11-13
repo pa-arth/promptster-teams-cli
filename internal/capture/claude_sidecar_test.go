@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // Claude Code writes a four-key sidecar beside every sidechain transcript. The

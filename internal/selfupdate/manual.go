@@ -7,8 +7,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // ManualStatus is what a foreground `update` run found and did.

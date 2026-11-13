@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // A `git rebase -i` ON A TRACKED FEATURE BRANCH USED TO LEAVE THAT BRANCH'S AI

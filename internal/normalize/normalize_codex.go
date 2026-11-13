@@ -10,8 +10,8 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // Codex instrumentation works by tailing the per-session rollout JSONL that the

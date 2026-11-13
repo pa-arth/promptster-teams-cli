@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/selfupdate"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
 )
 
 // This file answers ONE question doctor could not previously ask: is the binary

@@ -146,7 +146,7 @@ function cmdBuild() {
   const t0 = Date.now();
   const r = spawnSync("go", [
     "build",
-    `-ldflags=-s -w -X github.com/pa-arth/promptster-teams-cli/internal/version.Version=${version}`,
+    `-ldflags=-s -w -X github.com/promptster-ai/promptster-teams-cli/internal/version.Version=${version}`,
     "-o", BIN, "./cmd/promptster-teams",
   ], { cwd: REPO, encoding: "utf8" });
   if (r.error && r.error.code === "ENOENT")

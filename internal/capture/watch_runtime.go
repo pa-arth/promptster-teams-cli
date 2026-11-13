@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // The capture process records WHICH BINARY it is actually executing, because

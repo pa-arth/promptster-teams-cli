@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
 )
 
 // fakeManager stands in for launchd/systemd. Stop() runs onStop, letting a test

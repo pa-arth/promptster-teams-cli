@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
 )
 
 // THE DASHBOARD IS WHERE THIS HAS TO APPEAR, and review caught that it did not.

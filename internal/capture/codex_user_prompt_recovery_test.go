@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // End-to-end proof through the REAL watcher, not just the normalizer: a rollout

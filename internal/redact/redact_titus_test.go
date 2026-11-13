@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // Golden corpus: realistic-format secrets that MUST be redacted by the

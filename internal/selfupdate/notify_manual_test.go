@@ -24,7 +24,7 @@ func TestManualGUIPrompt(t *testing.T) {
 	defer cancel()
 
 	res := promptDarwin(ctx, "0.24.0", "0.25.0",
-		"https://github.com/pa-arth/promptster-teams-cli/releases/tag/v0.25.0")
+		"https://github.com/promptster-ai/promptster-teams-cli/releases/tag/v0.25.0")
 	t.Logf("promptDarwin result = %v (0=unavailable 1=declined 2=accepted)", res)
 	if res == guiUnavailable {
 		t.Error("no dialog could be shown from this process")

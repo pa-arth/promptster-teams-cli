@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // AN ORDINARY `git merge feature` ONTO THE DEFAULT BRANCH USED TO FOLD THE SAME

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // THE DAEMON MUST BE ABLE TO CATCH UP WITHOUT THE INTERNET AND WITHOUT A HUMAN.

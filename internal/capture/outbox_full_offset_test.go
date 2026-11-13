@@ -9,9 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // The tests here pin ONE rule on both transcript rails: a record whose events

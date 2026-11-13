@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 )
 
 // hookPayload builds a payload with the envelope fields every real Cursor hook

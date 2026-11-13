@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // TestRegisterCaptureRootPersists proves the round trip: a registered directory

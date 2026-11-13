@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 func vendorV2Data(ev event.Event) map[string]interface{} { return ev.Data.(map[string]interface{}) }

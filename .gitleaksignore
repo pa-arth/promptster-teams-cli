@@ -20,3 +20,20 @@
 # commit (fac85c9) that introduced it unsplit, which the PR-range scan still
 # walks. Same pattern as the entry above.
 fac85c9d32a682e00c13092304669d3fac130522:internal/redact/redact_test.go:generic-api-key:281
+
+# Redaction/presence test fixtures in early history, all synthetic (PSE-ABCD-2345,
+# PST-A7K2-M9Q4, priv123, abc123def456, and format-shaped fake vendor keys used
+# to exercise the redactor). Surfaced when secret-scan moved from
+# gitleaks-action to the gitleaks CLI scanning full history on every run.
+0b5a2f107b4595dd606386f3834f62f15f9a7c88:redact_test.go:generic-api-key:22
+6e6f4cff6fdfa09da7b40f013995a43420dbf2a6:redact_test.go:generic-api-key:42
+77274d761201cfd83ca2a729bcf9ce43ebd83842:presence_test.go:generic-api-key:14
+77274d761201cfd83ca2a729bcf9ce43ebd83842:presence_test.go:generic-api-key:80
+9f66d7464613d71542fe21df778ad80c613ef80b:redact_test.go:generic-api-key:18
+9f66d7464613d71542fe21df778ad80c613ef80b:redact_titus_test.go:generic-api-key:147
+9f66d7464613d71542fe21df778ad80c613ef80b:redact_titus_test.go:generic-api-key:28
+9f66d7464613d71542fe21df778ad80c613ef80b:redact_titus_test.go:generic-api-key:29
+ab2d824403c8bf8a44e07586f66b338fddcccf21:redact_test.go:generic-api-key:42
+c9f36a26dd831d5159a465392700def17397a55a:presence_test.go:generic-api-key:14
+c9f36a26dd831d5159a465392700def17397a55a:presence_test.go:generic-api-key:80
+eeddd5a88bd561a9293c4f5fc2101d80507b0ec0:redact_test.go:generic-api-key:22

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // openspec cursor-vendor-multi-account, Phase A — WHICH CURSOR LOGIN RAN A TURN.

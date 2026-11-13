@@ -3,7 +3,7 @@ package capture
 import (
 	"encoding/json"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // eventDataMap converts a typed payload struct into the map[string]interface{}

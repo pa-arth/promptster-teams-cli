@@ -8,8 +8,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // Off-HEAD commit detection.

@@ -581,7 +581,7 @@ walk back into:
   (`promptster` from `pa-arth/promptster-cli-releases` into `~/.promptster/bin`). It
   installed an unrelated product and left promptster-teams exactly as stale as it was.
   `nudgeCurl` must name **this** repo's `install.sh`
-  (`raw.githubusercontent.com/pa-arth/promptster-teams-cli/main/install.sh`).
+  (`raw.githubusercontent.com/promptster-ai/promptster-teams-cli/main/install.sh`).
   `TestNudgeCurlInstallsThisProduct` pins the CONTENT; every other nudge test compares
   against the `nudgeCurl` *constant* and therefore stayed green for the entire life of the
   bug. **A constant-vs-constant assertion proves nothing about a URL.**
@@ -613,7 +613,7 @@ GOOS=windows and would make the checks host-dependent and untestable from a unix
 
 - **Local builds never update.** The gate skips when version is `"dev"` or `""`. To
   exercise the real path you must build with
-  `-ldflags "-X github.com/pa-arth/promptster-teams-cli/internal/version.Version=0.0.1"`.
+  `-ldflags "-X github.com/promptster-ai/promptster-teams-cli/internal/version.Version=0.0.1"`.
 - **Isolate state or the single-instance lock refuses**: a real daemon on the dev machine
   makes `watch` print `capture already running (pid N) — not starting a second watcher`.
   Set `HOME` and `PROMPTSTER_STATE_DIR` to throwaway dirs. Never kill the developer's

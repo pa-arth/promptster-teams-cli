@@ -4,7 +4,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
+	"github.com/promptster-ai/promptster-teams-cli/internal/selfupdate"
 )
 
 // A HANDOFF IS THE ONE CASE WHERE "ALREADY RUNNING" IS THE WRONG ANSWER.

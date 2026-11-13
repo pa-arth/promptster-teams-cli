@@ -9,9 +9,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
 )
 
 // Live-status dashboard. A small bubbletea program that re-reads the capture

@@ -4,7 +4,7 @@ import (
 	"os"
 
 	"context"
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 	"net/http"
 	"net/http/httptest"
 	"testing"

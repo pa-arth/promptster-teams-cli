@@ -64,7 +64,7 @@ console.log(`Building promptster-teams v${version} for all platforms...\n`);
 
 for (const { goos, goarch, out } of TARGETS) {
   const outPath = path.join(binariesDir, out);
-  const cmd = `go build -ldflags "-s -w -X github.com/pa-arth/promptster-teams-cli/internal/version.Version=${version}" -o ${outPath} ./cmd/promptster-teams`;
+  const cmd = `go build -ldflags "-s -w -X github.com/promptster-ai/promptster-teams-cli/internal/version.Version=${version}" -o ${outPath} ./cmd/promptster-teams`;
   console.log(`  ${goos}/${goarch} → binaries/${out}`);
   try {
     execSync(cmd, {

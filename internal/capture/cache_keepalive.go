@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // Cache keep-alive keeps an idle Claude Code session's prompt cache warm so that

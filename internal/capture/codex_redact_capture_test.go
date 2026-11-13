@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 )
 
 // PII / business data must be scrubbed regardless of which layer catches it.

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
 )
 
 // cmdKeepalive dispatches `keepalive enable|disable|status`: the opt-in for

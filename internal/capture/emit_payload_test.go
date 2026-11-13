@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
 )
 
 // These tests cover the seam the per-half unit tests left open.

@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
 )
 
 // LineOrigin is a versioned, content-free SZZ receipt. Source and paths stay local.
