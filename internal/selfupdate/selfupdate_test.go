@@ -452,7 +452,7 @@ func TestOnlyTheCurlDestIsToldToRunInstallSh(t *testing.T) {
 }
 
 // nudgeCurl once pointed at https://get.promptster.ai — the HIRING CLI's
-// installer, which drops `promptster` from pa-arth/promptster-cli-releases into
+// installer, which drops `promptster` from promptster-ai/promptster-cli-releases into
 // ~/.promptster/bin and leaves promptster-teams exactly as stale as it was.
 //
 // Every other nudge test compares against the nudgeCurl CONSTANT, so all of

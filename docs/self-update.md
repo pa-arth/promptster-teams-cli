@@ -578,7 +578,7 @@ walk back into:
 
 - **Pointing `nudgeCurl` at the wrong PRODUCT.** It shipped as
   `curl -fsSL https://get.promptster.ai | sh` — which is the **hiring CLI's** installer
-  (`promptster` from `pa-arth/promptster-cli-releases` into `~/.promptster/bin`). It
+  (`promptster` from `promptster-ai/promptster-cli-releases` into `~/.promptster/bin`). It
   installed an unrelated product and left promptster-teams exactly as stale as it was.
   `nudgeCurl` must name **this** repo's `install.sh`
   (`raw.githubusercontent.com/promptster-ai/promptster-teams-cli/main/install.sh`).
