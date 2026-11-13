@@ -170,7 +170,7 @@ const npmPackage = "@promptster/teams-cli"
 //
 // nudgeCurl MUST point at THIS repo's install.sh. It previously pointed at
 // https://get.promptster.ai, which is the HIRING CLI's installer: it fetches
-// `promptster` from pa-arth/promptster-cli-releases into ~/.promptster/bin.
+// `promptster` from promptster-ai/promptster-cli-releases into ~/.promptster/bin.
 // Running it left promptster-teams exactly as stale as it was and dropped an
 // unrelated product on the box — the invariant above, violated in the worst
 // available way (wrong PROGRAM, not merely wrong path). The URL below is the
