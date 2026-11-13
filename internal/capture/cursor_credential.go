@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 	_ "modernc.org/sqlite" // pure-Go SQLite driver; keeps the 6-platform cross-build CGO-free.
 )
 

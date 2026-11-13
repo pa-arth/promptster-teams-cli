@@ -54,9 +54,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 const (
@@ -112,7 +112,7 @@ const (
 	belowMinCheckInterval = 15 * time.Minute
 
 	// repoSlug is the public releases repo.
-	repoSlug = "pa-arth/promptster-teams-cli"
+	repoSlug = "promptster-ai/promptster-teams-cli"
 
 	// envNoAutoUpdate opts a single machine out of self-update regardless of org
 	// policy. Any truthy value disables it.

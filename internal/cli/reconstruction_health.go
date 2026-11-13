@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // History reconstruction is the longest-running thing the daemon does and, until

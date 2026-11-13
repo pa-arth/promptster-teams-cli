@@ -29,8 +29,8 @@ func TestSanitizeForDialogStripsScriptBreakingCharacters(t *testing.T) {
 // rendered — a malformed link in that dialog is a signal, not decoration.
 func TestIsSafeURLAcceptsOnlyOurReleaseLinks(t *testing.T) {
 	good := []string{
-		"https://github.com/pa-arth/promptster-teams-cli/releases/tag/v0.25.0",
-		"https://github.com/pa-arth/promptster-teams-cli/releases/tag/v1.2.3-rc.1",
+		"https://github.com/promptster-ai/promptster-teams-cli/releases/tag/v0.25.0",
+		"https://github.com/promptster-ai/promptster-teams-cli/releases/tag/v1.2.3-rc.1",
 	}
 	for _, u := range good {
 		if !isSafeURL(u) {

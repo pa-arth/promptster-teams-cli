@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // The record is only worth anything if it describes the process that is

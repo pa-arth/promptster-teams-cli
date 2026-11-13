@@ -3,7 +3,7 @@ package redact
 import (
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // The census's tool discriminator must survive projection — and nothing else may

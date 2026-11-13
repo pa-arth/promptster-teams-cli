@@ -18,4 +18,4 @@ Tails Claude Code + Codex transcripts, redacts secrets on-device, signs each
 event into a tamper-evident chain, and streams to your team's backend. Capture
 is content, not surveillance — no keystroke logging, no behavioral analysis.
 
-Source (public, auditable): https://github.com/pa-arth/promptster-teams-cli
+Source (public, auditable): https://github.com/promptster-ai/promptster-teams-cli

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // codexSessionsRoot points CODEX_HOME at a temp dir and returns the sessions

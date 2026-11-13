@@ -6,12 +6,12 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // Presence heartbeat.

@@ -1,6 +1,6 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 BINARY  := promptster-teams
-LDFLAGS := -ldflags="-s -w -X github.com/pa-arth/promptster-teams-cli/internal/version.Version=$(VERSION)"
+LDFLAGS := -ldflags="-s -w -X github.com/promptster-ai/promptster-teams-cli/internal/version.Version=$(VERSION)"
 
 .PHONY: build install release clean test sync-capture-allowlist
 

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 )
 
 // Cursor invocation identity: delegations and MCP calls were dropped on the

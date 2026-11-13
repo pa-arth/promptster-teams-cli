@@ -3,7 +3,7 @@ package sign
 import (
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // bufferSegmentMaxBytes is the size at which the live ledger is rotated aside.

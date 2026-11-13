@@ -5,9 +5,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // The send queue (internal/outbox) is durable and drains in the background, so

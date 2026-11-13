@@ -1,4 +1,4 @@
-module github.com/pa-arth/promptster-teams-cli
+module github.com/promptster-ai/promptster-teams-cli
 
 go 1.27.0
 

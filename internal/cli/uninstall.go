@@ -8,9 +8,9 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // `uninstall` — undo everything this CLI installed outside its own directory,

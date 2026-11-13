@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/selfupdate"
+	"github.com/promptster-ai/promptster-teams-cli/internal/selfupdate"
 )
 
 func TestHumanInterval(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // claudeProjectsRoot points CLAUDE_CONFIG_DIR at a temp dir and returns the

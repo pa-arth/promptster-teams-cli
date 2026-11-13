@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // statuslineTestEnv points CLAUDE_CONFIG_DIR (the User settings layer) and the

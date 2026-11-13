@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // A COMMIT IS NEVER RECORDED AS ATTRIBUTED UNLESS ITS HUNKS WERE FOLDED.

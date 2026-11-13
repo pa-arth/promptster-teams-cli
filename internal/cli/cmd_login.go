@@ -11,11 +11,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/x/term"
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/discovery"
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/service"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/discovery"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/service"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // cmdLogin onboards an individual contributor: it takes the per-engineer key

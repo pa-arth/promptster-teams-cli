@@ -3,7 +3,7 @@ package capture
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 	"os"
 	"os/exec"
 	"path/filepath"

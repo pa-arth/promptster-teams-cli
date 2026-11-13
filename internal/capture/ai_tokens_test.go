@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // aiTokensOf pulls the scalar aiTokens field out of a commit_attribution event's

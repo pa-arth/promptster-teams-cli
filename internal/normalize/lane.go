@@ -1,6 +1,6 @@
 package normalize
 
-import "github.com/pa-arth/promptster-teams-cli/internal/event"
+import "github.com/promptster-ai/promptster-teams-cli/internal/event"
 
 // stampLaneID marks every event with the concurrent agent process that produced
 // it, so within-session parallelism is computable downstream.

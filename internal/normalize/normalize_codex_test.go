@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/redact"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/redact"
 )
 
 // Real rollout lines captured from codex-cli 0.137.0 (`codex exec`).
@@ -249,7 +249,7 @@ func idsByKindCodex(t *testing.T, sessionID string) map[string][]string {
 
 // TestCodexTranscriptDeterministicEventIDs is the regression guard for the
 // rollout double-emit bug (the Codex analogue of the Claude fix in
-// pa-arth/promptster-teams-cli#28): the SAME rollout record must never yield two
+// promptster-ai/promptster-teams-cli#28): the SAME rollout record must never yield two
 // distinct event ids, no matter how the rollout is re-observed. Codex
 // resume/fork writes a NEW rollout file that copies prior history verbatim, and
 // the watcher runs one processor (its own dedup state) per file — so two

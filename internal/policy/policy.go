@@ -19,8 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/ingest"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/ingest"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // maxPolicyBodyBytes caps how much of the policy response we read. The payload

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/normalize"
+	"github.com/promptster-ai/promptster-teams-cli/internal/normalize"
 )
 
 // TestClassifyClaudeTranscriptCutoffRouting pins the go-forward capture-time

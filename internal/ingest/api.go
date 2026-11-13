@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 const DefaultAPIURL = "https://api.promptster.ai"

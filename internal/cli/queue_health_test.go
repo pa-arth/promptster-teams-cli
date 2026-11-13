@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // worstLevel is the severity doctor actually communicates: one warn among the

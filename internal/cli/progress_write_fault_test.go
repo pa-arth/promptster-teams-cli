@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
 )
 
 // §2.3 EXISTS BECAUSE OF WHAT HAPPENED LAST TIME. The reconstruction line

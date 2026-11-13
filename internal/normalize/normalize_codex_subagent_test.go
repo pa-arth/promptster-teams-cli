@@ -3,7 +3,7 @@ package normalize
 import (
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 )
 
 // Real session_meta headers captured from codex-cli 0.146.0, trimmed of their

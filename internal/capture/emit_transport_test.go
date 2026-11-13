@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
 )
 
 // TestCensusIsQueuedAndPresenceIsNot pins the deliberate asymmetry between the

@@ -4,7 +4,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
 )
 
 // HISTORY RECONSTRUCTION IS THE LONGEST-RUNNING THING THIS DAEMON DOES, AND

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
-	"github.com/pa-arth/promptster-teams-cli/internal/version"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/version"
 )
 
 // Main is the CLI entry point. It parses argv (os.Args, including argv[0]) and
@@ -184,6 +184,6 @@ PROMPTSTER_TEAMS_TOKEN env, then ~/.promptster-teams/credentials (written by
 login). PROMPTSTER_TEAMS_API_URL overrides the ingest URL (default: hosted).
 
 Everything is captured locally and redacted on-device before anything is sent.
-Source: https://github.com/pa-arth/promptster-teams-cli
+Source: https://github.com/promptster-ai/promptster-teams-cli
 `)
 }

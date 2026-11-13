@@ -8,10 +8,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/event"
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
-	"github.com/pa-arth/promptster-teams-cli/internal/policy"
-	"github.com/pa-arth/promptster-teams-cli/internal/sign"
+	"github.com/promptster-ai/promptster-teams-cli/internal/event"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/policy"
+	"github.com/promptster-ai/promptster-teams-cli/internal/sign"
 )
 
 const cursorVendorPollInterval = 15 * time.Minute

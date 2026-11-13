@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // railFixture builds one machine's worth of ~/.cursor state and returns the

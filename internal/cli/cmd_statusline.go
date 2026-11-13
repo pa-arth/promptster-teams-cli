@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/capture"
+	"github.com/promptster-ai/promptster-teams-cli/internal/capture"
 )
 
 // cmdStatusline dispatches the `statusline` subcommands. `run` is the hot path

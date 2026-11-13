@@ -10,10 +10,10 @@
     "observability",
     "developer-productivity"
   ],
-  "homepage": "https://github.com/pa-arth/promptster-teams-cli",
+  "homepage": "https://github.com/promptster-ai/promptster-teams-cli",
   "repository": {
     "type": "git",
-    "url": "https://github.com/pa-arth/promptster-teams-cli"
+    "url": "https://github.com/promptster-ai/promptster-teams-cli"
   },
   "license": "MIT",
   "bin": {

@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/cli"
+	"github.com/promptster-ai/promptster-teams-cli/internal/cli"
 )
 
 func main() {

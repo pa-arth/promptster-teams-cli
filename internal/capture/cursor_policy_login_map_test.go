@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/policy"
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/policy"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // fetchedCursorPolicy builds a resolver that has run one real Refresh against a

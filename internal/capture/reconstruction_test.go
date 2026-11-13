@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/outbox"
+	"github.com/promptster-ai/promptster-teams-cli/internal/outbox"
 )
 
 // reconstructionFixture stands up an isolated state dir plus a Claude projects

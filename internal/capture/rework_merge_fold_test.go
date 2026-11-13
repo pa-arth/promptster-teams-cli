@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/pa-arth/promptster-teams-cli/internal/state"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // AN ORDINARY `git merge sidebranch` USED TO FOLD THE SAME EDITS TWICE.
