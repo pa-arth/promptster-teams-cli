@@ -8,9 +8,9 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/praetorian-inc/titus/pkg/scanner"
 	"github.com/promptster-ai/promptster-teams-cli/internal/event"
 	"github.com/promptster-ai/promptster-teams-cli/internal/state"
-	"github.com/praetorian-inc/titus/pkg/scanner"
 )
 
 // Secret redaction runs in THREE ordered stages, all behind RedactBytes:

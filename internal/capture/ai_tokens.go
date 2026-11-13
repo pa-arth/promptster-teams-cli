@@ -5,9 +5,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 	tiktoken "github.com/pkoukk/tiktoken-go"
 	tiktoken_loader "github.com/pkoukk/tiktoken-go-loader"
+	"github.com/promptster-ai/promptster-teams-cli/internal/state"
 )
 
 // On-device token counting of AI-authored committed lines.
